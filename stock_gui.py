@@ -14,7 +14,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from tkinter import ttk, messagebox, scrolledtext
+from matplotlib.figure import Figure
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
@@ -29,13 +30,9 @@ class StockMonitorApp:
         ensure_store_ready()
         self.root = root
         self.root.title("日终股票筛选器")
-        self.root.geometry("1680x980")
         self.root.minsize(1280, 820)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        try:
-            self.root.state("zoomed")
-        except tk.TclError:
-            pass
+        self._set_initial_window_geometry()
 
         self.stock_filter = StockFilter()
         self.stock_filter.set_log_callback(self._log_async)
@@ -62,6 +59,25 @@ class StockMonitorApp:
         self.apply_result_display_columns(save=False)
         self._load_last_results()
 
+    def _set_initial_window_geometry(self) -> None:
+        default_width = 1440
+        default_height = 900
+
+        try:
+            screen_width = max(self.root.winfo_screenwidth(), self.root.minsize()[0])
+            screen_height = max(self.root.winfo_screenheight(), self.root.minsize()[1])
+        except tk.TclError:
+            self.root.geometry(f"{default_width}x{default_height}")
+            return
+
+        width = min(default_width, screen_width - 120)
+        height = min(default_height, screen_height - 120)
+        width = max(width, 1280)
+        height = max(height, 820)
+        x = max((screen_width - width) // 2, 0)
+        y = max((screen_height - height) // 2, 0)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+
     def setup_ui(self):
         self.setup_menu()
 
@@ -78,7 +94,9 @@ class StockMonitorApp:
 
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="文件", menu=file_menu)
-        file_menu.add_command(label="导出结果", command=self.export_results)
+        file_menu.add_command(label="导出结果 CSV", command=self.export_results)
+        file_menu.add_command(label="导出结果图片", command=self.export_results_image)
+        file_menu.add_command(label="复制代码名称", command=self.copy_selected_stock_code_name, accelerator="Ctrl+C")
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_close)
 
@@ -207,6 +225,15 @@ class StockMonitorApp:
         result_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(result_frame, text="扫描结果")
 
+        action_frame = ttk.Frame(result_frame)
+        action_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(action_frame, text="导出结果图片", command=self.export_results_image).pack(side=tk.LEFT)
+        ttk.Button(action_frame, text="复制代码名称", command=self.copy_selected_stock_code_name).pack(side=tk.LEFT, padx=8)
+        ttk.Label(
+            action_frame,
+            text="导出图片会使用当前筛选结果和当前显示列，按 Ctrl+C 可复制选中股票。",
+        ).pack(side=tk.RIGHT)
+
         self.result_columns = (
             "code",
             "name",
@@ -288,6 +315,8 @@ class StockMonitorApp:
 
         self.result_tree.bind("<<TreeviewSelect>>", self.on_stock_select)
         self.result_tree.bind("<Double-1>", self.on_stock_double_click)
+        self.result_tree.bind("<Control-c>", self.copy_selected_stock_code_name)
+        self.result_tree.bind("<Control-C>", self.copy_selected_stock_code_name)
 
     def _visible_result_columns(self) -> tuple[str, ...]:
         ordered_columns = self.result_column_order or list(self.result_columns)
@@ -345,6 +374,57 @@ class StockMonitorApp:
         self.result_tree.configure(displaycolumns=self._visible_result_columns())
         if save:
             self._save_result_column_layout()
+
+    def _get_result_display_columns_and_headings(self) -> List[tuple[str, str]]:
+        return [
+            (col, self.result_headings.get(col, (col, 100))[0])
+            for col in self._visible_result_columns()
+        ]
+
+    def _format_result_row_values(self, result: Dict[str, Any]) -> Dict[str, str]:
+        data = result.get("data", {}) or {}
+        analysis = data.get("analysis") or {}
+        recent = analysis.get("recent_closes") or []
+        five_day_return = analysis.get("five_day_return")
+        volume_expand_ratio = analysis.get("volume_expand_ratio")
+
+        return {
+            "code": str(result.get("code", "-") or "-"),
+            "name": str(result.get("name", "-") or "-"),
+            "board": str(data.get("board") or data.get("exchange") or "-"),
+            "concepts": self._short_text(data.get("concepts", "-"), 30),
+            "latest_close": "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
+            "latest_ma": "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
+            "five_day_return": "-" if five_day_return is None else f"{five_day_return:.2f}%",
+            "limit_up_streak": str(analysis.get("limit_up_streak") or 0),
+            "broken_limit_up": "是" if analysis.get("broken_limit_up") else "否",
+            "volume_expand_ratio": "-" if volume_expand_ratio is None else f"{volume_expand_ratio:.2f}x",
+            "volume_expand": "是" if analysis.get("volume_expand") else "否",
+            "volume_break_limit_up": "是" if analysis.get("volume_break_limit_up") else "否",
+            "after_two_limit_up": "是" if analysis.get("after_two_limit_up") else "否",
+            "limit_up": "是" if analysis.get("limit_up") else "否",
+            "limit_up_reason": str(analysis.get("limit_up_reason") or "-"),
+            "recent_closes": ", ".join("-" if v is None else f"{v:.2f}" for v in recent),
+        }
+
+    def _build_result_image_pages(self, rows: List[List[str]], page_size: int = 40) -> List[List[List[str]]]:
+        if not rows:
+            return []
+        return [rows[index : index + page_size] for index in range(0, len(rows), page_size)]
+
+    def _get_selected_result_identity(self) -> Optional[tuple[str, str]]:
+        selection = self.result_tree.selection()
+        if not selection:
+            return None
+        item = self.result_tree.item(selection[0])
+        values = item.get("values") or []
+        if len(values) < 2:
+            return None
+        stock_code = str(values[0]).strip().zfill(6)
+        stock_name = str(values[1]).strip()
+        if not stock_code or not stock_name:
+            return None
+        return stock_code, stock_name
 
     def show_column_picker(self) -> None:
         picker = tk.Toplevel(self.root)
@@ -908,36 +988,8 @@ class StockMonitorApp:
         results = self._sort_results(results)
 
         for result in results:
-            data = result.get("data", {}) or {}
-            analysis = data.get("analysis") or {}
-            recent = analysis.get("recent_closes") or []
-            recent_text = ", ".join("-" if v is None else f"{v:.2f}" for v in recent)
-            five_day_return = analysis.get("five_day_return")
-            volume_expand_ratio = analysis.get("volume_expand_ratio")
-            volume_expand = "是" if analysis.get("volume_expand") else "否"
-            limit_up_streak = analysis.get("limit_up_streak") or 0
-            broken_limit_up = "是" if analysis.get("broken_limit_up") else "否"
-            volume_break_limit_up = "是" if analysis.get("volume_break_limit_up") else "否"
-            after_two_limit_up = "是" if analysis.get("after_two_limit_up") else "否"
-            limit_up = "是" if analysis.get("limit_up") else "否"
-            values = (
-                result.get("code", "-"),
-                result.get("name", "-"),
-                data.get("board") or data.get("exchange") or "-",
-                self._short_text(data.get("concepts", "-"), 30),
-                "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
-                "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
-                "-" if five_day_return is None else f"{five_day_return:.2f}%",
-                limit_up_streak,
-                broken_limit_up,
-                "-" if volume_expand_ratio is None else f"{volume_expand_ratio:.2f}x",
-                volume_expand,
-                volume_break_limit_up,
-                after_two_limit_up,
-                limit_up,
-                analysis.get("limit_up_reason", "-"),
-                recent_text,
-            )
+            row_values = self._format_result_row_values(result)
+            values = tuple(row_values.get(col, "-") for col in self.result_columns)
             self.result_tree.insert("", tk.END, values=values)
 
         self.filtered_stocks = results
@@ -1222,8 +1274,6 @@ class StockMonitorApp:
             messagebox.showwarning("警告", "没有可导出的结果")
             return
 
-        from tkinter import filedialog
-
         file_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV文件", "*.csv"), ("所有文件", "*.*")],
@@ -1262,6 +1312,130 @@ class StockMonitorApp:
             self._log(f"结果已导出到 {file_path}")
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {e}")
+
+    def export_results_image(self):
+        if not self.filtered_stocks:
+            messagebox.showwarning("警告", "没有可导出的结果")
+            return
+
+        display_columns = self._get_result_display_columns_and_headings()
+        if not display_columns:
+            messagebox.showwarning("警告", "当前没有可导出的显示列")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG图片", "*.png"), ("所有文件", "*.*")],
+        )
+
+        if not file_path:
+            return
+
+        rows = []
+        for result in self.filtered_stocks:
+            row_values = self._format_result_row_values(result)
+            rows.append([str(row_values.get(col, "-")) for col, _ in display_columns])
+
+        pages = self._build_result_image_pages(rows, page_size=40)
+        if not pages:
+            messagebox.showwarning("警告", "没有可导出的结果")
+            return
+
+        output_paths: List[Path] = []
+        base_path = Path(file_path)
+        headings = [heading for _, heading in display_columns]
+        column_widths = [max(self.result_headings.get(col, ("", 100))[1], 80) for col, _ in display_columns]
+        total_width = sum(column_widths) or 1
+        normalized_widths = [width / total_width for width in column_widths]
+        exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_pages = len(pages)
+
+        try:
+            for page_index, page_rows in enumerate(pages, start=1):
+                figure_width = min(max(total_width / 90, 10.0), 24.0)
+                figure_height = max(4.8, 1.6 + len(page_rows) * 0.34)
+
+                fig = Figure(figsize=(figure_width, figure_height), dpi=180)
+                fig.patch.set_facecolor("white")
+                ax = fig.add_subplot(111)
+                ax.axis("off")
+
+                title = "扫描结果导出"
+                if total_pages > 1:
+                    title = f"{title} 第 {page_index}/{total_pages} 页"
+                fig.text(0.01, 0.985, title, ha="left", va="top", fontsize=16, fontweight="bold")
+                fig.text(
+                    0.01,
+                    0.957,
+                    f"导出时间：{exported_at}    结果数量：{len(rows)}    显示列：{len(display_columns)}",
+                    ha="left",
+                    va="top",
+                    fontsize=9.5,
+                    color="#4b5563",
+                )
+
+                table = ax.table(
+                    cellText=page_rows,
+                    colLabels=headings,
+                    colLoc="center",
+                    cellLoc="center",
+                    colWidths=normalized_widths,
+                    loc="upper left",
+                    bbox=[0, 0, 1, 0.92],
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(8.5 if len(display_columns) >= 10 else 9.2)
+
+                left_aligned_columns = {"name", "concepts", "limit_up_reason", "recent_closes"}
+                for (row_index, col_index), cell in table.get_celld().items():
+                    cell.set_edgecolor("#d7deea")
+                    cell.set_linewidth(0.6)
+                    cell.get_text().set_wrap(True)
+                    if row_index == 0:
+                        cell.set_facecolor("#eaf2ff")
+                        cell.set_text_props(weight="bold", color="#111827")
+                        cell.set_height(0.042)
+                    else:
+                        cell.set_facecolor("#ffffff" if row_index % 2 else "#f8fafc")
+                        cell.set_height(0.037)
+                        if display_columns[col_index][0] in left_aligned_columns:
+                            cell.set_text_props(ha="left")
+
+                output_path = base_path
+                if total_pages > 1:
+                    output_path = base_path.with_name(f"{base_path.stem}_{page_index:02d}{base_path.suffix}")
+                fig.savefig(output_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+                plt.close(fig)
+                output_paths.append(output_path)
+
+            if len(output_paths) == 1:
+                messagebox.showinfo("成功", f"结果图片已导出到 {output_paths[0]}")
+                self._log(f"结果图片已导出到 {output_paths[0]}")
+            else:
+                messagebox.showinfo("成功", f"结果图片已导出，共 {len(output_paths)} 页，首个文件：{output_paths[0]}")
+                self._log(f"结果图片已导出，共 {len(output_paths)} 页，首个文件：{output_paths[0]}")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出图片失败: {e}")
+
+    def copy_selected_stock_code_name(self, event=None):
+        selection = self._get_selected_result_identity()
+        if selection is None:
+            messagebox.showwarning("提示", "请先在结果表中选中一只股票")
+            return "break" if event is not None else None
+
+        stock_code, stock_name = selection
+        payload = f"{stock_code} {stock_name}"
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(payload)
+            self.root.update_idletasks()
+            self.status_var.set(f"已复制: {payload}")
+            self._log(f"已复制股票代码名称: {payload}")
+        except tk.TclError as e:
+            messagebox.showerror("错误", f"复制失败: {e}")
+
+        return "break" if event is not None else None
 
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
