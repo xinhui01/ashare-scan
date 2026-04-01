@@ -89,6 +89,72 @@ python main.py
 pip install -r requirements.txt
 ```
 
+## 在新机器上快速运行
+
+推荐使用虚拟环境，这样最省心，也不容易和系统里其它 Python 项目互相影响。
+
+Windows：
+
+```bash
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python main.py
+```
+
+macOS / Linux：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+建议：
+
+- 尽量使用较新的 Python 3 版本
+- 如果更换了系统或环境，优先重新创建 `.venv`
+- 首次启动会自动创建本地数据库文件 `data/stock_store.sqlite3`
+
+## 跨系统运行说明
+
+本项目是桌面 GUI 程序，依赖 `tkinter`。
+
+- Windows 上通常可直接运行
+- Linux 上如果缺少 `tkinter`，通常需要额外安装 `python3-tk`
+- macOS 上一般使用官方 Python 安装包即可正常带上 `tkinter`
+
+如果遇到启动时报错，先确认：
+
+- Python 版本正常
+- `pip install -r requirements.txt` 已执行成功
+- 当前命令使用的是项目自己的虚拟环境解释器
+
+## 打包为可执行文件
+
+如果希望发给没有 Python 环境的电脑使用，可以在对应系统上使用 `PyInstaller` 打包。
+
+安装：
+
+```bash
+pip install pyinstaller
+```
+
+Windows 打包示例：
+
+```bash
+pyinstaller -w -F main.py -n gupiao
+```
+
+打包完成后，可执行文件会出现在 `dist/` 目录中。
+
+注意：
+
+- Windows 程序建议在 Windows 上打包
+- macOS 程序建议在 macOS 上打包
+- Linux 程序建议在 Linux 上打包
+- 一般不能做到“在一个系统打包后直接在所有系统通用”
+
 ## 项目结构
 
 | 文件 | 说明 |

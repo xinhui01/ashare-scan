@@ -1582,9 +1582,7 @@ class StockMonitorApp:
                 self.intraday_dist_ax.yaxis.tick_right()
                 self.intraday_dist_ax.tick_params(axis="y", labelright=True, labelleft=False, pad=4)
                 self.intraday_dist_ax.set_xlabel("占比(%)")
-                self.intraday_dist_ax.set_ylabel("价
-位
-(元)", rotation=0, labelpad=14, va="center")
+                self.intraday_dist_ax.set_ylabel("价\n位\n(元)", rotation=0, labelpad=14, va="center")
                 self.intraday_dist_ax.yaxis.set_label_position("right")
                 self.intraday_dist_ax.set_title("成交价格分布")
                 self.intraday_dist_ax.grid(True, axis="x", alpha=0.2)

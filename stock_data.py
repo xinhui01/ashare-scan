@@ -138,11 +138,17 @@ _apply_network_patches()
 
 import akshare as ak
 import pandas as pd
-from pandas.errors import SettingWithCopyWarning
+try:
+    from pandas.errors import SettingWithCopyWarning as _AkshareWarningCategory
+except ImportError:
+    try:
+        from pandas.errors import ChainedAssignmentError as _AkshareWarningCategory
+    except ImportError:
+        _AkshareWarningCategory = Warning
 
 warnings.filterwarnings(
     "ignore",
-    category=SettingWithCopyWarning,
+    category=_AkshareWarningCategory,
     module=r"akshare\.stock\.stock_board_concept_em",
 )
 
@@ -151,7 +157,7 @@ def _call_akshare_quietly(fn: Callable[..., T], *args, **kwargs) -> T:
     # AkShare's concept-board helpers emit noisy SettingWithCopyWarning logs
     # even when the returned data is usable. Silence only that warning locally.
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", SettingWithCopyWarning)
+        warnings.simplefilter("ignore", _AkshareWarningCategory)
         return _retry_ak_call(fn, *args, **kwargs)
 
 
