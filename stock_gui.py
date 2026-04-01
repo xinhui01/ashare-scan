@@ -2,6 +2,7 @@
 
 import csv
 import json
+import queue
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -57,11 +58,14 @@ class StockMonitorApp:
         self.result_column_order: List[str] = []
         self.default_result_display_columns: tuple[str, ...] = ()
         self.result_layout_path = Path("data") / "result_columns.json"
+        self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+        self._main_thread_id = threading.get_ident()
 
         self.setup_ui()
         self._load_result_column_layout()
         self.apply_result_display_columns(save=False)
         self._load_last_results()
+        self.root.after(100, self._drain_log_queue)
 
     def _set_initial_window_geometry(self) -> None:
         default_width = 1440
@@ -651,7 +655,19 @@ class StockMonitorApp:
                 f.write(line)
 
     def _log_async(self, message: str) -> None:
-        self.root.after(0, lambda: self._log(message))
+        if threading.get_ident() == self._main_thread_id:
+            self._log(message)
+            return
+        self._log_queue.put(message)
+
+    def _drain_log_queue(self) -> None:
+        while True:
+            try:
+                message = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._log(message)
+        self.root.after(100, self._drain_log_queue)
 
     def _selected_boards(self) -> List[str]:
         boards = [board for board, var in self.board_filter_vars.items() if var.get()]
@@ -1857,7 +1873,6 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
-
 
 
 

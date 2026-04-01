@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Dict, Any, Optional, Callable
 import threading
 import weakref
@@ -292,6 +293,8 @@ class StockFilter:
         stock_name: str = "",
         board: str = "",
         exchange: str = "",
+        history_mirror: Optional[str] = None,
+        mirror_pool: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         result = {
             "code": str(stock_code).strip().zfill(6),
@@ -311,7 +314,12 @@ class StockFilter:
             self.limit_up_lookback_days + self.ma_period + 4,
             self.volume_lookback_days + 4,
         )
-        history_data = self.fetcher.get_history_data(stock_code, days=hist_days)
+        history_data = self.fetcher.get_history_data(
+            stock_code,
+            days=hist_days,
+            preferred_mirror=history_mirror,
+            mirror_pool=mirror_pool,
+        )
         result["data"]["history"] = history_data
         if history_data is None or history_data.empty:
             result["reasons"].append("无法获取历史数据")
@@ -416,11 +424,31 @@ class StockFilter:
                 max_workers = 12
         workers = max(1, min(int(max_workers), 16))
 
+        available_mirrors = self.fetcher.get_available_history_mirrors(force_refresh=True)
+        if not available_mirrors:
+            if log:
+                log("历史接口镜像全部不可用，本次扫描已停止。")
+            return []
+
+        rows = subset.to_dict("records")
+        random.Random(int(time.time())).shuffle(rows)
+        assigned_jobs = []
+        mirror_counts: Dict[str, int] = {}
+        for idx, row in enumerate(rows):
+            mirror = available_mirrors[idx % len(available_mirrors)]
+            mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
+            assigned_jobs.append((row, mirror))
+
         if log:
             log(
                 f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。"
             )
             log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
+            mirror_summary = "，".join(
+                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
+                for mirror in available_mirrors
+            )
+            log(f"历史镜像分区：{mirror_summary}")
 
         results: List[Dict[str, Any]] = []
         completed = 0
@@ -429,13 +457,21 @@ class StockFilter:
 
         def _submit_tasks(executor: ThreadPoolExecutor):
             future_to_meta = {}
-            for _, row in subset.iterrows():
+            for row, mirror in assigned_jobs:
                 code = str(row["code"]).strip().zfill(6)
                 name = str(row.get("name", "") or "")
                 board = str(row.get("board", "") or "")
                 exchange = str(row.get("exchange", "") or "")
-                future = executor.submit(self.filter_stock, code, name, board, exchange)
-                future_to_meta[future] = (code, name, board, exchange)
+                future = executor.submit(
+                    self.filter_stock,
+                    code,
+                    name,
+                    board,
+                    exchange,
+                    mirror,
+                    available_mirrors,
+                )
+                future_to_meta[future] = (code, name, board, exchange, mirror)
             return future_to_meta
 
         executor = DaemonThreadPoolExecutor(max_workers=workers)
@@ -444,55 +480,81 @@ class StockFilter:
             if log:
                 log("【阶段 3/3】开始逐只拉取历史日线并计算结果...")
 
-            for fut in as_completed(future_to_meta):
-                code, name, board, exchange = future_to_meta[fut]
-                if should_stop and should_stop():
-                    if log:
-                        log("收到停止信号，正在取消未完成任务...")
-                    break
+            pending = set(future_to_meta)
+            while pending:
+                done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                if not done:
+                    if should_stop and should_stop():
+                        if log:
+                            log("收到停止信号，正在取消未完成任务...")
+                        break
+                    now = time.time()
+                    if log and now - last_report >= 10:
+                        elapsed = now - t0
+                        sample = [
+                            f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
+                            for f in list(pending)[:3]
+                        ]
+                        sample_text = "、".join(sample) if sample else "-"
+                        log(
+                            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
+                            f"仍在等待历史数据返回，示例代码 {sample_text}"
+                        )
+                        last_report = now
+                    continue
 
-                try:
-                    filter_result = fut.result()
-                except Exception as e:
-                    if log:
-                        log(f"  {code} {name} 检测异常: {e}")
-                    filter_result = {
-                        "code": code,
-                        "name": name,
-                        "passed": False,
-                        "reasons": [str(e)],
-                        "data": {"board": board, "exchange": exchange},
-                    }
-
-                completed += 1
-                analysis = filter_result.get("data", {}).get("analysis") or {}
-
-                if filter_result.get("passed") and log:
-                    log(
-                        f"  通过 {completed}/{total} {code} {name} "
-                        f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
-                    )
-
-                if filter_result.get("passed"):
-                    filter_result["name"] = name
-                    filter_result.setdefault("data", {})
-                    filter_result["data"].setdefault("board", board)
-                    filter_result["data"].setdefault("exchange", exchange)
-                    results.append(filter_result)
-
-                if progress_callback:
+                for fut in done:
+                    code, name, board, exchange, mirror = future_to_meta[fut]
+                    if should_stop and should_stop():
+                        if log:
+                            log("收到停止信号，正在取消未完成任务...")
+                        pending.clear()
+                        break
                     try:
-                        progress_callback(completed, total, code, name)
-                    except StopIteration:
-                        raise
+                        filter_result = fut.result()
+                    except Exception as e:
+                        if log:
+                            log(
+                                f"  {code} {name} 检测异常[{mirror.split('//', 1)[-1].split('/', 1)[0]}]: {e}"
+                            )
+                        filter_result = {
+                            "code": code,
+                            "name": name,
+                            "passed": False,
+                            "reasons": [str(e)],
+                            "data": {"board": board, "exchange": exchange},
+                        }
 
-                now = time.time()
-                if log and (completed % report_every == 0 or now - last_report >= 10):
-                    elapsed = now - t0
-                    log(
-                        f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，当前 {code} {name}"
-                    )
-                    last_report = now
+                    completed += 1
+                    analysis = filter_result.get("data", {}).get("analysis") or {}
+
+                    if filter_result.get("passed") and log:
+                        log(
+                            f"  通过 {completed}/{total} {code} {name} "
+                            f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
+                        )
+
+                    if filter_result.get("passed"):
+                        filter_result["name"] = name
+                        filter_result.setdefault("data", {})
+                        filter_result["data"].setdefault("board", board)
+                        filter_result["data"].setdefault("exchange", exchange)
+                        results.append(filter_result)
+
+                    if progress_callback:
+                        try:
+                            progress_callback(completed, total, code, name)
+                        except StopIteration:
+                            raise
+
+                    now = time.time()
+                    if log and (completed % report_every == 0 or now - last_report >= 10):
+                        elapsed = now - t0
+                        log(
+                            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
+                            f"当前 {code} {name} @ {mirror.split('//', 1)[-1].split('/', 1)[0]}"
+                        )
+                        last_report = now
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 

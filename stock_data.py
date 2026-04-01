@@ -24,6 +24,28 @@ from stock_store import (
 
 T = TypeVar("T")
 
+
+def _history_request_concurrency() -> int:
+    raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
+    try:
+        value = int(raw) if raw else 4
+    except ValueError:
+        value = 4
+    return max(1, min(value, 8))
+
+
+_HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
+_EASTMONEY_HISTORY_MIRRORS = [
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://33.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://7.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://81.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://72.push2.eastmoney.com/api/qt/stock/kline/get",
+    "https://28.push2.eastmoney.com/api/qt/stock/kline/get",
+]
+
 # 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
 _EASTMONEY_HEADERS = {
     "User-Agent": (
@@ -82,19 +104,16 @@ def _retry_ak_call(fn: Callable[..., T], *args, retries: int = 5, base_delay: fl
             raise
 
 
-def _fetch_eastmoney_hist_frame(
-    stock_code: str,
-    days: int,
-    start_date: str,
-    end_date: str,
-) -> pd.DataFrame:
-    """直接抓东方财富历史日线，并在多个镜像间轮换。"""
-    import random
+def _history_retry_ak_call(fn: Callable[..., T], *args, **kwargs) -> T:
+    # 历史 K 线接口对并发和出口网络都更敏感，先串行闸门。
+    # 具体的镜像轮换和短重试交给函数内部处理，避免外层再叠超长等待。
+    with _HISTORY_REQUEST_SEMAPHORE:
+        return fn(*args, **kwargs)
 
-    import requests
 
+def _eastmoney_history_request_params(stock_code: str, start_date: str, end_date: str) -> Dict[str, str]:
     market_code = 1 if str(stock_code).startswith("6") else 0
-    params = {
+    return {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
         "ut": "7eea3edcaed734bea9cbfc24409ed989",
@@ -104,93 +123,120 @@ def _fetch_eastmoney_hist_frame(
         "beg": start_date,
         "end": end_date,
     }
-    mirrors = [
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-        "https://push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://33.push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://7.push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://81.push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://72.push2.eastmoney.com/api/qt/stock/kline/get",
-        "https://28.push2.eastmoney.com/api/qt/stock/kline/get",
+
+
+def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict[str, Any]:
+    import requests
+
+    with requests.Session() as session:
+        if _use_bypass_proxy():
+            session.trust_env = False
+            session.proxies = {"http": None, "https": None}
+        req_kw: Dict[str, Any] = {
+            "url": url,
+            "params": params,
+            "timeout": timeout,
+            "headers": dict(_EASTMONEY_HEADERS),
+        }
+        if _use_insecure_ssl():
+            req_kw["verify"] = False
+        response = session.get(**req_kw)
+        response.raise_for_status()
+        return response.json()
+
+
+def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "pd.DataFrame":
+    klines = (data_json.get("data") or {}).get("klines") or []
+    if not klines:
+        return pd.DataFrame()
+    temp_df = pd.DataFrame([item.split(",") for item in klines])
+    temp_df["股票代码"] = str(stock_code).strip().zfill(6)
+    temp_df.columns = [
+        "日期",
+        "开盘",
+        "收盘",
+        "最高",
+        "最低",
+        "成交量",
+        "成交额",
+        "振幅",
+        "涨跌幅",
+        "涨跌额",
+        "换手率",
+        "股票代码",
     ]
-    timeout = 30
+    temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
+    for col in [
+        "开盘",
+        "收盘",
+        "最高",
+        "最低",
+        "成交量",
+        "成交额",
+        "振幅",
+        "涨跌幅",
+        "涨跌额",
+        "换手率",
+    ]:
+        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+    return temp_df[
+        [
+            "日期",
+            "股票代码",
+            "开盘",
+            "收盘",
+            "最高",
+            "最低",
+            "成交量",
+            "成交额",
+            "振幅",
+            "涨跌幅",
+            "涨跌额",
+            "换手率",
+        ]
+    ]
+
+
+def _probe_history_mirror(url: str) -> Tuple[bool, str]:
+    probe_code = "000001"
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
+    params = _eastmoney_history_request_params(probe_code, start_date, end_date)
+    try:
+        data_json = _request_session_get_json(url, params=params, timeout=(4, 6))
+        df = _parse_eastmoney_hist_json(probe_code, data_json)
+        if df.empty:
+            return False, "empty"
+        latest_series = df["日期"].dropna()
+        latest_date = str(latest_series.iloc[-1]) if not latest_series.empty else "unknown"
+        return True, latest_date
+    except Exception as e:
+        return False, str(e)
+
+
+def _fetch_eastmoney_hist_frame(
+    stock_code: str,
+    days: int,
+    start_date: str,
+    end_date: str,
+    mirror_urls: Optional[List[str]] = None,
+) -> "pd.DataFrame":
+    """直接抓东方财富历史日线，并在多个镜像间轮换。"""
+    import random
+
+    params = _eastmoney_history_request_params(stock_code, start_date, end_date)
+    mirrors = list(mirror_urls or _EASTMONEY_HISTORY_MIRRORS)
     last_exception: Optional[BaseException] = None
 
     for base_url in mirrors:
-        for attempt in range(4):
+        for attempt in range(2):
             try:
-                with requests.Session() as session:
-                    if _use_bypass_proxy():
-                        session.trust_env = False
-                        session.proxies = {"http": None, "https": None}
-                    req_kw: Dict[str, Any] = {
-                        "url": base_url,
-                        "params": params,
-                        "timeout": timeout,
-                        "headers": dict(_EASTMONEY_HEADERS),
-                    }
-                    if _use_insecure_ssl():
-                        req_kw["verify"] = False
-                    response = session.get(**req_kw)
-                    response.raise_for_status()
-                    data_json = response.json()
-                    klines = (data_json.get("data") or {}).get("klines") or []
-                    if not klines:
-                        return pd.DataFrame()
-                    temp_df = pd.DataFrame([item.split(",") for item in klines])
-                    temp_df["股票代码"] = str(stock_code).strip().zfill(6)
-                    temp_df.columns = [
-                        "日期",
-                        "开盘",
-                        "收盘",
-                        "最高",
-                        "最低",
-                        "成交量",
-                        "成交额",
-                        "振幅",
-                        "涨跌幅",
-                        "涨跌额",
-                        "换手率",
-                        "股票代码",
-                    ]
-                    temp_df["日期"] = pd.to_datetime(temp_df["日期"], errors="coerce").dt.date
-                    for col in [
-                        "开盘",
-                        "收盘",
-                        "最高",
-                        "最低",
-                        "成交量",
-                        "成交额",
-                        "振幅",
-                        "涨跌幅",
-                        "涨跌额",
-                        "换手率",
-                    ]:
-                        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
-                    temp_df = temp_df[
-                        [
-                            "日期",
-                            "股票代码",
-                            "开盘",
-                            "收盘",
-                            "最高",
-                            "最低",
-                            "成交量",
-                            "成交额",
-                            "振幅",
-                            "涨跌幅",
-                            "涨跌额",
-                            "换手率",
-                        ]
-                    ]
-                    return temp_df
-            except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+                data_json = _request_session_get_json(base_url, params=params, timeout=(4, 8))
+                return _parse_eastmoney_hist_json(stock_code, data_json)
+            except Exception as e:
                 last_exception = e
-                if attempt < 3:
-                    time.sleep(1.2 * (attempt + 1) + random.uniform(0.3, 0.9))
-                else:
-                    time.sleep(random.uniform(0.2, 0.6))
+                if attempt < 1:
+                    time.sleep(0.6 + random.uniform(0.2, 0.5))
     if last_exception is not None:
         raise last_exception
     return pd.DataFrame()
@@ -699,6 +745,8 @@ class StockDataFetcher:
         self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
+        self._history_mirror_cache: List[str] = []
+        self._history_mirror_checked_at: float = 0.0
         try:
             configured_limit = int(os.environ.get("GUPPIAO_CONCEPT_BOARD_LIMIT", "20").strip() or "20")
         except ValueError:
@@ -713,6 +761,27 @@ class StockDataFetcher:
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
+
+    def get_available_history_mirrors(self, force_refresh: bool = False) -> List[str]:
+        now = time.time()
+        if not force_refresh and self._history_mirror_cache and now - self._history_mirror_checked_at < 180:
+            return list(self._history_mirror_cache)
+
+        available: List[str] = []
+        if self._log:
+            self._log("开始检测东方财富历史接口镜像可用性...")
+        for url in _EASTMONEY_HISTORY_MIRRORS:
+            ok, detail = _probe_history_mirror(url)
+            host = re.sub(r"^https?://", "", url).split("/", 1)[0]
+            if ok:
+                available.append(url)
+                if self._log:
+                    self._log(f"历史镜像可用 {host}，最新日期 {detail}")
+            elif self._log:
+                self._log(f"历史镜像不可用 {host}：{detail}")
+        self._history_mirror_cache = available
+        self._history_mirror_checked_at = now
+        return list(available)
 
 
     def clear_saved_universe_data(self) -> None:
@@ -1064,7 +1133,10 @@ class StockDataFetcher:
         stock_code: str,
         days: int = 10,
         force_refresh: bool = False,
+        preferred_mirror: Optional[str] = None,
+        mirror_pool: Optional[List[str]] = None,
     ) -> Optional[pd.DataFrame]:
+        history_df: Optional[pd.DataFrame] = None
         try:
             stock_code = str(stock_code).strip().zfill(6)
             end_date = datetime.now().strftime('%Y%m%d')
@@ -1079,6 +1151,15 @@ class StockDataFetcher:
                         self._log(f"历史 {stock_code} 命中当天缓存，但尚未收盘，改为刷新最新日线。")
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
+            selected_mirrors = [x for x in (mirror_pool or self.get_available_history_mirrors()) if x]
+            if preferred_mirror:
+                selected_mirrors = [preferred_mirror] + [x for x in selected_mirrors if x != preferred_mirror]
+            if not selected_mirrors:
+                if history_df is not None and not history_df.empty:
+                    if self._log:
+                        self._log(f"历史 {stock_code} 当前无可用镜像，回退本地缓存。")
+                    return history_df.tail(days).reset_index(drop=True)
+                return None
             
             df = _history_retry_ak_call(
                 _fetch_eastmoney_hist_frame,
@@ -1086,9 +1167,14 @@ class StockDataFetcher:
                 days,
                 start_date,
                 end_date,
+                selected_mirrors,
             )
             
             if df.empty:
+                if history_df is not None and not history_df.empty:
+                    if self._log:
+                        self._log(f"历史 {stock_code} 刷新返回空结果，回退本地缓存。")
+                    return history_df.tail(days).reset_index(drop=True)
                 return None
             
             df = df.rename(columns={
@@ -1123,6 +1209,10 @@ class StockDataFetcher:
             _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
             return df.tail(days).reset_index(drop=True)
         except Exception as e:
+            if history_df is not None and not history_df.empty:
+                if self._log:
+                    self._log(f"历史 {stock_code} 刷新失败，回退本地缓存: {e}")
+                return history_df.tail(days).reset_index(drop=True)
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
