@@ -3,6 +3,8 @@ USE_INSECURE_SSL
 USE_BYPASS_PROXY
 .gupiao_bypass_proxy
 __pycache__
+.venv/
+venv/
 cache/
 .vscode/
 data/
