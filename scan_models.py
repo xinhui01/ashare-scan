@@ -30,7 +30,7 @@ class FilterSettings:
 class ScanRequest:
     filter_settings: FilterSettings
     max_stocks: int = 0
-    scan_workers: int = 12
+    scan_workers: int = 3
     allowed_boards: tuple[str, ...] = ()
     refresh_universe: bool = False
     ignore_result_snapshot: bool = False

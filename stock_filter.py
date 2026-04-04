@@ -52,6 +52,23 @@ class StockFilter:
         self._log = cb
         self.fetcher.set_log_callback(cb)
 
+    def _log_runtime_diagnostics(self, stage: str) -> None:
+        if not self._log:
+            return
+        diag = self.fetcher.get_runtime_diagnostics()
+        self._log(
+            f"【诊断/{stage}】历史并发上限={diag.get('history_concurrency_limit')}，"
+            f"最小请求间隔={diag.get('history_min_interval_sec')}s，"
+            f"镜像缓存={diag.get('cached_mirror_count')}，"
+            f"冷却中={'是' if diag.get('history_request_blocked') else '否'}"
+        )
+        self._log(
+            f"【诊断/{stage}】缓存命中={diag.get('cache_hits')}，网络请求={diag.get('network_requests')}，"
+            f"成功={diag.get('network_success')}，失败={diag.get('network_failures')}，"
+            f"缓存回退={diag.get('fallback_cache_returns')}，限流事件={diag.get('rate_limit_events')}，"
+            f"冷却跳过={diag.get('cooldown_skips')}"
+        )
+
     def get_settings(self) -> FilterSettings:
         return FilterSettings(
             trend_days=int(self.trend_days),
@@ -400,6 +417,7 @@ class StockFilter:
         t0 = time.time()
         if log:
             log("【阶段 1/3】加载股票池...")
+        self._log_runtime_diagnostics("扫描前")
 
         all_stocks = self.fetcher.get_all_stocks(force_refresh=refresh_universe)
         if all_stocks.empty:
@@ -434,20 +452,20 @@ class StockFilter:
         total = len(subset)
         if max_workers is None:
             try:
-                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "12").strip() or "12")
+                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "3").strip() or "3")
             except ValueError:
-                max_workers = 12
-        workers = max(1, min(int(max_workers), 16))
+                max_workers = 3
+        requested_workers = max(1, min(int(max_workers), 16))
+        history_workers = max(1, int(self.fetcher.history_request_concurrency_limit()))
+        workers = min(requested_workers, history_workers)
 
-        available_mirrors = self.fetcher.get_available_history_mirrors(force_refresh=True)
-        if not available_mirrors:
-            if log:
-                failures = self.fetcher.get_last_history_probe_failures()
-                if failures:
-                    sample = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
-                    log(f"历史接口镜像全部不可用，最近探测失败示例：{sample}")
-                log("历史接口镜像全部不可用，本轮扫描已停止。")
-            return []
+        available_mirrors = self.fetcher.get_available_history_mirrors(force_refresh=False)
+        if not available_mirrors and log:
+            failures = self.fetcher.get_last_history_probe_failures()
+            if failures:
+                sample = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
+                log(f"历史接口镜像当前不可用，最近探测失败示例：{sample}")
+            log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
 
         rows = subset.to_dict("records")
         random.Random(int(time.time())).shuffle(rows)
@@ -463,13 +481,20 @@ class StockFilter:
             log(
                 f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。"
             )
+            if requested_workers != workers:
+                log(
+                    f"并发保护已生效：你请求 {requested_workers} 线程，但历史接口当前只允许 {workers} 个并发，以降低东方财富限流风险。"
+                )
             log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
-            log("说明：单只股票历史数据会在少量镜像间快速切换，失败节点会短时冷却，避免长时间卡死。")
-            mirror_summary = "，".join(
-                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
-                for mirror in available_mirrors
-            )
-            log(f"历史镜像分区：{mirror_summary}")
+            log("说明：历史请求已启用全局节流、镜像冷却与封禁态熔断，避免失败后继续猛打东方财富。")
+            if available_mirrors:
+                mirror_summary = "，".join(
+                    f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
+                    for mirror in available_mirrors
+                )
+                log(f"历史镜像分区：{mirror_summary}")
+            else:
+                log("历史镜像分区：cache-only")
 
         results: List[Dict[str, Any]] = []
         completed = 0
@@ -588,6 +613,7 @@ class StockFilter:
         if log:
             elapsed = time.time() - t0
             log(f"【完成】扫描结束，命中 {len(results)} 只，用时 {elapsed:.1f}s。")
+        self._log_runtime_diagnostics("扫描后")
 
         return results
 

@@ -133,7 +133,7 @@ class StockMonitorApp:
         ttk.Entry(row1, textvariable=self.scan_count_var, width=8).pack(side=tk.LEFT, padx=5)
 
         ttk.Label(row1, text="并发线程:").pack(side=tk.LEFT, padx=5)
-        self.scan_workers_var = tk.StringVar(value="12")
+        self.scan_workers_var = tk.StringVar(value="3")
         ttk.Entry(row1, textvariable=self.scan_workers_var, width=6).pack(side=tk.LEFT, padx=5)
 
         ttk.Label(row1, text="连续天数:").pack(side=tk.LEFT, padx=5)
@@ -954,6 +954,16 @@ class StockMonitorApp:
             f"开始扫描：最近{request.filter_settings.trend_days}日收盘 > MA{request.filter_settings.ma_period}，"
             f"近{request.filter_settings.limit_up_lookback_days}日内涨停过滤={'开' if request.filter_settings.require_limit_up_within_days else '关'}。"
         )
+        if request.max_stocks <= 0:
+            self._log("本次为全量扫描，建议优先在收盘后执行，并尽量复用本地结果快照。")
+        if request.scan_workers >= 4:
+            self._log(
+                f"你当前设置了 {request.scan_workers} 个扫描线程；程序会自动做并发保护，但较大的线程数仍可能增加外部接口压力。"
+            )
+        if request.refresh_universe:
+            self._log("已开启“重新拉取股票池”，本轮会刷新股票池缓存，整体耗时会更长。")
+        if request.ignore_result_snapshot:
+            self._log("已开启“忽略本地结果快照”，本轮不会直接复用上次扫描结果。")
         self._log("扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
         self.status_var.set("正在扫描...")
         self.progress_var.set(0)

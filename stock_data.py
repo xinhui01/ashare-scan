@@ -28,10 +28,19 @@ T = TypeVar("T")
 def _history_request_concurrency() -> int:
     raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
     try:
-        value = int(raw) if raw else 4
+        value = int(raw) if raw else 2
     except ValueError:
-        value = 4
-    return max(1, min(value, 8))
+        value = 2
+    return max(1, min(value, 6))
+
+
+def _history_min_request_interval_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_MIN_INTERVAL_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 1.2
+    except ValueError:
+        value = 1.2
+    return max(0.0, min(value, 10.0))
 
 
 def _history_connect_timeout_sec() -> float:
@@ -79,7 +88,58 @@ def _history_max_mirrors_per_stock() -> int:
     return max(1, min(value, 8))
 
 
+def _history_probe_success_target() -> int:
+    raw = os.environ.get("GUPPIAO_HISTORY_PROBE_SUCCESS_TARGET", "").strip()
+    try:
+        value = int(raw) if raw else 2
+    except ValueError:
+        value = 2
+    return max(1, min(value, 4))
+
+
+def _history_block_window_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_WINDOW_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 180.0
+    except ValueError:
+        value = 180.0
+    return max(30.0, min(value, 3600.0))
+
+
+def _history_block_threshold() -> int:
+    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_THRESHOLD", "").strip()
+    try:
+        value = int(raw) if raw else 3
+    except ValueError:
+        value = 3
+    return max(1, min(value, 10))
+
+
+def _history_block_cooldown_sec() -> float:
+    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_COOLDOWN_SEC", "").strip()
+    try:
+        value = float(raw) if raw else 900.0
+    except ValueError:
+        value = 900.0
+    return max(60.0, min(value, 7200.0))
+
+
 _HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
+_HISTORY_REQUEST_RATE_LOCK = threading.Lock()
+_HISTORY_NEXT_REQUEST_AT = 0.0
+_HISTORY_DIAGNOSTICS_LOCK = threading.Lock()
+_HISTORY_DIAGNOSTICS: Dict[str, int] = {
+    "cache_hits": 0,
+    "network_requests": 0,
+    "network_success": 0,
+    "network_failures": 0,
+    "fallback_cache_returns": 0,
+    "rate_limit_events": 0,
+    "cooldown_skips": 0,
+    "probe_requests": 0,
+    "probe_success": 0,
+    "probe_failures": 0,
+}
 _EASTMONEY_HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://1.push2his.eastmoney.com/api/qt/stock/kline/get",
@@ -92,6 +152,9 @@ _EASTMONEY_HISTORY_MIRRORS = [
 ]
 _HISTORY_MIRROR_HEALTH: Dict[str, float] = {}
 _HISTORY_MIRROR_HEALTH_LOCK = threading.Lock()
+_HISTORY_BLOCK_LOCK = threading.Lock()
+_HISTORY_BLOCKED_UNTIL = 0.0
+_HISTORY_BLOCK_EVENTS: List[float] = []
 
 # 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
 _EASTMONEY_HEADERS = {
@@ -108,6 +171,24 @@ _EASTMONEY_HEADERS = {
 
 # 拉取全市场列表分页时写入 GUI 日志（由 get_all_stocks 临时注册）
 _list_download_log: Optional[Callable[[str], None]] = None
+
+
+class EastmoneyRateLimitError(RuntimeError):
+    pass
+
+
+class HistoryAccessSuspendedError(RuntimeError):
+    pass
+
+
+def _increment_history_diagnostic(key: str, step: int = 1) -> None:
+    with _HISTORY_DIAGNOSTICS_LOCK:
+        _HISTORY_DIAGNOSTICS[key] = int(_HISTORY_DIAGNOSTICS.get(key, 0)) + int(step)
+
+
+def _history_diagnostics_snapshot() -> Dict[str, int]:
+    with _HISTORY_DIAGNOSTICS_LOCK:
+        return {str(k): int(v) for k, v in _HISTORY_DIAGNOSTICS.items()}
 
 
 def _project_root() -> Path:
@@ -186,6 +267,8 @@ def _eastmoney_history_request_params(stock_code: str, start_date: str, end_date
 def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict[str, Any]:
     import requests
 
+    _wait_for_history_request_slot()
+    _increment_history_diagnostic("network_requests")
     with requests.Session() as session:
         if _use_bypass_proxy():
             session.trust_env = False
@@ -199,8 +282,117 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
         if _use_insecure_ssl():
             req_kw["verify"] = False
         response = session.get(**req_kw)
+        response_text = response.text or ""
+        if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
+            _increment_history_diagnostic("rate_limit_events")
+            _increment_history_diagnostic("network_failures")
+            message = _record_history_block(
+                f"东方财富返回 {response.status_code}，疑似触发限流或封禁"
+            )
+            raise EastmoneyRateLimitError(message)
         response.raise_for_status()
-        return response.json()
+        try:
+            data_json = response.json()
+        except ValueError as exc:
+            if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
+                _increment_history_diagnostic("rate_limit_events")
+                _increment_history_diagnostic("network_failures")
+                message = _record_history_block("东方财富返回非 JSON 内容，疑似触发限流或封禁")
+                raise EastmoneyRateLimitError(message) from exc
+            _increment_history_diagnostic("network_failures")
+            raise
+        if _eastmoney_json_indicates_rate_limit(data_json):
+            _increment_history_diagnostic("rate_limit_events")
+            _increment_history_diagnostic("network_failures")
+            message = _record_history_block("东方财富返回限流提示，进入冷却保护")
+            raise EastmoneyRateLimitError(message)
+        _increment_history_diagnostic("network_success")
+        return data_json
+
+
+def _looks_like_eastmoney_rate_limit(status_code: int, response_text: str) -> bool:
+    if int(status_code or 0) in (403, 418, 429, 451, 503):
+        return True
+    sample = str(response_text or "")[:400].lower()
+    if not sample:
+        return False
+    tokens = (
+        "访问过于频繁",
+        "访问频繁",
+        "请求过于频繁",
+        "频繁",
+        "forbidden",
+        "access denied",
+        "too many requests",
+        "rate limit",
+        "风控",
+        "验证码",
+    )
+    return any(token in sample for token in tokens)
+
+
+def _eastmoney_json_indicates_rate_limit(data_json: Any) -> bool:
+    if not isinstance(data_json, dict):
+        return False
+    texts: List[str] = []
+    for key in ("message", "msg", "rc", "rt", "code", "result", "reason"):
+        value = data_json.get(key)
+        if value is not None:
+            texts.append(str(value))
+    data_part = data_json.get("data")
+    if isinstance(data_part, dict):
+        for key in ("message", "msg", "tip", "reason"):
+            value = data_part.get(key)
+            if value is not None:
+                texts.append(str(value))
+    return any(_looks_like_eastmoney_rate_limit(200, text) for text in texts)
+
+
+def _history_access_blocked_until() -> float:
+    now = time.time()
+    with _HISTORY_BLOCK_LOCK:
+        global _HISTORY_BLOCKED_UNTIL
+        if _HISTORY_BLOCKED_UNTIL <= now:
+            _HISTORY_BLOCKED_UNTIL = 0.0
+            _HISTORY_BLOCK_EVENTS.clear()
+            return 0.0
+        return _HISTORY_BLOCKED_UNTIL
+
+
+def _record_history_block(reason: str) -> str:
+    now = time.time()
+    window_start = now - _history_block_window_sec()
+    with _HISTORY_BLOCK_LOCK:
+        global _HISTORY_BLOCKED_UNTIL
+        _HISTORY_BLOCK_EVENTS[:] = [ts for ts in _HISTORY_BLOCK_EVENTS if ts >= window_start]
+        _HISTORY_BLOCK_EVENTS.append(now)
+        if len(_HISTORY_BLOCK_EVENTS) >= _history_block_threshold():
+            _HISTORY_BLOCKED_UNTIL = max(_HISTORY_BLOCKED_UNTIL, now + _history_block_cooldown_sec())
+        blocked_until = _HISTORY_BLOCKED_UNTIL
+    if blocked_until > now:
+        remain = max(1, int(blocked_until - now))
+        return f"{reason}；已暂停新的东方财富历史请求，约 {remain}s 后再试"
+    return reason
+
+
+def _wait_for_history_request_slot() -> None:
+    min_interval = _history_min_request_interval_sec()
+    while True:
+        blocked_until = _history_access_blocked_until()
+        now = time.time()
+        if blocked_until > now:
+            remain = max(1, int(blocked_until - now))
+            _increment_history_diagnostic("cooldown_skips")
+            raise HistoryAccessSuspendedError(
+                f"东方财富历史接口正在冷却保护中，约 {remain}s 后恢复"
+            )
+        with _HISTORY_REQUEST_RATE_LOCK:
+            global _HISTORY_NEXT_REQUEST_AT
+            wait_sec = _HISTORY_NEXT_REQUEST_AT - now
+            if wait_sec <= 0:
+                _HISTORY_NEXT_REQUEST_AT = now + min_interval
+                return
+        time.sleep(min(wait_sec, 0.5))
 
 
 def _history_mirror_host(url: str) -> str:
@@ -324,6 +516,7 @@ def _probe_history_mirror(url: str) -> Tuple[bool, str]:
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
     params = _eastmoney_history_request_params(probe_code, start_date, end_date)
+    _increment_history_diagnostic("probe_requests")
     try:
         data_json = _request_session_get_json(
             url,
@@ -337,9 +530,19 @@ def _probe_history_mirror(url: str) -> Tuple[bool, str]:
         latest_series = df["日期"].dropna()
         latest_date = str(latest_series.iloc[-1]) if not latest_series.empty else "unknown"
         _mark_history_mirror_ok(url)
+        _increment_history_diagnostic("probe_success")
         return True, latest_date
+    except HistoryAccessSuspendedError as e:
+        _mark_history_mirror_failed(url)
+        _increment_history_diagnostic("probe_failures")
+        return False, str(e)
+    except EastmoneyRateLimitError as e:
+        _mark_history_mirror_failed(url)
+        _increment_history_diagnostic("probe_failures")
+        return False, str(e)
     except Exception as e:
         _mark_history_mirror_failed(url)
+        _increment_history_diagnostic("probe_failures")
         return False, str(e)
 
 
@@ -380,6 +583,17 @@ def _fetch_eastmoney_hist_frame(
                 continue
             _mark_history_mirror_ok(base_url)
             return df
+        except HistoryAccessSuspendedError as e:
+            last_exception = e
+            if log:
+                log(f"历史 {stock_code} 暂停访问东方财富：{e}")
+            break
+        except EastmoneyRateLimitError as e:
+            last_exception = e
+            _mark_history_mirror_failed(base_url)
+            if log:
+                log(f"历史 {stock_code} 触发东方财富限流保护：{e}")
+            break
         except Exception as e:
             last_exception = e
             _mark_history_mirror_failed(base_url)
@@ -907,13 +1121,54 @@ class StockDataFetcher:
         self.concept_fill_timeout_sec: float = max(5.0, configured_timeout)
         self._concepts_lock = threading.Lock()
         self._last_history_probe_failures: Dict[str, str] = {}
+        self._last_history_block_log_at: float = 0.0
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
 
+    def history_request_concurrency_limit(self) -> int:
+        return _history_request_concurrency()
+
+    def get_runtime_diagnostics(self) -> Dict[str, Any]:
+        blocked_until = _history_access_blocked_until()
+        now = time.time()
+        diagnostics: Dict[str, Any] = _history_diagnostics_snapshot()
+        diagnostics.update(
+            {
+                "history_concurrency_limit": _history_request_concurrency(),
+                "history_min_interval_sec": _history_min_request_interval_sec(),
+                "history_host_cooldown_sec": _history_host_cooldown_sec(),
+                "history_block_threshold": _history_block_threshold(),
+                "history_block_window_sec": _history_block_window_sec(),
+                "history_block_cooldown_sec": _history_block_cooldown_sec(),
+                "history_request_blocked": blocked_until > now,
+                "history_request_blocked_for_sec": max(0, int(blocked_until - now)) if blocked_until > now else 0,
+                "cached_mirror_count": len(self._history_mirror_cache),
+                "cached_mirrors": [
+                    _history_mirror_host(url) for url in self._history_mirror_cache
+                ],
+            }
+        )
+        return diagnostics
+
+    def _log_history_access_suspended(self) -> bool:
+        blocked_until = _history_access_blocked_until()
+        now = time.time()
+        if blocked_until <= now:
+            return False
+        if self._log and (now - self._last_history_block_log_at >= 10):
+            remain = max(1, int(blocked_until - now))
+            self._log(
+                f"东方财富历史接口已进入冷却保护，接下来约 {remain}s 内不再发新请求，优先回退本地缓存。"
+            )
+            self._last_history_block_log_at = now
+        return True
+
     def get_available_history_mirrors(self, force_refresh: bool = False) -> List[str]:
         now = time.time()
         if not force_refresh and self._history_mirror_cache and now - self._history_mirror_checked_at < 180:
+            return list(self._history_mirror_cache)
+        if self._log_history_access_suspended():
             return list(self._history_mirror_cache)
 
         available: List[str] = []
@@ -927,10 +1182,14 @@ class StockDataFetcher:
                 available.append(url)
                 if self._log:
                     self._log(f"历史镜像可用 {host}，最新日期 {detail}")
+                if len(available) >= _history_probe_success_target():
+                    break
             else:
                 failures[host] = str(detail)
                 if self._log:
                     self._log(f"历史镜像不可用 {host}：{detail}")
+                if "冷却保护" in str(detail):
+                    break
         self._history_mirror_cache = available
         self._history_mirror_checked_at = now
         self._last_history_probe_failures = failures
@@ -1305,10 +1564,17 @@ class StockDataFetcher:
             if not force_refresh:
                 history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
                 if history_df is not None and not history_df.empty:
+                    _increment_history_diagnostic("cache_hits")
                     if not _should_refresh_today_row(history_df):
                         return history_df.tail(days).reset_index(drop=True)
                     if self._log:
                         self._log(f"历史 {stock_code} 命中当天缓存，但尚未收盘，改为刷新最新日线。")
+
+            if self._log_history_access_suspended():
+                if history_df is not None and not history_df.empty:
+                    _increment_history_diagnostic("fallback_cache_returns")
+                    return history_df.tail(days).reset_index(drop=True)
+                return None
 
             start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
             selected_mirrors = [x for x in (mirror_pool or self.get_available_history_mirrors()) if x]
@@ -1320,6 +1586,7 @@ class StockDataFetcher:
                 if history_df is not None and not history_df.empty:
                     if self._log:
                         self._log(f"历史 {stock_code} 当前无可用镜像，回退本地缓存。")
+                    _increment_history_diagnostic("fallback_cache_returns")
                     return history_df.tail(days).reset_index(drop=True)
                 return None
             
@@ -1337,6 +1604,7 @@ class StockDataFetcher:
                 if history_df is not None and not history_df.empty:
                     if self._log:
                         self._log(f"历史 {stock_code} 刷新返回空结果，回退本地缓存。")
+                    _increment_history_diagnostic("fallback_cache_returns")
                     return history_df.tail(days).reset_index(drop=True)
                 return None
             
@@ -1372,9 +1640,12 @@ class StockDataFetcher:
             _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
             return df.tail(days).reset_index(drop=True)
         except Exception as e:
+            if not isinstance(e, (EastmoneyRateLimitError, HistoryAccessSuspendedError)):
+                _increment_history_diagnostic("network_failures")
             if history_df is not None and not history_df.empty:
                 if self._log:
                     self._log(f"历史 {stock_code} 刷新失败，回退本地缓存: {e}")
+                _increment_history_diagnostic("fallback_cache_returns")
                 return history_df.tail(days).reset_index(drop=True)
             if self._log:
                 self._log(f"历史 {stock_code} 获取失败: {e}")
