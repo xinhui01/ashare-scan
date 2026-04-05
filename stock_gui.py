@@ -115,7 +115,7 @@ class StockMonitorApp:
         menubar.add_cascade(label="文件", menu=file_menu)
         file_menu.add_command(label="导出结果 CSV", command=self.export_results)
         file_menu.add_command(label="导出结果图片", command=self.export_results_image)
-        file_menu.add_command(label="复制代码名称", command=self.copy_selected_stock_code_name, accelerator="Ctrl+C")
+        file_menu.add_command(label="复制代码", command=self.copy_selected_stock_code_name, accelerator="Ctrl+C")
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_close)
 
@@ -266,10 +266,10 @@ class StockMonitorApp:
         action_frame = ttk.Frame(result_frame)
         action_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(action_frame, text="导出结果图片", command=self.export_results_image).pack(side=tk.LEFT)
-        ttk.Button(action_frame, text="复制代码名称", command=self.copy_selected_stock_code_name).pack(side=tk.LEFT, padx=8)
+        ttk.Button(action_frame, text="复制代码", command=self.copy_selected_stock_code_name).pack(side=tk.LEFT, padx=8)
         ttk.Label(
             action_frame,
-            text="导出图片会使用当前筛选结果和当前显示列，按 Ctrl+C 可复制选中股票。",
+            text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
         ).pack(side=tk.RIGHT)
 
         self.result_columns = (
@@ -1966,10 +1966,7 @@ class StockMonitorApp:
             messagebox.showwarning("警告", "没有可导出的结果")
             return
 
-        display_columns = self._get_result_display_columns_and_headings()
-        if not display_columns:
-            messagebox.showwarning("警告", "当前没有可导出的显示列")
-            return
+        export_columns: List[tuple[str, str]] = [("code", "代码"), ("name", "名称")]
 
         file_path = filedialog.asksaveasfilename(
             defaultextension=".png",
@@ -1982,86 +1979,70 @@ class StockMonitorApp:
         rows = []
         for result in self.filtered_stocks:
             row_values = self._format_result_row_values(result)
-            rows.append([str(row_values.get(col, "-")) for col, _ in display_columns])
+            rows.append([str(row_values.get(col, "-")) for col, _ in export_columns])
 
-        pages = self._build_result_image_pages(rows, page_size=40)
-        if not pages:
+        if not rows:
             messagebox.showwarning("警告", "没有可导出的结果")
             return
 
-        output_paths: List[Path] = []
-        base_path = Path(file_path)
-        headings = [heading for _, heading in display_columns]
-        column_widths = [max(self.result_headings.get(col, ("", 100))[1], 80) for col, _ in display_columns]
+        output_path = Path(file_path)
+        headings = [heading for _, heading in export_columns]
+        column_widths = [max(self.result_headings.get(col, ("", 100))[1], 80) for col, _ in export_columns]
         total_width = sum(column_widths) or 1
         normalized_widths = [width / total_width for width in column_widths]
         exported_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        total_pages = len(pages)
 
         try:
-            for page_index, page_rows in enumerate(pages, start=1):
-                figure_width = min(max(total_width / 90, 10.0), 24.0)
-                figure_height = max(4.8, 1.6 + len(page_rows) * 0.34)
+            figure_width = min(max(total_width / 85, 7.2), 14.0)
+            figure_height = max(4.8, 1.6 + len(rows) * 0.34)
 
-                fig = Figure(figsize=(figure_width, figure_height), dpi=180)
-                fig.patch.set_facecolor("white")
-                ax = fig.add_subplot(111)
-                ax.axis("off")
+            fig = Figure(figsize=(figure_width, figure_height), dpi=180)
+            fig.patch.set_facecolor("white")
+            ax = fig.add_subplot(111)
+            ax.axis("off")
 
-                title = "扫描结果导出"
-                if total_pages > 1:
-                    title = f"{title} 第 {page_index}/{total_pages} 页"
-                fig.text(0.01, 0.985, title, ha="left", va="top", fontsize=16, fontweight="bold")
-                fig.text(
-                    0.01,
-                    0.957,
-                    f"导出时间：{exported_at}    结果数量：{len(rows)}    显示列：{len(display_columns)}",
-                    ha="left",
-                    va="top",
-                    fontsize=9.5,
-                    color="#4b5563",
-                )
+            fig.text(0.01, 0.985, "扫描结果导出", ha="left", va="top", fontsize=16, fontweight="bold")
+            fig.text(
+                0.01,
+                0.957,
+                f"导出时间：{exported_at}    结果数量：{len(rows)}    显示列：{len(export_columns)}",
+                ha="left",
+                va="top",
+                fontsize=9.5,
+                color="#4b5563",
+            )
 
-                table = ax.table(
-                    cellText=page_rows,
-                    colLabels=headings,
-                    colLoc="center",
-                    cellLoc="center",
-                    colWidths=normalized_widths,
-                    loc="upper left",
-                    bbox=[0, 0, 1, 0.92],
-                )
-                table.auto_set_font_size(False)
-                table.set_fontsize(8.5 if len(display_columns) >= 10 else 9.2)
+            table = ax.table(
+                cellText=rows,
+                colLabels=headings,
+                colLoc="center",
+                cellLoc="center",
+                colWidths=normalized_widths,
+                loc="upper left",
+                bbox=[0, 0, 1, 0.92],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9.2)
 
-                left_aligned_columns = {"name", "recent_closes"}
-                for (row_index, col_index), cell in table.get_celld().items():
-                    cell.set_edgecolor("#d7deea")
-                    cell.set_linewidth(0.6)
-                    cell.get_text().set_wrap(True)
-                    if row_index == 0:
-                        cell.set_facecolor("#eaf2ff")
-                        cell.set_text_props(weight="bold", color="#111827")
-                        cell.set_height(0.042)
-                    else:
-                        cell.set_facecolor("#ffffff" if row_index % 2 else "#f8fafc")
-                        cell.set_height(0.037)
-                        if display_columns[col_index][0] in left_aligned_columns:
-                            cell.set_text_props(ha="left")
+            left_aligned_columns = {"name"}
+            for (row_index, col_index), cell in table.get_celld().items():
+                cell.set_edgecolor("#d7deea")
+                cell.set_linewidth(0.6)
+                cell.get_text().set_wrap(True)
+                if row_index == 0:
+                    cell.set_facecolor("#eaf2ff")
+                    cell.set_text_props(weight="bold", color="#111827")
+                    cell.set_height(0.042)
+                else:
+                    cell.set_facecolor("#ffffff" if row_index % 2 else "#f8fafc")
+                    cell.set_height(0.037)
+                    if export_columns[col_index][0] in left_aligned_columns:
+                        cell.set_text_props(ha="left")
 
-                output_path = base_path
-                if total_pages > 1:
-                    output_path = base_path.with_name(f"{base_path.stem}_{page_index:02d}{base_path.suffix}")
-                fig.savefig(output_path, bbox_inches="tight", facecolor=fig.get_facecolor())
-                plt.close(fig)
-                output_paths.append(output_path)
-
-            if len(output_paths) == 1:
-                messagebox.showinfo("成功", f"结果图片已导出到 {output_paths[0]}")
-                self._log(f"结果图片已导出到 {output_paths[0]}")
-            else:
-                messagebox.showinfo("成功", f"结果图片已导出，共 {len(output_paths)} 页，首个文件：{output_paths[0]}")
-                self._log(f"结果图片已导出，共 {len(output_paths)} 页，首个文件：{output_paths[0]}")
+            fig.savefig(output_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+            plt.close(fig)
+            messagebox.showinfo("成功", f"结果图片已导出到 {output_path}")
+            self._log(f"结果图片已导出到 {output_path}")
         except Exception as e:
             messagebox.showerror("错误", f"导出图片失败: {e}")
 
@@ -2071,15 +2052,15 @@ class StockMonitorApp:
             messagebox.showwarning("提示", "请先在结果表中选中一只股票")
             return "break" if event is not None else None
 
-        stock_code, stock_name = selection
-        payload = f"{stock_code} {stock_name}"
+        stock_code, _ = selection
+        payload = stock_code
 
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(payload)
             self.root.update_idletasks()
             self.status_var.set(f"已复制: {payload}")
-            self._log(f"已复制股票代码名称: {payload}")
+            self._log(f"已复制股票代码: {payload}")
         except tk.TclError as e:
             messagebox.showerror("错误", f"复制失败: {e}")
 
