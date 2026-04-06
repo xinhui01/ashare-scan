@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import csv
 import json
@@ -48,6 +48,23 @@ class StockMonitorApp:
         self._current_detail_code = ""
         self._intraday_request_code = ""
         self._intraday_loading_code = ""
+        self._intraday_request_offset = 0
+        self._intraday_request_target_date = ""
+        self._intraday_loading_offset = 0
+        self._intraday_loading_target_date = ""
+        self._intraday_day_offset = 0
+        self._intraday_available_dates: List[str] = []
+        self._intraday_selected_date = ""
+        self._detail_chart_dates: List[str] = []
+        self._detail_chart_window_size = 60
+        self._detail_chart_window_start = 0
+        self._detail_chart_history = None
+        self._detail_chart_analysis: Dict[str, Any] = {}
+        self._detail_chart_scroll_bound = False
+        self._detail_chart_slider_updating = False
+        self._detail_summary_expanded = False
+        self._detail_chart_expanded = True
+        self._detail_flow_expanded = False
         self.sort_column = "five_day_return"
         self.sort_reverse = True
         self.is_scanning = False
@@ -249,6 +266,22 @@ class StockMonitorApp:
             text="忽略本地结果快照",
             variable=self.ignore_result_snapshot_var,
         ).pack(side=tk.LEFT, padx=18)
+
+        row4 = ttk.Frame(control_frame)
+        row4.pack(fill=tk.X, pady=5)
+        ttk.Label(row4, text="价格过滤(最新收盘):").pack(side=tk.LEFT, padx=5)
+        ttk.Label(row4, text="最低").pack(side=tk.LEFT, padx=(8, 2))
+        self.min_price_var = tk.StringVar(value="")
+        min_price_entry = ttk.Entry(row4, textvariable=self.min_price_var, width=8)
+        min_price_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row4, text="最高").pack(side=tk.LEFT, padx=(0, 2))
+        self.max_price_var = tk.StringVar(value="")
+        max_price_entry = ttk.Entry(row4, textvariable=self.max_price_var, width=8)
+        max_price_entry.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row4, text="应用价格过滤", command=self.on_price_filter_changed).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row4, text="清空价格过滤", command=self.clear_price_filter).pack(side=tk.LEFT, padx=4)
+        min_price_entry.bind("<Return>", self.on_price_filter_changed)
+        max_price_entry.bind("<Return>", self.on_price_filter_changed)
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -646,8 +679,19 @@ class StockMonitorApp:
         detail_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(detail_frame, text="股票详情")
 
-        info_frame = ttk.LabelFrame(detail_frame, text="历史摘要", padding="10")
-        info_frame.pack(fill=tk.X, pady=5)
+        info_header = ttk.Frame(detail_frame)
+        info_header.pack(fill=tk.X, pady=(5, 2))
+        self.detail_summary_toggle_btn = ttk.Button(
+            info_header,
+            text="展开历史摘要",
+            command=self.toggle_detail_summary_section,
+        )
+        self.detail_summary_toggle_btn.pack(side=tk.LEFT)
+        self.detail_summary_status_var = tk.StringVar(value="历史摘要已收起")
+        ttk.Label(info_header, textvariable=self.detail_summary_status_var).pack(side=tk.LEFT, padx=10)
+
+        self.info_frame = ttk.LabelFrame(detail_frame, text="历史摘要", padding="10")
+        self.info_frame.pack(fill=tk.X, pady=5)
 
         self.detail_labels: Dict[str, ttk.Label] = {}
         items = [
@@ -672,23 +716,72 @@ class StockMonitorApp:
         for i, (key, label) in enumerate(items):
             row = i // 3
             col = (i % 3) * 2
-            ttk.Label(info_frame, text=f"{label}:").grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
-            self.detail_labels[key] = ttk.Label(info_frame, text="-", width=30)
+            ttk.Label(self.info_frame, text=f"{label}:").grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
+            self.detail_labels[key] = ttk.Label(self.info_frame, text="-", width=30)
             self.detail_labels[key].grid(row=row, column=col + 1, padx=5, pady=5, sticky=tk.W)
 
-        chart_frame = ttk.LabelFrame(detail_frame, text="K线图", padding="5")
-        chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.info_frame.pack_forget()
+
+        chart_header = ttk.Frame(detail_frame)
+        chart_header.pack(fill=tk.X, pady=(6, 2))
+        self.detail_chart_toggle_btn = ttk.Button(
+            chart_header,
+            text="收起历史K线",
+            command=self.toggle_detail_chart_section,
+        )
+        self.detail_chart_toggle_btn.pack(side=tk.LEFT)
+        self.detail_chart_status_var = tk.StringVar(value="历史K线已展开")
+        ttk.Label(chart_header, textvariable=self.detail_chart_status_var).pack(side=tk.LEFT, padx=10)
+
+        self.detail_flow_toggle_btn = ttk.Button(
+            chart_header,
+            text="展开大单净额",
+            command=self.toggle_detail_flow_section,
+        )
+        self.detail_flow_toggle_btn.pack(side=tk.RIGHT)
+        self.detail_flow_status_var = tk.StringVar(value="大单净额已收起")
+        ttk.Label(chart_header, textvariable=self.detail_flow_status_var).pack(side=tk.RIGHT, padx=10)
+
+        self.chart_frame = ttk.LabelFrame(detail_frame, text="K线图", padding="5")
+        self.chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.chart_body = ttk.Frame(self.chart_frame)
+        self.chart_body.pack(fill=tk.BOTH, expand=True)
 
         self.fig, (self.price_ax, self.volume_ax, self.flow_ax) = plt.subplots(
             3,
             1,
-            figsize=(11, 7.4),
+            figsize=(12.8, 10.0),
             sharex=True,
-            gridspec_kw={"height_ratios": [3.2, 1.2, 1.2]},
+            gridspec_kw={"height_ratios": [4.8, 1.25, 1.25]},
         )
-        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_body)
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self.on_detail_chart_click)
+        self.canvas.mpl_connect("scroll_event", self.on_detail_chart_scroll)
+        self._bind_detail_chart_scroll(canvas_widget)
+
+        slider_row = ttk.Frame(self.chart_body)
+        slider_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(slider_row, text="左右滑动").pack(side=tk.LEFT)
+        self.detail_chart_window_var = tk.DoubleVar(value=0.0)
+        self.detail_chart_window_scale = tk.Scale(
+            slider_row,
+            orient=tk.HORIZONTAL,
+            from_=0,
+            to=0,
+            resolution=1,
+            showvalue=False,
+            variable=self.detail_chart_window_var,
+            command=self.on_detail_chart_window_changed,
+            length=480,
+        )
+        self.detail_chart_window_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.detail_chart_window_label_var = tk.StringVar(value="窗口: -")
+        ttk.Label(slider_row, textvariable=self.detail_chart_window_label_var).pack(side=tk.RIGHT)
+
+        self.detail_chart_placeholder = None
 
     def setup_intraday_tab(self):
         intraday_frame = ttk.Frame(self.notebook, padding="5")
@@ -699,6 +792,12 @@ class StockMonitorApp:
         info.pack(fill=tk.X, pady=(0, 6))
         self.intraday_title_var = tk.StringVar(value="分时图（点击 K 线打开）")
         ttk.Label(info, textvariable=self.intraday_title_var).pack(side=tk.LEFT)
+        self.intraday_day_var = tk.StringVar(value="交易日: -")
+        ttk.Label(info, textvariable=self.intraday_day_var).pack(side=tk.LEFT, padx=(12, 8))
+        self.intraday_prev_btn = ttk.Button(info, text="前一天", command=lambda: self.navigate_intraday_day(-1), state=tk.DISABLED)
+        self.intraday_prev_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self.intraday_next_btn = ttk.Button(info, text="后一天", command=lambda: self.navigate_intraday_day(1), state=tk.DISABLED)
+        self.intraday_next_btn.pack(side=tk.RIGHT)
 
         chart_frame = ttk.LabelFrame(intraday_frame, text="分时走势", padding="5")
         chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -809,6 +908,18 @@ class StockMonitorApp:
             raise ValueError(f"{field_name} 不能小于 {minimum:g}")
         if maximum is not None and value > maximum:
             raise ValueError(f"{field_name} 不能大于 {maximum:g}")
+        return value
+
+    def _parse_optional_price_limit(self, raw_value: str, field_name: str) -> Optional[float]:
+        text = str(raw_value).strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是数字") from exc
+        if value < 0:
+            raise ValueError(f"{field_name} 不能小于 0")
         return value
 
     def _build_filter_settings(self) -> FilterSettings:
@@ -938,6 +1049,51 @@ class StockMonitorApp:
                 filtered.append(item)
         return filtered
 
+    def _get_latest_close_value(self, item: Dict[str, Any]) -> Optional[float]:
+        data = item.get("data", {}) or {}
+        analysis = data.get("analysis") or {}
+        value = analysis.get("latest_close")
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _filter_results_by_price_range(
+        self,
+        results: List[Dict[str, Any]],
+        raise_error: bool = False,
+    ) -> List[Dict[str, Any]]:
+        try:
+            min_price = self._parse_optional_price_limit(self.min_price_var.get(), "最低价")
+            max_price = self._parse_optional_price_limit(self.max_price_var.get(), "最高价")
+            if min_price is not None and max_price is not None and min_price > max_price:
+                raise ValueError("最低价不能大于最高价")
+        except ValueError:
+            if raise_error:
+                raise
+            return list(results)
+        if min_price is None and max_price is None:
+            return list(results)
+
+        filtered: List[Dict[str, Any]] = []
+        for item in results:
+            latest_close = self._get_latest_close_value(item)
+            if latest_close is None:
+                continue
+            if min_price is not None and latest_close < min_price:
+                continue
+            if max_price is not None and latest_close > max_price:
+                continue
+            filtered.append(item)
+        return filtered
+
+    def _apply_result_filters(self, results: List[Dict[str, Any]], raise_price_error: bool = False) -> List[Dict[str, Any]]:
+        filtered = self._filter_results_by_selected_boards(results)
+        filtered = self._filter_results_by_price_range(filtered, raise_error=raise_price_error)
+        return filtered
+
     def on_board_filter_changed(self):
         self._save_board_filter_layout()
         if self.is_scanning:
@@ -946,9 +1102,31 @@ class StockMonitorApp:
         if not source:
             self.status_var.set("已保存显示板块筛选设置")
             return
-        filtered = self._filter_results_by_selected_boards(source)
-        self.update_result_table(filtered, announce=False, persist=False)
-        self.status_var.set(f"已按板块筛选，当前显示 {len(filtered)} 只")
+        try:
+            self.update_result_table(source, announce=False, persist=False)
+            self.status_var.set(f"已按筛选条件更新，当前显示 {len(self.filtered_stocks)} 只")
+        except ValueError as exc:
+            messagebox.showerror("错误", str(exc))
+
+    def on_price_filter_changed(self, event=None):
+        if self.is_scanning:
+            return "break" if event is not None else None
+        source = self.all_scan_results or self.filtered_stocks
+        if not source:
+            self.status_var.set("当前没有可筛选结果")
+            return "break" if event is not None else None
+        try:
+            self._apply_result_filters(source, raise_price_error=True)
+            self.update_result_table(source, announce=False, persist=False)
+            self.status_var.set(f"已按价格过滤，当前显示 {len(self.filtered_stocks)} 只")
+        except ValueError as exc:
+            messagebox.showerror("错误", str(exc))
+        return "break" if event is not None else None
+
+    def clear_price_filter(self):
+        self.min_price_var.set("")
+        self.max_price_var.set("")
+        self.on_price_filter_changed()
 
     def on_history_source_changed(self, event=None):
         self._save_app_settings()
@@ -1011,7 +1189,8 @@ class StockMonitorApp:
         results = payload.get("results", []) or []
         if not results:
             return
-        self.filtered_stocks = results
+        self.all_scan_results = list(results)
+        self.filtered_stocks = list(results)
         self.update_result_table(results, announce=False, persist=False)
         self.status_var.set("已从本地结果恢复")
 
@@ -1299,7 +1478,7 @@ class StockMonitorApp:
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
 
-        results = self._filter_results_by_selected_boards(results)
+        results = self._apply_result_filters(results)
         results = self._sort_results(results)
 
         for result in results:
@@ -1446,6 +1625,10 @@ class StockMonitorApp:
         self.status_var.set("查询完成")
 
     def _show_detail_loading(self, stock_code: str) -> None:
+        self._detail_chart_dates = []
+        self._detail_chart_history = None
+        self._detail_chart_analysis = {}
+        self._detail_chart_window_start = 0
         placeholders = {
             "code": str(stock_code).strip().zfill(6),
             "name": "加载中...",
@@ -1477,6 +1660,10 @@ class StockMonitorApp:
         self.canvas.draw()
 
     def _show_detail_error(self, stock_code: str, message: str) -> None:
+        self._detail_chart_dates = []
+        self._detail_chart_history = None
+        self._detail_chart_analysis = {}
+        self._detail_chart_window_start = 0
         code_text = str(stock_code).strip().zfill(6)
         if "code" in self.detail_labels:
             self.detail_labels["code"].config(text=code_text)
@@ -1524,7 +1711,8 @@ class StockMonitorApp:
 
         self._draw_chart(history, analysis)
 
-    def _draw_chart(self, history, analysis):
+    def _draw_chart(self, history, analysis, keep_window: bool = False):
+        self._detail_chart_dates = []
         self.price_ax.clear()
         self.volume_ax.clear()
         self.flow_ax.clear()
@@ -1533,13 +1721,38 @@ class StockMonitorApp:
         self.flow_ax.set_axis_on()
 
         if history is None or getattr(history, "empty", True):
+            self._detail_chart_history = None
+            self._detail_chart_analysis = {}
+            self._detail_chart_window_start = 0
+            self.detail_chart_window_scale.config(from_=0, to=0, state=tk.DISABLED)
+            self.detail_chart_window_var.set(0)
+            self.detail_chart_window_label_var.set("窗口: -")
             self.price_ax.text(0.5, 0.5, "暂无历史数据", ha="center", va="center", fontsize=14)
             self.canvas.draw()
             return
 
-        df = history.copy().tail(30).reset_index(drop=True)
+        df = history.copy()
+        if "date" in df.columns:
+            df = df.sort_values("date").reset_index(drop=True)
+        else:
+            df = df.reset_index(drop=True)
+        if df.empty:
+            self._detail_chart_history = None
+            self._detail_chart_analysis = {}
+            self._detail_chart_window_start = 0
+            self.detail_chart_window_scale.config(from_=0, to=0, state=tk.DISABLED)
+            self.detail_chart_window_var.set(0)
+            self.detail_chart_window_label_var.set("窗口: -")
+            self.price_ax.text(0.5, 0.5, "暂无历史数据", ha="center", va="center", fontsize=14)
+            self.canvas.draw()
+            return
+
+        self._detail_chart_history = df
+        self._detail_chart_analysis = dict(analysis or {})
+
         x = list(range(len(df)))
         dates = df["date"].astype(str).tolist() if "date" in df.columns else [str(i) for i in x]
+        self._detail_chart_dates = list(dates)
         opens = pd.to_numeric(df["open"], errors="coerce") if "open" in df.columns else pd.Series([None] * len(df))
         closes = pd.to_numeric(df["close"], errors="coerce") if "close" in df.columns else pd.Series([None] * len(df))
         highs = pd.to_numeric(df["high"], errors="coerce") if "high" in df.columns else pd.Series([None] * len(df))
@@ -1570,7 +1783,7 @@ class StockMonitorApp:
         ]
         self.volume_ax.bar(x, volumes.fillna(0), width=0.6, color=volume_colors, alpha=0.85)
 
-        flow_history = analysis.get("fund_flow_history") or []
+        flow_history = (analysis or {}).get("fund_flow_history") or []
         flow_map = {}
         for item in flow_history:
             if not isinstance(item, dict):
@@ -1581,44 +1794,186 @@ class StockMonitorApp:
             flow_map[flow_date] = item
         big_order_values = []
         flow_colors = []
-        for idx, date_str in enumerate(dates):
+        for _, date_str in enumerate(dates):
             flow_item = flow_map.get(date_str, {})
             amount = pd.to_numeric(pd.Series([flow_item.get("big_order_amount")]), errors="coerce").iloc[0]
             if pd.isna(amount):
                 amount = 0.0
             big_order_values.append(float(amount))
             flow_colors.append("#d94b4b" if amount >= 0 else "#1f8b4c")
-        self.flow_ax.bar(x, big_order_values, width=0.6, color=flow_colors, alpha=0.85)
-        self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
+        if self._detail_flow_expanded:
+            self.flow_ax.set_visible(True)
+            self.flow_ax.bar(x, big_order_values, width=0.6, color=flow_colors, alpha=0.85)
+            self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
+            self.flow_ax.set_ylabel("大单净额")
+            self.flow_ax.set_xlabel("日期")
+            self.flow_ax.grid(True, alpha=0.2)
+        else:
+            self.flow_ax.set_visible(False)
+            self.flow_ax.set_axis_off()
 
-        tick_step = max(1, len(x) // 6)
-        tick_positions = x[::tick_step]
-        if x and tick_positions[-1] != x[-1]:
-            tick_positions.append(x[-1])
+        total = len(x)
+        window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
+        max_start = max(0, total - window)
+        if keep_window:
+            start = max(0, min(int(self._detail_chart_window_start), max_start))
+        else:
+            start = max_start
+        end = min(total, start + window)
+        self._detail_chart_window_start = start
+        self.detail_chart_window_scale.config(from_=0, to=max_start, state=(tk.NORMAL if max_start > 0 else tk.DISABLED))
+        self._detail_chart_slider_updating = True
+        try:
+            self.detail_chart_window_var.set(start)
+        finally:
+            self._detail_chart_slider_updating = False
+
+        if total > 0:
+            self.price_ax.set_xlim(start - 0.5, end - 0.5)
+            self.volume_ax.set_xlim(start - 0.5, end - 0.5)
+        if self._detail_flow_expanded:
+            self.flow_ax.set_xlim(start - 0.5, end - 0.5)
+
+        view_len = max(1, end - start)
+        tick_step = max(1, view_len // 6)
+        tick_positions = list(range(start, end, tick_step))
+        if tick_positions and tick_positions[-1] != end - 1:
+            tick_positions.append(end - 1)
+        elif not tick_positions and end > start:
+            tick_positions = [end - 1]
         tick_labels = [dates[pos][5:] if len(dates[pos]) >= 10 else dates[pos] for pos in tick_positions]
 
-        self.price_ax.set_xlim(-0.5, len(x) - 0.5)
-        self.volume_ax.set_xlim(-0.5, len(x) - 0.5)
-        self.flow_ax.set_xlim(-0.5, len(x) - 0.5)
         self.price_ax.set_ylabel("价格")
-        self.price_ax.set_title("近一个月K线（点击图表进入分时）")
+        self.price_ax.set_title("K线图（滚轮左右滑动，点击K线进入分时）")
         self.price_ax.legend(loc="upper left")
         self.price_ax.grid(True, alpha=0.25)
         self.volume_ax.set_ylabel("成交量")
         self.volume_ax.grid(True, alpha=0.2)
-        self.flow_ax.set_ylabel("大单净额")
-        self.flow_ax.set_xlabel("日期")
-        self.flow_ax.grid(True, alpha=0.2)
         self.price_ax.set_xticks(tick_positions)
         self.price_ax.set_xticklabels([])
         self.volume_ax.set_xticks(tick_positions)
-        self.volume_ax.set_xticklabels([])
-        self.volume_ax.set_xticks(tick_positions)
-        self.flow_ax.set_xticks(tick_positions)
-        self.flow_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+
+        if self._detail_flow_expanded:
+            self.volume_ax.set_xticklabels([])
+            self.flow_ax.set_xticks(tick_positions)
+            self.flow_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+        else:
+            self.volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+        if dates:
+            self.detail_chart_window_label_var.set(f"窗口: {dates[start]} ~ {dates[end - 1]}")
+        else:
+            self.detail_chart_window_label_var.set("窗口: -")
 
         self.fig.tight_layout()
         self.canvas.draw()
+
+    def toggle_detail_summary_section(self):
+        self._detail_summary_expanded = not self._detail_summary_expanded
+        if self._detail_summary_expanded:
+            self.info_frame.pack(fill=tk.X, pady=5, after=self.detail_summary_toggle_btn.master)
+            self.detail_summary_toggle_btn.config(text="收起历史摘要")
+            self.detail_summary_status_var.set("历史摘要已展开")
+        else:
+            self.info_frame.pack_forget()
+            self.detail_summary_toggle_btn.config(text="展开历史摘要")
+            self.detail_summary_status_var.set("历史摘要已收起")
+
+    def toggle_detail_chart_section(self):
+        self._detail_chart_expanded = not self._detail_chart_expanded
+        if self._detail_chart_expanded:
+            self.chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+            self.detail_chart_toggle_btn.config(text="收起历史K线")
+            self.detail_chart_status_var.set("历史K线已展开")
+        else:
+            self.chart_frame.pack_forget()
+            self.detail_chart_toggle_btn.config(text="展开历史K线")
+            self.detail_chart_status_var.set("历史K线已收起")
+
+    def toggle_detail_flow_section(self):
+        self._detail_flow_expanded = not self._detail_flow_expanded
+        if self._detail_flow_expanded:
+            self.detail_flow_toggle_btn.config(text="收起大单净额")
+            self.detail_flow_status_var.set("大单净额已展开")
+        else:
+            self.detail_flow_toggle_btn.config(text="展开大单净额")
+            self.detail_flow_status_var.set("大单净额已收起")
+        if self._detail_chart_history is not None:
+            self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+
+    def on_detail_chart_window_changed(self, value):
+        if self._detail_chart_slider_updating:
+            return
+        if self._detail_chart_history is None or getattr(self._detail_chart_history, "empty", True):
+            return
+        try:
+            new_start = int(float(value))
+        except (TypeError, ValueError):
+            return
+        total = len(self._detail_chart_history)
+        window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
+        max_start = max(0, total - window)
+        new_start = max(0, min(new_start, max_start))
+        if new_start == self._detail_chart_window_start:
+            return
+        self._detail_chart_window_start = new_start
+        self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+
+    def _bind_detail_chart_scroll(self, widget) -> None:
+        if self._detail_chart_scroll_bound:
+            return
+        try:
+            widget.bind("<MouseWheel>", self.on_detail_chart_mousewheel)
+            widget.bind("<Shift-MouseWheel>", self.on_detail_chart_mousewheel)
+            widget.bind("<Button-4>", self.on_detail_chart_mousewheel)
+            widget.bind("<Button-5>", self.on_detail_chart_mousewheel)
+            widget.bind("<Enter>", lambda _e: widget.focus_set())
+            self._detail_chart_scroll_bound = True
+        except tk.TclError:
+            pass
+
+    def _detail_scroll_delta(self, event) -> int:
+        button = str(getattr(event, "button", "") or "").lower()
+        if button == "up":
+            return -6
+        if button == "down":
+            return 6
+        num = getattr(event, "num", None)
+        if num == 4:
+            return -6
+        if num == 5:
+            return 6
+        delta = getattr(event, "delta", 0) or 0
+        if delta > 0:
+            return -6
+        if delta < 0:
+            return 6
+        return 0
+
+    def on_detail_chart_scroll(self, event):
+        if event is None:
+            return
+        inaxes = getattr(event, "inaxes", None)
+        if inaxes is not None and inaxes not in (self.price_ax, self.volume_ax, self.flow_ax):
+            return
+        if self._detail_chart_history is None or getattr(self._detail_chart_history, "empty", True):
+            return
+        total = len(self._detail_chart_history)
+        window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
+        max_start = max(0, total - window)
+        if max_start <= 0:
+            return
+
+        delta = self._detail_scroll_delta(event)
+        if delta == 0:
+            return
+        new_start = max(0, min(self._detail_chart_window_start + delta, max_start))
+        if new_start == self._detail_chart_window_start:
+            return
+        self._detail_chart_window_start = new_start
+        self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+
+    def on_detail_chart_mousewheel(self, event):
+        self.on_detail_chart_scroll(event)
 
     def on_detail_chart_click(self, event):
         if event is None:
@@ -1628,44 +1983,132 @@ class StockMonitorApp:
         code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
         if not code:
             return
-        self.open_intraday_view(code)
+        target_trade_date = ""
+        if self._detail_chart_dates and event.xdata is not None:
+            try:
+                idx = int(round(float(event.xdata)))
+                idx = max(0, min(idx, len(self._detail_chart_dates) - 1))
+                target_trade_date = str(self._detail_chart_dates[idx] or "").strip()
+            except (TypeError, ValueError):
+                target_trade_date = ""
+        self.open_intraday_view_with_offset(code, day_offset=0, target_trade_date=target_trade_date)
 
     def open_intraday_view(self, stock_code: str):
+        self.open_intraday_view_with_offset(stock_code, day_offset=0)
+
+    def navigate_intraday_day(self, delta: int):
+        code = str(self._intraday_request_code or self._current_detail_code or "").strip().zfill(6)
+        if not code:
+            return
+        try:
+            step = int(delta)
+        except (TypeError, ValueError):
+            return
+        if step == 0:
+            return
+        if not self._intraday_available_dates:
+            self.open_intraday_view_with_offset(code, day_offset=self._intraday_day_offset + step)
+            return
+        try:
+            current_idx = self._intraday_available_dates.index(self._intraday_selected_date)
+        except ValueError:
+            current_idx = len(self._intraday_available_dates) - 1
+        target_idx = max(0, min(current_idx + step, len(self._intraday_available_dates) - 1))
+        target_date = self._intraday_available_dates[target_idx]
+        self.open_intraday_view_with_offset(code, day_offset=0, target_trade_date=target_date)
+
+    def _refresh_intraday_nav_buttons(self):
+        has_code = bool(str(self._intraday_request_code or "").strip())
+        has_dates = len(self._intraday_available_dates) > 0
+        can_prev = has_code and has_dates and (self._intraday_day_offset > -(len(self._intraday_available_dates) - 1))
+        can_next = has_code and has_dates and (self._intraday_day_offset < 0)
+        self.intraday_prev_btn.config(state=(tk.NORMAL if can_prev else tk.DISABLED))
+        self.intraday_next_btn.config(state=(tk.NORMAL if can_next else tk.DISABLED))
+
+    def open_intraday_view_with_offset(self, stock_code: str, day_offset: int = 0, target_trade_date: str = ""):
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return
+        last_code = str(self._intraday_request_code or "").strip().zfill(6)
+        if last_code and last_code != code:
+            self._intraday_available_dates = []
+            self._intraday_selected_date = ""
+
+        try:
+            requested_offset = int(day_offset)
+        except (TypeError, ValueError):
+            requested_offset = 0
+        if requested_offset > 0:
+            requested_offset = 0
+        if self._intraday_available_dates:
+            requested_offset = max(requested_offset, -(len(self._intraday_available_dates) - 1))
+
         self._intraday_request_code = code
+        self._intraday_request_offset = requested_offset
+        self._intraday_day_offset = requested_offset
         self.intraday_title_var.set(f"分时图 - {code}")
+        self.intraday_day_var.set("交易日: 加载中...")
+        self._refresh_intraday_nav_buttons()
         self._draw_intraday_loading(f"正在加载 {code} 分时...")
         self.notebook.select(self.intraday_tab)
 
-        if self._intraday_loading_code == code:
+        normalized_target_date = str(target_trade_date or "").strip()
+        self._intraday_request_target_date = normalized_target_date
+        if (
+            self._intraday_loading_code == code
+            and self._intraday_loading_offset == requested_offset
+            and self._intraday_loading_target_date == normalized_target_date
+        ):
             return
         self._intraday_loading_code = code
-        threading.Thread(target=self._load_intraday, args=(code,), daemon=True).start()
+        self._intraday_loading_offset = requested_offset
+        self._intraday_loading_target_date = normalized_target_date
+        threading.Thread(target=self._load_intraday, args=(code, requested_offset, normalized_target_date), daemon=True).start()
 
-    def _load_intraday(self, stock_code: str):
+    def _load_intraday(self, stock_code: str, day_offset: int, target_trade_date: str = ""):
         try:
-            payload = self.stock_filter.get_stock_intraday(stock_code)
-            self.root.after(0, lambda: self._apply_intraday_if_current(stock_code, payload))
+            payload = self.stock_filter.get_stock_intraday(
+                stock_code,
+                day_offset=day_offset,
+                target_trade_date=target_trade_date,
+            )
+            self.root.after(0, lambda: self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload))
         except Exception as e:
             self.root.after(0, lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
             self.root.after(0, lambda: self._log(f"分时加载失败 {stock_code}: {e}"))
         finally:
-            self.root.after(0, lambda: self._finish_intraday_status(stock_code))
+            self.root.after(0, lambda: self._finish_intraday_status(stock_code, day_offset))
 
-    def _apply_intraday_if_current(self, stock_code: str, payload: Dict[str, Any]) -> None:
+    def _apply_intraday_if_current(self, stock_code: str, day_offset: int, target_trade_date: str, payload: Dict[str, Any]) -> None:
         code = str(stock_code).strip().zfill(6)
-        if code != self._intraday_request_code:
+        if (
+            code != self._intraday_request_code
+            or int(day_offset) != int(self._intraday_request_offset)
+            or str(target_trade_date or "").strip() != self._intraday_request_target_date
+        ):
             return
         intraday_df = payload.get("intraday")
         prev_close = payload.get("prev_close")
+        selected_trade_date = str(payload.get("selected_trade_date") or "")
+        available_trade_dates = [str(d) for d in (payload.get("available_trade_dates") or [])]
+        try:
+            applied_day_offset = int(payload.get("applied_day_offset") or 0)
+        except (TypeError, ValueError):
+            applied_day_offset = int(day_offset)
+        self._intraday_available_dates = available_trade_dates
+        self._intraday_day_offset = applied_day_offset
+        self._intraday_request_offset = applied_day_offset
+        self._intraday_selected_date = selected_trade_date
+        self.intraday_day_var.set(f"交易日: {selected_trade_date or '-'}")
+        self._refresh_intraday_nav_buttons()
         self._draw_intraday_chart(code, intraday_df, prev_close=prev_close)
 
-    def _finish_intraday_status(self, stock_code: str) -> None:
+    def _finish_intraday_status(self, stock_code: str, day_offset: int) -> None:
         code = str(stock_code).strip().zfill(6)
-        if code == self._intraday_loading_code:
+        if code == self._intraday_loading_code and int(day_offset) == int(self._intraday_loading_offset):
             self._intraday_loading_code = ""
+            self._intraday_loading_offset = 0
+            self._intraday_loading_target_date = ""
 
     def _draw_intraday_loading(self, message: str):
         self.intraday_price_ax.clear()
@@ -1680,6 +2123,8 @@ class StockMonitorApp:
         self.intraday_canvas.draw()
     def _draw_intraday_error(self, stock_code: str, message: str):
         self.intraday_title_var.set(f"分时图 - {str(stock_code).strip().zfill(6)}")
+        if not self._intraday_selected_date:
+            self.intraday_day_var.set("交易日: -")
         self.intraday_price_ax.clear()
         self.intraday_volume_ax.clear()
         self.intraday_dist_ax.clear()
@@ -1689,6 +2134,7 @@ class StockMonitorApp:
         self.intraday_price_ax.set_axis_off()
         self.intraday_volume_ax.set_axis_off()
         self.intraday_dist_ax.set_axis_off()
+        self._refresh_intraday_nav_buttons()
         self.intraday_canvas.draw()
     def _draw_intraday_chart(self, stock_code: str, intraday_df, prev_close: Optional[float] = None):
         code = str(stock_code).strip().zfill(6)

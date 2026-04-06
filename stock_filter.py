@@ -744,14 +744,37 @@ class StockFilter:
             "analysis": analysis,
         }
 
-    def get_stock_intraday(self, stock_code: str) -> Dict[str, Any]:
+    def get_stock_intraday(
+        self,
+        stock_code: str,
+        day_offset: int = 0,
+        target_trade_date: str = "",
+    ) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
-        intraday_df = self._call_with_timeout(
-            lambda: self.fetcher.get_intraday_data(code),
+        intraday_payload = self._call_with_timeout(
+            lambda: self.fetcher.get_intraday_data(
+                code,
+                day_offset=day_offset,
+                target_trade_date=target_trade_date,
+                include_meta=True,
+            ),
             timeout_sec=12.0,
-            fallback=None,
+            fallback={},
             task_name=f"分时 {code}",
         )
+        intraday_df = None
+        selected_trade_date = ""
+        available_trade_dates: List[str] = []
+        applied_day_offset = 0
+        if isinstance(intraday_payload, dict):
+            intraday_df = intraday_payload.get("intraday")
+            selected_trade_date = str(intraday_payload.get("selected_trade_date") or "")
+            available_trade_dates = [str(d) for d in (intraday_payload.get("available_trade_dates") or [])]
+            try:
+                applied_day_offset = int(intraday_payload.get("applied_day_offset") or 0)
+            except (TypeError, ValueError):
+                applied_day_offset = 0
+
         prev_close = None
         history_df = self._call_with_timeout(
             lambda: self.fetcher.get_history_data(code, days=2),
@@ -767,4 +790,7 @@ class StockFilter:
             "code": code,
             "intraday": intraday_df,
             "prev_close": prev_close,
+            "selected_trade_date": selected_trade_date,
+            "available_trade_dates": available_trade_dates,
+            "applied_day_offset": applied_day_offset,
         }

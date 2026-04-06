@@ -1989,10 +1989,22 @@ class StockDataFetcher:
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
-    def get_intraday_data(self, stock_code: str, source: Optional[str] = None) -> Optional[pd.DataFrame]:
+    def get_intraday_data(
+        self,
+        stock_code: str,
+        source: Optional[str] = None,
+        day_offset: int = 0,
+        target_trade_date: str = "",
+        include_meta: bool = False,
+    ) -> Any:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
-            return None
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": "",
+                "available_trade_dates": [],
+                "applied_day_offset": 0,
+            }
 
         raw = None
         last_error: Optional[Exception] = None
@@ -2018,7 +2030,12 @@ class StockDataFetcher:
         if raw is None or getattr(raw, "empty", True):
             if self._log and last_error is not None:
                 self._log(f"分时行情 {code} 无可用数据: {last_error}")
-            return None
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": "",
+                "available_trade_dates": [],
+                "applied_day_offset": 0,
+            }
 
         source_columns = [str(col) for col in raw.columns.tolist()]
         rename_map: Dict[str, str] = {}
@@ -2046,20 +2063,65 @@ class StockDataFetcher:
         if "time" not in df.columns:
             if self._log:
                 self._log(f"分时行情 {code} 缺少时间列，返回列: {', '.join(source_columns)}")
-            return None
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": "",
+                "available_trade_dates": [],
+                "applied_day_offset": 0,
+            }
 
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
         df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
         if df.empty:
-            return None
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": "",
+                "available_trade_dates": [],
+                "applied_day_offset": 0,
+            }
 
-        # Some providers return multiple trading days in one payload.
-        # Keep only the latest trading date for intraday rendering.
-        latest_trade_date = df["time"].dt.date.max()
-        if latest_trade_date is not None:
-            df = df[df["time"].dt.date == latest_trade_date].reset_index(drop=True)
+        trade_dates = sorted({d.isoformat() for d in df["time"].dt.date.dropna().tolist()})
+        if not trade_dates:
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": "",
+                "available_trade_dates": [],
+                "applied_day_offset": 0,
+            }
+
+        selected_trade_date = ""
+        normalized_target = str(target_trade_date or "").strip()
+        if normalized_target:
+            if normalized_target in trade_dates:
+                selected_trade_date = normalized_target
+            else:
+                for d in reversed(trade_dates):
+                    if d <= normalized_target:
+                        selected_trade_date = d
+                        break
+                if not selected_trade_date:
+                    selected_trade_date = trade_dates[0]
+        else:
+            try:
+                request_offset = int(day_offset)
+            except (TypeError, ValueError):
+                request_offset = 0
+            max_back = len(trade_dates) - 1
+            applied_offset = max(-max_back, min(request_offset, 0))
+            selected_index = len(trade_dates) - 1 + applied_offset
+            selected_trade_date = trade_dates[selected_index]
+
+        selected_index = trade_dates.index(selected_trade_date)
+        applied_offset = selected_index - (len(trade_dates) - 1)
+        target_date = pd.to_datetime(selected_trade_date, errors="coerce").date()
+        df = df[df["time"].dt.date == target_date].reset_index(drop=True)
         if df.empty:
-            return None
+            return None if not include_meta else {
+                "intraday": None,
+                "selected_trade_date": selected_trade_date,
+                "available_trade_dates": trade_dates,
+                "applied_day_offset": applied_offset,
+            }
 
         for col in ["open", "close", "high", "low", "volume", "amount"]:
             if col in df.columns:
@@ -2067,6 +2129,12 @@ class StockDataFetcher:
             else:
                 df[col] = None
 
-        if len(df) > 300:
-            df = df.tail(300).reset_index(drop=True)
-        return df[["time", "open", "close", "high", "low", "volume", "amount"]]
+        intraday_df = df[["time", "open", "close", "high", "low", "volume", "amount"]]
+        if include_meta:
+            return {
+                "intraday": intraday_df,
+                "selected_trade_date": selected_trade_date,
+                "available_trade_dates": trade_dates,
+                "applied_day_offset": applied_offset,
+            }
+        return intraday_df
