@@ -62,6 +62,13 @@ class StockMonitorApp:
         self._detail_chart_analysis: Dict[str, Any] = {}
         self._detail_chart_scroll_bound = False
         self._detail_chart_slider_updating = False
+        self._detail_chart_dragging = False
+        self._detail_chart_drag_moved = False
+        self._detail_chart_drag_start_x = 0.0
+        self._detail_chart_drag_start_window = 0
+        self._detail_chart_click_target_date = ""
+        self._detail_chart_loading_more = False
+        self._detail_chart_loaded_days = 0
         self._detail_summary_expanded = False
         self._detail_chart_expanded = True
         self._detail_flow_expanded = False
@@ -85,6 +92,7 @@ class StockMonitorApp:
         self.app_settings_path = Path("data") / "app_settings.json"
         self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._main_thread_id = threading.get_ident()
+        self._is_closing = False
 
         self.setup_ui()
         self._load_app_settings()
@@ -678,9 +686,11 @@ class StockMonitorApp:
     def setup_detail_tab(self):
         detail_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(detail_frame, text="股票详情")
+        self.detail_tab_frame = detail_frame
 
         info_header = ttk.Frame(detail_frame)
         info_header.pack(fill=tk.X, pady=(5, 2))
+        self.detail_info_header = info_header
         self.detail_summary_toggle_btn = ttk.Button(
             info_header,
             text="展开历史摘要",
@@ -694,13 +704,14 @@ class StockMonitorApp:
         self.info_frame.pack(fill=tk.X, pady=5)
 
         self.detail_labels: Dict[str, ttk.Label] = {}
+        self.detail_label_caption_vars: Dict[str, tk.StringVar] = {}
         items = [
             ("code", "股票代码"),
             ("name", "股票名称"),
             ("latest_date", "最新日期"),
             ("quote_time", "刷新时间"),
             ("latest_close", "最新收盘"),
-            ("latest_ma", "MA"),
+            ("latest_ma", f"MA{max(1, int(self.stock_filter.ma_period))}"),
             ("latest_ma10", "MA10"),
             ("latest_volume", "成交量"),
             ("latest_amount", "成交额"),
@@ -716,7 +727,9 @@ class StockMonitorApp:
         for i, (key, label) in enumerate(items):
             row = i // 3
             col = (i % 3) * 2
-            ttk.Label(self.info_frame, text=f"{label}:").grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
+            caption_var = tk.StringVar(value=f"{label}:")
+            self.detail_label_caption_vars[key] = caption_var
+            ttk.Label(self.info_frame, textvariable=caption_var).grid(row=row, column=col, padx=5, pady=5, sticky=tk.E)
             self.detail_labels[key] = ttk.Label(self.info_frame, text="-", width=30)
             self.detail_labels[key].grid(row=row, column=col + 1, padx=5, pady=5, sticky=tk.W)
 
@@ -724,6 +737,7 @@ class StockMonitorApp:
 
         chart_header = ttk.Frame(detail_frame)
         chart_header.pack(fill=tk.X, pady=(6, 2))
+        self.detail_chart_header = chart_header
         self.detail_chart_toggle_btn = ttk.Button(
             chart_header,
             text="收起历史K线",
@@ -760,6 +774,8 @@ class StockMonitorApp:
         canvas_widget.pack(fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self.on_detail_chart_click)
         self.canvas.mpl_connect("scroll_event", self.on_detail_chart_scroll)
+        self.canvas.mpl_connect("motion_notify_event", self.on_detail_chart_drag_motion)
+        self.canvas.mpl_connect("button_release_event", self.on_detail_chart_drag_release)
         self._bind_detail_chart_scroll(canvas_widget)
 
         slider_row = ttk.Frame(self.chart_body)
@@ -782,6 +798,7 @@ class StockMonitorApp:
         ttk.Label(slider_row, textvariable=self.detail_chart_window_label_var).pack(side=tk.RIGHT)
 
         self.detail_chart_placeholder = None
+        self._apply_detail_section_visibility()
 
     def setup_intraday_tab(self):
         intraday_frame = ttk.Frame(self.notebook, padding="5")
@@ -845,6 +862,8 @@ class StockMonitorApp:
         self._run_log_file = None
 
     def _log(self, message: str) -> None:
+        if self._is_closing:
+            return
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
         self.log_text.insert(tk.END, line)
         self.log_text.see(tk.END)
@@ -853,19 +872,33 @@ class StockMonitorApp:
                 f.write(line)
 
     def _log_async(self, message: str) -> None:
+        if self._is_closing:
+            return
         if threading.get_ident() == self._main_thread_id:
             self._log(message)
             return
         self._log_queue.put(message)
 
     def _drain_log_queue(self) -> None:
+        if self._is_closing or not self.root.winfo_exists():
+            return
         while True:
             try:
                 message = self._log_queue.get_nowait()
             except queue.Empty:
                 break
             self._log(message)
-        self.root.after(100, self._drain_log_queue)
+        if not self._is_closing and self.root.winfo_exists():
+            self.root.after(100, self._drain_log_queue)
+
+    def _safe_after(self, delay_ms: int, callback) -> None:
+        if self._is_closing:
+            return
+        try:
+            if self.root.winfo_exists():
+                self.root.after(delay_ms, callback)
+        except tk.TclError:
+            pass
 
     def _selected_boards(self) -> List[str]:
         boards = [board for board, var in self.board_filter_vars.items() if var.get()]
@@ -956,6 +989,7 @@ class StockMonitorApp:
                 messagebox.showerror("错误", str(exc))
             return None
         self.stock_filter.apply_settings(settings)
+        self._refresh_detail_metric_labels()
         return settings
 
     def _build_scan_request(self) -> Optional[ScanRequest]:
@@ -1024,6 +1058,18 @@ class StockMonitorApp:
         if abs_volume >= 1e4:
             return f"{volume / 1e4:.2f}万"
         return f"{volume:.0f}"
+
+    def _format_axis_volume(self, value: float, _pos: float = 0) -> str:
+        text = self._format_volume(value)
+        return text if text != "-" else "0"
+
+    def _refresh_detail_metric_labels(self) -> None:
+        ma_period = max(1, int(self.stock_filter.ma_period))
+        if "latest_ma" in self.detail_label_caption_vars:
+            self.detail_label_caption_vars["latest_ma"].set(f"MA{ma_period}:")
+        volume_days = max(1, int(self.stock_filter.volume_lookback_days))
+        if "latest_volume" in self.detail_label_caption_vars:
+            self.detail_label_caption_vars["latest_volume"].set(f"成交量(近{volume_days}日均量占比):")
 
     def _filter_results_by_selected_boards(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         allowed = {str(board).strip() for board in self._selected_boards() if str(board).strip()}
@@ -1629,6 +1675,8 @@ class StockMonitorApp:
         self._detail_chart_history = None
         self._detail_chart_analysis = {}
         self._detail_chart_window_start = 0
+        self._detail_chart_loaded_days = 0
+        self._detail_chart_loading_more = False
         placeholders = {
             "code": str(stock_code).strip().zfill(6),
             "name": "加载中...",
@@ -1664,6 +1712,8 @@ class StockMonitorApp:
         self._detail_chart_history = None
         self._detail_chart_analysis = {}
         self._detail_chart_window_start = 0
+        self._detail_chart_loaded_days = 0
+        self._detail_chart_loading_more = False
         code_text = str(stock_code).strip().zfill(6)
         if "code" in self.detail_labels:
             self.detail_labels["code"].config(text=code_text)
@@ -1685,6 +1735,8 @@ class StockMonitorApp:
         analysis = detail.get("analysis") or {}
         history = detail.get("history")
         self._current_detail_code = str(detail.get("code", "") or "").strip().zfill(6)
+        self._detail_chart_loading_more = False
+        self._refresh_detail_metric_labels()
 
         self.detail_labels["code"].config(text=detail.get("code", "-"))
         self.detail_labels["name"].config(text=detail.get("name", "-"))
@@ -1699,7 +1751,11 @@ class StockMonitorApp:
         self.detail_labels["latest_ma10"].config(
             text="-" if analysis.get("latest_ma10") is None else f"{analysis['latest_ma10']:.2f}"
         )
-        self.detail_labels["latest_volume"].config(text=self._format_volume(analysis.get("latest_volume")))
+        latest_volume_text = self._format_volume(analysis.get("latest_volume"))
+        latest_volume_ratio = analysis.get("latest_volume_ratio")
+        if latest_volume_text != "-" and latest_volume_ratio is not None:
+            latest_volume_text = f"{latest_volume_text} ({latest_volume_ratio:.1f}%)"
+        self.detail_labels["latest_volume"].config(text=latest_volume_text)
         self.detail_labels["latest_amount"].config(text=self._format_amount(analysis.get("latest_amount")))
         self.detail_labels["five_day_return"].config(
             text="-" if analysis.get("five_day_return") is None else f"{analysis['five_day_return']:.2f}%"
@@ -1749,6 +1805,7 @@ class StockMonitorApp:
 
         self._detail_chart_history = df
         self._detail_chart_analysis = dict(analysis or {})
+        self._detail_chart_loaded_days = max(self._detail_chart_loaded_days, len(df))
 
         x = list(range(len(df)))
         dates = df["date"].astype(str).tolist() if "date" in df.columns else [str(i) for i in x]
@@ -1773,15 +1830,30 @@ class StockMonitorApp:
         ma_period = max(1, int(self.stock_filter.ma_period))
         ma = closes.rolling(window=ma_period, min_periods=ma_period).mean()
         ma10 = closes.rolling(window=10, min_periods=10).mean()
-        self.price_ax.plot(x, closes, color="#2f6fd6", linewidth=1.0, alpha=0.35, label="收盘价")
-        self.price_ax.plot(x, ma, color="#f08a24", linewidth=1.4, label=f"MA{ma_period}")
-        self.price_ax.plot(x, ma10, color="#7b52ab", linewidth=1.2, label="MA10")
+        latest_close = closes.dropna().iloc[-1] if not closes.dropna().empty else None
+        latest_ma = ma.dropna().iloc[-1] if not ma.dropna().empty else None
+        latest_ma10 = ma10.dropna().iloc[-1] if not ma10.dropna().empty else None
+        close_label = "收盘价" if latest_close is None else f"收盘价 {latest_close:.2f}"
+        ma_label = f"MA{ma_period}" if latest_ma is None else f"MA{ma_period} {latest_ma:.2f}"
+        ma10_label = "MA10" if latest_ma10 is None else f"MA10 {latest_ma10:.2f}"
+        self.price_ax.plot(x, closes, color="#2f6fd6", linewidth=1.0, alpha=0.35, label=close_label)
+        self.price_ax.plot(x, ma, color="#f08a24", linewidth=1.4, label=ma_label)
+        self.price_ax.plot(x, ma10, color="#7b52ab", linewidth=1.2, label=ma10_label)
 
         volume_colors = [
             "#d94b4b" if (not pd.isna(c) and not pd.isna(o) and c >= o) else "#1f8b4c"
             for o, c in zip(opens, closes)
         ]
         self.volume_ax.bar(x, volumes.fillna(0), width=0.6, color=volume_colors, alpha=0.85)
+        volume_compare_window = volumes.iloc[-6:-1].dropna() if len(volumes) > 1 else pd.Series(dtype=float)
+        if volume_compare_window.empty:
+            volume_compare_window = volumes.dropna()
+        latest_volume_value = volumes.dropna().iloc[-1] if not volumes.dropna().empty else None
+        latest_volume_ratio_text = ""
+        if latest_volume_value is not None and not volume_compare_window.empty:
+            avg_volume = float(volume_compare_window.mean())
+            if avg_volume > 0:
+                latest_volume_ratio_text = f"  最新 {self._format_volume(latest_volume_value)} / 均量 {latest_volume_value / avg_volume * 100.0:.1f}%"
 
         flow_history = (analysis or {}).get("fund_flow_history") or []
         flow_map = {}
@@ -1835,7 +1907,7 @@ class StockMonitorApp:
             self.flow_ax.set_xlim(start - 0.5, end - 0.5)
 
         view_len = max(1, end - start)
-        tick_step = max(1, view_len // 6)
+        tick_step = max(1, view_len // 8)
         tick_positions = list(range(start, end, tick_step))
         if tick_positions and tick_positions[-1] != end - 1:
             tick_positions.append(end - 1)
@@ -1848,17 +1920,22 @@ class StockMonitorApp:
         self.price_ax.legend(loc="upper left")
         self.price_ax.grid(True, alpha=0.25)
         self.volume_ax.set_ylabel("成交量")
+        self.volume_ax.set_title(f"成交量{latest_volume_ratio_text}" if latest_volume_ratio_text else "成交量")
+        self.volume_ax.yaxis.set_major_formatter(FuncFormatter(self._format_axis_volume))
+        self.volume_ax.yaxis.get_offset_text().set_visible(False)
         self.volume_ax.grid(True, alpha=0.2)
         self.price_ax.set_xticks(tick_positions)
-        self.price_ax.set_xticklabels([])
-        self.volume_ax.set_xticks(tick_positions)
+        self.price_ax.tick_params(axis="x", labelbottom=False)
 
         if self._detail_flow_expanded:
-            self.volume_ax.set_xticklabels([])
-            self.flow_ax.set_xticks(tick_positions)
+            self.volume_ax.set_xticklabels([""] * len(tick_positions))
+            self.volume_ax.tick_params(axis="x", labelbottom=False)
             self.flow_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+            self.flow_ax.tick_params(axis="x", labelbottom=True)
         else:
+            self.flow_ax.tick_params(axis="x", labelbottom=False)
             self.volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+            self.volume_ax.tick_params(axis="x", labelbottom=True)
         if dates:
             self.detail_chart_window_label_var.set(f"窗口: {dates[start]} ~ {dates[end - 1]}")
         else:
@@ -1869,23 +1946,32 @@ class StockMonitorApp:
 
     def toggle_detail_summary_section(self):
         self._detail_summary_expanded = not self._detail_summary_expanded
-        if self._detail_summary_expanded:
-            self.info_frame.pack(fill=tk.X, pady=5, after=self.detail_summary_toggle_btn.master)
-            self.detail_summary_toggle_btn.config(text="收起历史摘要")
-            self.detail_summary_status_var.set("历史摘要已展开")
-        else:
-            self.info_frame.pack_forget()
-            self.detail_summary_toggle_btn.config(text="展开历史摘要")
-            self.detail_summary_status_var.set("历史摘要已收起")
+        self._apply_detail_section_visibility()
 
     def toggle_detail_chart_section(self):
         self._detail_chart_expanded = not self._detail_chart_expanded
+        self._apply_detail_section_visibility()
+
+    def _apply_detail_section_visibility(self):
+        if self._detail_summary_expanded:
+            if not self.info_frame.winfo_ismapped():
+                self.info_frame.pack(fill=tk.X, pady=5, after=self.detail_info_header)
+            self.detail_summary_toggle_btn.config(text="收起历史摘要")
+            self.detail_summary_status_var.set("历史摘要已展开")
+        else:
+            if self.info_frame.winfo_ismapped():
+                self.info_frame.pack_forget()
+            self.detail_summary_toggle_btn.config(text="展开历史摘要")
+            self.detail_summary_status_var.set("历史摘要已收起")
+
         if self._detail_chart_expanded:
-            self.chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+            if not self.chart_frame.winfo_ismapped():
+                self.chart_frame.pack(fill=tk.BOTH, expand=True, pady=5, after=self.detail_chart_header)
             self.detail_chart_toggle_btn.config(text="收起历史K线")
             self.detail_chart_status_var.set("历史K线已展开")
         else:
-            self.chart_frame.pack_forget()
+            if self.chart_frame.winfo_ismapped():
+                self.chart_frame.pack_forget()
             self.detail_chart_toggle_btn.config(text="展开历史K线")
             self.detail_chart_status_var.set("历史K线已收起")
 
@@ -1926,10 +2012,85 @@ class StockMonitorApp:
             widget.bind("<Shift-MouseWheel>", self.on_detail_chart_mousewheel)
             widget.bind("<Button-4>", self.on_detail_chart_mousewheel)
             widget.bind("<Button-5>", self.on_detail_chart_mousewheel)
+            widget.bind("<Left>", lambda _e: self._move_detail_chart_window(-12))
+            widget.bind("<Right>", lambda _e: self._move_detail_chart_window(12))
             widget.bind("<Enter>", lambda _e: widget.focus_set())
+            widget.bind("<Button-1>", lambda _e: widget.focus_set())
             self._detail_chart_scroll_bound = True
         except tk.TclError:
             pass
+
+    def _move_detail_chart_window(self, delta: int) -> bool:
+        if self._detail_chart_history is None or getattr(self._detail_chart_history, "empty", True):
+            return False
+        total = len(self._detail_chart_history)
+        window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
+        max_start = max(0, total - window)
+        if max_start <= 0:
+            self._maybe_load_more_detail_history(need_older=True)
+            return False
+        try:
+            shift = int(delta)
+        except (TypeError, ValueError):
+            return False
+        if shift == 0:
+            return False
+        new_start = max(0, min(self._detail_chart_window_start + shift, max_start))
+        if new_start == self._detail_chart_window_start:
+            if new_start == 0 and shift < 0:
+                self._maybe_load_more_detail_history(need_older=True)
+            return False
+        self._detail_chart_window_start = new_start
+        self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+        if self._detail_chart_window_start <= max(0, min(12, max_start)) and shift < 0:
+            self._maybe_load_more_detail_history(need_older=True)
+        return True
+
+    def _maybe_load_more_detail_history(self, need_older: bool = False) -> None:
+        if not need_older:
+            return
+        if self._detail_chart_loading_more:
+            return
+        code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not code:
+            return
+        current_rows = 0
+        if self._detail_chart_history is not None and not getattr(self._detail_chart_history, "empty", True):
+            current_rows = len(self._detail_chart_history)
+        request_days = max(120, self._detail_chart_loaded_days + 120, current_rows + 120)
+        self._detail_chart_loading_more = True
+        self.detail_chart_status_var.set("历史K线补载中...")
+        threading.Thread(
+            target=self._load_more_detail_history,
+            args=(code, request_days, current_rows),
+            daemon=True,
+        ).start()
+
+    def _load_more_detail_history(self, stock_code: str, request_days: int, previous_rows: int) -> None:
+        history = self.stock_filter.get_stock_detail_history(stock_code, request_days)
+        self.root.after(
+            0,
+            lambda: self._apply_more_detail_history_if_current(stock_code, history, request_days, previous_rows),
+        )
+
+    def _apply_more_detail_history_if_current(self, stock_code: str, history, request_days: int, previous_rows: int) -> None:
+        self._detail_chart_loading_more = False
+        code = str(stock_code).strip().zfill(6)
+        if code != str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6):
+            return
+        if history is None or getattr(history, "empty", True):
+            self.detail_chart_status_var.set("历史K线补载失败")
+            return
+        if len(history) <= previous_rows:
+            self._detail_chart_loaded_days = max(self._detail_chart_loaded_days, request_days)
+            self.detail_chart_status_var.set("历史K线已展开")
+            return
+        old_start = int(self._detail_chart_window_start)
+        added_rows = len(history) - previous_rows
+        self._detail_chart_history = history
+        self._detail_chart_window_start = old_start + added_rows
+        self.detail_chart_status_var.set("历史K线已展开")
+        self._draw_chart(history, self._detail_chart_analysis, keep_window=True)
 
     def _detail_scroll_delta(self, event) -> int:
         button = str(getattr(event, "button", "") or "").lower()
@@ -1966,11 +2127,7 @@ class StockMonitorApp:
         delta = self._detail_scroll_delta(event)
         if delta == 0:
             return
-        new_start = max(0, min(self._detail_chart_window_start + delta, max_start))
-        if new_start == self._detail_chart_window_start:
-            return
-        self._detail_chart_window_start = new_start
-        self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+        self._move_detail_chart_window(delta)
 
     def on_detail_chart_mousewheel(self, event):
         self.on_detail_chart_scroll(event)
@@ -1980,18 +2137,59 @@ class StockMonitorApp:
             return
         if event.inaxes not in (self.price_ax, self.volume_ax, self.flow_ax):
             return
-        code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
-        if not code:
+        if getattr(event, "button", None) not in (1, None):
             return
-        target_trade_date = ""
+        self._detail_chart_click_target_date = ""
         if self._detail_chart_dates and event.xdata is not None:
             try:
                 idx = int(round(float(event.xdata)))
                 idx = max(0, min(idx, len(self._detail_chart_dates) - 1))
-                target_trade_date = str(self._detail_chart_dates[idx] or "").strip()
+                self._detail_chart_click_target_date = str(self._detail_chart_dates[idx] or "").strip()
             except (TypeError, ValueError):
-                target_trade_date = ""
-        self.open_intraday_view_with_offset(code, day_offset=0, target_trade_date=target_trade_date)
+                self._detail_chart_click_target_date = ""
+        if event.x is None:
+            self._detail_chart_dragging = False
+            return
+        self._detail_chart_dragging = True
+        self._detail_chart_drag_moved = False
+        self._detail_chart_drag_start_x = float(event.x)
+        self._detail_chart_drag_start_window = int(self._detail_chart_window_start)
+
+    def on_detail_chart_drag_motion(self, event):
+        if not self._detail_chart_dragging:
+            return
+        if event is None or getattr(event, "inaxes", None) not in (self.price_ax, self.volume_ax, self.flow_ax):
+            return
+        if self._detail_chart_history is None or getattr(self._detail_chart_history, "empty", True):
+            return
+        if event.x is None:
+            return
+        total = len(self._detail_chart_history)
+        window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
+        max_start = max(0, total - window)
+        if max_start <= 0:
+            return
+        pixel_per_bar = max(3.0, self.canvas.get_tk_widget().winfo_width() / max(1, window))
+        bars = int(round((float(event.x) - self._detail_chart_drag_start_x) / pixel_per_bar))
+        new_start = max(0, min(self._detail_chart_drag_start_window - bars, max_start))
+        if new_start == self._detail_chart_window_start:
+            return
+        self._detail_chart_drag_moved = True
+        self._detail_chart_window_start = new_start
+        self._draw_chart(self._detail_chart_history, self._detail_chart_analysis, keep_window=True)
+
+    def on_detail_chart_drag_release(self, event):
+        if not self._detail_chart_dragging:
+            return
+        self._detail_chart_dragging = False
+        if self._detail_chart_drag_moved:
+            self._detail_chart_drag_moved = False
+            return
+        code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not code:
+            return
+        self.open_intraday_view_with_offset(code, day_offset=0, target_trade_date=self._detail_chart_click_target_date)
+        self._detail_chart_drag_moved = False
 
     def open_intraday_view(self, stock_code: str):
         self.open_intraday_view_with_offset(stock_code, day_offset=0)
@@ -2100,6 +2298,22 @@ class StockMonitorApp:
         self._intraday_request_offset = applied_day_offset
         self._intraday_selected_date = selected_trade_date
         self.intraday_day_var.set(f"交易日: {selected_trade_date or '-'}")
+        # 调试日志：检查分时数据内容和竞价点
+        try:
+            if intraday_df is not None and not intraday_df.empty:
+                times = pd.to_datetime(intraday_df["time"], errors="coerce")
+                time_strs = [t.strftime("%H:%M") for t in times if not pd.isna(t)]
+                has_0925 = "09:25" in time_strs
+                self._log(f"【分时调试】{code} 数据共 {len(intraday_df)} 行，包含 09:25: {'是' if has_0925 else '否'}")
+                if has_0925:
+                    idx = time_strs.index("09:25")
+                    row = intraday_df.iloc[idx]
+                    self._log(f"   09:25 数据: 价格={row.get('close')}, 成交量={row.get('volume')}")
+            else:
+                self._log(f"【分时调试】{code} 分时数据为空")
+        except Exception as e:
+            self._log(f"【分时调试】记录日志出错: {e}")
+
         self._refresh_intraday_nav_buttons()
         self._draw_intraday_chart(code, intraday_df, prev_close=prev_close)
 
@@ -2246,7 +2460,7 @@ class StockMonitorApp:
         auction_indexes = [idx for idx, label in enumerate(time_labels) if label == "09:25"]
         has_auction = bool(auction_indexes)
         self.intraday_price_ax.set_title("分时走势（含竞价）" if has_auction else "分时走势（不含竞价）")
-        self.intraday_price_ax.legend(loc="upper left", fontsize=9)
+        self.intraday_price_ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
 
         if has_auction:
             q_idx = auction_indexes[0]
@@ -2298,10 +2512,15 @@ class StockMonitorApp:
             tick_map[0] = time_labels[0]
             tick_map[len(x) - 1] = time_labels[-1]
 
-        tick_positions = sorted(tick_map.keys())
+        raw_tick_positions = sorted(tick_map.keys())
+        tick_positions = []
+        min_tick_gap = max(12, len(x) // 10) if x else 12
+        for pos in raw_tick_positions:
+            if not tick_positions or pos - tick_positions[-1] >= min_tick_gap or pos == len(x) - 1:
+                tick_positions.append(pos)
         tick_labels = [tick_map[pos] for pos in tick_positions]
         if len(tick_positions) < 5 and x:
-            tick_step = max(1, len(x) // 7)
+            tick_step = max(1, len(x) // 6)
             tick_positions = x[::tick_step]
             if tick_positions[-1] != x[-1]:
                 tick_positions.append(x[-1])
@@ -2312,7 +2531,7 @@ class StockMonitorApp:
         self.intraday_price_ax.tick_params(axis="x", which="both", length=0)
 
         self.intraday_volume_ax.set_xticks(tick_positions)
-        self.intraday_volume_ax.set_xticklabels(tick_labels, rotation=90, ha="center", fontsize=8)
+        self.intraday_volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
 
         dist_df = pd.DataFrame({"price": close_series, "volume": volume_series}).dropna(subset=["price"])
         dist_df["volume"] = pd.to_numeric(dist_df["volume"], errors="coerce").fillna(0)
@@ -2623,7 +2842,14 @@ class StockMonitorApp:
         self._log("已清空历史数据。")
 
     def on_close(self):
+        self._is_closing = True
         self.is_scanning = False
+        self.is_updating_cache = False
+        self._detail_request_code = ""
+        self._detail_loading_code = ""
+        self._intraday_request_code = ""
+        self._intraday_loading_code = ""
+        self._cancel_scheduled_detail()
         self._close_run_log()
         try:
             self.root.quit()

@@ -200,6 +200,7 @@ class StockFilter:
             "volume_min": None,
             "volume_max": None,
             "volume_expand_ratio": None,
+            "latest_volume_ratio": None,
             "volume_expand": False,
             "limit_up_threshold": None,
             "limit_up": False,
@@ -260,6 +261,14 @@ class StockFilter:
                 result["volume_max"] = vmax
                 result["volume_expand_ratio"] = ratio
                 result["volume_expand"] = bool(volume_enabled and ratio is not None and ratio >= volume_factor)
+            compare_window = volume.iloc[-(volume_days + 1):-1].dropna() if len(volume) > 1 else pd.Series(dtype=float)
+            if compare_window.empty:
+                compare_window = recent_volume
+            latest_volume = volume.iloc[-1] if not volume.empty else None
+            if latest_volume is not None and not pd.isna(latest_volume) and not compare_window.empty:
+                avg_volume = float(compare_window.mean())
+                if avg_volume > 0:
+                    result["latest_volume_ratio"] = float(float(latest_volume) / avg_volume * 100.0)
 
         threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
         result["limit_up_threshold"] = threshold
@@ -663,7 +672,7 @@ class StockFilter:
 
     def get_stock_detail(self, stock_code: str) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
-        history_days = max(30, self.trend_days + self.limit_up_lookback_days + self.ma_period + 4)
+        history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
         history = self._call_with_timeout(
             lambda: self.fetcher.get_history_data(code, days=history_days),
             timeout_sec=15.0,
@@ -743,6 +752,16 @@ class StockFilter:
             "history": history,
             "analysis": analysis,
         }
+
+    def get_stock_detail_history(self, stock_code: str, days: int) -> Optional[pd.DataFrame]:
+        code = str(stock_code).strip().zfill(6)
+        history_days = max(60, int(days))
+        return self._call_with_timeout(
+            lambda: self.fetcher.get_history_data(code, days=history_days),
+            timeout_sec=15.0,
+            fallback=None,
+            task_name=f"补充详情历史 {code}",
+        )
 
     def get_stock_intraday(
         self,

@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import os
 import time
 import re
 import warnings
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
@@ -10,6 +13,74 @@ from datetime import datetime, timedelta
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent
+
+def _use_insecure_ssl() -> bool:
+    if os.environ.get("GUPPIAO_INSECURE_SSL", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    root = _project_root()
+    return (root / "USE_INSECURE_SSL").is_file() or (root / ".gupiao_insecure_ssl").is_file()
+
+def _use_bypass_proxy() -> bool:
+    """不走 HTTP(S)_PROXY 等环境代理（避免公司代理对东方财富断开）。"""
+    if os.environ.get("GUPPIAO_BYPASS_PROXY", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    root = _project_root()
+    return (root / "USE_BYPASS_PROXY").is_file() or (root / ".gupiao_bypass_proxy").is_file()
+
+# 须在 import akshare 之前执行：统一为 requests 补头；可选 SSL / 忽略环境代理
+def _apply_network_patches() -> None:
+    need_ssl = _use_insecure_ssl()
+    need_no_proxy = _use_bypass_proxy()
+
+    if need_ssl:
+        import ssl
+        ssl._create_default_https_context = ssl._create_unverified_context
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except ImportError:
+            pass
+
+    try:
+        import requests
+        _orig_init = requests.Session.__init__
+        _orig_req = requests.Session.request
+
+        def _patched_init(self, *args, **kwargs):
+            _orig_init(self, *args, **kwargs)
+            if need_no_proxy:
+                self.trust_env = False
+
+        def _patched_request(self, method, url, **kwargs):
+            if need_ssl:
+                kwargs.setdefault("verify", False)
+            u = str(url)
+            if "eastmoney.com" in u:
+                merged = dict(_EASTMONEY_HEADERS)
+                merged.setdefault("Connection", "close")
+                extra = kwargs.get("headers")
+                if isinstance(extra, dict):
+                    merged.update(extra)
+                elif extra is not None:
+                    try:
+                        merged.update(dict(extra))
+                    except (TypeError, ValueError):
+                        pass
+                kwargs["headers"] = merged
+            return _orig_req(self, method, url, **kwargs)
+
+        requests.Session.__init__ = _patched_init  # type: ignore[method-assign]
+        requests.Session.request = _patched_request  # type: ignore[method-assign]
+    except ImportError:
+        pass
+
+_apply_network_patches()
+
+import pandas as pd
+import akshare as ak
 
 from stock_store import (
     clear_history as clear_history_store,
@@ -24,8 +95,36 @@ from stock_store import (
     save_universe as save_universe_store,
 )
 from data_source_models import DATA_SOURCE_OPTIONS, DataProviderPlan, HistoryRequestPlan
+from concurrent.futures.thread import _worker, _threads_queues
 
 T = TypeVar("T")
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)
+            _threads_queues[t] = self._work_queue
 def _history_request_concurrency() -> int:
     raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
     try:
@@ -310,6 +409,76 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
             raise EastmoneyRateLimitError(message)
         _increment_history_diagnostic("network_success")
         return data_json
+
+
+def _fetch_eastmoney_pre_market_frame(
+    stock_code: str,
+    start_time: str = "09:00:00",
+    end_time: str = "15:50:00",
+    logger: Optional[Callable[[str], None]] = None,
+) -> pd.DataFrame:
+    market_code = 1 if str(stock_code).startswith("6") else 0
+    url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ndays": "1",
+        "iscr": "1",
+        "iscca": "1",
+        "secid": f"{market_code}.{stock_code}",
+    }
+    # 分时数据对实时性要求高，且请求量集中于个别个股，不应受历史回测全局锁限流。
+    # 直接使用 requests 抓取，共用东财头和 SSL 配置。
+    import requests
+    try:
+        req_kw = {
+            "url": url,
+            "params": params,
+            "timeout": 8.0,
+            "headers": dict(_EASTMONEY_HEADERS),
+        }
+        if _use_insecure_ssl():
+            req_kw["verify"] = False
+        with requests.Session() as session:
+            if _use_bypass_proxy():
+                session.trust_env = False
+            r = session.get(**req_kw)
+            r.raise_for_status()
+            data_json = r.json()
+    except Exception as exc:
+        if logger:
+            logger(f"竞价数据网络请求失败 {stock_code}: {exc}")
+        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+    if not data_json or not data_json.get("data"):
+        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+    
+    trends = (data_json.get("data") or {}).get("trends") or []
+    if not trends:
+        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+    temp_df = pd.DataFrame([str(item).split(",") for item in trends])
+    if temp_df.empty:
+        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+    
+    # 东方财富 trends2 fields2=f51,f52,f53,f54,f55,f56,f57,f58
+    # 实际映射：f51=时间, f52=开盘, f53=收盘, f54=最高, f55=最低, f56=成交量, f57=成交额, f58=均价
+    available_cols = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
+    temp_df.columns = available_cols[:len(temp_df.columns)]
+    
+    temp_df["时间"] = pd.to_datetime(temp_df["时间"], errors="coerce")
+    temp_df = temp_df.dropna(subset=["时间"]).sort_values("时间").reset_index(drop=True)
+    if temp_df.empty:
+        return temp_df
+    trade_date = temp_df["时间"].iloc[0].date().isoformat()
+    start_dt = pd.to_datetime(f"{trade_date} {start_time}", errors="coerce")
+    end_dt = pd.to_datetime(f"{trade_date} {end_time}", errors="coerce")
+    temp_df = temp_df[(temp_df["时间"] >= start_dt) & (temp_df["时间"] <= end_dt)].reset_index(drop=True)
+    
+    numeric_cols = [c for c in temp_df.columns if c != "时间"]
+    for col in numeric_cols:
+        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+
+    temp_df["时间"] = temp_df["时间"].astype(str)
+    return temp_df
 
 
 def _looks_like_eastmoney_rate_limit(status_code: int, response_text: str) -> bool:
@@ -1303,7 +1472,7 @@ class StockDataFetcher:
             )
             return code, name, bool(df is not None and not df.empty)
 
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
+        with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
             futures = [executor.submit(_work, item) for item in rows]
             completed = 0
             for fut in as_completed(futures):
@@ -2007,12 +2176,24 @@ class StockDataFetcher:
             }
 
         raw = None
+        pre_market_raw = None
         last_error: Optional[Exception] = None
         plan = self.build_intraday_request_plan(source or self._default_intraday_source)
         for provider in plan.provider_sequence:
             if provider == "eastmoney":
                 try:
                     raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
+                    try:
+                        pre_market_raw = _retry_ak_call(
+                            _fetch_eastmoney_pre_market_frame,
+                            code,
+                            "09:00:00",
+                            "15:50:00",
+                            logger=self._log,
+                        )
+                    except Exception as pre_exc:
+                        if self._log:
+                            self._log(f"分时行情(东财竞价) {code} 获取失败，继续使用常规分时: {pre_exc}")
                 except Exception as e:
                     last_error = e
                     if self._log:
@@ -2060,6 +2241,37 @@ class StockDataFetcher:
                 rename_map[src] = dst
 
         df = raw.rename(columns=rename_map).copy()
+        if pre_market_raw is not None and not getattr(pre_market_raw, "empty", True):
+            pre_market_columns = [str(col) for col in pre_market_raw.columns.tolist()]
+            pre_market_rename_map: Dict[str, str] = {}
+            pre_time_col = _first_existing_column(pre_market_columns, ["时间", "日期时间", "datetime", "time"])
+            pre_open_col = _first_existing_column(pre_market_columns, ["开盘", "open"])
+            pre_close_col = _first_existing_column(pre_market_columns, ["收盘", "close", "最新价"])
+            pre_high_col = _first_existing_column(pre_market_columns, ["最高", "high"])
+            pre_low_col = _first_existing_column(pre_market_columns, ["最低", "low"])
+            pre_volume_col = _first_existing_column(pre_market_columns, ["成交量", "volume"])
+            pre_amount_col = _first_existing_column(pre_market_columns, ["成交额", "amount"])
+            for src, dst in [
+                (pre_time_col, "time"),
+                (pre_open_col, "open"),
+                (pre_close_col, "close"),
+                (pre_high_col, "high"),
+                (pre_low_col, "low"),
+                (pre_volume_col, "volume"),
+                (pre_amount_col, "amount"),
+            ]:
+                if src:
+                    pre_market_rename_map[src] = dst
+            pre_df = pre_market_raw.rename(columns=pre_market_rename_map).copy()
+            if "time" in pre_df.columns:
+                pre_df["time"] = pd.to_datetime(pre_df["time"], errors="coerce")
+                pre_df = pre_df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+                if not pre_df.empty:
+                    latest_pre_date = pre_df["time"].dt.date.iloc[-1]
+                    df["time"] = pd.to_datetime(df["time"], errors="coerce")
+                    df = df[df["time"].dt.date != latest_pre_date].reset_index(drop=True)
+                    df = pd.concat([df, pre_df], ignore_index=True)
+
         if "time" not in df.columns:
             if self._log:
                 self._log(f"分时行情 {code} 缺少时间列，返回列: {', '.join(source_columns)}")
