@@ -411,12 +411,10 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
         return data_json
 
 
-def _fetch_eastmoney_pre_market_frame(
+def _fetch_eastmoney_auction_snapshot(
     stock_code: str,
-    start_time: str = "09:00:00",
-    end_time: str = "15:50:00",
     logger: Optional[Callable[[str], None]] = None,
-) -> pd.DataFrame:
+) -> Optional[Dict[str, Any]]:
     market_code = 1 if str(stock_code).startswith("6") else 0
     url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
     params = {
@@ -427,8 +425,7 @@ def _fetch_eastmoney_pre_market_frame(
         "iscca": "1",
         "secid": f"{market_code}.{stock_code}",
     }
-    # 分时数据对实时性要求高，且请求量集中于个别个股，不应受历史回测全局锁限流。
-    # 直接使用 requests 抓取，共用东财头和 SSL 配置。
+    # 竞价信息只作为分时页辅助标记，不能污染主分钟序列。
     import requests
     try:
         req_kw = {
@@ -448,37 +445,180 @@ def _fetch_eastmoney_pre_market_frame(
     except Exception as exc:
         if logger:
             logger(f"竞价数据网络请求失败 {stock_code}: {exc}")
-        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+        return None
     if not data_json or not data_json.get("data"):
-        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
-    
+        return None
+
     trends = (data_json.get("data") or {}).get("trends") or []
     if not trends:
-        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
+        return None
     temp_df = pd.DataFrame([str(item).split(",") for item in trends])
     if temp_df.empty:
-        return pd.DataFrame(columns=["时间", "最新价", "均价", "成交额", "成交量", "最高", "最低", "开盘"])
-    
-    # 东方财富 trends2 fields2=f51,f52,f53,f54,f55,f56,f57,f58
-    # 实际映射：f51=时间, f52=开盘, f53=收盘, f54=最高, f55=最低, f56=成交量, f57=成交额, f58=均价
+        return None
+
     available_cols = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
     temp_df.columns = available_cols[:len(temp_df.columns)]
-    
+    if "时间" not in temp_df.columns:
+        return None
+
     temp_df["时间"] = pd.to_datetime(temp_df["时间"], errors="coerce")
     temp_df = temp_df.dropna(subset=["时间"]).sort_values("时间").reset_index(drop=True)
     if temp_df.empty:
-        return temp_df
-    trade_date = temp_df["时间"].iloc[0].date().isoformat()
-    start_dt = pd.to_datetime(f"{trade_date} {start_time}", errors="coerce")
-    end_dt = pd.to_datetime(f"{trade_date} {end_time}", errors="coerce")
-    temp_df = temp_df[(temp_df["时间"] >= start_dt) & (temp_df["时间"] <= end_dt)].reset_index(drop=True)
-    
+        return None
+
     numeric_cols = [c for c in temp_df.columns if c != "时间"]
     for col in numeric_cols:
         temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
 
-    temp_df["时间"] = temp_df["时间"].astype(str)
-    return temp_df
+    auction_rows = temp_df[temp_df["时间"].dt.strftime("%H:%M") == "09:25"].reset_index(drop=True)
+    if auction_rows.empty:
+        return None
+
+    row = auction_rows.iloc[-1]
+    price_candidates = [
+        row.get("收盘"),
+        row.get("开盘"),
+        row.get("均价"),
+        row.get("最高"),
+        row.get("最低"),
+    ]
+    auction_price = next(
+        (
+            float(value)
+            for value in price_candidates
+            if pd.notna(value) and float(value) > 0
+        ),
+        None,
+    )
+    if auction_price is None:
+        return None
+
+    amount = row.get("成交额")
+    volume = row.get("成交量")
+    avg_price = row.get("均价")
+    return {
+        "trade_date": row["时间"].date().isoformat(),
+        "time": row["时间"],
+        "price": auction_price,
+        "open": float(row["开盘"]) if pd.notna(row.get("开盘")) else None,
+        "high": float(row["最高"]) if pd.notna(row.get("最高")) else None,
+        "low": float(row["最低"]) if pd.notna(row.get("最低")) else None,
+        "avg_price": float(avg_price) if pd.notna(avg_price) and float(avg_price) > 0 else None,
+        "volume": float(volume) if pd.notna(volume) and float(volume) > 0 else None,
+        "amount": float(amount) if pd.notna(amount) and float(amount) > 0 else None,
+    }
+
+
+def _empty_intraday_meta_payload(
+    selected_trade_date: str = "",
+    available_trade_dates: Optional[List[str]] = None,
+    applied_day_offset: int = 0,
+    auction_snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "intraday": None,
+        "selected_trade_date": str(selected_trade_date or "").strip(),
+        "available_trade_dates": [str(item).strip() for item in (available_trade_dates or []) if str(item).strip()],
+        "applied_day_offset": int(applied_day_offset),
+        "auction": auction_snapshot if isinstance(auction_snapshot, dict) else None,
+    }
+
+
+def _normalize_intraday_source_frame(
+    raw_frame: "pd.DataFrame",
+    stock_code: str,
+    logger: Optional[Callable[[str], None]] = None,
+) -> "pd.DataFrame":
+    if raw_frame is None or getattr(raw_frame, "empty", True):
+        return pd.DataFrame()
+
+    source_columns = [str(col) for col in raw_frame.columns.tolist()]
+    rename_map: Dict[str, str] = {}
+    time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time"])
+    open_col = _first_existing_column(source_columns, ["开盘", "open"])
+    close_col = _first_existing_column(source_columns, ["收盘", "close", "最新价"])
+    high_col = _first_existing_column(source_columns, ["最高", "high"])
+    low_col = _first_existing_column(source_columns, ["最低", "low"])
+    volume_col = _first_existing_column(source_columns, ["成交量", "volume"])
+    amount_col = _first_existing_column(source_columns, ["成交额", "amount"])
+    avg_price_col = _first_existing_column(source_columns, ["均价", "avg_price"])
+
+    for src, dst in [
+        (time_col, "time"),
+        (open_col, "open"),
+        (close_col, "close"),
+        (high_col, "high"),
+        (low_col, "low"),
+        (volume_col, "volume"),
+        (amount_col, "amount"),
+        (avg_price_col, "avg_price"),
+    ]:
+        if src:
+            rename_map[src] = dst
+
+    normalized = raw_frame.rename(columns=rename_map).copy()
+    if "time" not in normalized.columns:
+        if logger:
+            logger(f"分时行情 {stock_code} 缺少时间列，返回列: {', '.join(source_columns)}")
+        return pd.DataFrame()
+
+    normalized["time"] = pd.to_datetime(normalized["time"], errors="coerce")
+    normalized = normalized.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    if normalized.empty:
+        return pd.DataFrame()
+
+    for col in ["open", "close", "high", "low", "volume", "amount", "avg_price"]:
+        if col in normalized.columns:
+            normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
+        else:
+            normalized[col] = None
+    return normalized[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]]
+
+
+def _resolve_intraday_trade_dates(df: "pd.DataFrame") -> List[str]:
+    if df is None or df.empty or "time" not in df.columns:
+        return []
+    return sorted({d.isoformat() for d in df["time"].dt.date.dropna().tolist()})
+
+
+def _select_intraday_trade_date(
+    trade_dates: List[str],
+    day_offset: int = 0,
+    target_trade_date: str = "",
+) -> Tuple[str, int]:
+    if not trade_dates:
+        return "", 0
+
+    normalized_target = str(target_trade_date or "").strip()
+    if normalized_target:
+        selected_trade_date = ""
+        if normalized_target in trade_dates:
+            selected_trade_date = normalized_target
+        else:
+            for candidate in reversed(trade_dates):
+                if candidate <= normalized_target:
+                    selected_trade_date = candidate
+                    break
+            if not selected_trade_date:
+                selected_trade_date = trade_dates[0]
+        selected_index = trade_dates.index(selected_trade_date)
+        return selected_trade_date, selected_index - (len(trade_dates) - 1)
+
+    try:
+        request_offset = int(day_offset)
+    except (TypeError, ValueError):
+        request_offset = 0
+    max_back = len(trade_dates) - 1
+    applied_offset = max(-max_back, min(request_offset, 0))
+    selected_index = len(trade_dates) - 1 + applied_offset
+    return trade_dates[selected_index], applied_offset
+
+
+def _slice_intraday_frame_by_trade_date(df: "pd.DataFrame", selected_trade_date: str) -> "pd.DataFrame":
+    if df is None or df.empty or "time" not in df.columns or not selected_trade_date:
+        return pd.DataFrame()
+    target_date = pd.to_datetime(selected_trade_date, errors="coerce").date()
+    return df[df["time"].dt.date == target_date].reset_index(drop=True)
 
 
 def _looks_like_eastmoney_rate_limit(status_code: int, response_text: str) -> bool:
@@ -2168,15 +2308,10 @@ class StockDataFetcher:
     ) -> Any:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": "",
-                "available_trade_dates": [],
-                "applied_day_offset": 0,
-            }
+            return None if not include_meta else _empty_intraday_meta_payload()
 
         raw = None
-        pre_market_raw = None
+        auction_snapshot = None
         last_error: Optional[Exception] = None
         plan = self.build_intraday_request_plan(source or self._default_intraday_source)
         for provider in plan.provider_sequence:
@@ -2184,11 +2319,9 @@ class StockDataFetcher:
                 try:
                     raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
                     try:
-                        pre_market_raw = _retry_ak_call(
-                            _fetch_eastmoney_pre_market_frame,
+                        auction_snapshot = _retry_ak_call(
+                            _fetch_eastmoney_auction_snapshot,
                             code,
-                            "09:00:00",
-                            "15:50:00",
                             logger=self._log,
                         )
                     except Exception as pre_exc:
@@ -2211,142 +2344,40 @@ class StockDataFetcher:
         if raw is None or getattr(raw, "empty", True):
             if self._log and last_error is not None:
                 self._log(f"分时行情 {code} 无可用数据: {last_error}")
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": "",
-                "available_trade_dates": [],
-                "applied_day_offset": 0,
-            }
+            return None if not include_meta else _empty_intraday_meta_payload()
 
-        source_columns = [str(col) for col in raw.columns.tolist()]
-        rename_map: Dict[str, str] = {}
-        time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time"])
-        open_col = _first_existing_column(source_columns, ["开盘", "open"])
-        close_col = _first_existing_column(source_columns, ["收盘", "close", "最新价"])
-        high_col = _first_existing_column(source_columns, ["最高", "high"])
-        low_col = _first_existing_column(source_columns, ["最低", "low"])
-        volume_col = _first_existing_column(source_columns, ["成交量", "volume"])
-        amount_col = _first_existing_column(source_columns, ["成交额", "amount"])
-
-        for src, dst in [
-            (time_col, "time"),
-            (open_col, "open"),
-            (close_col, "close"),
-            (high_col, "high"),
-            (low_col, "low"),
-            (volume_col, "volume"),
-            (amount_col, "amount"),
-        ]:
-            if src:
-                rename_map[src] = dst
-
-        df = raw.rename(columns=rename_map).copy()
-        if pre_market_raw is not None and not getattr(pre_market_raw, "empty", True):
-            pre_market_columns = [str(col) for col in pre_market_raw.columns.tolist()]
-            pre_market_rename_map: Dict[str, str] = {}
-            pre_time_col = _first_existing_column(pre_market_columns, ["时间", "日期时间", "datetime", "time"])
-            pre_open_col = _first_existing_column(pre_market_columns, ["开盘", "open"])
-            pre_close_col = _first_existing_column(pre_market_columns, ["收盘", "close", "最新价"])
-            pre_high_col = _first_existing_column(pre_market_columns, ["最高", "high"])
-            pre_low_col = _first_existing_column(pre_market_columns, ["最低", "low"])
-            pre_volume_col = _first_existing_column(pre_market_columns, ["成交量", "volume"])
-            pre_amount_col = _first_existing_column(pre_market_columns, ["成交额", "amount"])
-            for src, dst in [
-                (pre_time_col, "time"),
-                (pre_open_col, "open"),
-                (pre_close_col, "close"),
-                (pre_high_col, "high"),
-                (pre_low_col, "low"),
-                (pre_volume_col, "volume"),
-                (pre_amount_col, "amount"),
-            ]:
-                if src:
-                    pre_market_rename_map[src] = dst
-            pre_df = pre_market_raw.rename(columns=pre_market_rename_map).copy()
-            if "time" in pre_df.columns:
-                pre_df["time"] = pd.to_datetime(pre_df["time"], errors="coerce")
-                pre_df = pre_df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-                if not pre_df.empty:
-                    latest_pre_date = pre_df["time"].dt.date.iloc[-1]
-                    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-                    df = df[df["time"].dt.date != latest_pre_date].reset_index(drop=True)
-                    df = pd.concat([df, pre_df], ignore_index=True)
-
-        if "time" not in df.columns:
-            if self._log:
-                self._log(f"分时行情 {code} 缺少时间列，返回列: {', '.join(source_columns)}")
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": "",
-                "available_trade_dates": [],
-                "applied_day_offset": 0,
-            }
-
-        df["time"] = pd.to_datetime(df["time"], errors="coerce")
-        df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+        df = _normalize_intraday_source_frame(raw, code, logger=self._log)
         if df.empty:
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": "",
-                "available_trade_dates": [],
-                "applied_day_offset": 0,
-            }
+            return None if not include_meta else _empty_intraday_meta_payload()
 
-        trade_dates = sorted({d.isoformat() for d in df["time"].dt.date.dropna().tolist()})
+        trade_dates = _resolve_intraday_trade_dates(df)
         if not trade_dates:
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": "",
-                "available_trade_dates": [],
-                "applied_day_offset": 0,
-            }
+            return None if not include_meta else _empty_intraday_meta_payload()
 
-        selected_trade_date = ""
-        normalized_target = str(target_trade_date or "").strip()
-        if normalized_target:
-            if normalized_target in trade_dates:
-                selected_trade_date = normalized_target
-            else:
-                for d in reversed(trade_dates):
-                    if d <= normalized_target:
-                        selected_trade_date = d
-                        break
-                if not selected_trade_date:
-                    selected_trade_date = trade_dates[0]
-        else:
-            try:
-                request_offset = int(day_offset)
-            except (TypeError, ValueError):
-                request_offset = 0
-            max_back = len(trade_dates) - 1
-            applied_offset = max(-max_back, min(request_offset, 0))
-            selected_index = len(trade_dates) - 1 + applied_offset
-            selected_trade_date = trade_dates[selected_index]
-
-        selected_index = trade_dates.index(selected_trade_date)
-        applied_offset = selected_index - (len(trade_dates) - 1)
-        target_date = pd.to_datetime(selected_trade_date, errors="coerce").date()
-        df = df[df["time"].dt.date == target_date].reset_index(drop=True)
+        selected_trade_date, applied_offset = _select_intraday_trade_date(
+            trade_dates,
+            day_offset=day_offset,
+            target_trade_date=target_trade_date,
+        )
+        df = _slice_intraday_frame_by_trade_date(df, selected_trade_date)
         if df.empty:
-            return None if not include_meta else {
-                "intraday": None,
-                "selected_trade_date": selected_trade_date,
-                "available_trade_dates": trade_dates,
-                "applied_day_offset": applied_offset,
-            }
+            return None if not include_meta else _empty_intraday_meta_payload(
+                selected_trade_date=selected_trade_date,
+                available_trade_dates=trade_dates,
+                applied_day_offset=applied_offset,
+            )
 
-        for col in ["open", "close", "high", "low", "volume", "amount"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            else:
-                df[col] = None
+        if auction_snapshot is not None and str(auction_snapshot.get("trade_date") or "") != selected_trade_date:
+            auction_snapshot = None
 
-        intraday_df = df[["time", "open", "close", "high", "low", "volume", "amount"]]
+        intraday_df = df[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]].copy()
         if include_meta:
-            return {
-                "intraday": intraday_df,
-                "selected_trade_date": selected_trade_date,
-                "available_trade_dates": trade_dates,
-                "applied_day_offset": applied_offset,
-            }
+            payload = _empty_intraday_meta_payload(
+                selected_trade_date=selected_trade_date,
+                available_trade_dates=trade_dates,
+                applied_day_offset=applied_offset,
+                auction_snapshot=auction_snapshot,
+            )
+            payload["intraday"] = intraday_df
+            return payload
         return intraday_df

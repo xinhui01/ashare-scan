@@ -154,13 +154,9 @@ class StockMonitorApp:
         menubar.add_cascade(label="帮助", menu=help_menu)
         help_menu.add_command(label="关于", command=self.show_about)
 
-    def setup_control_panel(self, parent):
-        control_frame = ttk.LabelFrame(parent, text="控制面板", padding="10")
-        control_frame.pack(fill=tk.X, pady=5)
-
+    def _build_control_scan_params_row(self, control_frame) -> None:
         row1 = ttk.Frame(control_frame)
         row1.pack(fill=tk.X, pady=5)
-
         ttk.Label(row1, text="扫描数量(0=全量):").pack(side=tk.LEFT, padx=5)
         self.scan_count_var = tk.StringVar(value="0")
         ttk.Entry(row1, textvariable=self.scan_count_var, width=8).pack(side=tk.LEFT, padx=5)
@@ -210,9 +206,17 @@ class StockMonitorApp:
             variable=self.refresh_universe_var,
         ).pack(side=tk.LEFT, padx=15)
 
+    def _build_control_scan_params_note_row(self, control_frame) -> None:
+        row1_note = ttk.Frame(control_frame)
+        row1_note.pack(fill=tk.X, pady=2)
+        ttk.Label(
+            row1_note,
+            text="备注：放量倍数=最近N天成交量最大值/最小值，勾选“启用放量倍数”后才参与筛选。",
+        ).pack(side=tk.LEFT, padx=5)
+
+    def _build_control_actions_row(self, control_frame) -> None:
         row2 = ttk.Frame(control_frame)
         row2.pack(fill=tk.X, pady=5)
-
         self.scan_btn = ttk.Button(row2, text="开始扫描", command=self.start_scan)
         self.scan_btn.pack(side=tk.LEFT, padx=5)
 
@@ -243,9 +247,9 @@ class StockMonitorApp:
         self.fund_flow_source_var = tk.StringVar(value="auto")
         self.limit_up_reason_source_var = tk.StringVar(value="auto")
 
+    def _build_control_board_filter_row(self, control_frame) -> None:
         row3 = ttk.Frame(control_frame)
         row3.pack(fill=tk.X, pady=5)
-
         ttk.Label(row3, text="显示板块:").pack(side=tk.LEFT, padx=5)
         self.board_filter_vars = {
             "上交所主板": tk.BooleanVar(value=True),
@@ -275,6 +279,7 @@ class StockMonitorApp:
             variable=self.ignore_result_snapshot_var,
         ).pack(side=tk.LEFT, padx=18)
 
+    def _build_control_price_filter_row(self, control_frame) -> None:
         row4 = ttk.Frame(control_frame)
         row4.pack(fill=tk.X, pady=5)
         ttk.Label(row4, text="价格过滤(最新收盘):").pack(side=tk.LEFT, padx=5)
@@ -290,6 +295,15 @@ class StockMonitorApp:
         ttk.Button(row4, text="清空价格过滤", command=self.clear_price_filter).pack(side=tk.LEFT, padx=4)
         min_price_entry.bind("<Return>", self.on_price_filter_changed)
         max_price_entry.bind("<Return>", self.on_price_filter_changed)
+
+    def setup_control_panel(self, parent):
+        control_frame = ttk.LabelFrame(parent, text="控制面板", padding="10")
+        control_frame.pack(fill=tk.X, pady=5)
+        self._build_control_scan_params_row(control_frame)
+        self._build_control_scan_params_note_row(control_frame)
+        self._build_control_actions_row(control_frame)
+        self._build_control_board_filter_row(control_frame)
+        self._build_control_price_filter_row(control_frame)
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -1767,7 +1781,7 @@ class StockMonitorApp:
 
         self._draw_chart(history, analysis)
 
-    def _draw_chart(self, history, analysis, keep_window: bool = False):
+    def _reset_detail_chart_axes(self) -> None:
         self._detail_chart_dates = []
         self.price_ax.clear()
         self.volume_ax.clear()
@@ -1776,16 +1790,19 @@ class StockMonitorApp:
         self.volume_ax.set_axis_on()
         self.flow_ax.set_axis_on()
 
+    def _show_empty_detail_chart(self, message: str) -> None:
+        self._detail_chart_history = None
+        self._detail_chart_analysis = {}
+        self._detail_chart_window_start = 0
+        self.detail_chart_window_scale.config(from_=0, to=0, state=tk.DISABLED)
+        self.detail_chart_window_var.set(0)
+        self.detail_chart_window_label_var.set("窗口: -")
+        self.price_ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=14)
+        self.canvas.draw()
+
+    def _prepare_detail_chart_dataset(self, history, analysis):
         if history is None or getattr(history, "empty", True):
-            self._detail_chart_history = None
-            self._detail_chart_analysis = {}
-            self._detail_chart_window_start = 0
-            self.detail_chart_window_scale.config(from_=0, to=0, state=tk.DISABLED)
-            self.detail_chart_window_var.set(0)
-            self.detail_chart_window_label_var.set("窗口: -")
-            self.price_ax.text(0.5, 0.5, "暂无历史数据", ha="center", va="center", fontsize=14)
-            self.canvas.draw()
-            return
+            return None
 
         df = history.copy()
         if "date" in df.columns:
@@ -1793,15 +1810,7 @@ class StockMonitorApp:
         else:
             df = df.reset_index(drop=True)
         if df.empty:
-            self._detail_chart_history = None
-            self._detail_chart_analysis = {}
-            self._detail_chart_window_start = 0
-            self.detail_chart_window_scale.config(from_=0, to=0, state=tk.DISABLED)
-            self.detail_chart_window_var.set(0)
-            self.detail_chart_window_label_var.set("窗口: -")
-            self.price_ax.text(0.5, 0.5, "暂无历史数据", ha="center", va="center", fontsize=14)
-            self.canvas.draw()
-            return
+            return None
 
         self._detail_chart_history = df
         self._detail_chart_analysis = dict(analysis or {})
@@ -1815,6 +1824,23 @@ class StockMonitorApp:
         highs = pd.to_numeric(df["high"], errors="coerce") if "high" in df.columns else pd.Series([None] * len(df))
         lows = pd.to_numeric(df["low"], errors="coerce") if "low" in df.columns else pd.Series([None] * len(df))
         volumes = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else pd.Series([0] * len(df))
+        return {
+            "df": df,
+            "x": x,
+            "dates": dates,
+            "opens": opens,
+            "closes": closes,
+            "highs": highs,
+            "lows": lows,
+            "volumes": volumes,
+        }
+
+    def _draw_detail_price_panel(self, chart_data: Dict[str, Any]) -> None:
+        x = chart_data["x"]
+        opens = chart_data["opens"]
+        closes = chart_data["closes"]
+        highs = chart_data["highs"]
+        lows = chart_data["lows"]
 
         for idx, (open_price, close_price, high_price, low_price) in enumerate(zip(opens, closes, highs, lows)):
             if pd.isna(open_price) or pd.isna(close_price) or pd.isna(high_price) or pd.isna(low_price):
@@ -1839,7 +1865,37 @@ class StockMonitorApp:
         self.price_ax.plot(x, closes, color="#2f6fd6", linewidth=1.0, alpha=0.35, label=close_label)
         self.price_ax.plot(x, ma, color="#f08a24", linewidth=1.4, label=ma_label)
         self.price_ax.plot(x, ma10, color="#7b52ab", linewidth=1.2, label=ma10_label)
+        self.price_ax.set_ylabel("价格")
+        self.price_ax.set_title("K线图（滚轮左右滑动，点击K线进入分时）")
+        self.price_ax.legend(loc="upper left")
+        self.price_ax.grid(True, alpha=0.25)
 
+    def _build_detail_flow_series(self, dates: List[str], analysis: Dict[str, Any]):
+        flow_history = (analysis or {}).get("fund_flow_history") or []
+        flow_map = {}
+        for item in flow_history:
+            if not isinstance(item, dict):
+                continue
+            flow_date = str(item.get("date", "") or "").strip()
+            if flow_date:
+                flow_map[flow_date] = item
+
+        values = []
+        colors = []
+        for date_str in dates:
+            flow_item = flow_map.get(date_str, {})
+            amount = pd.to_numeric(pd.Series([flow_item.get("big_order_amount")]), errors="coerce").iloc[0]
+            if pd.isna(amount):
+                amount = 0.0
+            values.append(float(amount))
+            colors.append("#d94b4b" if amount >= 0 else "#1f8b4c")
+        return values, colors
+
+    def _draw_detail_volume_panel(self, chart_data: Dict[str, Any]) -> None:
+        x = chart_data["x"]
+        opens = chart_data["opens"]
+        closes = chart_data["closes"]
+        volumes = chart_data["volumes"]
         volume_colors = [
             "#d94b4b" if (not pd.isna(c) and not pd.isna(o) and c >= o) else "#1f8b4c"
             for o, c in zip(opens, closes)
@@ -1854,44 +1910,40 @@ class StockMonitorApp:
             avg_volume = float(volume_compare_window.mean())
             if avg_volume > 0:
                 latest_volume_ratio_text = f"  最新 {self._format_volume(latest_volume_value)} / 均量 {latest_volume_value / avg_volume * 100.0:.1f}%"
+        self.volume_ax.set_ylabel("成交量")
+        self.volume_ax.set_title(f"成交量{latest_volume_ratio_text}" if latest_volume_ratio_text else "成交量")
+        self.volume_ax.yaxis.set_major_formatter(FuncFormatter(self._format_axis_volume))
+        self.volume_ax.yaxis.get_offset_text().set_visible(False)
+        self.volume_ax.grid(True, alpha=0.2)
 
-        flow_history = (analysis or {}).get("fund_flow_history") or []
-        flow_map = {}
-        for item in flow_history:
-            if not isinstance(item, dict):
-                continue
-            flow_date = str(item.get("date", "") or "").strip()
-            if not flow_date:
-                continue
-            flow_map[flow_date] = item
-        big_order_values = []
-        flow_colors = []
-        for _, date_str in enumerate(dates):
-            flow_item = flow_map.get(date_str, {})
-            amount = pd.to_numeric(pd.Series([flow_item.get("big_order_amount")]), errors="coerce").iloc[0]
-            if pd.isna(amount):
-                amount = 0.0
-            big_order_values.append(float(amount))
-            flow_colors.append("#d94b4b" if amount >= 0 else "#1f8b4c")
-        if self._detail_flow_expanded:
-            self.flow_ax.set_visible(True)
-            self.flow_ax.bar(x, big_order_values, width=0.6, color=flow_colors, alpha=0.85)
-            self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
-            self.flow_ax.set_ylabel("大单净额")
-            self.flow_ax.set_xlabel("日期")
-            self.flow_ax.grid(True, alpha=0.2)
-        else:
+    def _draw_detail_flow_panel(self, chart_data: Dict[str, Any], analysis: Dict[str, Any]) -> None:
+        if not self._detail_flow_expanded:
             self.flow_ax.set_visible(False)
             self.flow_ax.set_axis_off()
+            return
 
-        total = len(x)
+        flow_values, flow_colors = self._build_detail_flow_series(chart_data["dates"], analysis)
+        self.flow_ax.set_visible(True)
+        self.flow_ax.bar(chart_data["x"], flow_values, width=0.6, color=flow_colors, alpha=0.85)
+        self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
+        self.flow_ax.set_ylabel("大单净额")
+        self.flow_ax.set_xlabel("日期")
+        self.flow_ax.grid(True, alpha=0.2)
+
+    def _resolve_detail_chart_window(self, total: int, keep_window: bool = False) -> Dict[str, int]:
         window = max(15, min(int(self._detail_chart_window_size), max(15, total)))
         max_start = max(0, total - window)
-        if keep_window:
-            start = max(0, min(int(self._detail_chart_window_start), max_start))
-        else:
-            start = max_start
+        start = max(0, min(int(self._detail_chart_window_start), max_start)) if keep_window else max_start
         end = min(total, start + window)
+        return {"window": window, "max_start": max_start, "start": start, "end": end}
+
+    def _apply_detail_chart_window(self, chart_data: Dict[str, Any], window_meta: Dict[str, int]) -> None:
+        x = chart_data["x"]
+        dates = chart_data["dates"]
+        start = window_meta["start"]
+        end = window_meta["end"]
+        max_start = window_meta["max_start"]
+
         self._detail_chart_window_start = start
         self.detail_chart_window_scale.config(from_=0, to=max_start, state=(tk.NORMAL if max_start > 0 else tk.DISABLED))
         self._detail_chart_slider_updating = True
@@ -1900,11 +1952,11 @@ class StockMonitorApp:
         finally:
             self._detail_chart_slider_updating = False
 
-        if total > 0:
+        if x:
             self.price_ax.set_xlim(start - 0.5, end - 0.5)
             self.volume_ax.set_xlim(start - 0.5, end - 0.5)
-        if self._detail_flow_expanded:
-            self.flow_ax.set_xlim(start - 0.5, end - 0.5)
+            if self._detail_flow_expanded:
+                self.flow_ax.set_xlim(start - 0.5, end - 0.5)
 
         view_len = max(1, end - start)
         tick_step = max(1, view_len // 8)
@@ -1915,18 +1967,8 @@ class StockMonitorApp:
             tick_positions = [end - 1]
         tick_labels = [dates[pos][5:] if len(dates[pos]) >= 10 else dates[pos] for pos in tick_positions]
 
-        self.price_ax.set_ylabel("价格")
-        self.price_ax.set_title("K线图（滚轮左右滑动，点击K线进入分时）")
-        self.price_ax.legend(loc="upper left")
-        self.price_ax.grid(True, alpha=0.25)
-        self.volume_ax.set_ylabel("成交量")
-        self.volume_ax.set_title(f"成交量{latest_volume_ratio_text}" if latest_volume_ratio_text else "成交量")
-        self.volume_ax.yaxis.set_major_formatter(FuncFormatter(self._format_axis_volume))
-        self.volume_ax.yaxis.get_offset_text().set_visible(False)
-        self.volume_ax.grid(True, alpha=0.2)
         self.price_ax.set_xticks(tick_positions)
         self.price_ax.tick_params(axis="x", labelbottom=False)
-
         if self._detail_flow_expanded:
             self.volume_ax.set_xticklabels([""] * len(tick_positions))
             self.volume_ax.tick_params(axis="x", labelbottom=False)
@@ -1936,11 +1978,25 @@ class StockMonitorApp:
             self.flow_ax.tick_params(axis="x", labelbottom=False)
             self.volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
             self.volume_ax.tick_params(axis="x", labelbottom=True)
+
         if dates:
             self.detail_chart_window_label_var.set(f"窗口: {dates[start]} ~ {dates[end - 1]}")
         else:
             self.detail_chart_window_label_var.set("窗口: -")
 
+    def _draw_chart(self, history, analysis, keep_window: bool = False):
+        self._reset_detail_chart_axes()
+
+        chart_data = self._prepare_detail_chart_dataset(history, analysis)
+        if chart_data is None:
+            self._show_empty_detail_chart("暂无历史数据")
+            return
+
+        self._draw_detail_price_panel(chart_data)
+        self._draw_detail_volume_panel(chart_data)
+        self._draw_detail_flow_panel(chart_data, analysis or {})
+        window_meta = self._resolve_detail_chart_window(len(chart_data["x"]), keep_window=keep_window)
+        self._apply_detail_chart_window(chart_data, window_meta)
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -2287,6 +2343,7 @@ class StockMonitorApp:
             return
         intraday_df = payload.get("intraday")
         prev_close = payload.get("prev_close")
+        auction_snapshot = payload.get("auction")
         selected_trade_date = str(payload.get("selected_trade_date") or "")
         available_trade_dates = [str(d) for d in (payload.get("available_trade_dates") or [])]
         try:
@@ -2303,19 +2360,23 @@ class StockMonitorApp:
             if intraday_df is not None and not intraday_df.empty:
                 times = pd.to_datetime(intraday_df["time"], errors="coerce")
                 time_strs = [t.strftime("%H:%M") for t in times if not pd.isna(t)]
-                has_0925 = "09:25" in time_strs
-                self._log(f"【分时调试】{code} 数据共 {len(intraday_df)} 行，包含 09:25: {'是' if has_0925 else '否'}")
-                if has_0925:
-                    idx = time_strs.index("09:25")
-                    row = intraday_df.iloc[idx]
-                    self._log(f"   09:25 数据: 价格={row.get('close')}, 成交量={row.get('volume')}")
+                first_label = time_strs[0] if time_strs else "-"
+                last_label = time_strs[-1] if time_strs else "-"
+                has_auction = isinstance(auction_snapshot, dict) and auction_snapshot.get("price") is not None
+                self._log(
+                    f"【分时调试】{code} 数据共 {len(intraday_df)} 行，区间 {first_label}~{last_label}，竞价标记: {'是' if has_auction else '否'}"
+                )
+                if has_auction:
+                    self._log(
+                        f"   竞价数据: 时间={auction_snapshot.get('time')}, 价格={auction_snapshot.get('price')}, 成交量={auction_snapshot.get('volume')}"
+                    )
             else:
                 self._log(f"【分时调试】{code} 分时数据为空")
         except Exception as e:
             self._log(f"【分时调试】记录日志出错: {e}")
 
         self._refresh_intraday_nav_buttons()
-        self._draw_intraday_chart(code, intraday_df, prev_close=prev_close)
+        self._draw_intraday_chart(code, intraday_df, prev_close=prev_close, auction_snapshot=auction_snapshot)
 
     def _finish_intraday_status(self, stock_code: str, day_offset: int) -> None:
         code = str(stock_code).strip().zfill(6)
@@ -2350,7 +2411,271 @@ class StockMonitorApp:
         self.intraday_dist_ax.set_axis_off()
         self._refresh_intraday_nav_buttons()
         self.intraday_canvas.draw()
-    def _draw_intraday_chart(self, stock_code: str, intraday_df, prev_close: Optional[float] = None):
+
+    def _resolve_intraday_base_price(self, close_series, prev_close: Optional[float]) -> float:
+        if prev_close is not None and pd.notna(prev_close) and float(prev_close) > 0:
+            return float(prev_close)
+        first_close = pd.to_numeric(close_series, errors="coerce").dropna()
+        if not first_close.empty:
+            return max(float(first_close.iloc[0]), 1.0)
+        return 1.0
+
+    def _resolve_intraday_average_price(self, df, close_series, volume_series):
+        avg_price = pd.to_numeric(df.get("avg_price"), errors="coerce")
+        if not avg_price.isna().all():
+            return avg_price
+        cumulative_volume = volume_series.cumsum()
+        if (cumulative_volume > 0).any():
+            weighted_amount = (close_series.ffill().fillna(0) * volume_series).cumsum()
+            return pd.to_numeric(weighted_amount / cumulative_volume.replace(0, pd.NA), errors="coerce")
+        return close_series.expanding(min_periods=1).mean()
+
+    def _normalize_intraday_auction_snapshot(self, auction_snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        context = {
+            "time_label": "",
+            "price": None,
+            "amount": None,
+            "volume": None,
+            "has_auction": False,
+            "x": None,
+        }
+        if not isinstance(auction_snapshot, dict):
+            return context
+
+        auction_time = pd.to_datetime(auction_snapshot.get("time"), errors="coerce")
+        if not pd.isna(auction_time):
+            context["time_label"] = auction_time.strftime("%H:%M")
+
+        for source_key, target_key in [("price", "price"), ("amount", "amount"), ("volume", "volume")]:
+            raw_value = pd.to_numeric(pd.Series([auction_snapshot.get(source_key)]), errors="coerce").iloc[0]
+            if pd.notna(raw_value) and float(raw_value) > 0:
+                context[target_key] = float(raw_value)
+
+        context["has_auction"] = context["price"] is not None
+        if context["has_auction"]:
+            context["x"] = -0.6
+        return context
+
+    def _build_intraday_tick_positions(self, time_labels: List[str], x: List[int], auction_context: Dict[str, Any]):
+        key_times = ["09:30", "10:30", "11:30", "13:00", "14:00", "15:00"]
+        tick_map: Dict[int, str] = {}
+        for idx, text in enumerate(time_labels):
+            if text in key_times and idx not in tick_map:
+                tick_map[idx] = text
+
+        if x:
+            tick_map[0] = time_labels[0]
+            tick_map[len(x) - 1] = time_labels[-1]
+
+        raw_tick_positions = sorted(tick_map.keys())
+        tick_positions: List[Any] = []
+        min_tick_gap = max(12, len(x) // 10) if x else 12
+        for pos in raw_tick_positions:
+            if not tick_positions or pos - tick_positions[-1] >= min_tick_gap or pos == len(x) - 1:
+                tick_positions.append(pos)
+        tick_labels = [tick_map[pos] for pos in tick_positions]
+
+        if len(tick_positions) < 5 and x:
+            tick_step = max(1, len(x) // 6)
+            tick_positions = x[::tick_step]
+            if tick_positions[-1] != x[-1]:
+                tick_positions.append(x[-1])
+            tick_labels = [time_labels[pos] for pos in tick_positions]
+
+        if auction_context["has_auction"] and auction_context["x"] is not None:
+            tick_positions = [auction_context["x"]] + tick_positions
+            tick_labels = [auction_context["time_label"] or "09:25"] + tick_labels
+        return tick_positions, tick_labels
+
+    def _draw_intraday_price_panel(
+        self,
+        x: List[int],
+        pct_close,
+        pct_avg,
+        pct_ma5,
+        base_price: float,
+        first_close,
+        auction_context: Dict[str, Any],
+    ) -> None:
+        self.intraday_price_ax.plot(x, pct_close, color="#2f6fd6", linewidth=1.4, label="分时")
+        self.intraday_price_ax.plot(x, pct_avg, color="#f08a24", linewidth=1.3, label="均价线")
+        self.intraday_price_ax.plot(x, pct_ma5, color="#7b52ab", linewidth=1.0, linestyle="--", alpha=0.85, label="MA5")
+        self.intraday_price_ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--", alpha=0.85, label="昨收")
+        self.intraday_price_ax.grid(True, alpha=0.25)
+        self.intraday_price_ax.set_ylabel("涨\n跌\n幅\n(%)", rotation=0, labelpad=14, va="center")
+        self.intraday_price_ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.1f}%"))
+
+        valid_pct_parts = [pct_close, pct_avg, pct_ma5]
+        if auction_context["has_auction"] and auction_context["price"] is not None:
+            valid_pct_parts.append(pd.Series([(auction_context["price"] / base_price - 1.0) * 100.0]))
+        valid_pct = pd.concat(valid_pct_parts, ignore_index=True)
+        valid_pct = pd.to_numeric(valid_pct, errors="coerce").dropna()
+        if valid_pct.empty:
+            self.intraday_price_ax.set_ylim(-2.0, 2.0)
+        elif not first_close.empty:
+            low = float(valid_pct.quantile(0.01))
+            high = float(valid_pct.quantile(0.99))
+            if low > high:
+                low, high = high, low
+            span = max(high - low, 0.4)
+            pad = max(span * 0.12, 0.08)
+            low = max(low - pad, -35.0)
+            high = min(high + pad, 35.0)
+            if low >= 0:
+                low = max(0.0, low - max(span * 0.04, 0.03))
+            if high <= 0:
+                high = min(0.0, high + max(span * 0.04, 0.03))
+            if abs(high - low) < 0.2:
+                mid = (high + low) / 2.0
+                low, high = mid - 0.1, mid + 0.1
+            self.intraday_price_ax.set_ylim(low, high)
+        else:
+            self.intraday_price_ax.set_ylim(-2.0, 2.0)
+
+        secax = self.intraday_price_ax.secondary_yaxis(
+            "right",
+            functions=(
+                lambda y: base_price * (1.0 + y / 100.0),
+                lambda p: (p / base_price - 1.0) * 100.0,
+            ),
+        )
+        secax.set_ylabel("价\n格\n(元)", rotation=0, labelpad=12, va="center")
+        secax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
+
+        self.intraday_price_ax.set_title("分时走势（含竞价标记）" if auction_context["has_auction"] else "分时走势")
+        self.intraday_price_ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+
+        if auction_context["has_auction"] and auction_context["x"] is not None and auction_context["price"] is not None:
+            q_pct = (auction_context["price"] / base_price - 1.0) * 100.0
+            self.intraday_price_ax.axvline(auction_context["x"] + 0.1, color="#888888", linewidth=0.9, alpha=0.7, linestyle=":")
+            self.intraday_price_ax.scatter([auction_context["x"]], [q_pct], s=26, color="#555555", zorder=5, label="_nolegend_")
+            first_intraday_pct = pd.to_numeric(pd.Series([pct_close.iloc[0]]), errors="coerce").iloc[0] if len(pct_close) else None
+            if first_intraday_pct is not None and pd.notna(first_intraday_pct):
+                self.intraday_price_ax.plot(
+                    [auction_context["x"], 0],
+                    [q_pct, float(first_intraday_pct)],
+                    color="#777777",
+                    linewidth=0.9,
+                    linestyle=":",
+                )
+            self.intraday_price_ax.text(
+                auction_context["x"],
+                self.intraday_price_ax.get_ylim()[1],
+                "竞价",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                color="#666666",
+            )
+
+        auction_info_text = "竞价: 无可靠数据"
+        if auction_context["has_auction"] and auction_context["price"] is not None:
+            parts = [auction_context["time_label"] or "09:25", f"{auction_context['price']:.2f}"]
+            if auction_context["volume"] is not None:
+                parts.append(f"量 {self._format_volume(auction_context['volume'])}")
+            elif auction_context["amount"] is not None:
+                parts.append(f"额 {self._format_amount(auction_context['amount'])}")
+            auction_info_text = "竞价: " + " / ".join(parts)
+        self.intraday_price_ax.text(
+            0.995,
+            0.98,
+            auction_info_text,
+            transform=self.intraday_price_ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            color="#555555",
+            bbox=dict(boxstyle="round,pad=0.2", fc="#f2f2f2", ec="#c9c9c9", alpha=0.9),
+        )
+
+    def _draw_intraday_volume_panel(
+        self,
+        x: List[int],
+        open_series,
+        close_series,
+        volume_series,
+        tick_positions,
+        tick_labels,
+        auction_context: Dict[str, Any],
+    ) -> None:
+        colors = [
+            "#d94b4b" if (not pd.isna(c) and not pd.isna(o) and c >= o) else "#1f8b4c"
+            for o, c in zip(open_series, close_series)
+        ]
+        self.intraday_volume_ax.bar(x, volume_series, width=0.65, color=colors, alpha=0.85)
+        self.intraday_volume_ax.grid(True, alpha=0.2)
+        self.intraday_volume_ax.set_ylabel("成\n交\n量", rotation=0, labelpad=10, va="center")
+        self.intraday_volume_ax.set_xlabel("时间")
+        if auction_context["has_auction"] and auction_context["x"] is not None:
+            self.intraday_volume_ax.axvline(auction_context["x"] + 0.1, color="#888888", linewidth=0.9, alpha=0.65, linestyle=":")
+
+        self.intraday_price_ax.set_xticks(tick_positions)
+        self.intraday_price_ax.set_xticklabels([])
+        self.intraday_price_ax.tick_params(axis="x", which="both", length=0)
+
+        self.intraday_volume_ax.set_xticks(tick_positions)
+        self.intraday_volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
+        if x:
+            left_limit = -1.0 if auction_context["has_auction"] else -0.5
+            right_limit = x[-1] + 0.5
+            self.intraday_price_ax.set_xlim(left_limit, right_limit)
+            self.intraday_volume_ax.set_xlim(left_limit, right_limit)
+
+    def _draw_intraday_distribution_panel(self, close_series, volume_series) -> None:
+        dist_df = pd.DataFrame({"price": close_series, "volume": volume_series}).dropna(subset=["price"])
+        dist_df["volume"] = pd.to_numeric(dist_df["volume"], errors="coerce").fillna(0)
+        dist_df = dist_df[dist_df["volume"] > 0]
+
+        if dist_df.empty:
+            self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
+            self.intraday_dist_ax.set_axis_off()
+            return
+
+        dist_df["price"] = dist_df["price"].round(2)
+        grouped = dist_df.groupby("price", as_index=False)["volume"].sum()
+        total_volume = float(grouped["volume"].sum())
+        if total_volume <= 0:
+            self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
+            self.intraday_dist_ax.set_axis_off()
+            return
+
+        grouped["ratio"] = grouped["volume"] / total_volume
+        grouped = grouped.sort_values("ratio", ascending=False).reset_index(drop=True).head(min(12, len(grouped)))
+        y = list(range(len(grouped)))
+        ratios_pct = (grouped["ratio"] * 100.0).tolist()
+        labels = [f"{p:.2f}" for p in grouped["price"].tolist()]
+        self.intraday_dist_ax.barh(y, ratios_pct, color="#5b7bd5", alpha=0.9)
+        self.intraday_dist_ax.set_yticks(y)
+        self.intraday_dist_ax.set_yticklabels(labels, fontsize=9)
+        self.intraday_dist_ax.invert_yaxis()
+        self.intraday_dist_ax.yaxis.tick_right()
+        self.intraday_dist_ax.tick_params(axis="y", labelright=True, labelleft=False, pad=4)
+        self.intraday_dist_ax.set_xlabel("占比(%)")
+        self.intraday_dist_ax.set_ylabel("价\n位\n(元)", rotation=0, labelpad=14, va="center")
+        self.intraday_dist_ax.yaxis.set_label_position("right")
+        self.intraday_dist_ax.set_title("成交价格分布")
+        self.intraday_dist_ax.grid(True, axis="x", alpha=0.2)
+
+        for yi, value in zip(y, ratios_pct):
+            text_x = max(value - 0.35, 0.12)
+            text_color = "white" if value >= 3.0 else "#222222"
+            self.intraday_dist_ax.text(
+                text_x,
+                yi,
+                f"{value:.2f}%",
+                va="center",
+                ha="right",
+                fontsize=8,
+                color=text_color,
+            )
+
+    def _draw_intraday_chart(
+        self,
+        stock_code: str,
+        intraday_df,
+        prev_close: Optional[float] = None,
+        auction_snapshot: Optional[Dict[str, Any]] = None,
+    ):
         code = str(stock_code).strip().zfill(6)
         self.intraday_title_var.set(f"分时图 - {code}")
         self.intraday_price_ax.clear()
@@ -2367,8 +2692,6 @@ class StockMonitorApp:
         df = intraday_df.copy().reset_index(drop=True)
         close_series = pd.to_numeric(df.get("close"), errors="coerce")
         open_series = pd.to_numeric(df.get("open"), errors="coerce")
-        high_series = pd.to_numeric(df.get("high"), errors="coerce")
-        low_series = pd.to_numeric(df.get("low"), errors="coerce")
         volume_series = pd.to_numeric(df.get("volume"), errors="coerce").fillna(0)
         times = pd.to_datetime(df.get("time"), errors="coerce")
 
@@ -2376,212 +2699,36 @@ class StockMonitorApp:
             self._draw_intraday_error(code, "分时数据无有效价格")
             return
 
+        base_price = self._resolve_intraday_base_price(close_series, prev_close)
         first_close = close_series.dropna()
-        if prev_close is not None and pd.notna(prev_close) and float(prev_close) > 0:
-            base_price = float(prev_close)
-        elif not first_close.empty:
-            base_price = float(first_close.iloc[0])
-        else:
-            base_price = 1.0
-
-        # 自动纠正价格单位（如分/厘与元混用），避免价格轴出现几百上千的异常。
-        if not first_close.empty and base_price > 0:
-            median_price = float(first_close.median())
-            scale_candidates = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
-            best_scale = 1.0
-            best_diff = abs((median_price / base_price) - 1.0)
-            for scale in scale_candidates:
-                diff = abs((median_price * scale / base_price) - 1.0)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_scale = scale
-            if best_scale != 1.0 and best_diff < 0.65:
-                close_series = close_series * best_scale
-                open_series = open_series * best_scale
-                high_series = high_series * best_scale
-                low_series = low_series * best_scale
-
-        x = list(range(len(df)))
-
-        cum_volume = volume_series.cumsum()
-        if (cum_volume > 0).any():
-            avg_price = (close_series.ffill().fillna(0) * volume_series).cumsum() / cum_volume.replace(0, pd.NA)
-            avg_price = pd.to_numeric(avg_price, errors="coerce")
-        else:
-            avg_price = close_series.expanding(min_periods=1).mean()
+        avg_price = self._resolve_intraday_average_price(df, close_series, volume_series)
         ma5 = close_series.rolling(window=5, min_periods=1).mean()
-
+        auction_context = self._normalize_intraday_auction_snapshot(auction_snapshot)
+        x = list(range(len(df)))
         pct_close = (close_series / base_price - 1.0) * 100.0
         pct_avg = (avg_price / base_price - 1.0) * 100.0
         pct_ma5 = (ma5 / base_price - 1.0) * 100.0
-
-        self.intraday_price_ax.plot(x, pct_close, color="#2f6fd6", linewidth=1.4, label="分时")
-        self.intraday_price_ax.plot(x, pct_avg, color="#f08a24", linewidth=1.3, label="均价线")
-        self.intraday_price_ax.plot(x, pct_ma5, color="#7b52ab", linewidth=1.0, linestyle="--", alpha=0.85, label="MA5")
-        self.intraday_price_ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--", alpha=0.85, label="昨收")
-        self.intraday_price_ax.grid(True, alpha=0.25)
-        self.intraday_price_ax.set_ylabel("涨\n跌\n幅\n(%)", rotation=0, labelpad=14, va="center")
-        self.intraday_price_ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.1f}%"))
-
-        valid_pct = pd.concat([pct_close, pct_avg, pct_ma5], ignore_index=True)
-        valid_pct = pd.to_numeric(valid_pct, errors="coerce").dropna()
-        if valid_pct.empty:
-            self.intraday_price_ax.set_ylim(-2.0, 2.0)
-        else:
-            low = float(valid_pct.quantile(0.01))
-            high = float(valid_pct.quantile(0.99))
-            if low > high:
-                low, high = high, low
-            span = max(high - low, 0.4)
-            pad = max(span * 0.12, 0.08)
-            low = max(low - pad, -35.0)
-            high = min(high + pad, 35.0)
-            # 没有负值时不强行显示负区间；没有正值时同理。
-            if low >= 0:
-                low = max(0.0, low - max(span * 0.04, 0.03))
-            if high <= 0:
-                high = min(0.0, high + max(span * 0.04, 0.03))
-            if abs(high - low) < 0.2:
-                mid = (high + low) / 2.0
-                low, high = mid - 0.1, mid + 0.1
-            self.intraday_price_ax.set_ylim(low, high)
-
-        secax = self.intraday_price_ax.secondary_yaxis(
-            "right",
-            functions=(
-                lambda y: base_price * (1.0 + y / 100.0),
-                lambda p: (p / base_price - 1.0) * 100.0,
-            ),
-        )
-        secax.set_ylabel("价\n格\n(元)", rotation=0, labelpad=12, va="center")
-        secax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
-
         time_labels = [t.strftime("%H:%M") if not pd.isna(t) else "" for t in times]
-        auction_indexes = [idx for idx, label in enumerate(time_labels) if label == "09:25"]
-        has_auction = bool(auction_indexes)
-        self.intraday_price_ax.set_title("分时走势（含竞价）" if has_auction else "分时走势（不含竞价）")
-        self.intraday_price_ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
-
-        if has_auction:
-            q_idx = auction_indexes[0]
-            self.intraday_price_ax.axvline(q_idx, color="#888888", linewidth=0.9, alpha=0.7, linestyle=":")
-            self.intraday_price_ax.text(
-                q_idx,
-                self.intraday_price_ax.get_ylim()[1],
-                "竞价",
-                ha="center",
-                va="bottom",
-                fontsize=9,
-                color="#666666",
-            )
-            q_price = pd.to_numeric(close_series.iloc[q_idx], errors="coerce")
-            if pd.notna(q_price):
-                q_pct = (float(q_price) / base_price - 1.0) * 100.0
-                self.intraday_price_ax.scatter([q_idx], [q_pct], s=22, color="#666666", zorder=4)
-
-        self.intraday_price_ax.text(
-            0.995,
-            0.98,
-            "竞价: 有(09:25)" if has_auction else "竞价: 无",
-            transform=self.intraday_price_ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=8,
-            color="#555555",
-            bbox=dict(boxstyle="round,pad=0.2", fc="#f2f2f2", ec="#c9c9c9", alpha=0.9),
+        self._draw_intraday_price_panel(
+            x,
+            pct_close,
+            pct_avg,
+            pct_ma5,
+            base_price,
+            first_close,
+            auction_context,
         )
-
-        colors = [
-            "#d94b4b" if (not pd.isna(c) and not pd.isna(o) and c >= o) else "#1f8b4c"
-            for o, c in zip(open_series, close_series)
-        ]
-        self.intraday_volume_ax.bar(x, volume_series, width=0.65, color=colors, alpha=0.85)
-        self.intraday_volume_ax.grid(True, alpha=0.2)
-        self.intraday_volume_ax.set_ylabel("成\n交\n量", rotation=0, labelpad=10, va="center")
-        self.intraday_volume_ax.set_xlabel("时间")
-        if has_auction:
-            self.intraday_volume_ax.axvline(q_idx, color="#888888", linewidth=0.9, alpha=0.65, linestyle=":")
-
-        key_times = ["09:25", "09:30", "10:30", "11:30", "13:00", "14:00", "15:00"]
-        tick_map: Dict[int, str] = {}
-        for idx, text in enumerate(time_labels):
-            if text in key_times and idx not in tick_map:
-                tick_map[idx] = text
-
-        if x:
-            tick_map[0] = time_labels[0]
-            tick_map[len(x) - 1] = time_labels[-1]
-
-        raw_tick_positions = sorted(tick_map.keys())
-        tick_positions = []
-        min_tick_gap = max(12, len(x) // 10) if x else 12
-        for pos in raw_tick_positions:
-            if not tick_positions or pos - tick_positions[-1] >= min_tick_gap or pos == len(x) - 1:
-                tick_positions.append(pos)
-        tick_labels = [tick_map[pos] for pos in tick_positions]
-        if len(tick_positions) < 5 and x:
-            tick_step = max(1, len(x) // 6)
-            tick_positions = x[::tick_step]
-            if tick_positions[-1] != x[-1]:
-                tick_positions.append(x[-1])
-            tick_labels = [time_labels[pos] for pos in tick_positions]
-
-        self.intraday_price_ax.set_xticks(tick_positions)
-        self.intraday_price_ax.set_xticklabels([])
-        self.intraday_price_ax.tick_params(axis="x", which="both", length=0)
-
-        self.intraday_volume_ax.set_xticks(tick_positions)
-        self.intraday_volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right", fontsize=8)
-
-        dist_df = pd.DataFrame({"price": close_series, "volume": volume_series}).dropna(subset=["price"])
-        dist_df["volume"] = pd.to_numeric(dist_df["volume"], errors="coerce").fillna(0)
-        dist_df = dist_df[dist_df["volume"] > 0]
-
-        if dist_df.empty:
-            self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
-            self.intraday_dist_ax.set_axis_off()
-        else:
-            dist_df["price"] = dist_df["price"].round(2)
-            grouped = dist_df.groupby("price", as_index=False)["volume"].sum()
-            total_volume = float(grouped["volume"].sum())
-
-            if total_volume <= 0:
-                self.intraday_dist_ax.text(0.5, 0.5, "暂无成交分布数据", ha="center", va="center", fontsize=11)
-                self.intraday_dist_ax.set_axis_off()
-            else:
-                grouped["ratio"] = grouped["volume"] / total_volume
-                grouped = grouped.sort_values("ratio", ascending=False).reset_index(drop=True)
-                grouped = grouped.head(min(12, len(grouped)))
-
-                y = list(range(len(grouped)))
-                ratios_pct = (grouped["ratio"] * 100.0).tolist()
-                labels = [f"{p:.2f}" for p in grouped["price"].tolist()]
-                self.intraday_dist_ax.barh(y, ratios_pct, color="#5b7bd5", alpha=0.9)
-                self.intraday_dist_ax.set_yticks(y)
-                self.intraday_dist_ax.set_yticklabels(labels, fontsize=9)
-                self.intraday_dist_ax.invert_yaxis()
-                self.intraday_dist_ax.yaxis.tick_right()
-                self.intraday_dist_ax.tick_params(axis="y", labelright=True, labelleft=False, pad=4)
-                self.intraday_dist_ax.set_xlabel("占比(%)")
-                self.intraday_dist_ax.set_ylabel("价\n位\n(元)", rotation=0, labelpad=14, va="center")
-                self.intraday_dist_ax.yaxis.set_label_position("right")
-                self.intraday_dist_ax.set_title("成交价格分布")
-                self.intraday_dist_ax.grid(True, axis="x", alpha=0.2)
-
-                for yi, v in zip(y, ratios_pct):
-                    # Place ratio labels inside bars to avoid overlapping the right-side price ticks.
-                    text_x = max(v - 0.35, 0.12)
-                    text_color = "white" if v >= 3.0 else "#222222"
-                    self.intraday_dist_ax.text(
-                        text_x,
-                        yi,
-                        f"{v:.2f}%",
-                        va="center",
-                        ha="right",
-                        fontsize=8,
-                        color=text_color,
-                    )
-
+        tick_positions, tick_labels = self._build_intraday_tick_positions(time_labels, x, auction_context)
+        self._draw_intraday_volume_panel(
+            x,
+            open_series,
+            close_series,
+            volume_series,
+            tick_positions,
+            tick_labels,
+            auction_context,
+        )
+        self._draw_intraday_distribution_panel(close_series, volume_series)
         self.intraday_fig.tight_layout(rect=[0.02, 0.06, 0.98, 0.98], h_pad=1.2, w_pad=0.8)
         self.intraday_canvas.draw()
     def export_results(self):

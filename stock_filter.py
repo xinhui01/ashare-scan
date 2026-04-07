@@ -4,7 +4,7 @@ import os
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 import threading
 import weakref
 
@@ -80,6 +80,79 @@ class StockFilter:
             f"缓存回退={diag.get('fallback_cache_returns')}，限流事件={diag.get('rate_limit_events')}，"
             f"冷却跳过={diag.get('cooldown_skips')}"
         )
+
+    def _resolve_stock_identity(self, universe: Optional[pd.DataFrame], stock_code: str) -> Dict[str, str]:
+        code = str(stock_code or "").strip().zfill(6)
+        if universe is None or universe.empty or not code:
+            return {"name": "", "board": "", "exchange": ""}
+        try:
+            match = universe[universe["code"].astype(str).str.zfill(6) == code]
+        except Exception:
+            return {"name": "", "board": "", "exchange": ""}
+        if match.empty:
+            return {"name": "", "board": "", "exchange": ""}
+        row = match.iloc[0]
+        return {
+            "name": str(row.get("name", "") or ""),
+            "board": str(row.get("board", "") or ""),
+            "exchange": str(row.get("exchange", "") or ""),
+        }
+
+    def _enrich_analysis_with_history_snapshot(
+        self,
+        analysis: Dict[str, Any],
+        history: Optional[pd.DataFrame],
+    ) -> None:
+        if history is not None and not history.empty:
+            latest_row = history.iloc[-1]
+            analysis["latest_volume"] = latest_row.get("volume")
+            analysis["latest_amount"] = latest_row.get("amount")
+            analysis["quote_time"] = str(latest_row.get("date", "") or "")
+            return
+        analysis["latest_volume"] = None
+        analysis["latest_amount"] = None
+        analysis["quote_time"] = ""
+
+    def _enrich_analysis_with_fund_flow(
+        self,
+        analysis: Dict[str, Any],
+        fund_flow_df: Optional[pd.DataFrame],
+    ) -> None:
+        if fund_flow_df is not None and not fund_flow_df.empty:
+            latest_flow = fund_flow_df.iloc[-1]
+            analysis["flow_date"] = str(latest_flow.get("date", "") or "")
+            analysis["main_force_amount"] = latest_flow.get("main_force_amount")
+            analysis["big_order_amount"] = latest_flow.get("big_order_amount")
+            analysis["super_big_order_amount"] = latest_flow.get("super_big_order_amount")
+            analysis["main_force_ratio"] = latest_flow.get("main_force_ratio")
+            analysis["big_order_ratio"] = latest_flow.get("big_order_ratio")
+            analysis["super_big_order_ratio"] = latest_flow.get("super_big_order_ratio")
+            analysis["fund_flow_history"] = fund_flow_df.to_dict("records")
+            return
+        analysis["flow_date"] = ""
+        analysis["main_force_amount"] = None
+        analysis["big_order_amount"] = None
+        analysis["super_big_order_amount"] = None
+        analysis["main_force_ratio"] = None
+        analysis["big_order_ratio"] = None
+        analysis["super_big_order_ratio"] = None
+        analysis["fund_flow_history"] = []
+
+    def _build_stock_detail_payload(
+        self,
+        stock_code: str,
+        stock_identity: Dict[str, str],
+        history: Optional[pd.DataFrame],
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "code": str(stock_code).strip().zfill(6),
+            "name": str(stock_identity.get("name", "") or ""),
+            "board": str(stock_identity.get("board", "") or ""),
+            "exchange": str(stock_identity.get("exchange", "") or ""),
+            "history": history,
+            "analysis": analysis,
+        }
 
     def get_settings(self) -> FilterSettings:
         return FilterSettings(
@@ -165,26 +238,13 @@ class StockFilter:
             return 20.0
         return 10.0
 
-    def analyze_history(
+    def _create_empty_analysis_result(
         self,
-        history_data: pd.DataFrame,
-        streak_days: Optional[int] = None,
-        ma_period: Optional[int] = None,
-        limit_up_lookback_days: Optional[int] = None,
-        volume_lookback_days: Optional[int] = None,
-        volume_expand_enabled: Optional[bool] = None,
-        volume_expand_factor: Optional[float] = None,
-        board: str = "",
-        stock_name: str = "",
-        stock_code: str = "",
+        volume_days: int,
+        volume_enabled: bool,
+        volume_factor: float,
     ) -> Dict[str, Any]:
-        streak_days = int(streak_days or self.trend_days)
-        ma_period = int(ma_period or self.ma_period)
-        lookback_days = int(limit_up_lookback_days or self.limit_up_lookback_days)
-        volume_days = int(volume_lookback_days or self.volume_lookback_days)
-        volume_enabled = self.volume_expand_enabled if volume_expand_enabled is None else bool(volume_expand_enabled)
-        volume_factor = float(volume_expand_factor or self.volume_expand_factor)
-        result = {
+        return {
             "passed": False,
             "latest_date": None,
             "latest_close": None,
@@ -213,16 +273,16 @@ class StockFilter:
             "after_two_limit_up": False,
             "summary": "",
         }
-        if history_data is None or history_data.empty:
-            result["summary"] = "无历史数据"
-            return result
-        if "date" not in history_data.columns or "close" not in history_data.columns:
-            result["summary"] = "历史数据缺少 date/close"
-            return result
 
-        df = history_data.sort_values("date").reset_index(drop=True)
-        close = pd.to_numeric(df["close"], errors="coerce")
-        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
+    def _populate_price_metrics(
+        self,
+        result: Dict[str, Any],
+        df: pd.DataFrame,
+        close: pd.Series,
+        ma: pd.Series,
+        streak_days: int,
+        ma_period: int,
+    ) -> None:
         recent = df.tail(streak_days).copy()
         recent_close = pd.to_numeric(recent["close"], errors="coerce")
         recent_ma = ma.tail(streak_days)
@@ -248,107 +308,198 @@ class StockFilter:
         if len(df) >= streak_days + ma_period - 1 and not recent_close.isna().any() and not recent_ma.isna().any():
             result["passed"] = bool((recent_close.values > recent_ma.values).all())
 
-        if "volume" in df.columns and len(df) >= volume_days:
-            volume = pd.to_numeric(df["volume"], errors="coerce")
-            recent_volume = volume.tail(volume_days).dropna()
-            if not recent_volume.empty:
-                vmin = float(recent_volume.min())
-                vmax = float(recent_volume.max())
-                ratio = None
-                if vmin > 0:
-                    ratio = float(vmax / vmin)
-                result["volume_min"] = vmin
-                result["volume_max"] = vmax
-                result["volume_expand_ratio"] = ratio
-                result["volume_expand"] = bool(volume_enabled and ratio is not None and ratio >= volume_factor)
-            compare_window = volume.iloc[-(volume_days + 1):-1].dropna() if len(volume) > 1 else pd.Series(dtype=float)
-            if compare_window.empty:
-                compare_window = recent_volume
-            latest_volume = volume.iloc[-1] if not volume.empty else None
-            if latest_volume is not None and not pd.isna(latest_volume) and not compare_window.empty:
-                avg_volume = float(compare_window.mean())
-                if avg_volume > 0:
-                    result["latest_volume_ratio"] = float(float(latest_volume) / avg_volume * 100.0)
+    def _apply_volume_analysis(
+        self,
+        result: Dict[str, Any],
+        df: pd.DataFrame,
+        volume_days: int,
+        volume_enabled: bool,
+        volume_factor: float,
+    ) -> Optional[pd.Series]:
+        if "volume" not in df.columns or len(df) < volume_days:
+            return None
 
+        volume = pd.to_numeric(df["volume"], errors="coerce")
+        recent_volume = volume.tail(volume_days).dropna()
+        if not recent_volume.empty:
+            vmin = float(recent_volume.min())
+            vmax = float(recent_volume.max())
+            ratio = None
+            if vmin > 0:
+                ratio = float(vmax / vmin)
+            result["volume_min"] = vmin
+            result["volume_max"] = vmax
+            result["volume_expand_ratio"] = ratio
+            result["volume_expand"] = bool(volume_enabled and ratio is not None and ratio >= volume_factor)
+
+        compare_window = volume.iloc[-(volume_days + 1):-1].dropna() if len(volume) > 1 else pd.Series(dtype=float)
+        if compare_window.empty:
+            compare_window = recent_volume
+        latest_volume = volume.iloc[-1] if not volume.empty else None
+        if latest_volume is not None and not pd.isna(latest_volume) and not compare_window.empty:
+            avg_volume = float(compare_window.mean())
+            if avg_volume > 0:
+                result["latest_volume_ratio"] = float(float(latest_volume) / avg_volume * 100.0)
+        return volume
+
+    def _calculate_limit_up_streak(self, mask: pd.Series) -> int:
+        streak = 0
+        for flag in reversed(mask.tolist()):
+            if bool(flag):
+                streak += 1
+            else:
+                break
+        return streak
+
+    def _calculate_broken_limit_up_streak(self, mask: pd.Series) -> int:
+        if len(mask) < 2 or bool(mask.iloc[-1]) or not bool(mask.iloc[-2]):
+            return 0
+        broken_streak = 0
+        idx = len(mask) - 2
+        while idx >= 0 and bool(mask.iloc[idx]):
+            broken_streak += 1
+            idx -= 1
+        return broken_streak
+
+    def _apply_limit_up_analysis(
+        self,
+        result: Dict[str, Any],
+        df: pd.DataFrame,
+        board: str,
+        stock_name: str,
+        lookback_days: int,
+        volume: Optional[pd.Series],
+        volume_enabled: bool,
+        volume_factor: float,
+    ) -> None:
         threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
         result["limit_up_threshold"] = threshold
-        if "change_pct" in df.columns:
-            change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
-            full_limit_up_mask = (change_pct >= (threshold - 0.2)).fillna(False)
-            limit_up_mask = change_pct.tail(max(lookback_days, 1)) >= (threshold - 0.2)
-            recent_dates = df.tail(max(lookback_days, 1))["date"].astype(str).tolist()
-            hit_dates = [d for d, hit in zip(recent_dates, limit_up_mask.tolist()) if bool(hit)]
-            result["limit_up_hit_dates"] = hit_dates
-            result["limit_up_within_days"] = bool(hit_dates)
-            result["limit_up"] = bool(
-                not pd.isna(result["latest_change_pct"])
-                and result["latest_change_pct"] >= (threshold - 0.2)
-            )
-            streak = 0
-            for flag in reversed(full_limit_up_mask.tolist()):
-                if bool(flag):
-                    streak += 1
-                else:
-                    break
-            result["limit_up_streak"] = streak
+        if "change_pct" not in df.columns:
+            return
 
-            broken_streak = 0
-            if len(full_limit_up_mask) >= 2 and (not bool(full_limit_up_mask.iloc[-1])) and bool(full_limit_up_mask.iloc[-2]):
-                result["broken_limit_up"] = True
-                idx = len(full_limit_up_mask) - 2
-                while idx >= 0 and bool(full_limit_up_mask.iloc[idx]):
-                    broken_streak += 1
-                    idx -= 1
-            result["broken_streak_count"] = broken_streak
-            result["after_two_limit_up"] = bool(result["broken_limit_up"] and broken_streak >= 2)
+        change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
+        full_limit_up_mask = (change_pct >= (threshold - 0.2)).fillna(False)
+        limit_up_mask = change_pct.tail(max(lookback_days, 1)) >= (threshold - 0.2)
+        recent_dates = df.tail(max(lookback_days, 1))["date"].astype(str).tolist()
+        hit_dates = [d for d, hit in zip(recent_dates, limit_up_mask.tolist()) if bool(hit)]
+        result["limit_up_hit_dates"] = hit_dates
+        result["limit_up_within_days"] = bool(hit_dates)
+        result["limit_up"] = bool(
+            not pd.isna(result["latest_change_pct"])
+            and result["latest_change_pct"] >= (threshold - 0.2)
+        )
+        result["limit_up_streak"] = self._calculate_limit_up_streak(full_limit_up_mask)
 
-            if result["broken_limit_up"] and "volume" in df.columns and volume_enabled:
-                volume = pd.to_numeric(df["volume"], errors="coerce")
-                break_volume = volume.iloc[-1] if len(volume) >= 1 else None
-                streak_volumes = volume.iloc[-1 - broken_streak:-1] if broken_streak > 0 else pd.Series(dtype=float)
-                streak_volumes = streak_volumes.dropna()
-                if (
-                    break_volume is not None
-                    and not pd.isna(break_volume)
-                    and float(break_volume) > 0
-                    and not streak_volumes.empty
-                ):
-                    base_volume = float(streak_volumes.min())
-                    if base_volume > 0:
-                        break_ratio = float(break_volume) / base_volume
-                        result["volume_break_limit_up"] = bool(break_ratio >= volume_factor)
+        broken_streak = self._calculate_broken_limit_up_streak(full_limit_up_mask)
+        result["broken_limit_up"] = broken_streak > 0
+        result["broken_streak_count"] = broken_streak
+        result["after_two_limit_up"] = bool(result["broken_limit_up"] and broken_streak >= 2)
 
+        if not result["broken_limit_up"] or volume is None or not volume_enabled:
+            return
+
+        break_volume = volume.iloc[-1] if len(volume) >= 1 else None
+        streak_volumes = volume.iloc[-1 - broken_streak:-1] if broken_streak > 0 else pd.Series(dtype=float)
+        streak_volumes = streak_volumes.dropna()
+        if (
+            break_volume is None
+            or pd.isna(break_volume)
+            or float(break_volume) <= 0
+            or streak_volumes.empty
+        ):
+            return
+        base_volume = float(streak_volumes.min())
+        if base_volume > 0:
+            break_ratio = float(break_volume) / base_volume
+            result["volume_break_limit_up"] = bool(break_ratio >= volume_factor)
+
+    def _build_analysis_summary(
+        self,
+        result: Dict[str, Any],
+        streak_days: int,
+        ma_period: int,
+        volume_days: int,
+        volume_enabled: bool,
+    ) -> str:
         if result["passed"]:
-            result["summary"] = (
+            summary = (
                 f"最近{streak_days}日收盘全部高于MA{ma_period}，"
                 f"最新收盘 {result['latest_close']:.2f} / MA{ma_period} {result['latest_ma']:.2f}"
             )
         else:
-            result["summary"] = f"未满足最近{streak_days}日收盘全部高于MA{ma_period}"
+            summary = f"未满足最近{streak_days}日收盘全部高于MA{ma_period}"
 
         if volume_enabled and result["volume_expand"]:
             ratio_text = "-" if result["volume_expand_ratio"] is None else f"{result['volume_expand_ratio']:.2f}倍"
-            result["summary"] = f"{result['summary']}；近{volume_days}日放量 {ratio_text}"
+            summary = f"{summary}；近{volume_days}日放量 {ratio_text}"
         elif not volume_enabled:
-            result["summary"] = f"{result['summary']}；放量倍数检测已关闭"
+            summary = f"{summary}；放量倍数检测已关闭"
 
         if result["limit_up_streak"] >= 2:
-            result["summary"] = f"{result['summary']}；连板 {result['limit_up_streak']} 板"
+            summary = f"{summary}；连板 {result['limit_up_streak']} 板"
         if result["broken_limit_up"]:
-            result["summary"] = f"{result['summary']}；断板，前序连板 {result['broken_streak_count']} 板"
+            summary = f"{summary}；断板，前序连板 {result['broken_streak_count']} 板"
         if result["volume_break_limit_up"]:
-            result["summary"] = f"{result['summary']}；放量后断板"
+            summary = f"{summary}；放量后断板"
+        return summary
+
+    def analyze_history(
+        self,
+        history_data: pd.DataFrame,
+        streak_days: Optional[int] = None,
+        ma_period: Optional[int] = None,
+        limit_up_lookback_days: Optional[int] = None,
+        volume_lookback_days: Optional[int] = None,
+        volume_expand_enabled: Optional[bool] = None,
+        volume_expand_factor: Optional[float] = None,
+        board: str = "",
+        stock_name: str = "",
+        stock_code: str = "",
+    ) -> Dict[str, Any]:
+        streak_days = int(streak_days or self.trend_days)
+        ma_period = int(ma_period or self.ma_period)
+        lookback_days = int(limit_up_lookback_days or self.limit_up_lookback_days)
+        volume_days = int(volume_lookback_days or self.volume_lookback_days)
+        volume_enabled = self.volume_expand_enabled if volume_expand_enabled is None else bool(volume_expand_enabled)
+        volume_factor = float(volume_expand_factor or self.volume_expand_factor)
+        result = self._create_empty_analysis_result(volume_days, volume_enabled, volume_factor)
+        if history_data is None or history_data.empty:
+            result["summary"] = "无历史数据"
+            return result
+        if "date" not in history_data.columns or "close" not in history_data.columns:
+            result["summary"] = "历史数据缺少 date/close"
+            return result
+
+        df = history_data.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
+        self._populate_price_metrics(result, df, close, ma, streak_days, ma_period)
+        volume = self._apply_volume_analysis(result, df, volume_days, volume_enabled, volume_factor)
+        self._apply_limit_up_analysis(
+            result,
+            df,
+            board,
+            stock_name,
+            lookback_days,
+            volume,
+            volume_enabled,
+            volume_factor,
+        )
+        result["summary"] = self._build_analysis_summary(
+            result,
+            streak_days,
+            ma_period,
+            volume_days,
+            volume_enabled,
+        )
         return result
 
-    def filter_stock(
+    def _build_filter_result_shell(
         self,
         stock_code: str,
-        stock_name: str = "",
-        board: str = "",
-        exchange: str = "",
-        history_mirror: Optional[str] = None,
-        mirror_pool: Optional[List[str]] = None,
-        history_plan: Optional[HistoryRequestPlan] = None,
+        stock_name: str,
+        board: str,
+        exchange: str,
     ) -> Dict[str, Any]:
         result = {
             "code": str(stock_code).strip().zfill(6),
@@ -361,25 +512,24 @@ class StockFilter:
             result["data"]["board"] = board
         if exchange:
             result["data"]["exchange"] = exchange
+        return result
 
-        hist_days = max(
+    def _resolve_filter_history_days(self) -> int:
+        return max(
             14,
             self.trend_days + self.ma_period + 4,
             self.limit_up_lookback_days + self.ma_period + 4,
             self.volume_lookback_days + 4,
         )
-        history_data = self.fetcher.get_history_data(
-            stock_code,
-            days=hist_days,
-            preferred_mirror=history_mirror,
-            mirror_pool=mirror_pool,
-            request_plan=history_plan,
-        )
-        result["data"]["history"] = history_data
-        if history_data is None or history_data.empty:
-            result["reasons"].append("无法获取历史数据")
-            return result
 
+    def _attach_filter_analysis(
+        self,
+        result: Dict[str, Any],
+        history_data: pd.DataFrame,
+        stock_code: str,
+        stock_name: str,
+        board: str,
+    ) -> Dict[str, Any]:
         analysis = self.analyze_history(
             history_data,
             self.trend_days,
@@ -394,24 +544,59 @@ class StockFilter:
         )
         result["data"]["analysis"] = analysis
         result["data"]["history_tail"] = history_data.tail(max(self.trend_days, self.limit_up_lookback_days)).copy()
+        return analysis
 
-        if self.require_limit_up_within_days and not analysis.get("limit_up_within_days"):
-            analysis["summary"] = (
-                f"{analysis['summary']}；未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
-                if analysis.get("summary")
-                else f"未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
-            )
-            result["reasons"].append(analysis["summary"])
-            return result
+    def _apply_limit_up_requirement_failure(
+        self,
+        result: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> bool:
+        if not self.require_limit_up_within_days or analysis.get("limit_up_within_days"):
+            return False
+        analysis["summary"] = (
+            f"{analysis['summary']}；未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
+            if analysis.get("summary")
+            else f"未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
+        )
+        result["reasons"].append(analysis["summary"])
+        return True
 
-        if analysis.get("passed"):
-            result["passed"] = True
-            result["reasons"].append(analysis["summary"])
-        else:
-            result["reasons"].append(analysis["summary"])
-            return result
-
+    def _finalize_filter_result(
+        self,
+        result: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result["passed"] = bool(analysis.get("passed"))
+        result["reasons"].append(analysis["summary"])
         return result
+
+    def filter_stock(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        board: str = "",
+        exchange: str = "",
+        history_mirror: Optional[str] = None,
+        mirror_pool: Optional[List[str]] = None,
+        history_plan: Optional[HistoryRequestPlan] = None,
+    ) -> Dict[str, Any]:
+        result = self._build_filter_result_shell(stock_code, stock_name, board, exchange)
+        history_data = self.fetcher.get_history_data(
+            stock_code,
+            days=self._resolve_filter_history_days(),
+            preferred_mirror=history_mirror,
+            mirror_pool=mirror_pool,
+            request_plan=history_plan,
+        )
+        result["data"]["history"] = history_data
+        if history_data is None or history_data.empty:
+            result["reasons"].append("无法获取历史数据")
+            return result
+
+        analysis = self._attach_filter_analysis(result, history_data, stock_code, stock_name, board)
+        if self._apply_limit_up_requirement_failure(result, analysis):
+            return result
+        return self._finalize_filter_result(result, analysis)
 
     def _result_sort_key(self, item: Dict[str, Any]):
         analysis = (item.get("data", {}) or {}).get("analysis") or {}
@@ -425,6 +610,313 @@ class StockFilter:
             latest_change_pct if latest_change_pct is not None else float("-inf"),
             str(item.get("code", "")),
         )
+
+    def _filter_scan_universe(
+        self,
+        all_stocks: pd.DataFrame,
+        allowed_boards: Optional[List[str]],
+        allowed_exchanges: Optional[List[str]],
+        log: Optional[Callable[[str], None]] = None,
+    ) -> pd.DataFrame:
+        filtered = all_stocks
+        if allowed_boards and "board" in filtered.columns:
+            allowed_board_set = {str(x).strip() for x in allowed_boards if str(x).strip()}
+            if allowed_board_set:
+                before = len(filtered)
+                filtered = filtered[filtered["board"].astype(str).isin(allowed_board_set)]
+                if log:
+                    log(f"板块过滤：保留 {len(filtered)}/{before} 只，目标板块 {', '.join(sorted(allowed_board_set))}")
+
+        if allowed_exchanges and "exchange" in filtered.columns:
+            allowed_exchange_set = {str(x).strip() for x in allowed_exchanges if str(x).strip()}
+            if allowed_exchange_set:
+                before = len(filtered)
+                filtered = filtered[filtered["exchange"].astype(str).isin(allowed_exchange_set)]
+                if log:
+                    log(f"交易所过滤：保留 {len(filtered)}/{before} 只，目标交易所 {', '.join(sorted(allowed_exchange_set))}")
+        return filtered
+
+    def _limit_scan_subset(self, all_stocks: pd.DataFrame, max_stocks: int) -> pd.DataFrame:
+        if max_stocks and max_stocks > 0:
+            return all_stocks.head(max_stocks).reset_index(drop=True)
+        return all_stocks.reset_index(drop=True)
+
+    def _resolve_scan_workers(self, max_workers: Optional[int]) -> Tuple[int, int]:
+        if max_workers is None:
+            try:
+                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "3").strip() or "3")
+            except ValueError:
+                max_workers = 3
+        requested_workers = max(1, min(int(max_workers), 16))
+        history_workers = max(1, int(self.fetcher.history_request_concurrency_limit()))
+        return requested_workers, min(requested_workers, history_workers)
+
+    def _build_scan_history_plan(self, history_source: str, local_history_only: bool) -> HistoryRequestPlan:
+        if local_history_only:
+            return HistoryRequestPlan(
+                mode="cache_only",
+                provider_sequence=("local-cache",),
+                mirror_urls=(),
+                reason="scan-local-cache-only",
+            )
+        return self.fetcher.build_history_request_plan(
+            source=history_source,
+            force_refresh=False,
+        )
+
+    def _assign_scan_jobs(
+        self,
+        subset: pd.DataFrame,
+        available_mirrors: List[str],
+    ) -> Tuple[List[Tuple[Dict[str, Any], Optional[str]]], Dict[str, int]]:
+        rows = subset.to_dict("records")
+        random.Random(int(time.time())).shuffle(rows)
+        assigned_jobs: List[Tuple[Dict[str, Any], Optional[str]]] = []
+        mirror_counts: Dict[str, int] = {}
+        for idx, row in enumerate(rows):
+            mirror = available_mirrors[idx % len(available_mirrors)] if available_mirrors else None
+            if mirror:
+                mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
+            assigned_jobs.append((row, mirror))
+        return assigned_jobs, mirror_counts
+
+    def _log_scan_history_context(
+        self,
+        log: Optional[Callable[[str], None]],
+        coverage: Dict[str, Any],
+        history_plan: HistoryRequestPlan,
+        local_history_only: bool,
+    ) -> None:
+        if not log:
+            return
+        log(
+            f"历史缓存覆盖率：{coverage.get('covered_count', 0)}/{coverage.get('universe_count', 0)} "
+            f"({coverage.get('coverage_ratio', 0.0) * 100:.1f}%)，最新交易日 {coverage.get('latest_trade_date') or '-'}"
+        )
+        log(f"历史数据源策略：{'/'.join(history_plan.provider_sequence)}")
+        if history_plan.cache_only:
+            if history_plan.reason and history_plan.reason != "scan-local-cache-only":
+                log(f"历史接口镜像当前不可用，最近探测失败示例：{history_plan.reason}")
+            if history_plan.reason == "scan-local-cache-only":
+                log("本轮扫描使用本地历史缓存，不发起公网历史请求；未命中缓存的股票会被跳过。")
+            else:
+                log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
+            return
+        if not history_plan.mirror_urls and history_plan.provider_sequence and history_plan.provider_sequence[0] != "eastmoney":
+            log("当前扫描已切换到非东方财富历史源。")
+
+    def _log_scan_execution_context(
+        self,
+        log: Optional[Callable[[str], None]],
+        total_universe: int,
+        total: int,
+        workers: int,
+        requested_workers: int,
+        local_history_only: bool,
+        available_mirrors: List[str],
+        mirror_counts: Dict[str, int],
+    ) -> None:
+        if not log:
+            return
+        log(f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。")
+        if requested_workers != workers:
+            log(f"并发保护已生效：你请求 {requested_workers} 线程，但历史接口当前只允许 {workers} 个并发，以降低东方财富限流风险。")
+        log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
+        if local_history_only:
+            log("说明：扫描阶段默认只读本地缓存；首次或缓存不足时请先执行“更新历史缓存”。")
+        else:
+            log("说明：历史请求优先使用所选数据源；若为自动模式，会在东财失败后切换到腾讯/新浪。")
+        if available_mirrors:
+            mirror_summary = "，".join(
+                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
+                for mirror in available_mirrors
+            )
+            log(f"历史镜像分区：{mirror_summary}")
+        else:
+            log("历史镜像分区：cache-only")
+
+    def _submit_scan_tasks(
+        self,
+        executor: ThreadPoolExecutor,
+        assigned_jobs: List[Tuple[Dict[str, Any], Optional[str]]],
+        available_mirrors: List[str],
+        history_plan: HistoryRequestPlan,
+    ) -> Dict[Any, Tuple[str, str, str, str, Optional[str]]]:
+        future_to_meta = {}
+        for row, mirror in assigned_jobs:
+            code = str(row["code"]).strip().zfill(6)
+            name = str(row.get("name", "") or "")
+            board = str(row.get("board", "") or "")
+            exchange = str(row.get("exchange", "") or "")
+            future = executor.submit(
+                self.filter_stock,
+                code,
+                name,
+                board,
+                exchange,
+                mirror,
+                available_mirrors,
+                history_plan,
+            )
+            future_to_meta[future] = (code, name, board, exchange, mirror)
+        return future_to_meta
+
+    def _pending_scan_sample_text(
+        self,
+        pending,
+        future_to_meta: Dict[Any, Tuple[str, str, str, str, Optional[str]]],
+    ) -> str:
+        sample = [
+            (
+                f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
+                if future_to_meta[f][4]
+                else f"{future_to_meta[f][0]}@cache-only"
+            )
+            for f in list(pending)[:3]
+        ]
+        return "、".join(sample) if sample else "-"
+
+    def _scan_mirror_label(self, mirror: Optional[str]) -> str:
+        if not mirror:
+            return "cache-only"
+        return mirror.split("//", 1)[-1].split("/", 1)[0]
+
+    def _should_stop_scan(
+        self,
+        should_stop: Optional[Callable[[], bool]],
+        log: Optional[Callable[[str], None]],
+    ) -> bool:
+        if not should_stop or not should_stop():
+            return False
+        if log:
+            log("收到停止信号，正在取消未完成任务...")
+        return True
+
+    def _log_pending_scan_wait(
+        self,
+        log: Optional[Callable[[str], None]],
+        pending,
+        future_to_meta: Dict[Any, Tuple[str, str, str, str, Optional[str]]],
+        completed: int,
+        total: int,
+        results: List[Dict[str, Any]],
+        started_at: float,
+        last_report: float,
+    ) -> float:
+        now = time.time()
+        if not log or now - last_report < 10:
+            return last_report
+        elapsed = now - started_at
+        sample_text = self._pending_scan_sample_text(pending, future_to_meta)
+        log(
+            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
+            f"仍在等待历史数据返回，示例代码 {sample_text}"
+        )
+        return now
+
+    def _build_scan_error_result(
+        self,
+        code: str,
+        name: str,
+        board: str,
+        exchange: str,
+        mirror: Optional[str],
+        error: Exception,
+        log: Optional[Callable[[str], None]],
+    ) -> Dict[str, Any]:
+        if log:
+            log(f"  {code} {name} 检测异常[{self._scan_mirror_label(mirror)}]: {error}")
+        return {
+            "code": code,
+            "name": name,
+            "passed": False,
+            "reasons": [str(error)],
+            "data": {"board": board, "exchange": exchange},
+        }
+
+    def _resolve_scan_future_result(
+        self,
+        fut,
+        future_to_meta: Dict[Any, Tuple[str, str, str, str, Optional[str]]],
+        log: Optional[Callable[[str], None]],
+    ) -> Tuple[str, str, str, str, Optional[str], Dict[str, Any]]:
+        code, name, board, exchange, mirror = future_to_meta[fut]
+        try:
+            filter_result = fut.result()
+        except Exception as exc:
+            filter_result = self._build_scan_error_result(code, name, board, exchange, mirror, exc, log)
+        return code, name, board, exchange, mirror, filter_result
+
+    def _log_scan_pass_result(
+        self,
+        log: Optional[Callable[[str], None]],
+        completed: int,
+        total: int,
+        code: str,
+        name: str,
+        filter_result: Dict[str, Any],
+    ) -> None:
+        if not log or not filter_result.get("passed"):
+            return
+        analysis = filter_result.get("data", {}).get("analysis") or {}
+        log(
+            f"  通过 {completed}/{total} {code} {name} "
+            f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
+        )
+
+    def _append_scan_hit(
+        self,
+        results: List[Dict[str, Any]],
+        filter_result: Dict[str, Any],
+        name: str,
+        board: str,
+        exchange: str,
+    ) -> None:
+        if not filter_result.get("passed"):
+            return
+        filter_result["name"] = name
+        filter_result.setdefault("data", {})
+        filter_result["data"].setdefault("board", board)
+        filter_result["data"].setdefault("exchange", exchange)
+        results.append(filter_result)
+
+    def _notify_scan_progress(
+        self,
+        progress_callback,
+        completed: int,
+        total: int,
+        code: str,
+        name: str,
+    ) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(completed, total, code, name)
+        except StopIteration:
+            raise
+
+    def _maybe_log_scan_progress(
+        self,
+        log: Optional[Callable[[str], None]],
+        completed: int,
+        total: int,
+        results: List[Dict[str, Any]],
+        started_at: float,
+        last_report: float,
+        report_every: int,
+        code: str,
+        name: str,
+        mirror: Optional[str],
+    ) -> float:
+        now = time.time()
+        if not log or (completed % report_every != 0 and now - last_report < 10):
+            return last_report
+        elapsed = now - started_at
+        log(
+            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
+            f"当前 {code} {name} @ {self._scan_mirror_label(mirror)}"
+        )
+        return now
 
     def scan_all_stocks(
         self,
@@ -451,131 +943,35 @@ class StockFilter:
             return []
 
         total_universe = len(all_stocks)
-        if allowed_boards and "board" in all_stocks.columns:
-            allowed_board_set = {str(x).strip() for x in allowed_boards if str(x).strip()}
-            if allowed_board_set:
-                before = len(all_stocks)
-                all_stocks = all_stocks[all_stocks["board"].astype(str).isin(allowed_board_set)]
-                if log:
-                    log(
-                        f"板块过滤：保留 {len(all_stocks)}/{before} 只，目标板块 {', '.join(sorted(allowed_board_set))}"
-                    )
-        if allowed_exchanges and "exchange" in all_stocks.columns:
-            allowed_exchange_set = {str(x).strip() for x in allowed_exchanges if str(x).strip()}
-            if allowed_exchange_set:
-                before = len(all_stocks)
-                all_stocks = all_stocks[all_stocks["exchange"].astype(str).isin(allowed_exchange_set)]
-                if log:
-                    log(
-                        f"交易所过滤：保留 {len(all_stocks)}/{before} 只，目标交易所 {', '.join(sorted(allowed_exchange_set))}"
-                    )
-
-        if max_stocks and max_stocks > 0:
-            subset = all_stocks.head(max_stocks).reset_index(drop=True)
-        else:
-            subset = all_stocks.reset_index(drop=True)
+        all_stocks = self._filter_scan_universe(all_stocks, allowed_boards, allowed_exchanges, log=log)
+        subset = self._limit_scan_subset(all_stocks, max_stocks)
         total = len(subset)
-        if max_workers is None:
-            try:
-                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "3").strip() or "3")
-            except ValueError:
-                max_workers = 3
-        requested_workers = max(1, min(int(max_workers), 16))
-        history_workers = max(1, int(self.fetcher.history_request_concurrency_limit()))
-        workers = min(requested_workers, history_workers)
+        requested_workers, workers = self._resolve_scan_workers(max_workers)
 
         coverage = self.fetcher.get_history_cache_summary()
-        if log:
-            log(
-                f"历史缓存覆盖率：{coverage.get('covered_count', 0)}/{coverage.get('universe_count', 0)} "
-                f"({coverage.get('coverage_ratio', 0.0) * 100:.1f}%)，最新交易日 {coverage.get('latest_trade_date') or '-'}"
-            )
-
-        if local_history_only:
-            history_plan = HistoryRequestPlan(
-                mode="cache_only",
-                provider_sequence=("local-cache",),
-                mirror_urls=(),
-                reason="scan-local-cache-only",
-            )
-        else:
-            history_plan = self.fetcher.build_history_request_plan(
-                source=history_source,
-                force_refresh=False,
-            )
+        history_plan = self._build_scan_history_plan(history_source, local_history_only)
         available_mirrors = list(history_plan.mirror_urls)
-        if log:
-            log(f"历史数据源策略：{'/'.join(history_plan.provider_sequence)}")
-        if history_plan.cache_only and log:
-            if history_plan.reason and history_plan.reason != "scan-local-cache-only":
-                log(f"历史接口镜像当前不可用，最近探测失败示例：{history_plan.reason}")
-            if history_plan.reason == "scan-local-cache-only":
-                log("本轮扫描使用本地历史缓存，不发起公网历史请求；未命中缓存的股票会被跳过。")
-            else:
-                log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
-        elif not available_mirrors and history_plan.provider_sequence and history_plan.provider_sequence[0] != "eastmoney" and log:
-            log("当前扫描已切换到非东方财富历史源。")
-
-        rows = subset.to_dict("records")
-        random.Random(int(time.time())).shuffle(rows)
-        assigned_jobs = []
-        mirror_counts: Dict[str, int] = {}
-        for idx, row in enumerate(rows):
-            mirror = available_mirrors[idx % len(available_mirrors)] if available_mirrors else None
-            if mirror:
-                mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
-            assigned_jobs.append((row, mirror))
-
-        if log:
-            log(
-                f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。"
-            )
-            if requested_workers != workers:
-                log(
-                    f"并发保护已生效：你请求 {requested_workers} 线程，但历史接口当前只允许 {workers} 个并发，以降低东方财富限流风险。"
-                )
-            log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
-            if local_history_only:
-                log("说明：扫描阶段默认只读本地缓存；首次或缓存不足时请先执行“更新历史缓存”。")
-            else:
-                log("说明：历史请求优先使用所选数据源；若为自动模式，会在东财失败后切换到腾讯/新浪。")
-            if available_mirrors:
-                mirror_summary = "，".join(
-                    f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
-                    for mirror in available_mirrors
-                )
-                log(f"历史镜像分区：{mirror_summary}")
-            else:
-                log("历史镜像分区：cache-only")
+        self._log_scan_history_context(log, coverage, history_plan, local_history_only)
+        assigned_jobs, mirror_counts = self._assign_scan_jobs(subset, available_mirrors)
+        self._log_scan_execution_context(
+            log,
+            total_universe,
+            total,
+            workers,
+            requested_workers,
+            local_history_only,
+            available_mirrors,
+            mirror_counts,
+        )
 
         results: List[Dict[str, Any]] = []
         completed = 0
         last_report = time.time()
         report_every = 25
 
-        def _submit_tasks(executor: ThreadPoolExecutor):
-            future_to_meta = {}
-            for row, mirror in assigned_jobs:
-                code = str(row["code"]).strip().zfill(6)
-                name = str(row.get("name", "") or "")
-                board = str(row.get("board", "") or "")
-                exchange = str(row.get("exchange", "") or "")
-                future = executor.submit(
-                    self.filter_stock,
-                    code,
-                    name,
-                    board,
-                    exchange,
-                    mirror,
-                    available_mirrors,
-                    history_plan,
-                )
-                future_to_meta[future] = (code, name, board, exchange, mirror)
-            return future_to_meta
-
         executor = DaemonThreadPoolExecutor(max_workers=workers)
         try:
-            future_to_meta = _submit_tasks(executor)
+            future_to_meta = self._submit_scan_tasks(executor, assigned_jobs, available_mirrors, history_plan)
             if log:
                 log("【阶段 3/3】开始逐只拉取历史日线并计算结果...")
 
@@ -583,81 +979,45 @@ class StockFilter:
             while pending:
                 done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
                 if not done:
-                    if should_stop and should_stop():
-                        if log:
-                            log("收到停止信号，正在取消未完成任务...")
+                    if self._should_stop_scan(should_stop, log):
                         break
-                    now = time.time()
-                    if log and now - last_report >= 10:
-                        elapsed = now - t0
-                        sample = [
-                            (
-                                f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
-                                if future_to_meta[f][4]
-                                else f"{future_to_meta[f][0]}@cache-only"
-                            )
-                            for f in list(pending)[:3]
-                        ]
-                        sample_text = "、".join(sample) if sample else "-"
-                        log(
-                            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
-                            f"仍在等待历史数据返回，示例代码 {sample_text}"
-                        )
-                        last_report = now
+                    last_report = self._log_pending_scan_wait(
+                        log,
+                        pending,
+                        future_to_meta,
+                        completed,
+                        total,
+                        results,
+                        t0,
+                        last_report,
+                    )
                     continue
 
                 for fut in done:
-                    code, name, board, exchange, mirror = future_to_meta[fut]
-                    if should_stop and should_stop():
-                        if log:
-                            log("收到停止信号，正在取消未完成任务...")
+                    if self._should_stop_scan(should_stop, log):
                         pending.clear()
                         break
-                    try:
-                        filter_result = fut.result()
-                    except Exception as e:
-                        if log:
-                            log(
-                                f"  {code} {name} 检测异常[{mirror.split('//', 1)[-1].split('/', 1)[0] if mirror else 'cache-only'}]: {e}"
-                            )
-                        filter_result = {
-                            "code": code,
-                            "name": name,
-                            "passed": False,
-                            "reasons": [str(e)],
-                            "data": {"board": board, "exchange": exchange},
-                        }
-
+                    code, name, board, exchange, mirror, filter_result = self._resolve_scan_future_result(
+                        fut,
+                        future_to_meta,
+                        log,
+                    )
                     completed += 1
-                    analysis = filter_result.get("data", {}).get("analysis") or {}
-
-                    if filter_result.get("passed") and log:
-                        log(
-                            f"  通过 {completed}/{total} {code} {name} "
-                            f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
-                        )
-
-                    if filter_result.get("passed"):
-                        filter_result["name"] = name
-                        filter_result.setdefault("data", {})
-                        filter_result["data"].setdefault("board", board)
-                        filter_result["data"].setdefault("exchange", exchange)
-                        results.append(filter_result)
-
-                    if progress_callback:
-                        try:
-                            progress_callback(completed, total, code, name)
-                        except StopIteration:
-                            raise
-
-                    now = time.time()
-                    if log and (completed % report_every == 0 or now - last_report >= 10):
-                        elapsed = now - t0
-                        log(
-                            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
-                            f"当前 {code} {name} @ {mirror.split('//', 1)[-1].split('/', 1)[0] if mirror else 'cache-only'}"
-                        )
-                        last_report = now
+                    self._log_scan_pass_result(log, completed, total, code, name, filter_result)
+                    self._append_scan_hit(results, filter_result, name, board, exchange)
+                    self._notify_scan_progress(progress_callback, completed, total, code, name)
+                    last_report = self._maybe_log_scan_progress(
+                        log,
+                        completed,
+                        total,
+                        results,
+                        t0,
+                        last_report,
+                        report_every,
+                        code,
+                        name,
+                        mirror,
+                    )
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -679,25 +1039,13 @@ class StockFilter:
             fallback=None,
             task_name=f"详情历史 {code}",
         )
-        name = ""
-        board = ""
-        exchange = ""
         universe = self._call_with_timeout(
             lambda: self.fetcher.get_all_stocks(),
             timeout_sec=8.0,
             fallback=None,
             task_name=f"详情股票池 {code}",
         )
-        if universe is not None:
-            try:
-                match = universe[universe["code"].astype(str).str.zfill(6) == code]
-                if not match.empty:
-                    row = match.iloc[0]
-                    name = str(row.get("name", "") or "")
-                    board = str(row.get("board", "") or "")
-                    exchange = str(row.get("exchange", "") or "")
-            except Exception:
-                pass
+        stock_identity = self._resolve_stock_identity(universe, code)
         analysis = self.analyze_history(
             history,
             self.trend_days,
@@ -706,18 +1054,11 @@ class StockFilter:
             self.volume_lookback_days,
             self.volume_expand_enabled,
             self.volume_expand_factor,
-            board=board,
-            stock_name=name,
+            board=stock_identity["board"],
+            stock_name=stock_identity["name"],
             stock_code=stock_code,
         )
-        if history is not None and not history.empty:
-            latest_row = history.iloc[-1]
-            analysis["latest_volume"] = latest_row.get("volume")
-            analysis["latest_amount"] = latest_row.get("amount")
-            analysis["quote_time"] = str(latest_row.get("date", "") or "")
-        else:
-            analysis["latest_volume"] = None
-            analysis["latest_amount"] = None
+        self._enrich_analysis_with_history_snapshot(analysis, history)
 
         fund_flow_df = self._call_with_timeout(
             lambda: self.fetcher.get_fund_flow_data(code, days=30, force_refresh=False),
@@ -725,33 +1066,8 @@ class StockFilter:
             fallback=None,
             task_name=f"详情资金流 {code}",
         )
-        if fund_flow_df is not None and not fund_flow_df.empty:
-            latest_flow = fund_flow_df.iloc[-1]
-            analysis["flow_date"] = str(latest_flow.get("date", "") or "")
-            analysis["main_force_amount"] = latest_flow.get("main_force_amount")
-            analysis["big_order_amount"] = latest_flow.get("big_order_amount")
-            analysis["super_big_order_amount"] = latest_flow.get("super_big_order_amount")
-            analysis["main_force_ratio"] = latest_flow.get("main_force_ratio")
-            analysis["big_order_ratio"] = latest_flow.get("big_order_ratio")
-            analysis["super_big_order_ratio"] = latest_flow.get("super_big_order_ratio")
-            analysis["fund_flow_history"] = fund_flow_df.to_dict("records")
-        else:
-            analysis["flow_date"] = ""
-            analysis["main_force_amount"] = None
-            analysis["big_order_amount"] = None
-            analysis["super_big_order_amount"] = None
-            analysis["main_force_ratio"] = None
-            analysis["big_order_ratio"] = None
-            analysis["super_big_order_ratio"] = None
-            analysis["fund_flow_history"] = []
-        return {
-            "code": code,
-            "name": name,
-            "board": board,
-            "exchange": exchange,
-            "history": history,
-            "analysis": analysis,
-        }
+        self._enrich_analysis_with_fund_flow(analysis, fund_flow_df)
+        return self._build_stock_detail_payload(code, stock_identity, history, analysis)
 
     def get_stock_detail_history(self, stock_code: str, days: int) -> Optional[pd.DataFrame]:
         code = str(stock_code).strip().zfill(6)
@@ -762,6 +1078,34 @@ class StockFilter:
             fallback=None,
             task_name=f"补充详情历史 {code}",
         )
+
+    def _resolve_intraday_prev_close(
+        self,
+        history_df: Optional[pd.DataFrame],
+        selected_trade_date: str,
+    ) -> Optional[float]:
+        if history_df is None or history_df.empty or "close" not in history_df.columns:
+            return None
+
+        df = history_df.copy()
+        if "date" in df.columns:
+            df["date"] = df["date"].astype(str).str.strip()
+        else:
+            df["date"] = ""
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+        if df.empty:
+            return None
+
+        target_date = str(selected_trade_date or "").strip()
+        if target_date:
+            previous_rows = df[df["date"] < target_date]
+            if not previous_rows.empty:
+                return float(previous_rows.iloc[-1]["close"])
+
+        if len(df) >= 2:
+            return float(df.iloc[-2]["close"])
+        return float(df.iloc[-1]["close"])
 
     def get_stock_intraday(
         self,
@@ -785,10 +1129,14 @@ class StockFilter:
         selected_trade_date = ""
         available_trade_dates: List[str] = []
         applied_day_offset = 0
+        auction_snapshot = None
         if isinstance(intraday_payload, dict):
             intraday_df = intraday_payload.get("intraday")
             selected_trade_date = str(intraday_payload.get("selected_trade_date") or "")
             available_trade_dates = [str(d) for d in (intraday_payload.get("available_trade_dates") or [])]
+            raw_auction = intraday_payload.get("auction")
+            if isinstance(raw_auction, dict):
+                auction_snapshot = raw_auction
             try:
                 applied_day_offset = int(intraday_payload.get("applied_day_offset") or 0)
             except (TypeError, ValueError):
@@ -796,15 +1144,12 @@ class StockFilter:
 
         prev_close = None
         history_df = self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=2),
+            lambda: self.fetcher.get_history_data(code, days=20),
             timeout_sec=6.0,
             fallback=None,
             task_name=f"分时昨收 {code}",
         )
-        if history_df is not None and not history_df.empty and "close" in history_df.columns:
-            close_series = pd.to_numeric(history_df["close"], errors="coerce").dropna()
-            if not close_series.empty:
-                prev_close = float(close_series.iloc[-1])
+        prev_close = self._resolve_intraday_prev_close(history_df, selected_trade_date)
         return {
             "code": code,
             "intraday": intraday_df,
@@ -812,4 +1157,5 @@ class StockFilter:
             "selected_trade_date": selected_trade_date,
             "available_trade_dates": available_trade_dates,
             "applied_day_offset": applied_day_offset,
+            "auction": auction_snapshot,
         }
