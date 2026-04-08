@@ -2503,6 +2503,185 @@ class StockDataFetcher:
             return ""
         return reason
 
+    def get_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
+        """获取指定日期的涨停板池（东方财富）。"""
+        date_key = self._normalize_trade_date(trade_date)
+        if not date_key:
+            return pd.DataFrame()
+        try:
+            df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            if self._log:
+                self._log(f"涨停池 {date_key} 获取失败: {e}")
+        return pd.DataFrame()
+
+    def get_previous_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
+        """获取指定日期的昨日涨停板池（东方财富），即昨日涨停股今日表现。"""
+        date_key = self._normalize_trade_date(trade_date)
+        if not date_key:
+            return pd.DataFrame()
+        try:
+            df = _retry_ak_call(ak.stock_zt_pool_previous_em, date=date_key)
+            if df is not None and not df.empty:
+                return df
+        except Exception as e:
+            if self._log:
+                self._log(f"昨日涨停池 {date_key} 获取失败: {e}")
+        return pd.DataFrame()
+
+    def compare_limit_up_pools(
+        self,
+        today_date: str,
+        yesterday_date: str,
+    ) -> Dict[str, Any]:
+        """对比今日与昨日首次涨停股票的差异。
+
+        返回:
+            today_first: 今日首次涨停列表（连板数=1）
+            yesterday_first: 昨日首次涨停列表（昨日连板数=1）
+            new_codes: 今日新增的首板股票代码（昨日未涨停）
+            continued_codes: 昨日首板今日继续涨停的代码
+            lost_codes: 昨日首板今日未涨停的代码
+            industry_today: 今日首板行业分布
+            industry_yesterday: 昨日首板行业分布
+            industry_new: 今日新增首板行业分布
+            summary: 文字总结
+        """
+        if self._log:
+            self._log(f"正在获取涨停池对比数据: 今日={today_date}, 昨日={yesterday_date}")
+
+        today_pool = self.get_limit_up_pool(today_date)
+        prev_pool = self.get_previous_limit_up_pool(today_date)
+        yesterday_pool = self.get_limit_up_pool(yesterday_date)
+
+        result: Dict[str, Any] = {
+            "today_date": today_date,
+            "yesterday_date": yesterday_date,
+            "today_pool_count": len(today_pool),
+            "yesterday_pool_count": len(yesterday_pool),
+            "today_first": [],
+            "yesterday_first": [],
+            "new_codes": [],
+            "continued_codes": [],
+            "lost_codes": [],
+            "industry_today": {},
+            "industry_yesterday": {},
+            "industry_new": {},
+            "summary": "",
+        }
+
+        # ---- 今日首板：连板数=1 的股票 ----
+        today_first_df = pd.DataFrame()
+        if not today_pool.empty and "连板数" in today_pool.columns:
+            today_first_df = today_pool[today_pool["连板数"] == 1].copy()
+            result["today_first"] = self._pool_to_records(today_first_df, "today")
+
+        # ---- 昨日首板：从昨日涨停池中取连板数=1 的 ----
+        yesterday_first_df = pd.DataFrame()
+        if not yesterday_pool.empty and "连板数" in yesterday_pool.columns:
+            yesterday_first_df = yesterday_pool[yesterday_pool["连板数"] == 1].copy()
+            result["yesterday_first"] = self._pool_to_records(yesterday_first_df, "yesterday")
+
+        # ---- 对比：新增 / 延续 / 流失 ----
+        today_codes = set()
+        if not today_first_df.empty and "代码" in today_first_df.columns:
+            today_codes = set(today_first_df["代码"].astype(str).str.strip().str.zfill(6))
+
+        yesterday_codes = set()
+        if not yesterday_first_df.empty and "代码" in yesterday_first_df.columns:
+            yesterday_codes = set(yesterday_first_df["代码"].astype(str).str.strip().str.zfill(6))
+
+        # 昨日首板今日继续涨停（不限于首板，包括晋级二板）
+        today_all_codes = set()
+        if not today_pool.empty and "代码" in today_pool.columns:
+            today_all_codes = set(today_pool["代码"].astype(str).str.strip().str.zfill(6))
+
+        result["new_codes"] = sorted(today_codes - yesterday_codes)
+        result["continued_codes"] = sorted(yesterday_codes & today_all_codes)
+        result["lost_codes"] = sorted(yesterday_codes - today_all_codes)
+
+        # ---- 行业分布 ----
+        result["industry_today"] = self._count_industry(today_first_df)
+        result["industry_yesterday"] = self._count_industry(yesterday_first_df)
+        # 新增首板的行业分布
+        if result["new_codes"] and not today_first_df.empty and "代码" in today_first_df.columns:
+            new_set = set(result["new_codes"])
+            new_df = today_first_df[today_first_df["代码"].astype(str).str.strip().str.zfill(6).isin(new_set)]
+            result["industry_new"] = self._count_industry(new_df)
+
+        # ---- 昨日首板今日表现（从 previous pool 取） ----
+        yesterday_first_today_perf = []
+        if not prev_pool.empty and "代码" in prev_pool.columns and yesterday_codes:
+            prev_pool_codes = prev_pool.copy()
+            prev_pool_codes["_code"] = prev_pool_codes["代码"].astype(str).str.strip().str.zfill(6)
+            match = prev_pool_codes[prev_pool_codes["_code"].isin(yesterday_codes)]
+            if not match.empty:
+                for _, row in match.iterrows():
+                    code = str(row.get("代码", "")).strip().zfill(6)
+                    yesterday_first_today_perf.append({
+                        "code": code,
+                        "name": str(row.get("名称", "")),
+                        "change_pct": float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None,
+                        "close": float(row["最新价"]) if pd.notna(row.get("最新价")) else None,
+                        "still_limit_up": code in today_all_codes,
+                    })
+        result["yesterday_first_today_performance"] = yesterday_first_today_perf
+
+        # ---- 文字总结 ----
+        lines = []
+        lines.append(f"今日({today_date}) 涨停 {result['today_pool_count']} 只，首板 {len(result['today_first'])} 只")
+        lines.append(f"昨日({yesterday_date}) 涨停 {result['yesterday_pool_count']} 只，首板 {len(result['yesterday_first'])} 只")
+        lines.append(f"今日新增首板: {len(result['new_codes'])} 只")
+        lines.append(f"昨日首板今日继续涨停(含晋级): {len(result['continued_codes'])} 只")
+        lines.append(f"昨日首板今日未涨停: {len(result['lost_codes'])} 只")
+        if result["industry_today"]:
+            top3 = sorted(result["industry_today"].items(), key=lambda x: -x[1])[:3]
+            lines.append(f"今日首板 TOP3 行业: {'、'.join(f'{k}({v})' for k, v in top3)}")
+        if result["industry_yesterday"]:
+            top3 = sorted(result["industry_yesterday"].items(), key=lambda x: -x[1])[:3]
+            lines.append(f"昨日首板 TOP3 行业: {'、'.join(f'{k}({v})' for k, v in top3)}")
+        if yesterday_codes:
+            rate = len(result['continued_codes']) / len(yesterday_codes) * 100
+            lines.append(f"昨日首板晋级率: {rate:.1f}%")
+        result["summary"] = "\n".join(lines)
+
+        if self._log:
+            self._log(result["summary"])
+        return result
+
+    def _pool_to_records(self, df: pd.DataFrame, tag: str) -> List[Dict[str, Any]]:
+        """将涨停池 DataFrame 转为标准记录列表。"""
+        records = []
+        if df.empty:
+            return records
+        for _, row in df.iterrows():
+            rec: Dict[str, Any] = {
+                "code": str(row.get("代码", "")).strip().zfill(6),
+                "name": str(row.get("名称", "")),
+                "change_pct": float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None,
+                "close": float(row["最新价"]) if pd.notna(row.get("最新价")) else None,
+                "industry": str(row.get("所属行业", "")),
+                "amount": float(row["成交额"]) if pd.notna(row.get("成交额")) else None,
+                "market_cap": float(row["流通市值"]) if pd.notna(row.get("流通市值")) else None,
+                "turnover": float(row["换手率"]) if pd.notna(row.get("换手率")) else None,
+            }
+            if tag == "today":
+                rec["first_board_time"] = str(row.get("首次封板时间", ""))
+                rec["last_board_time"] = str(row.get("最后封板时间", ""))
+                rec["break_count"] = int(row["炸板次数"]) if pd.notna(row.get("炸板次数")) else 0
+                rec["board_amount"] = float(row["封板资金"]) if pd.notna(row.get("封板资金")) else None
+            records.append(rec)
+        return records
+
+    @staticmethod
+    def _count_industry(df: pd.DataFrame) -> Dict[str, int]:
+        if df.empty or "所属行业" not in df.columns:
+            return {}
+        counts = df["所属行业"].astype(str).value_counts().to_dict()
+        return {k: int(v) for k, v in counts.items() if k and k.lower() != "nan"}
+
     def get_stock_concepts(self, stock_code: str) -> str:
         code = str(stock_code or "").strip().zfill(6)
         if not code:

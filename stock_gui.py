@@ -312,6 +312,7 @@ class StockMonitorApp:
         self.setup_result_tab()
         self.setup_detail_tab()
         self.setup_intraday_tab()
+        self.setup_limit_up_compare_tab()
         self.setup_log_tab()
 
     def setup_result_tab(self):
@@ -848,6 +849,238 @@ class StockMonitorApp:
         self.intraday_canvas = FigureCanvasTkAgg(self.intraday_fig, master=chart_frame)
         self.intraday_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._draw_intraday_loading("点击详情页 K 线打开分时")
+
+    # ================= 涨停对比 Tab =================
+    def setup_limit_up_compare_tab(self):
+        compare_frame = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(compare_frame, text="涨停对比")
+
+        # ---- 操作栏 ----
+        action_bar = ttk.Frame(compare_frame)
+        action_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(action_bar, text="获取涨停对比", command=self._start_limit_up_compare).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="今日:").pack(side=tk.LEFT, padx=(12, 2))
+        self._zt_today_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
+        ttk.Entry(action_bar, textvariable=self._zt_today_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="昨日:").pack(side=tk.LEFT, padx=(8, 2))
+        self._zt_yesterday_var = tk.StringVar()
+        ttk.Entry(action_bar, textvariable=self._zt_yesterday_var, width=10).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="(昨日留空自动推断)").pack(side=tk.LEFT, padx=4)
+
+        # ---- 主区域：左侧摘要 + 右侧表格 ----
+        body = ttk.PanedWindow(compare_frame, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左侧：摘要面板
+        summary_frame = ttk.LabelFrame(body, text="对比摘要", padding="6")
+        self._zt_summary_text = scrolledtext.ScrolledText(summary_frame, width=40, height=30, wrap=tk.WORD)
+        self._zt_summary_text.pack(fill=tk.BOTH, expand=True)
+        self._zt_summary_text.insert(tk.END, "点击「获取涨停对比」开始分析")
+        self._zt_summary_text.config(state=tk.DISABLED)
+        body.add(summary_frame, weight=1)
+
+        # 右侧：今日首板 / 昨日首板表格（Notebook 切换）
+        table_frame = ttk.Frame(body)
+        self._zt_table_nb = ttk.Notebook(table_frame)
+        self._zt_table_nb.pack(fill=tk.BOTH, expand=True)
+
+        # 今日首板 Tab
+        today_tab = ttk.Frame(self._zt_table_nb)
+        self._zt_table_nb.add(today_tab, text="今日首板")
+        zt_cols_today = ("code", "name", "industry", "change_pct", "close", "first_time", "break_count", "turnover")
+        self._zt_today_tree = ttk.Treeview(today_tab, columns=zt_cols_today, show="headings", height=20)
+        for col, (heading, w) in {
+            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
+            "change_pct": ("涨跌幅%", 80), "close": ("最新价", 80),
+            "first_time": ("首封时间", 80), "break_count": ("炸板", 60), "turnover": ("换手率%", 80),
+        }.items():
+            self._zt_today_tree.heading(col, text=heading)
+            self._zt_today_tree.column(col, width=w, anchor=tk.CENTER)
+        sb1 = ttk.Scrollbar(today_tab, orient=tk.VERTICAL, command=self._zt_today_tree.yview)
+        self._zt_today_tree.configure(yscrollcommand=sb1.set)
+        sb1.pack(side=tk.RIGHT, fill=tk.Y)
+        self._zt_today_tree.pack(fill=tk.BOTH, expand=True)
+
+        # 昨日首板 Tab
+        yest_tab = ttk.Frame(self._zt_table_nb)
+        self._zt_table_nb.add(yest_tab, text="昨日首板今日表现")
+        zt_cols_yest = ("code", "name", "industry", "today_chg", "close", "still_zt", "status")
+        self._zt_yest_tree = ttk.Treeview(yest_tab, columns=zt_cols_yest, show="headings", height=20)
+        for col, (heading, w) in {
+            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
+            "today_chg": ("今日涨跌%", 90), "close": ("最新价", 80),
+            "still_zt": ("继续涨停", 80), "status": ("状态", 80),
+        }.items():
+            self._zt_yest_tree.heading(col, text=heading)
+            self._zt_yest_tree.column(col, width=w, anchor=tk.CENTER)
+        sb2 = ttk.Scrollbar(yest_tab, orient=tk.VERTICAL, command=self._zt_yest_tree.yview)
+        self._zt_yest_tree.configure(yscrollcommand=sb2.set)
+        sb2.pack(side=tk.RIGHT, fill=tk.Y)
+        self._zt_yest_tree.pack(fill=tk.BOTH, expand=True)
+
+        # 新增首板 Tab
+        new_tab = ttk.Frame(self._zt_table_nb)
+        self._zt_table_nb.add(new_tab, text="今日新增首板")
+        self._zt_new_tree = ttk.Treeview(new_tab, columns=zt_cols_today, show="headings", height=20)
+        for col, (heading, w) in {
+            "code": ("代码", 80), "name": ("名称", 100), "industry": ("行业", 100),
+            "change_pct": ("涨跌幅%", 80), "close": ("最新价", 80),
+            "first_time": ("首封时间", 80), "break_count": ("炸板", 60), "turnover": ("换手率%", 80),
+        }.items():
+            self._zt_new_tree.heading(col, text=heading)
+            self._zt_new_tree.column(col, width=w, anchor=tk.CENTER)
+        sb3 = ttk.Scrollbar(new_tab, orient=tk.VERTICAL, command=self._zt_new_tree.yview)
+        self._zt_new_tree.configure(yscrollcommand=sb3.set)
+        sb3.pack(side=tk.RIGHT, fill=tk.Y)
+        self._zt_new_tree.pack(fill=tk.BOTH, expand=True)
+
+        body.add(table_frame, weight=3)
+
+        self._zt_compare_thread = None
+        self._zt_compare_result: Optional[Dict[str, Any]] = None
+
+    def _estimate_yesterday(self, today_str: str) -> str:
+        """根据今日日期估算上一个交易日。"""
+        from datetime import timedelta
+        try:
+            d = datetime.strptime(today_str.strip(), "%Y%m%d").date()
+        except (ValueError, TypeError):
+            d = datetime.now().date()
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:  # skip weekend
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d")
+
+    def _start_limit_up_compare(self):
+        if self._zt_compare_thread is not None and self._zt_compare_thread.is_alive():
+            return
+        today = self._zt_today_var.get().strip()
+        if not today:
+            today = datetime.now().strftime("%Y%m%d")
+            self._zt_today_var.set(today)
+        yesterday = self._zt_yesterday_var.get().strip()
+        if not yesterday:
+            yesterday = self._estimate_yesterday(today)
+            self._zt_yesterday_var.set(yesterday)
+
+        self._zt_summary_text.config(state=tk.NORMAL)
+        self._zt_summary_text.delete("1.0", tk.END)
+        self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停对比数据...\n")
+        self._zt_summary_text.config(state=tk.DISABLED)
+        self.status_var.set("正在获取涨停对比...")
+
+        self._zt_compare_thread = threading.Thread(
+            target=self._load_limit_up_compare, args=(today, yesterday), daemon=True
+        )
+        self._zt_compare_thread.start()
+
+    def _load_limit_up_compare(self, today: str, yesterday: str):
+        try:
+            result = self.stock_filter.fetcher.compare_limit_up_pools(today, yesterday)
+            self.root.after(0, lambda r=result: self._apply_limit_up_compare(r))
+        except Exception as e:
+            err = str(e)
+            self.root.after(0, lambda: self._zt_show_error(f"涨停对比失败: {err}"))
+
+    def _zt_show_error(self, msg: str):
+        self._zt_summary_text.config(state=tk.NORMAL)
+        self._zt_summary_text.delete("1.0", tk.END)
+        self._zt_summary_text.insert(tk.END, msg)
+        self._zt_summary_text.config(state=tk.DISABLED)
+        self.status_var.set("涨停对比失败")
+
+    def _apply_limit_up_compare(self, result: Dict[str, Any]):
+        self._zt_compare_result = result
+
+        # ---- 填充摘要 ----
+        self._zt_summary_text.config(state=tk.NORMAL)
+        self._zt_summary_text.delete("1.0", tk.END)
+        summary = result.get("summary", "")
+        self._zt_summary_text.insert(tk.END, summary + "\n")
+
+        # 行业分布详情
+        ind_today = result.get("industry_today", {})
+        ind_yest = result.get("industry_yesterday", {})
+        ind_new = result.get("industry_new", {})
+        if ind_today:
+            self._zt_summary_text.insert(tk.END, "\n── 今日首板行业分布 ──\n")
+            for k, v in sorted(ind_today.items(), key=lambda x: -x[1]):
+                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
+        if ind_yest:
+            self._zt_summary_text.insert(tk.END, "\n── 昨日首板行业分布 ──\n")
+            for k, v in sorted(ind_yest.items(), key=lambda x: -x[1]):
+                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
+        if ind_new:
+            self._zt_summary_text.insert(tk.END, "\n── 今日新增首板行业 ──\n")
+            for k, v in sorted(ind_new.items(), key=lambda x: -x[1]):
+                self._zt_summary_text.insert(tk.END, f"  {k}: {v} 只\n")
+
+        # 晋级明细
+        continued = result.get("continued_codes", [])
+        lost = result.get("lost_codes", [])
+        if continued:
+            self._zt_summary_text.insert(tk.END, f"\n── 昨日首板→今日继续涨停 ({len(continued)}) ──\n")
+            self._zt_summary_text.insert(tk.END, "  " + ", ".join(continued) + "\n")
+        if lost:
+            self._zt_summary_text.insert(tk.END, f"\n── 昨日首板→今日未涨停 ({len(lost)}) ──\n")
+            self._zt_summary_text.insert(tk.END, "  " + ", ".join(lost) + "\n")
+
+        self._zt_summary_text.config(state=tk.DISABLED)
+
+        # ---- 填充今日首板表格 ----
+        new_codes_set = set(result.get("new_codes", []))
+        self._zt_today_tree.delete(*self._zt_today_tree.get_children())
+        self._zt_new_tree.delete(*self._zt_new_tree.get_children())
+        for rec in result.get("today_first", []):
+            ft = str(rec.get("first_time", "") or "")
+            if len(ft) >= 4:
+                ft = ft[:2] + ":" + ft[2:4] if len(ft) <= 4 else ft[:2] + ":" + ft[2:4] + ":" + ft[4:]
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                ft,
+                str(rec.get("break_count", 0)),
+                f"{rec['turnover']:.2f}" if rec.get("turnover") is not None else "-",
+            )
+            self._zt_today_tree.insert("", tk.END, values=vals)
+            if rec.get("code", "") in new_codes_set:
+                self._zt_new_tree.insert("", tk.END, values=vals)
+
+        # ---- 填充昨日首板今日表现表格 ----
+        self._zt_yest_tree.delete(*self._zt_yest_tree.get_children())
+        yest_first = result.get("yesterday_first", [])
+        perf_map = {}
+        for p in result.get("yesterday_first_today_performance", []):
+            perf_map[p["code"]] = p
+        for rec in yest_first:
+            code = rec.get("code", "")
+            perf = perf_map.get(code, {})
+            chg = perf.get("change_pct")
+            close = perf.get("close")
+            still = perf.get("still_limit_up", False)
+            if still:
+                status = "晋级"
+            elif chg is not None and chg > 0:
+                status = "高开"
+            elif chg is not None and chg < -3:
+                status = "大跌"
+            else:
+                status = "平开"
+            vals = (
+                code,
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{chg:.2f}" if chg is not None else "-",
+                f"{close:.2f}" if close is not None else rec.get("close", "-"),
+                "是" if still else "否",
+                status,
+            )
+            self._zt_yest_tree.insert("", tk.END, values=vals)
+
+        self.status_var.set("涨停对比完成")
 
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
