@@ -5,8 +5,8 @@ from typing import Dict, Tuple
 
 DATA_SOURCE_OPTIONS: Dict[str, Tuple[str, ...]] = {
     "history": ("auto", "eastmoney", "tencent", "sina"),
-    "intraday": ("auto", "eastmoney", "legacy"),
-    "fund_flow": ("auto", "eastmoney"),
+    "intraday": ("auto", "eastmoney", "sina"),
+    "fund_flow": ("auto", "eastmoney", "ths"),
     "limit_up_reason": ("auto", "eastmoney"),
 }
 

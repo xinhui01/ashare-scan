@@ -1486,6 +1486,59 @@ def _find_fund_flow_column(columns: List[str], includes: List[str], excludes: Op
             return col
     return None
 
+
+def _parse_cn_numeric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    text = str(value).strip().replace(",", "")
+    if not text or text.lower() == "nan":
+        return None
+    multiplier = 1.0
+    if text.endswith("%"):
+        text = text[:-1]
+    if text.endswith("亿"):
+        multiplier = 1e8
+        text = text[:-1]
+    elif text.endswith("万"):
+        multiplier = 1e4
+        text = text[:-1]
+    try:
+        return float(text) * multiplier
+    except Exception:
+        return None
+
+
+def _fetch_ths_fund_flow_frame(stock_code: str):
+    candidates = (
+        ("stock_fund_flow_individual", ("symbol",)),
+        ("stock_fund_flow_individual", ("stock",)),
+        ("stock_individual_fund_flow_ths", ("symbol",)),
+        ("stock_individual_fund_flow_ths", ("stock",)),
+    )
+    last_error: Optional[Exception] = None
+    for func_name, arg_names in candidates:
+        fn = getattr(ak, func_name, None)
+        if fn is None:
+            continue
+        kwargs = {}
+        for arg_name in arg_names:
+            kwargs[arg_name] = stock_code
+        try:
+            df = _retry_ak_call(fn, **kwargs)
+            if df is not None and not getattr(df, "empty", True):
+                return df
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("ths-fund-flow-function-unavailable")
+
 def clear_universe_data() -> None:
     """清空已保存的股票池和扫描快照。"""
     clear_universe_store()
@@ -2022,7 +2075,10 @@ class StockDataFetcher:
         return self._normalize_source("history", source)
 
     def normalize_intraday_source(self, source: str) -> str:
-        return self._normalize_source("intraday", source)
+        value = str(source or "auto").strip().lower()
+        if value == "legacy":
+            value = "sina"
+        return self._normalize_source("intraday", value)
 
     def normalize_fund_flow_source(self, source: str) -> str:
         return self._normalize_source("fund_flow", source)
@@ -2090,7 +2146,7 @@ class StockDataFetcher:
         days: int = 60,
         source: Optional[str] = None,
         workers: Optional[int] = None,
-        progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
+        progress_callback: Optional[Callable[[int, int, str, str, int, int, int], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         refresh_universe: bool = False,
         allowed_boards: Optional[List[str]] = None,
@@ -2172,7 +2228,7 @@ class StockDataFetcher:
                 else:
                     failed += 1
                 if progress_callback:
-                    progress_callback(completed, total, code, name)
+                    progress_callback(completed, total, code, name, updated, failed, skipped)
 
         return {
             "total": total,
@@ -2186,15 +2242,17 @@ class StockDataFetcher:
         normalized = self.normalize_intraday_source(source)
         if normalized == "eastmoney":
             return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="intraday-provider=eastmoney")
-        if normalized == "legacy":
-            return DataProviderPlan(mode="network", provider_sequence=("legacy",), reason="intraday-provider=legacy")
-        return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "legacy"), reason="intraday-provider=auto")
+        if normalized == "sina":
+            return DataProviderPlan(mode="network", provider_sequence=("sina",), reason="intraday-provider=sina")
+        return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "sina"), reason="intraday-provider=auto")
 
     def build_fund_flow_request_plan(self, source: str = "auto") -> DataProviderPlan:
         normalized = self.normalize_fund_flow_source(source)
         if normalized == "eastmoney":
             return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=eastmoney")
-        return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=auto")
+        if normalized == "ths":
+            return DataProviderPlan(mode="network", provider_sequence=("ths",), reason="fund-flow-provider=ths")
+        return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "ths"), reason="fund-flow-provider=auto")
 
     def build_limit_up_reason_plan(self, source: str = "auto") -> DataProviderPlan:
         normalized = self.normalize_limit_up_reason_source(source)
@@ -2531,6 +2589,27 @@ class StockDataFetcher:
                 self._log(f"昨日涨停池 {date_key} 获取失败: {e}")
         return pd.DataFrame()
 
+    def _recent_trade_dates(self, end_date: str, count: int) -> List[str]:
+        date_key = self._normalize_trade_date(end_date)
+        if not date_key:
+            return []
+        try:
+            cursor = datetime.strptime(date_key, "%Y%m%d").date()
+        except ValueError:
+            return []
+
+        target = max(1, int(count))
+        dates: List[str] = []
+        checked = 0
+        max_checked = max(target * 7, 20)
+        while len(dates) < target and checked < max_checked:
+            if cursor.weekday() < 5:
+                dates.append(cursor.strftime("%Y%m%d"))
+            cursor -= timedelta(days=1)
+            checked += 1
+        dates.reverse()
+        return dates
+
     def compare_limit_up_pools(
         self,
         today_date: str,
@@ -2651,6 +2730,81 @@ class StockDataFetcher:
             self._log(result["summary"])
         return result
 
+    def compare_limit_up_pools_window(
+        self,
+        today_date: str,
+        compare_days: int = 2,
+    ) -> Dict[str, Any]:
+        window_days = max(2, int(compare_days or 2))
+        trade_dates = self._recent_trade_dates(today_date, window_days)
+        if len(trade_dates) < 2:
+            fallback_today = self._normalize_trade_date(today_date)
+            fallback_prev = self._recent_trade_dates(today_date, 2)
+            if len(fallback_prev) >= 2:
+                trade_dates = fallback_prev
+            elif fallback_today:
+                trade_dates = [fallback_today, fallback_today]
+            else:
+                trade_dates = []
+        if len(trade_dates) < 2:
+            return {
+                "today_date": str(today_date or ""),
+                "yesterday_date": "",
+                "compare_days": 0,
+                "trade_dates": [],
+                "daily_stats": [],
+                "summary": "未能解析有效交易日范围",
+            }
+
+        result = self.compare_limit_up_pools(trade_dates[-1], trade_dates[-2])
+        daily_stats: List[Dict[str, Any]] = []
+        for trade_date in trade_dates:
+            pool_df = self.get_limit_up_pool(trade_date)
+            first_df = pd.DataFrame()
+            if not pool_df.empty and "连板数" in pool_df.columns:
+                first_df = pool_df[pool_df["连板数"] == 1].copy()
+            industry_top = sorted(self._count_industry(first_df).items(), key=lambda x: -x[1])[:3]
+            daily_stats.append(
+                {
+                    "trade_date": trade_date,
+                    "pool_count": int(len(pool_df)),
+                    "first_count": int(len(first_df)),
+                    "top_industries": industry_top,
+                }
+            )
+
+        first_counts = [item["first_count"] for item in daily_stats]
+        avg_first = sum(first_counts) / len(first_counts) if first_counts else 0.0
+        max_day = max(daily_stats, key=lambda item: item["first_count"]) if daily_stats else None
+        min_day = min(daily_stats, key=lambda item: item["first_count"]) if daily_stats else None
+        latest_delta = 0
+        if len(daily_stats) >= 2:
+            latest_delta = int(daily_stats[-1]["first_count"] - daily_stats[-2]["first_count"])
+
+        summary_lines = [result.get("summary", "")]
+        summary_lines.append("")
+        summary_lines.append(f"最近 {len(trade_dates)} 个交易日首板概览:")
+        for item in daily_stats:
+            industries_text = "、".join(f"{name}({count})" for name, count in item["top_industries"]) or "-"
+            summary_lines.append(
+                f"{item['trade_date']}: 涨停 {item['pool_count']} 只，首板 {item['first_count']} 只，TOP行业 {industries_text}"
+            )
+        summary_lines.append(f"近{len(trade_dates)}日首板均值: {avg_first:.1f} 只")
+        if max_day is not None and min_day is not None:
+            summary_lines.append(
+                f"首板高点/低点: {max_day['trade_date']} ({max_day['first_count']}只) / "
+                f"{min_day['trade_date']} ({min_day['first_count']}只)"
+            )
+        if len(daily_stats) >= 2:
+            sign = "+" if latest_delta > 0 else ""
+            summary_lines.append(f"今日较前一交易日首板变化: {sign}{latest_delta} 只")
+
+        result["compare_days"] = len(trade_dates)
+        result["trade_dates"] = trade_dates
+        result["daily_stats"] = daily_stats
+        result["summary"] = "\n".join(line for line in summary_lines if line is not None)
+        return result
+
     def _pool_to_records(self, df: pd.DataFrame, tag: str) -> List[Dict[str, Any]]:
         """将涨停池 DataFrame 转为标准记录列表。"""
         records = []
@@ -2736,6 +2890,21 @@ class StockDataFetcher:
                     last_error = e
                     if self._log:
                         self._log(f"个股资金流 {code} 获取失败: {e}")
+            elif provider == "ths":
+                try:
+                    if self._log:
+                        self._log(f"个股资金流 {code} 正在使用同花顺源补位。")
+                    flow_df = _fetch_ths_fund_flow_frame(code)
+                    if flow_df is not None and not flow_df.empty:
+                        flow_df = flow_df.copy()
+                        today_text = datetime.now().strftime("%Y-%m-%d")
+                        if "日期" not in flow_df.columns and "date" not in flow_df.columns and "交易日" not in flow_df.columns:
+                            flow_df["日期"] = today_text
+                        break
+                except Exception as e:
+                    last_error = e
+                    if self._log:
+                        self._log(f"个股资金流 {code} 使用同花顺源失败: {e}")
         if flow_df is None:
             return None
         if flow_df is None or flow_df.empty:
@@ -2799,7 +2968,7 @@ class StockDataFetcher:
             "super_big_order_ratio",
         ]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = df[col].map(_parse_cn_numeric)
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         _save_fund_flow_store(code, df, keep_rows=max(60, days + 10))
         return df.tail(days).reset_index(drop=True)
@@ -3068,13 +3237,13 @@ class StockDataFetcher:
                     last_error = e
                     if self._log:
                         self._log(f"分时行情(东财) {code} 获取失败: {e}")
-            elif provider == "legacy":
+            elif provider == "sina":
                 try:
                     raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=code, period="1")
                 except Exception as e:
                     last_error = e
                     if self._log:
-                        self._log(f"分时行情(备用源) {code} 获取失败: {e}")
+                        self._log(f"分时行情(新浪) {code} 获取失败: {e}")
             if raw is not None and not getattr(raw, "empty", True):
                 break
 

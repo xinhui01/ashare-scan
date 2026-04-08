@@ -17,13 +17,22 @@ import tkinter as tk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
-from tkinter import ttk, messagebox, scrolledtext, filedialog
+from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 
 from scan_models import FilterSettings, ScanRequest
 from data_source_models import DATA_SOURCE_OPTIONS
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
-from stock_store import ensure_store_ready, load_latest_scan_snapshot, load_scan_snapshot, save_scan_snapshot
+from stock_store import (
+    ensure_store_ready,
+    load_latest_scan_snapshot,
+    load_scan_snapshot,
+    save_scan_snapshot,
+    save_watchlist_item,
+    load_watchlist,
+    load_watchlist_item,
+    delete_watchlist_item,
+)
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -72,7 +81,7 @@ class StockMonitorApp:
         self._detail_summary_expanded = False
         self._detail_chart_expanded = True
         self._detail_flow_expanded = False
-        self.sort_column = "five_day_return"
+        self.sort_column = "score"
         self.sort_reverse = True
         self.is_scanning = False
         self.is_updating_cache = False
@@ -82,6 +91,7 @@ class StockMonitorApp:
         self._run_log_file: Optional[Path] = None
         self._current_scan_allowed_boards: List[str] = []
         self._current_scan_max_stocks: int = 0
+        self.watchlist_items: Dict[str, Dict[str, Any]] = {}
         self.result_columns: tuple[str, ...] = ()
         self.result_headings: Dict[str, tuple[str, int]] = {}
         self.result_column_vars: Dict[str, tk.BooleanVar] = {}
@@ -90,6 +100,7 @@ class StockMonitorApp:
         self.result_layout_path = Path("data") / "result_columns.json"
         self.board_filter_layout_path = Path("data") / "board_filters.json"
         self.app_settings_path = Path("data") / "app_settings.json"
+        self.limit_up_compare_snapshot_path = Path("data") / "limit_up_compare_snapshot.json"
         self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._main_thread_id = threading.get_ident()
         self._is_closing = False
@@ -101,6 +112,8 @@ class StockMonitorApp:
         self._load_board_filter_layout()
         self.apply_result_display_columns(save=False)
         self._load_last_results()
+        self._load_last_limit_up_compare()
+        self._load_watchlist_items()
         self.root.after(100, self._drain_log_queue)
 
     def _set_initial_window_geometry(self) -> None:
@@ -300,7 +313,6 @@ class StockMonitorApp:
         control_frame = ttk.LabelFrame(parent, text="控制面板", padding="10")
         control_frame.pack(fill=tk.X, pady=5)
         self._build_control_scan_params_row(control_frame)
-        self._build_control_scan_params_note_row(control_frame)
         self._build_control_actions_row(control_frame)
         self._build_control_board_filter_row(control_frame)
         self._build_control_price_filter_row(control_frame)
@@ -313,6 +325,7 @@ class StockMonitorApp:
         self.setup_detail_tab()
         self.setup_intraday_tab()
         self.setup_limit_up_compare_tab()
+        self.setup_watchlist_tab()
         self.setup_log_tab()
 
     def setup_result_tab(self):
@@ -323,6 +336,8 @@ class StockMonitorApp:
         action_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(action_frame, text="导出结果图片", command=self.export_results_image).pack(side=tk.LEFT)
         ttk.Button(action_frame, text="复制代码", command=self.copy_selected_stock_code_name).pack(side=tk.LEFT, padx=8)
+        ttk.Button(action_frame, text="加入自选", command=self.add_selected_result_to_watchlist).pack(side=tk.LEFT, padx=8)
+        ttk.Button(action_frame, text="移除自选", command=self.remove_selected_result_from_watchlist).pack(side=tk.LEFT)
         ttk.Label(
             action_frame,
             text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
@@ -331,6 +346,8 @@ class StockMonitorApp:
         self.result_columns = (
             "code",
             "name",
+            "watch",
+            "score",
             "board",
             "latest_close",
             "latest_ma",
@@ -354,6 +371,8 @@ class StockMonitorApp:
         self.result_headings = {
             "code": ("代码", 90),
             "name": ("名称", 140),
+            "watch": ("自选", 60),
+            "score": ("评分", 70),
             "board": ("板块", 120),
             "latest_close": ("最新收盘", 100),
             "latest_ma": ("MA", 100),
@@ -370,6 +389,8 @@ class StockMonitorApp:
         default_visible_columns = (
             "code",
             "name",
+            "watch",
+            "score",
             "board",
             "latest_close",
             "latest_ma",
@@ -391,7 +412,10 @@ class StockMonitorApp:
         for col in self.result_columns:
             text, width = self.result_headings[col]
             self.result_tree.heading(col, text=text, command=lambda c=col: self.on_result_heading_click(c))
-            self.result_tree.column(col, width=width, anchor=tk.CENTER)
+            anchor = tk.CENTER
+            if col == "name":
+                anchor = tk.W
+            self.result_tree.column(col, width=width, anchor=anchor)
         self.result_tree.configure(displaycolumns=default_visible_columns)
 
         scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.result_tree.yview)
@@ -474,6 +498,8 @@ class StockMonitorApp:
         if source in DATA_SOURCE_OPTIONS["history"]:
             self.history_source_var.set(source)
         intraday_source = str(payload.get("intraday_source") or "auto").strip().lower() or "auto"
+        if intraday_source == "legacy":
+            intraday_source = "sina"
         if intraday_source in DATA_SOURCE_OPTIONS["intraday"]:
             self.intraday_source_var.set(intraday_source)
         fund_flow_source = str(payload.get("fund_flow_source") or "auto").strip().lower() or "auto"
@@ -488,6 +514,37 @@ class StockMonitorApp:
         self.stock_filter.set_intraday_source_preference(self.intraday_source_var.get())
         self.stock_filter.set_fund_flow_source_preference(self.fund_flow_source_var.get())
         self.stock_filter.set_limit_up_reason_source_preference(self.limit_up_reason_source_var.get())
+
+    def _save_limit_up_compare_snapshot(self, result: Dict[str, Any]) -> None:
+        self.limit_up_compare_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "result": result,
+        }
+        self.limit_up_compare_snapshot_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _load_last_limit_up_compare(self) -> None:
+        if not self.limit_up_compare_snapshot_path.exists():
+            return
+        try:
+            payload = json.loads(self.limit_up_compare_snapshot_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            return
+        today_date = str(result.get("today_date") or "").strip()
+        yesterday_date = str(result.get("yesterday_date") or "").strip()
+        compare_days = int(result.get("compare_days", 2) or 2)
+        if today_date:
+            self._zt_today_var.set(today_date)
+        if yesterday_date:
+            self._zt_yesterday_var.set(yesterday_date)
+        self._zt_compare_days_var.set(str(max(2, compare_days)))
+        self._apply_limit_up_compare(result, persist=False, status_message="已从本地恢复涨停对比")
 
     def _save_result_column_layout(self) -> None:
         self.result_layout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -547,10 +604,14 @@ class StockMonitorApp:
         recent = analysis.get("recent_closes") or []
         five_day_return = analysis.get("five_day_return")
         volume_expand_ratio = analysis.get("volume_expand_ratio")
+        code = str(result.get("code", "") or "").strip().zfill(6)
+        watch_item = self.watchlist_items.get(code) or {}
 
         return {
             "code": str(result.get("code", "-") or "-"),
             "name": str(result.get("name", "-") or "-"),
+            "watch": "自选" if watch_item else "",
+            "score": "-" if analysis.get("score") is None else str(int(analysis.get("score") or 0)),
             "board": str(data.get("board") or data.get("exchange") or "-"),
             "latest_close": "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
             "latest_ma": "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
@@ -583,6 +644,67 @@ class StockMonitorApp:
         if not stock_code or not stock_name:
             return None
         return stock_code, stock_name
+
+    def _load_watchlist_items(self) -> None:
+        items = load_watchlist()
+        self.watchlist_items = {
+            str(item.get("code", "") or "").strip().zfill(6): dict(item)
+            for item in items
+            if str(item.get("code", "") or "").strip()
+        }
+        if hasattr(self, "_watch_tree"):
+            self.refresh_watchlist_view()
+        if self.filtered_stocks:
+            self.update_result_table(self.filtered_stocks, announce=False, persist=False)
+
+    def _lookup_result_by_code(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return None
+        for result in self.all_scan_results:
+            if str(result.get("code", "") or "").strip().zfill(6) == code:
+                return result
+        for result in self.filtered_stocks:
+            if str(result.get("code", "") or "").strip().zfill(6) == code:
+                return result
+        return None
+
+    def _build_watchlist_item_payload(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        status: str = "",
+        note: Optional[str] = None,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        code = str(stock_code or "").strip().zfill(6)
+        existing = self.watchlist_items.get(code, {})
+        result = self._lookup_result_by_code(code)
+        data = result.get("data", {}) if result else {}
+        analysis = data.get("analysis") if data else {}
+        board = data.get("board", "") if data else ""
+
+        if detail:
+            analysis = detail.get("analysis") or analysis or {}
+            board = detail.get("board", "") or board
+            stock_name = stock_name or str(detail.get("name", "") or "")
+        elif result:
+            stock_name = stock_name or str(result.get("name", "") or "")
+
+        payload = {
+            "code": code,
+            "name": stock_name or existing.get("name", ""),
+            "status": status or existing.get("status", "") or "观察",
+            "note": existing.get("note", "") if note is None else note,
+            "board": board or existing.get("board", ""),
+            "latest_close": analysis.get("latest_close") if isinstance(analysis, dict) else existing.get("latest_close"),
+            "score": analysis.get("score") if isinstance(analysis, dict) else existing.get("score"),
+            "score_breakdown": (
+                analysis.get("score_breakdown", "") if isinstance(analysis, dict) else existing.get("score_breakdown", "")
+            ),
+            "added_at": existing.get("added_at", ""),
+        }
+        return payload
 
     def show_column_picker(self) -> None:
         picker = tk.Toplevel(self.root)
@@ -664,6 +786,8 @@ class StockMonitorApp:
             core = {
                 "code",
                 "name",
+                "watch",
+                "score",
                 "board",
                 "latest_close",
                 "latest_ma",
@@ -712,6 +836,18 @@ class StockMonitorApp:
             command=self.toggle_detail_summary_section,
         )
         self.detail_summary_toggle_btn.pack(side=tk.LEFT)
+        self.detail_watch_btn = ttk.Button(
+            info_header,
+            text="加入自选",
+            command=self.toggle_current_detail_watchlist,
+        )
+        self.detail_watch_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.detail_watch_note_btn = ttk.Button(
+            info_header,
+            text="编辑备注",
+            command=self.edit_current_detail_watch_note,
+        )
+        self.detail_watch_note_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.detail_summary_status_var = tk.StringVar(value="历史摘要已收起")
         ttk.Label(info_header, textvariable=self.detail_summary_status_var).pack(side=tk.LEFT, padx=10)
 
@@ -726,6 +862,8 @@ class StockMonitorApp:
             ("latest_date", "最新日期"),
             ("quote_time", "刷新时间"),
             ("latest_close", "最新收盘"),
+            ("score", "综合评分"),
+            ("watch_status", "自选状态"),
             ("latest_ma", f"MA{max(1, int(self.stock_filter.ma_period))}"),
             ("latest_ma10", "MA10"),
             ("latest_volume", "成交量"),
@@ -855,6 +993,14 @@ class StockMonitorApp:
         compare_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(compare_frame, text="涨停对比")
 
+        style = ttk.Style()
+        style.configure("ZT.Treeview", rowheight=24)
+        style.map(
+            "ZT.Treeview",
+            background=[("selected", "#2f6fd6")],
+            foreground=[("selected", "#ffffff")],
+        )
+
         # ---- 操作栏 ----
         action_bar = ttk.Frame(compare_frame)
         action_bar.pack(fill=tk.X, pady=(0, 6))
@@ -865,7 +1011,10 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="昨日:").pack(side=tk.LEFT, padx=(8, 2))
         self._zt_yesterday_var = tk.StringVar()
         ttk.Entry(action_bar, textvariable=self._zt_yesterday_var, width=10).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(昨日留空自动推断)").pack(side=tk.LEFT, padx=4)
+        ttk.Label(action_bar, text="对比天数:").pack(side=tk.LEFT, padx=(10, 2))
+        self._zt_compare_days_var = tk.StringVar(value="2")
+        ttk.Entry(action_bar, textvariable=self._zt_compare_days_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="(>2 时自动回看最近N个交易日)").pack(side=tk.LEFT, padx=4)
         self._zt_status_label = ttk.Label(action_bar, text="")
         self._zt_status_label.pack(side=tk.RIGHT, padx=8)
 
@@ -897,11 +1046,18 @@ class StockMonitorApp:
         pattern_tab = ttk.Frame(self._zt_table_nb)
         self._zt_table_nb.add(pattern_tab, text="今日涨停形态分类")
         zt_pattern_cols = ("code", "name", "industry", "pattern", "change_pct", "close",
-                           "dist_ma5", "trend_10d", "pos_60d", "detail")
-        self._zt_pattern_tree = ttk.Treeview(pattern_tab, columns=zt_pattern_cols, show="headings", height=22)
+                           "burst", "dist_ma5", "trend_10d", "pos_60d", "detail")
+        self._zt_pattern_tree = ttk.Treeview(
+            pattern_tab,
+            columns=zt_pattern_cols,
+            show="headings",
+            height=22,
+            style="ZT.Treeview",
+        )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
             "pattern": ("技术形态", 110), "change_pct": ("涨跌幅%", 70), "close": ("最新价", 70),
+            "burst": ("放量倍数", 80),
             "dist_ma5": ("距MA5%", 70), "trend_10d": ("10日涨幅%", 80),
             "pos_60d": ("60日分位%", 80), "detail": ("形态说明", 220),
         }.items():
@@ -911,19 +1067,29 @@ class StockMonitorApp:
         self._zt_pattern_tree.configure(yscrollcommand=sb_p.set)
         sb_p.pack(side=tk.RIGHT, fill=tk.Y)
         self._zt_pattern_tree.pack(fill=tk.BOTH, expand=True)
+        self._zt_pattern_tree.bind("<<TreeviewSelect>>", self.on_zt_stock_select)
+        self._zt_pattern_tree.bind("<Double-1>", self.on_zt_stock_double_click)
         # 行标签色
-        self._zt_pattern_tree.tag_configure("pat_ma5", background="#e8f5e9")
-        self._zt_pattern_tree.tag_configure("pat_oversold", background="#fff3e0")
-        self._zt_pattern_tree.tag_configure("pat_trend", background="#e3f2fd")
-        self._zt_pattern_tree.tag_configure("pat_streak", background="#fce4ec")
-        self._zt_pattern_tree.tag_configure("pat_breakout", background="#f3e5f5")
-        self._zt_pattern_tree.tag_configure("pat_lowpos", background="#e0f7fa")
+        self._zt_pattern_tree.tag_configure("pat_ma5", background="#e8f5e9", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_oversold", background="#fff3e0", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_trend", background="#e3f2fd", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_streak", background="#fce4ec", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_breakout", background="#f3e5f5", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_lowpos", background="#e0f7fa", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_burst", background="#ffe9d6", foreground="#1f1f1f")
 
         # 昨日首板今日表现 Tab
         yest_tab = ttk.Frame(self._zt_table_nb)
+        self._zt_yest_tab = yest_tab
         self._zt_table_nb.add(yest_tab, text="昨日首板今日表现")
         zt_cols_yest = ("code", "name", "industry", "pattern", "today_chg", "close", "still_zt", "status")
-        self._zt_yest_tree = ttk.Treeview(yest_tab, columns=zt_cols_yest, show="headings", height=22)
+        self._zt_yest_tree = ttk.Treeview(
+            yest_tab,
+            columns=zt_cols_yest,
+            show="headings",
+            height=22,
+            style="ZT.Treeview",
+        )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
             "pattern": ("昨日形态", 110), "today_chg": ("今日涨跌%", 80), "close": ("最新价", 70),
@@ -935,6 +1101,8 @@ class StockMonitorApp:
         self._zt_yest_tree.configure(yscrollcommand=sb2.set)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self._zt_yest_tree.pack(fill=tk.BOTH, expand=True)
+        self._zt_yest_tree.bind("<<TreeviewSelect>>", self.on_zt_stock_select)
+        self._zt_yest_tree.bind("<Double-1>", self.on_zt_stock_double_click)
 
         body.add(table_frame, weight=4)
 
@@ -942,6 +1110,7 @@ class StockMonitorApp:
         self._zt_compare_result: Optional[Dict[str, Any]] = None
 
     _ZT_PATTERN_TAG_MAP = {
+        "暴量涨停": "pat_burst",
         "回踩MA5涨停": "pat_ma5",
         "超跌反弹涨停": "pat_oversold",
         "趋势加速涨停": "pat_trend",
@@ -968,27 +1137,41 @@ class StockMonitorApp:
         if not today:
             today = datetime.now().strftime("%Y%m%d")
             self._zt_today_var.set(today)
+        try:
+            compare_days = max(2, min(int(self._zt_compare_days_var.get().strip() or "2"), 15))
+        except ValueError:
+            compare_days = 2
+        self._zt_compare_days_var.set(str(compare_days))
         yesterday = self._zt_yesterday_var.get().strip()
-        if not yesterday:
+        if compare_days <= 2 and not yesterday:
             yesterday = self._estimate_yesterday(today)
             self._zt_yesterday_var.set(yesterday)
 
         self._zt_summary_text.config(state=tk.NORMAL)
         self._zt_summary_text.delete("1.0", tk.END)
-        self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停数据...\n")
+        if compare_days > 2:
+            self._zt_summary_text.insert(tk.END, f"正在获取截至 {today} 的最近 {compare_days} 个交易日涨停对比...\n")
+        else:
+            self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停数据...\n")
         self._zt_summary_text.config(state=tk.DISABLED)
         self._zt_status_label.config(text="获取涨停池...")
         self.status_var.set("正在获取涨停对比...")
 
         self._zt_compare_thread = threading.Thread(
-            target=self._load_limit_up_compare, args=(today, yesterday), daemon=True
+            target=self._load_limit_up_compare, args=(today, yesterday, compare_days), daemon=True
         )
         self._zt_compare_thread.start()
 
-    def _load_limit_up_compare(self, today: str, yesterday: str):
+    def _load_limit_up_compare(self, today: str, yesterday: str, compare_days: int):
         try:
             # 阶段1：获取涨停池对比数据
-            result = self.stock_filter.fetcher.compare_limit_up_pools(today, yesterday)
+            if compare_days > 2:
+                result = self.stock_filter.fetcher.compare_limit_up_pools_window(today, compare_days)
+            else:
+                result = self.stock_filter.fetcher.compare_limit_up_pools(today, yesterday)
+                result["compare_days"] = 2
+                result["trade_dates"] = [result.get("yesterday_date", ""), result.get("today_date", "")]
+                result["daily_stats"] = []
             self.root.after(0, lambda: self._zt_status_label.config(
                 text=f"涨停池获取完成，正在分析今日 {len(result.get('today_first', []))} 只首板形态..."
             ))
@@ -1005,10 +1188,10 @@ class StockMonitorApp:
             yesterday_first = result.get("yesterday_first", [])
             if yesterday_first:
                 self.root.after(0, lambda: self._zt_status_label.config(
-                    text=f"正在分析昨日 {len(yesterday_first)} 只首板形态..."))
+                    text=f"正在分析上一交易日 {len(yesterday_first)} 只首板形态..."))
                 def _progress2(cur, tot, info):
                     self.root.after(0, lambda c=cur, t=tot, i=info:
-                        self._zt_status_label.config(text=f"分类昨日首板 {c}/{t}: {i}"))
+                        self._zt_status_label.config(text=f"分类上一交易日首板 {c}/{t}: {i}"))
                 yesterday_classified = self.stock_filter.classify_limit_up_pool(yesterday_first, progress_callback=_progress2)
                 result["yesterday_classified"] = yesterday_classified
 
@@ -1025,10 +1208,20 @@ class StockMonitorApp:
         self._zt_status_label.config(text="")
         self.status_var.set("涨停对比失败")
 
-    def _apply_limit_up_compare(self, result: Dict[str, Any]):
+    def _apply_limit_up_compare(
+        self,
+        result: Dict[str, Any],
+        *,
+        persist: bool = True,
+        status_message: str = "涨停对比完成",
+    ):
         self._zt_compare_result = result
         today_classified = result.get("today_classified", [])
         yesterday_classified = result.get("yesterday_classified", [])
+        compare_days = int(result.get("compare_days", 2) or 2)
+        trade_dates = [d for d in result.get("trade_dates", []) if d]
+        daily_stats = result.get("daily_stats", []) or []
+        ref_label = "昨日" if compare_days <= 2 else "上一交易日"
 
         # ---- 统计形态分布 ----
         pattern_counts_today: Dict[str, int] = {}
@@ -1040,6 +1233,8 @@ class StockMonitorApp:
         for rec in yesterday_classified:
             p = rec.get("pattern", "其他涨停")
             pattern_counts_yest[p] = pattern_counts_yest.get(p, 0) + 1
+        today_burst_count = sum(1 for rec in today_classified if rec.get("is_volume_burst"))
+        yest_burst_count = sum(1 for rec in yesterday_classified if rec.get("is_volume_burst"))
 
         # ---- 填充摘要 ----
         self._zt_summary_text.config(state=tk.NORMAL)
@@ -1047,6 +1242,20 @@ class StockMonitorApp:
         txt = self._zt_summary_text
 
         txt.insert(tk.END, result.get("summary", "") + "\n")
+        if today_burst_count or yest_burst_count:
+            txt.insert(tk.END, f"今日暴量涨停: {today_burst_count} 只；{ref_label}暴量涨停: {yest_burst_count} 只\n")
+
+        if compare_days > 2 and daily_stats:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  最近 {compare_days} 个交易日逐日统计\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for item in daily_stats:
+                industries_text = "、".join(f"{name}({count})" for name, count in item.get("top_industries", [])) or "-"
+                txt.insert(
+                    tk.END,
+                    f"  {item.get('trade_date', '-')}: 涨停 {item.get('pool_count', 0):3d} 只 | "
+                    f"首板 {item.get('first_count', 0):3d} 只 | TOP行业 {industries_text}\n",
+                )
 
         txt.insert(tk.END, f"\n{'='*36}\n")
         txt.insert(tk.END, f"  今日首板形态分布 ({len(today_classified)} 只)\n")
@@ -1057,8 +1266,23 @@ class StockMonitorApp:
             txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
 
         if pattern_counts_yest:
+            all_patterns = sorted(
+                set(list(pattern_counts_today.keys()) + list(pattern_counts_yest.keys())),
+                key=lambda p: (-pattern_counts_today.get(p, 0), -pattern_counts_yest.get(p, 0), p),
+            )
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  昨日首板形态分布 ({len(yesterday_classified)} 只)\n")
+            txt.insert(tk.END, f"  各涨停类型数量对比（今日 vs {ref_label}）\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for p in all_patterns:
+                t = pattern_counts_today.get(p, 0)
+                y = pattern_counts_yest.get(p, 0)
+                delta = t - y
+                sign = "+" if delta > 0 else ""
+                txt.insert(tk.END, f"  {p:10s}  {y:2d} -> {t:2d}  ({sign}{delta})\n")
+
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            label_date = result.get("yesterday_date", trade_dates[-2] if len(trade_dates) >= 2 else "")
+            txt.insert(tk.END, f"  {ref_label}首板形态分布 ({label_date}, {len(yesterday_classified)} 只)\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for p, c in sorted(pattern_counts_yest.items(), key=lambda x: -x[1]):
                 pct = c / max(len(yesterday_classified), 1) * 100
@@ -1066,9 +1290,8 @@ class StockMonitorApp:
                 txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
 
             # 形态变化对比
-            all_patterns = sorted(set(list(pattern_counts_today.keys()) + list(pattern_counts_yest.keys())))
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, "  形态变化（今日 vs 昨日）\n")
+            txt.insert(tk.END, f"  形态变化（今日 vs {ref_label}）\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for p in all_patterns:
                 t = pattern_counts_today.get(p, 0)
@@ -1085,17 +1308,17 @@ class StockMonitorApp:
             for k, v in sorted(ind_today.items(), key=lambda x: -x[1])[:8]:
                 txt.insert(tk.END, f"  {k}: {v} 只\n")
         if ind_yest:
-            txt.insert(tk.END, "\n── 昨日首板 TOP 行业 ──\n")
+            txt.insert(tk.END, f"\n── {ref_label}首板 TOP 行业 ──\n")
             for k, v in sorted(ind_yest.items(), key=lambda x: -x[1])[:8]:
                 txt.insert(tk.END, f"  {k}: {v} 只\n")
 
         continued = result.get("continued_codes", [])
         lost = result.get("lost_codes", [])
         if continued:
-            txt.insert(tk.END, f"\n── 昨日首板→今日继续涨停 ({len(continued)}) ──\n")
+            txt.insert(tk.END, f"\n── {ref_label}首板→今日继续涨停 ({len(continued)}) ──\n")
             txt.insert(tk.END, "  " + ", ".join(continued) + "\n")
         if lost:
-            txt.insert(tk.END, f"\n── 昨日首板→今日未涨停 ({len(lost)}) ──\n")
+            txt.insert(tk.END, f"\n── {ref_label}首板→今日未涨停 ({len(lost)}) ──\n")
             txt.insert(tk.END, "  " + ", ".join(lost) + "\n")
         self._zt_summary_text.config(state=tk.DISABLED)
 
@@ -1110,6 +1333,7 @@ class StockMonitorApp:
                 rec.get("pattern", ""),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                f"{rec['volume_burst_ratio']:.2f}x" if rec.get("volume_burst_ratio") is not None else "-",
                 f"{rec['distance_ma5_pct']:+.1f}" if rec.get("distance_ma5_pct") is not None else "-",
                 f"{rec['trend_10d_pct']:+.1f}" if rec.get("trend_10d_pct") is not None else "-",
                 f"{rec['position_60d_pct']:.0f}" if rec.get("position_60d_pct") is not None else "-",
@@ -1117,9 +1341,9 @@ class StockMonitorApp:
             )
             self._zt_pattern_tree.insert("", tk.END, values=vals, tags=(tag,) if tag else ())
 
-        # ---- 填充昨日首板今日表现表格（带形态） ----
+        # ---- 填充上一交易日首板今日表现表格（带形态） ----
+        self._zt_table_nb.tab(self._zt_yest_tab, text=f"{ref_label}首板今日表现")
         self._zt_yest_tree.delete(*self._zt_yest_tree.get_children())
-        yest_class_map = {r["code"]: r for r in yesterday_classified}
         perf_map = {p["code"]: p for p in result.get("yesterday_first_today_performance", [])}
         for rec in yesterday_classified:
             code = rec.get("code", "")
@@ -1150,7 +1374,47 @@ class StockMonitorApp:
             self._zt_yest_tree.insert("", tk.END, values=vals)
 
         self._zt_status_label.config(text="")
-        self.status_var.set("涨停对比完成")
+        self.status_var.set(status_message)
+        if persist:
+            self._save_limit_up_compare_snapshot(result)
+
+    def setup_watchlist_tab(self):
+        watch_frame = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(watch_frame, text="自选池")
+        self.watchlist_tab = watch_frame
+
+        action_bar = ttk.Frame(watch_frame)
+        action_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(action_bar, text="刷新自选池", command=self.refresh_watchlist_view).pack(side=tk.LEFT)
+        ttk.Button(action_bar, text="加入当前详情", command=self.add_current_detail_to_watchlist).pack(side=tk.LEFT, padx=6)
+        ttk.Button(action_bar, text="编辑备注", command=self.edit_selected_watchlist_item).pack(side=tk.LEFT, padx=6)
+        ttk.Button(action_bar, text="移除", command=self.remove_selected_watchlist_item).pack(side=tk.LEFT)
+        self.watchlist_summary_var = tk.StringVar(value="自选 0 只")
+        ttk.Label(action_bar, textvariable=self.watchlist_summary_var).pack(side=tk.RIGHT)
+
+        columns = ("code", "name", "status", "score", "latest_close", "board", "note", "updated_at")
+        self._watch_tree = ttk.Treeview(watch_frame, columns=columns, show="headings", height=20)
+        headings = {
+            "code": ("代码", 80),
+            "name": ("名称", 110),
+            "status": ("状态", 90),
+            "score": ("评分", 70),
+            "latest_close": ("最新收盘", 90),
+            "board": ("板块", 110),
+            "note": ("备注", 320),
+            "updated_at": ("更新时间", 150),
+        }
+        for col, (label, width) in headings.items():
+            self._watch_tree.heading(col, text=label)
+            anchor = tk.W if col in {"name", "note"} else tk.CENTER
+            self._watch_tree.column(col, width=width, anchor=anchor)
+        sb = ttk.Scrollbar(watch_frame, orient=tk.VERTICAL, command=self._watch_tree.yview)
+        self._watch_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._watch_tree.pack(fill=tk.BOTH, expand=True)
+        self._watch_tree.bind("<<TreeviewSelect>>", self.on_watchlist_select)
+        self._watch_tree.bind("<Double-1>", self.on_watchlist_double_click)
+        self.refresh_watchlist_view()
 
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
@@ -1161,12 +1425,32 @@ class StockMonitorApp:
 
     def setup_status_bar(self):
         self.status_var = tk.StringVar(value="就绪")
-        status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.progress_text_var = tk.StringVar(value="")
+
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        status_bar = ttk.Label(status_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        progress_text = ttk.Label(status_frame, textvariable=self.progress_text_var, relief=tk.SUNKEN, anchor=tk.E, width=28)
+        progress_text.pack(side=tk.RIGHT)
 
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(self.root, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _set_progress_text(self, current: int, total: int, extra: str = "") -> None:
+        base = f"{current}/{total}" if total > 0 else ""
+        self.progress_text_var.set(f"{base} {extra}".strip())
+
+    def _set_progressbar_indeterminate(self, active: bool) -> None:
+        if active:
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start(10)
+            return
+        self.progress_bar.stop()
+        self.progress_bar.configure(mode="determinate")
 
     def _open_run_log(self) -> None:
         log_dir = Path("data") / "run_logs"
@@ -1387,6 +1671,27 @@ class StockMonitorApp:
         volume_days = max(1, int(self.stock_filter.volume_lookback_days))
         if "latest_volume" in self.detail_label_caption_vars:
             self.detail_label_caption_vars["latest_volume"].set(f"成交量(近{volume_days}日均量占比):")
+
+    def _sync_watchlist_with_scan_results(self) -> None:
+        if not self.watchlist_items:
+            return
+        changed = False
+        for code, item in list(self.watchlist_items.items()):
+            result = self._lookup_result_by_code(code)
+            if not result:
+                continue
+            payload = self._build_watchlist_item_payload(
+                code,
+                stock_name=str(item.get("name", "") or result.get("name", "") or ""),
+                status=str(item.get("status", "") or "观察"),
+                note=str(item.get("note", "") or ""),
+            )
+            save_watchlist_item(payload)
+            self.watchlist_items[code] = {**item, **payload}
+            changed = True
+        if changed:
+            self.refresh_watchlist_view()
+            self._refresh_result_table_if_ready()
 
     def _filter_results_by_selected_boards(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         allowed = {str(board).strip() for board in self._selected_boards() if str(board).strip()}
@@ -1627,6 +1932,7 @@ class StockMonitorApp:
         self._log("扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
         self.status_var.set("正在扫描...")
         self.progress_var.set(0)
+        self._set_progress_text(0, 0)
 
         self._scan_thread = threading.Thread(target=self.scan_stocks, args=(request,), daemon=True)
         self._scan_thread.start()
@@ -1644,8 +1950,10 @@ class StockMonitorApp:
         self._open_run_log()
         self._log("开始更新历史缓存。")
         self._log(self._history_cache_summary_text())
-        self.status_var.set("正在更新历史缓存...")
+        self.status_var.set("正在统计待更新股票范围...")
         self.progress_var.set(0)
+        self._set_progress_text(0, 0, "准备中")
+        self._set_progressbar_indeterminate(True)
         self._cache_thread = threading.Thread(target=self.update_history_cache, args=(request,), daemon=True)
         self._cache_thread.start()
 
@@ -1680,6 +1988,7 @@ class StockMonitorApp:
                     eta_text = f"{int(eta_sec)}秒"
                 status_text = f"扫描中 {current}/{total} ({progress:.0f}%) | {speed:.1f}只/秒 | 剩余 {eta_text}"
                 self.root.after(0, lambda: self.progress_var.set(progress))
+                self.root.after(0, lambda c=current, t=total: self._set_progress_text(c, t))
                 self.root.after(0, lambda s=status_text: self.status_var.set(s))
 
             results = scan_filter.scan_all_stocks(
@@ -1698,6 +2007,7 @@ class StockMonitorApp:
                 return
             self.all_scan_results = results
             self.root.after(0, lambda res=results, req=request: self.update_result_table(res, request=req))
+            self.root.after(0, self._sync_watchlist_with_scan_results)
             self.root.after(0, lambda count=len(results): self.scan_finished(f"扫描完成，命中 {count} 只。"))
         except StopIteration:
             self.root.after(0, lambda: self._log("扫描已停止。"))
@@ -1718,12 +2028,41 @@ class StockMonitorApp:
                 f"缓存更新参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
             )
 
+            self.root.after(0, lambda: self.status_var.set("正在加载股票池并统计总数..."))
+            universe = scan_filter.fetcher.get_all_stocks(force_refresh=request.refresh_universe)
+            if universe is None or universe.empty:
+                self.root.after(0, lambda: self._set_progressbar_indeterminate(False))
+                self.root.after(0, lambda: self.scan_finished("历史缓存更新失败: 股票池为空"))
+                return
+            if request.allowed_boards and "board" in universe.columns:
+                allowed = {str(x).strip() for x in request.allowed_boards if str(x).strip()}
+                if allowed:
+                    universe = universe[universe["board"].astype(str).isin(allowed)].reset_index(drop=True)
+            if request.max_stocks and request.max_stocks > 0:
+                universe = universe.head(request.max_stocks).reset_index(drop=True)
+            estimated_total = int(len(universe))
+
+            self.root.after(0, lambda: self._set_progressbar_indeterminate(False))
+            self.root.after(0, lambda: self.progress_var.set(0))
+            self.root.after(
+                0,
+                lambda total=estimated_total: self._set_progress_text(0, total, "等待任务启动"),
+            )
+            self.root.after(
+                0,
+                lambda total=estimated_total: self.status_var.set(f"准备更新历史缓存，共 {total} 只股票..."),
+            )
+
             cache_t0 = _time.time()
             cache_updated = 0
             cache_failed = 0
             cache_skipped = 0
+            last_updated = 0
+            last_failed = 0
+            last_skipped = 0
 
-            def progress_callback(current, total, code, name):
+            def progress_callback(current, total, code, name, updated, failed, skipped):
+                nonlocal last_updated, last_failed, last_skipped
                 if not self.is_updating_cache:
                     raise StopIteration
                 progress = (current / total) * 100 if total else 0
@@ -1734,12 +2073,33 @@ class StockMonitorApp:
                     eta_text = f"{int(eta_sec // 60)}分{int(eta_sec % 60)}秒"
                 else:
                     eta_text = f"{int(eta_sec)}秒"
+                remaining = max(0, total - current)
+                if updated > last_updated:
+                    outcome_text = "成功"
+                elif failed > last_failed:
+                    outcome_text = "失败"
+                elif skipped > last_skipped:
+                    outcome_text = "跳过"
+                else:
+                    outcome_text = "完成"
+                last_updated = updated
+                last_failed = failed
+                last_skipped = skipped
                 status_text = (
                     f"更新缓存 {current}/{total} ({progress:.0f}%) "
                     f"| 速度 {speed:.1f}只/秒 | 预计剩余 {eta_text} "
-                    f"| 跳过{cache_skipped} 失败{cache_failed}"
+                    f"| 当前 {code} {name}".strip()
+                )
+                self._log_async(
+                    f"缓存进度 {current}/{total}，剩余 {remaining} 只，"
+                    f"{outcome_text} {code} {name}；成功{updated} 跳过{skipped} 失败{failed}"
                 )
                 self.root.after(0, lambda: self.progress_var.set(progress))
+                self.root.after(
+                    0,
+                    lambda c=current, t=total, u=updated, s=skipped, f=failed:
+                        self._set_progress_text(c, t, f"成功{u} 跳过{s} 失败{f}"),
+                )
                 self.root.after(0, lambda s=status_text: self.status_var.set(s))
 
             result = scan_filter.fetcher.update_history_cache(
@@ -1783,11 +2143,17 @@ class StockMonitorApp:
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         data = item.get("data", {}) or {}
         analysis = data.get("analysis") or {}
+        code = str(item.get("code", "")).zfill(6)
 
         if column == "code":
-            return str(item.get("code", "")).zfill(6)
+            return code
         if column == "name":
             return str(item.get("name", ""))
+        if column == "watch":
+            return 1 if code in self.watchlist_items else 0
+        if column == "score":
+            value = analysis.get("score")
+            return float(value) if value is not None else float("-inf")
         if column == "board":
             return str(data.get("board") or data.get("exchange") or "")
         if column == "latest_close":
@@ -1829,6 +2195,7 @@ class StockMonitorApp:
         sort_column = column or self.sort_column
         sort_reverse = self.sort_reverse if reverse is None else bool(reverse)
         secondary_columns = [
+            "score",
             "limit_up_streak",
             "volume_break_limit_up",
             "volume_expand_ratio",
@@ -1854,6 +2221,8 @@ class StockMonitorApp:
         else:
             self.sort_column = column
             self.sort_reverse = column in {
+                "score",
+                "watch",
                 "five_day_return",
                 "limit_up_streak",
                 "broken_limit_up",
@@ -1893,10 +2262,16 @@ class StockMonitorApp:
             self._log(f"扫描完成，命中 {len(results)} 只。")
 
     def scan_finished(self, status_text: str = "扫描完成"):
+        self._set_progressbar_indeterminate(False)
         self.scan_btn.config(state=tk.NORMAL)
         self.update_cache_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
         self.status_var.set(status_text)
+        if self.progress_var.get() >= 100:
+            progress_total_text = self.progress_text_var.get().strip()
+            self.progress_text_var.set(progress_total_text)
+        elif not self.is_scanning and not self.is_updating_cache:
+            self.progress_text_var.set("")
         self.is_scanning = False
         self.is_updating_cache = False
         self._scan_thread = None
@@ -1925,7 +2300,213 @@ class StockMonitorApp:
             stock_code = item["values"][0]
             self._cancel_scheduled_detail()
             self.show_stock_detail(stock_code, force_refresh=True)
-            self.notebook.select(1)
+            self.notebook.select(self.detail_tab_frame)
+
+    def _get_tree_selected_code(self, tree) -> str:
+        selection = tree.selection()
+        if not selection:
+            return ""
+        item = tree.item(selection[0])
+        values = item.get("values") or []
+        if not values:
+            return ""
+        return str(values[0]).strip().zfill(6)
+
+    def on_zt_stock_select(self, event):
+        try:
+            tree = event.widget
+            stock_code = self._get_tree_selected_code(tree)
+            if not stock_code:
+                return
+            self._schedule_show_stock_detail(stock_code)
+        except Exception as e:
+            self._log(f"选择涨停对比股票详情失败: {e}")
+
+    def on_zt_stock_double_click(self, event):
+        tree = event.widget
+        stock_code = self._get_tree_selected_code(tree)
+        if not stock_code:
+            return
+        self._cancel_scheduled_detail()
+        self.show_stock_detail(stock_code, force_refresh=True)
+        self.notebook.select(self.detail_tab_frame)
+
+    def _get_selected_watchlist_code(self) -> str:
+        if not hasattr(self, "_watch_tree"):
+            return ""
+        return self._get_tree_selected_code(self._watch_tree)
+
+    def add_selected_result_to_watchlist(self) -> None:
+        selection = self._get_selected_result_identity()
+        if selection is None:
+            messagebox.showwarning("提示", "请先在结果表中选中一只股票")
+            return
+        stock_code, stock_name = selection
+        self._add_code_to_watchlist(stock_code, stock_name=stock_name)
+
+    def remove_selected_result_from_watchlist(self) -> None:
+        selection = self._get_selected_result_identity()
+        if selection is None:
+            messagebox.showwarning("提示", "请先在结果表中选中一只股票")
+            return
+        stock_code, _ = selection
+        self._remove_code_from_watchlist(stock_code)
+
+    def add_current_detail_to_watchlist(self) -> None:
+        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not stock_code:
+            messagebox.showwarning("提示", "请先打开一只股票详情")
+            return
+        stock_name = self.detail_labels.get("name").cget("text") if "name" in self.detail_labels else ""
+        detail_payload = {
+            "code": stock_code,
+            "name": stock_name,
+            "board": self._lookup_result_by_code(stock_code).get("data", {}).get("board", "") if self._lookup_result_by_code(stock_code) else "",
+            "analysis": getattr(self, "_detail_chart_analysis", {}) or {},
+        }
+        self._add_code_to_watchlist(stock_code, stock_name=stock_name, detail=detail_payload)
+
+    def toggle_current_detail_watchlist(self) -> None:
+        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not stock_code:
+            messagebox.showwarning("提示", "请先打开一只股票详情")
+            return
+        if stock_code in self.watchlist_items:
+            self._remove_code_from_watchlist(stock_code)
+        else:
+            self.add_current_detail_to_watchlist()
+
+    def edit_current_detail_watch_note(self) -> None:
+        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
+        if not stock_code:
+            messagebox.showwarning("提示", "请先打开一只股票详情")
+            return
+        if stock_code not in self.watchlist_items:
+            self.add_current_detail_to_watchlist()
+        self._edit_watchlist_item(stock_code)
+
+    def _add_code_to_watchlist(
+        self,
+        stock_code: str,
+        stock_name: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+        status: str = "观察",
+        note: Optional[str] = None,
+    ) -> None:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return
+        payload = self._build_watchlist_item_payload(
+            code,
+            stock_name=stock_name,
+            status=status,
+            note=note,
+            detail=detail,
+        )
+        save_watchlist_item(payload)
+        self.watchlist_items[code] = {**self.watchlist_items.get(code, {}), **payload}
+        self.refresh_watchlist_view()
+        self._refresh_result_table_if_ready()
+        self._update_detail_watch_state(code)
+        self.status_var.set(f"{code} 已加入自选池")
+
+    def _remove_code_from_watchlist(self, stock_code: str) -> None:
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return
+        if code not in self.watchlist_items:
+            return
+        delete_watchlist_item(code)
+        self.watchlist_items.pop(code, None)
+        self.refresh_watchlist_view()
+        self._refresh_result_table_if_ready()
+        self._update_detail_watch_state(code)
+        self.status_var.set(f"{code} 已移除自选池")
+
+    def _edit_watchlist_item(self, stock_code: str) -> None:
+        code = str(stock_code or "").strip().zfill(6)
+        item = self.watchlist_items.get(code) or load_watchlist_item(code)
+        if not item:
+            return
+        current_status = str(item.get("status", "") or "观察")
+        new_status = simpledialog.askstring("自选状态", "请输入状态（观察/重点/持仓/淘汰）:", initialvalue=current_status, parent=self.root)
+        if new_status is None:
+            return
+        new_note = simpledialog.askstring("自选备注", "请输入备注:", initialvalue=str(item.get("note", "") or ""), parent=self.root)
+        if new_note is None:
+            return
+        payload = self._build_watchlist_item_payload(
+            code,
+            stock_name=str(item.get("name", "") or ""),
+            status=str(new_status).strip() or current_status,
+            note=str(new_note).strip(),
+        )
+        save_watchlist_item(payload)
+        self.watchlist_items[code] = {**item, **payload}
+        self.refresh_watchlist_view()
+        self._refresh_result_table_if_ready()
+        self._update_detail_watch_state(code)
+        self.status_var.set(f"{code} 自选备注已更新")
+
+    def edit_selected_watchlist_item(self) -> None:
+        code = self._get_selected_watchlist_code()
+        if not code:
+            messagebox.showwarning("提示", "请先在自选池中选中一只股票")
+            return
+        self._edit_watchlist_item(code)
+
+    def remove_selected_watchlist_item(self) -> None:
+        code = self._get_selected_watchlist_code()
+        if not code:
+            messagebox.showwarning("提示", "请先在自选池中选中一只股票")
+            return
+        self._remove_code_from_watchlist(code)
+
+    def refresh_watchlist_view(self) -> None:
+        if not hasattr(self, "_watch_tree"):
+            return
+        self._watch_tree.delete(*self._watch_tree.get_children())
+        items = sorted(
+            self.watchlist_items.values(),
+            key=lambda item: (str(item.get("status", "") or ""), str(item.get("updated_at", "") or "")),
+            reverse=True,
+        )
+        for item in items:
+            latest_close = item.get("latest_close")
+            score = item.get("score")
+            self._watch_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    item.get("code", ""),
+                    item.get("name", ""),
+                    item.get("status", ""),
+                    "-" if score is None else str(int(score)),
+                    "-" if latest_close is None else f"{float(latest_close):.2f}",
+                    item.get("board", ""),
+                    item.get("note", ""),
+                    item.get("updated_at", ""),
+                ),
+            )
+        self.watchlist_summary_var.set(f"自选 {len(items)} 只")
+
+    def on_watchlist_select(self, event):
+        stock_code = self._get_selected_watchlist_code()
+        if not stock_code:
+            return
+        self._schedule_show_stock_detail(stock_code)
+
+    def on_watchlist_double_click(self, event):
+        stock_code = self._get_selected_watchlist_code()
+        if not stock_code:
+            return
+        self._cancel_scheduled_detail()
+        self.show_stock_detail(stock_code, force_refresh=True)
+        self.notebook.select(self.detail_tab_frame)
+
+    def _refresh_result_table_if_ready(self) -> None:
+        if hasattr(self, "result_tree") and self.filtered_stocks:
+            self.update_result_table(self.filtered_stocks, announce=False, persist=False)
 
     def query_single_stock(self):
         stock_code = self.stock_code_var.get().strip()
@@ -1936,7 +2517,7 @@ class StockMonitorApp:
             return
         self._cancel_scheduled_detail()
         self.show_stock_detail(stock_code, force_refresh=True)
-        self.notebook.select(1)
+        self.notebook.select(self.detail_tab_frame)
 
     def _cancel_scheduled_detail(self) -> None:
         if self._detail_after_id is None:
@@ -2002,7 +2583,14 @@ class StockMonitorApp:
         detail_thread.start()
     def _load_detail(self, stock_code: str):
         try:
-            detail = self.stock_filter.get_stock_detail(stock_code)
+            quick_detail = self.stock_filter.get_stock_detail_quick(stock_code)
+            quick_history = None
+            if isinstance(quick_detail, dict):
+                quick_history = quick_detail.get("history")
+                if quick_history is not None and not getattr(quick_history, "empty", True):
+                    self.root.after(0, lambda: self._apply_quick_detail_if_current(stock_code, quick_detail))
+
+            detail = self.stock_filter.get_stock_detail(stock_code, preloaded_history=quick_history)
             self.root.after(0, lambda: self._apply_detail_if_current(stock_code, detail))
         except Exception as e:
             error_text = str(e)
@@ -2010,6 +2598,15 @@ class StockMonitorApp:
             self.root.after(0, lambda: self._show_detail_error(stock_code, f"详情加载失败: {error_text}"))
         finally:
             self.root.after(0, lambda: self._finish_detail_status(stock_code))
+
+    def _apply_quick_detail_if_current(self, stock_code: str, detail: Dict[str, Any]) -> None:
+        if str(stock_code).strip().zfill(6) != self._detail_request_code:
+            return
+        try:
+            self._update_detail_ui(detail)
+            self.status_var.set(f"{stock_code} 详情（历史缓存）")
+        except Exception as e:
+            self._log(f"更新缓存详情失败: {e}")
 
     def _apply_detail_if_current(self, stock_code: str, detail: Dict[str, Any]) -> None:
         if str(stock_code).strip().zfill(6) != self._detail_request_code:
@@ -2040,6 +2637,8 @@ class StockMonitorApp:
             "latest_date": "加载中...",
             "quote_time": "加载中...",
             "latest_close": "加载中...",
+            "score": "加载中...",
+            "watch_status": "加载中...",
             "latest_ma": "加载中...",
             "latest_ma10": "加载中...",
             "latest_volume": "加载中...",
@@ -2053,6 +2652,7 @@ class StockMonitorApp:
         for key, value in placeholders.items():
             if key in self.detail_labels:
                 self.detail_labels[key].config(text=value)
+        self._update_detail_watch_state(stock_code)
         self.price_ax.clear()
         self.volume_ax.clear()
         self.flow_ax.clear()
@@ -2076,6 +2676,10 @@ class StockMonitorApp:
             self.detail_labels["code"].config(text=code_text)
         if "name" in self.detail_labels:
             self.detail_labels["name"].config(text="加载失败")
+        if "score" in self.detail_labels:
+            self.detail_labels["score"].config(text="-")
+        if "watch_status" in self.detail_labels:
+            self.detail_labels["watch_status"].config(text="-")
         if "summary" in self.detail_labels:
             self.detail_labels["summary"].config(text=message or "详情加载失败")
         self.price_ax.clear()
@@ -2102,6 +2706,9 @@ class StockMonitorApp:
         self.detail_labels["latest_close"].config(
             text="-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}"
         )
+        self.detail_labels["score"].config(
+            text="-" if analysis.get("score") is None else f"{int(analysis['score'])}"
+        )
         self.detail_labels["latest_ma"].config(
             text="-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}"
         )
@@ -2121,8 +2728,24 @@ class StockMonitorApp:
         self.detail_labels["big_order_amount"].config(text=self._format_amount(analysis.get("big_order_amount")))
         self.detail_labels["main_force_amount"].config(text=self._format_amount(analysis.get("main_force_amount")))
         self.detail_labels["summary"].config(text=analysis.get("summary", "-"))
+        self._update_detail_watch_state(self._current_detail_code)
 
         self._draw_chart(history, analysis)
+
+    def _update_detail_watch_state(self, stock_code: str) -> None:
+        code = str(stock_code or "").strip().zfill(6)
+        item = self.watchlist_items.get(code) or {}
+        if "watch_status" in self.detail_labels:
+            if item:
+                text = str(item.get("status", "") or "观察")
+                note = str(item.get("note", "") or "").strip()
+                if note:
+                    text = f"{text} | {self._short_text(note, max_len=18)}"
+                self.detail_labels["watch_status"].config(text=text)
+            else:
+                self.detail_labels["watch_status"].config(text="未加入")
+        if hasattr(self, "detail_watch_btn"):
+            self.detail_watch_btn.config(text="移除自选" if item else "加入自选")
 
     def _reset_detail_chart_axes(self) -> None:
         self._detail_chart_dates = []
@@ -2807,7 +3430,8 @@ class StockMonitorApp:
                 tick_map[idx] = text
 
         if x:
-            tick_map[0] = time_labels[0]
+            if not auction_context["has_auction"]:
+                tick_map[0] = time_labels[0]
             tick_map[len(x) - 1] = time_labels[-1]
 
         raw_tick_positions = sorted(tick_map.keys())
@@ -2828,6 +3452,9 @@ class StockMonitorApp:
         if auction_context["has_auction"] and auction_context["x"] is not None:
             tick_positions = [auction_context["x"]] + tick_positions
             tick_labels = [auction_context["time_label"] or "09:25"] + tick_labels
+            if len(tick_positions) >= 2 and tick_positions[1] - tick_positions[0] < 12:
+                tick_positions.pop(1)
+                tick_labels.pop(1)
         return tick_positions, tick_labels
 
     def _draw_intraday_price_panel(
@@ -3356,17 +3983,3 @@ def run_app():
 
 if __name__ == "__main__":
     run_app()
-
-
-
-
-
-
-
-
-
-
-
-
-
-

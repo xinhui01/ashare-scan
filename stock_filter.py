@@ -271,6 +271,8 @@ class StockFilter:
             "broken_streak_count": 0,
             "volume_break_limit_up": False,
             "after_two_limit_up": False,
+            "score": 0,
+            "score_breakdown": "",
             "summary": "",
         }
 
@@ -443,6 +445,89 @@ class StockFilter:
             summary = f"{summary}；放量后断板"
         return summary
 
+    def _calculate_trade_score(
+        self,
+        result: Dict[str, Any],
+        streak_days: int,
+        ma_period: int,
+        volume_enabled: bool,
+    ) -> tuple[int, str]:
+        score = 50.0
+        reasons: List[str] = []
+
+        if result.get("passed"):
+            score += 18
+            reasons.append(f"站上MA{ma_period}+18")
+        else:
+            score -= 10
+            reasons.append(f"跌破MA{ma_period}-10")
+
+        five_day_return = result.get("five_day_return")
+        if five_day_return is not None:
+            if five_day_return >= 15:
+                score += 12
+                reasons.append("5日强势+12")
+            elif five_day_return >= 5:
+                score += 8
+                reasons.append("5日偏强+8")
+            elif five_day_return <= -8:
+                score -= 8
+                reasons.append("5日转弱-8")
+
+        latest_change_pct = result.get("latest_change_pct")
+        if latest_change_pct is not None:
+            if latest_change_pct >= 9.5:
+                score += 14
+                reasons.append("当日涨停+14")
+            elif latest_change_pct >= 5:
+                score += 6
+                reasons.append("当日走强+6")
+            elif latest_change_pct <= -5:
+                score -= 8
+                reasons.append("当日大跌-8")
+
+        limit_up_streak = int(result.get("limit_up_streak") or 0)
+        if limit_up_streak >= 3:
+            score += 10
+            reasons.append("高连板+10")
+        elif limit_up_streak == 2:
+            score += 7
+            reasons.append("二连板+7")
+        elif result.get("limit_up_within_days"):
+            score += 4
+            reasons.append(f"{streak_days}日内有涨停+4")
+
+        if volume_enabled and result.get("volume_expand"):
+            score += 8
+            reasons.append("放量有效+8")
+        elif volume_enabled and result.get("volume_expand_ratio") is not None:
+            ratio = float(result["volume_expand_ratio"])
+            if ratio < max(1.2, self.volume_expand_factor * 0.8):
+                score -= 4
+                reasons.append("量能偏弱-4")
+
+        latest_volume_ratio = result.get("latest_volume_ratio")
+        if latest_volume_ratio is not None:
+            if latest_volume_ratio >= 180:
+                score += 6
+                reasons.append("量比活跃+6")
+            elif latest_volume_ratio < 80:
+                score -= 3
+                reasons.append("量比不足-3")
+
+        if result.get("broken_limit_up"):
+            score -= 10
+            reasons.append("断板-10")
+        if result.get("after_two_limit_up"):
+            score -= 6
+            reasons.append("二板后断板-6")
+        if result.get("volume_break_limit_up"):
+            score -= 5
+            reasons.append("放量断板-5")
+
+        final_score = max(0, min(100, int(round(score))))
+        return final_score, " / ".join(reasons[:6])
+
     def analyze_history(
         self,
         history_data: pd.DataFrame,
@@ -492,6 +577,14 @@ class StockFilter:
             volume_days,
             volume_enabled,
         )
+        score, score_breakdown = self._calculate_trade_score(
+            result,
+            streak_days,
+            ma_period,
+            volume_enabled,
+        )
+        result["score"] = score
+        result["score_breakdown"] = score_breakdown
         return result
 
     def _build_filter_result_shell(
@@ -1030,7 +1123,7 @@ class StockFilter:
 
         return results
 
-    def get_stock_detail(self, stock_code: str) -> Dict[str, Any]:
+    def get_stock_detail_quick(self, stock_code: str) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
         history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
         history = self._call_with_timeout(
@@ -1039,6 +1132,39 @@ class StockFilter:
             fallback=None,
             task_name=f"详情历史 {code}",
         )
+        analysis = self.analyze_history(
+            history,
+            self.trend_days,
+            self.ma_period,
+            self.limit_up_lookback_days,
+            self.volume_lookback_days,
+            self.volume_expand_enabled,
+            self.volume_expand_factor,
+            stock_code=stock_code,
+        )
+        self._enrich_analysis_with_history_snapshot(analysis, history)
+        return self._build_stock_detail_payload(
+            code,
+            {"name": "", "board": "", "exchange": ""},
+            history,
+            analysis,
+        )
+
+    def get_stock_detail(
+        self,
+        stock_code: str,
+        preloaded_history: Optional[pd.DataFrame] = None,
+    ) -> Dict[str, Any]:
+        code = str(stock_code).strip().zfill(6)
+        history = preloaded_history
+        if history is None:
+            history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
+            history = self._call_with_timeout(
+                lambda: self.fetcher.get_history_data(code, days=history_days),
+                timeout_sec=15.0,
+                fallback=None,
+                task_name=f"详情历史 {code}",
+            )
         universe = self._call_with_timeout(
             lambda: self.fetcher.get_all_stocks(),
             timeout_sec=8.0,
@@ -1113,6 +1239,9 @@ class StockFilter:
             "trend_10d_pct": None,
             "position_60d_pct": None,
             "volatility_10d": None,
+            "volume_burst_ratio": None,
+            "amount_burst_ratio": None,
+            "is_volume_burst": False,
             "consecutive_boards": 0,
         }
 
@@ -1129,6 +1258,8 @@ class StockFilter:
         df = history.sort_values("date").reset_index(drop=True)
         close = pd.to_numeric(df["close"], errors="coerce")
         change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+        volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+        amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
 
         ma5 = close.rolling(5, min_periods=5).mean()
         ma10 = close.rolling(10, min_periods=10).mean()
@@ -1171,6 +1302,22 @@ class StockFilter:
             if len(recent_10) >= 5 and recent_10.mean() > 0:
                 result["volatility_10d"] = round(float(recent_10.std() / recent_10.mean() * 100), 2)
 
+        # 暴量倍数：当日量/额 相对前5日均值
+        if len(volume) >= 6 and not pd.isna(volume.iloc[-1]):
+            prev_volume = volume.iloc[-6:-1].dropna()
+            if not prev_volume.empty and float(prev_volume.mean()) > 0:
+                result["volume_burst_ratio"] = round(float(volume.iloc[-1]) / float(prev_volume.mean()), 2)
+        if len(amount) >= 6 and not pd.isna(amount.iloc[-1]):
+            prev_amount = amount.iloc[-6:-1].dropna()
+            if not prev_amount.empty and float(prev_amount.mean()) > 0:
+                result["amount_burst_ratio"] = round(float(amount.iloc[-1]) / float(prev_amount.mean()), 2)
+        volume_burst = result["volume_burst_ratio"]
+        amount_burst = result["amount_burst_ratio"]
+        result["is_volume_burst"] = bool(
+            (volume_burst is not None and volume_burst >= 2.5)
+            or (amount_burst is not None and amount_burst >= 2.5)
+        )
+
         # 连板数
         threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
         if not change_pct.empty:
@@ -1184,10 +1331,21 @@ class StockFilter:
         trend_10d = result["trend_10d_pct"]
         pos_60d = result["position_60d_pct"]
         vol_10d = result["volatility_10d"]
+        volume_burst = result["volume_burst_ratio"]
+        amount_burst = result["amount_burst_ratio"]
 
         if streak >= 2:
             result["pattern"] = "高位连板"
             result["pattern_detail"] = f"连板{streak}板"
+
+        elif result["is_volume_burst"]:
+            result["pattern"] = "暴量涨停"
+            parts = []
+            if volume_burst is not None:
+                parts.append(f"量比前5日均量 {volume_burst:.2f}倍")
+            if amount_burst is not None:
+                parts.append(f"额比前5日均额 {amount_burst:.2f}倍")
+            result["pattern_detail"] = "，".join(parts)
 
         elif (prev_close is not None and prev_ma5 is not None and prev_close <= prev_ma5 * 1.01
               and dist_ma5 is not None and dist_ma5 > 0):

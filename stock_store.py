@@ -91,6 +91,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             refreshed_at TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS watchlist (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            board TEXT NOT NULL DEFAULT '',
+            latest_close REAL,
+            score REAL,
+            score_breakdown TEXT NOT NULL DEFAULT '',
+            added_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     existing_columns = {
@@ -139,6 +152,131 @@ def clear_history() -> None:
 def clear_scan_snapshots() -> None:
     with _DB_WRITE_LOCK:
         _retry_locked(lambda: _clear_table("scan_snapshots"))
+
+
+def save_watchlist_item(item: Dict[str, Any]) -> None:
+    code = str(item.get("code", "") or "").strip().zfill(6)
+    if not code:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    added_at = str(item.get("added_at") or "").strip() or now
+
+    def _write():
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watchlist(
+                    code, name, status, note, board, latest_close, score,
+                    score_breakdown, added_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name=excluded.name,
+                    status=excluded.status,
+                    note=excluded.note,
+                    board=excluded.board,
+                    latest_close=excluded.latest_close,
+                    score=excluded.score,
+                    score_breakdown=excluded.score_breakdown,
+                    added_at=COALESCE(NULLIF(watchlist.added_at, ''), excluded.added_at),
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    code,
+                    str(item.get("name", "") or ""),
+                    str(item.get("status", "") or ""),
+                    str(item.get("note", "") or ""),
+                    str(item.get("board", "") or ""),
+                    _to_float(item.get("latest_close")),
+                    _to_float(item.get("score")),
+                    str(item.get("score_breakdown", "") or ""),
+                    added_at,
+                    now,
+                ),
+            )
+
+    with _DB_WRITE_LOCK:
+        _retry_locked(_write)
+
+
+def load_watchlist() -> List[Dict[str, Any]]:
+    if not _DB_PATH.is_file():
+        return []
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                """
+                SELECT code, name, status, note, board, latest_close, score,
+                       score_breakdown, added_at, updated_at
+                FROM watchlist
+                ORDER BY updated_at DESC, code ASC
+                """
+            ).fetchall()
+
+    rows = _retry_locked(_read)
+    return [
+        {
+            "code": str(row["code"] or "").strip().zfill(6),
+            "name": str(row["name"] or ""),
+            "status": str(row["status"] or ""),
+            "note": str(row["note"] or ""),
+            "board": str(row["board"] or ""),
+            "latest_close": _to_float(row["latest_close"]),
+            "score": _to_float(row["score"]),
+            "score_breakdown": str(row["score_breakdown"] or ""),
+            "added_at": str(row["added_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+        for row in rows
+    ]
+
+
+def load_watchlist_item(stock_code: str) -> Optional[Dict[str, Any]]:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code or not _DB_PATH.is_file():
+        return None
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                """
+                SELECT code, name, status, note, board, latest_close, score,
+                       score_breakdown, added_at, updated_at
+                FROM watchlist
+                WHERE code = ?
+                """,
+                (code,),
+            ).fetchone()
+
+    row = _retry_locked(_read)
+    if row is None:
+        return None
+    return {
+        "code": str(row["code"] or "").strip().zfill(6),
+        "name": str(row["name"] or ""),
+        "status": str(row["status"] or ""),
+        "note": str(row["note"] or ""),
+        "board": str(row["board"] or ""),
+        "latest_close": _to_float(row["latest_close"]),
+        "score": _to_float(row["score"]),
+        "score_breakdown": str(row["score_breakdown"] or ""),
+        "added_at": str(row["added_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
+def delete_watchlist_item(stock_code: str) -> None:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code:
+        return
+
+    def _write():
+        with _connect() as conn:
+            conn.execute("DELETE FROM watchlist WHERE code = ?", (code,))
+
+    with _DB_WRITE_LOCK:
+        _retry_locked(_write)
 
 
 def save_universe(df: pd.DataFrame) -> None:
