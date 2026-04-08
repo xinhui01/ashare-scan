@@ -83,6 +83,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             saved_at TEXT NOT NULL DEFAULT '',
             payload_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS history_meta (
+            code TEXT PRIMARY KEY,
+            latest_trade_date TEXT NOT NULL DEFAULT '',
+            row_count INTEGER NOT NULL DEFAULT 0,
+            refreshed_at TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     existing_columns = {
@@ -125,7 +133,7 @@ def clear_universe() -> None:
 
 def clear_history() -> None:
     with _DB_WRITE_LOCK:
-        _retry_locked(lambda: (_clear_table("history"), _clear_table("fund_flow")))
+        _retry_locked(lambda: (_clear_table("history"), _clear_table("fund_flow"), _clear_table("history_meta")))
 
 
 def clear_scan_snapshots() -> None:
@@ -289,6 +297,52 @@ def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.Da
     if limit is not None and limit > 0:
         df = df.sort_values("date").reset_index(drop=True)
     return df.reset_index(drop=True)
+
+
+def save_history_meta(stock_code: str, latest_trade_date: str, row_count: int, source: str = "") -> None:
+    code = str(stock_code).strip().zfill(6)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write():
+        with _connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO history_meta(code, latest_trade_date, row_count, refreshed_at, source)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    latest_trade_date=excluded.latest_trade_date,
+                    row_count=excluded.row_count,
+                    refreshed_at=excluded.refreshed_at,
+                    source=excluded.source
+                """,
+                (code, str(latest_trade_date).strip(), int(row_count), now, str(source)),
+            )
+
+    with _DB_WRITE_LOCK:
+        _retry_locked(_write)
+
+
+def load_history_meta(stock_code: str) -> Optional[Dict[str, Any]]:
+    if not _DB_PATH.is_file():
+        return None
+    code = str(stock_code).strip().zfill(6)
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT latest_trade_date, row_count, refreshed_at, source FROM history_meta WHERE code = ?",
+                (code,),
+            ).fetchone()
+
+    row = _retry_locked(_read)
+    if row is None:
+        return None
+    return {
+        "latest_trade_date": str(row["latest_trade_date"] or ""),
+        "row_count": int(row["row_count"] or 0),
+        "refreshed_at": str(row["refreshed_at"] or ""),
+        "source": str(row["source"] or ""),
+    }
 
 
 def history_coverage_summary() -> Dict[str, Any]:

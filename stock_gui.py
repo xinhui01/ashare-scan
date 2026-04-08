@@ -1353,6 +1353,7 @@ class StockMonitorApp:
         self._log("已请求停止，正在等待当前任务结束。")
 
     def scan_stocks(self, request: ScanRequest):
+        import time as _time
         try:
             scan_filter = StockFilter()
             scan_filter.apply_settings(request.filter_settings)
@@ -1361,12 +1362,22 @@ class StockMonitorApp:
                 f"扫描参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
             )
 
+            scan_t0 = _time.time()
+
             def progress_callback(current, total, code, name):
                 if not self.is_scanning:
                     raise StopIteration
                 progress = (current / total) * 100 if total else 0
+                elapsed = _time.time() - scan_t0
+                speed = current / elapsed if elapsed > 0 else 0
+                eta_sec = (total - current) / speed if speed > 0 else 0
+                if eta_sec >= 60:
+                    eta_text = f"{int(eta_sec // 60)}分{int(eta_sec % 60)}秒"
+                else:
+                    eta_text = f"{int(eta_sec)}秒"
+                status_text = f"扫描中 {current}/{total} ({progress:.0f}%) | {speed:.1f}只/秒 | 剩余 {eta_text}"
                 self.root.after(0, lambda: self.progress_var.set(progress))
-                self.root.after(0, lambda: self.status_var.set(f"扫描中 {current}/{total}: {code} {name}"))
+                self.root.after(0, lambda s=status_text: self.status_var.set(s))
 
             results = scan_filter.scan_all_stocks(
                 max_stocks=request.max_stocks,
@@ -1394,6 +1405,7 @@ class StockMonitorApp:
             self.root.after(0, lambda: self.scan_finished(f"扫描失败: {error_text}"))
 
     def update_history_cache(self, request: ScanRequest):
+        import time as _time
         try:
             scan_filter = StockFilter()
             scan_filter.apply_settings(request.filter_settings)
@@ -1403,12 +1415,29 @@ class StockMonitorApp:
                 f"缓存更新参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
             )
 
+            cache_t0 = _time.time()
+            cache_updated = 0
+            cache_failed = 0
+            cache_skipped = 0
+
             def progress_callback(current, total, code, name):
                 if not self.is_updating_cache:
                     raise StopIteration
                 progress = (current / total) * 100 if total else 0
+                elapsed = _time.time() - cache_t0
+                speed = current / elapsed if elapsed > 0 else 0
+                eta_sec = (total - current) / speed if speed > 0 else 0
+                if eta_sec >= 60:
+                    eta_text = f"{int(eta_sec // 60)}分{int(eta_sec % 60)}秒"
+                else:
+                    eta_text = f"{int(eta_sec)}秒"
+                status_text = (
+                    f"更新缓存 {current}/{total} ({progress:.0f}%) "
+                    f"| 速度 {speed:.1f}只/秒 | 预计剩余 {eta_text} "
+                    f"| 跳过{cache_skipped} 失败{cache_failed}"
+                )
                 self.root.after(0, lambda: self.progress_var.set(progress))
-                self.root.after(0, lambda: self.status_var.set(f"更新缓存 {current}/{total}: {code} {name}"))
+                self.root.after(0, lambda s=status_text: self.status_var.set(s))
 
             result = scan_filter.fetcher.update_history_cache(
                 max_stocks=request.max_stocks,
@@ -1420,16 +1449,24 @@ class StockMonitorApp:
                 refresh_universe=request.refresh_universe,
                 allowed_boards=list(request.allowed_boards),
             )
+            cache_updated = result.get("updated", 0)
+            cache_failed = result.get("failed", 0)
+            cache_skipped = result.get("skipped", 0)
             if not self.is_updating_cache:
                 self.root.after(0, lambda: self._log("历史缓存更新已停止。"))
                 self.root.after(0, lambda: self.scan_finished("历史缓存更新已停止"))
                 return
-            self.root.after(
-                0,
-                lambda res=result: self._log(
-                    f"历史缓存更新完成：总计 {res.get('total', 0)}，成功 {res.get('updated', 0)}，失败 {res.get('failed', 0)}，跳过 {res.get('skipped', 0)}。"
-                ),
+            total_time = _time.time() - cache_t0
+            if total_time >= 60:
+                time_text = f"{int(total_time // 60)}分{int(total_time % 60)}秒"
+            else:
+                time_text = f"{total_time:.1f}秒"
+            summary_msg = (
+                f"历史缓存更新完成：总计 {result.get('total', 0)}，"
+                f"成功 {cache_updated}，跳过(已新鲜) {cache_skipped}，失败 {cache_failed}，"
+                f"耗时 {time_text}。"
             )
+            self.root.after(0, lambda m=summary_msg: self._log(m))
             self.root.after(0, lambda: self._log(self._history_cache_summary_text()))
             self.root.after(0, lambda: self.scan_finished("历史缓存更新完成"))
         except StopIteration:
@@ -1639,8 +1676,11 @@ class StockMonitorApp:
             except Exception as e:
                 self._log(f"渲染缓存详情失败: {e}")
                 self._show_detail_error(code, f"渲染详情失败: {e}")
-            if not force_refresh and self._detail_loading_code == code:
-                self.status_var.set(f"{code} 详情正在加载...")
+            if not force_refresh:
+                # 扫描结果中已有完整数据，直接展示不再发起后台刷新。
+                # get_history_data 内部的缓存新鲜度机制会确保数据时效性。
+                self.status_var.set(f"{code} 详情（缓存）")
+                self._detail_loading_code = ""
                 return
             self.status_var.set(f"正在刷新 {code} 最新详情...")
             self._detail_loading_code = code

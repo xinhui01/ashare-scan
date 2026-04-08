@@ -59,7 +59,7 @@ def _apply_network_patches() -> None:
                 kwargs.setdefault("verify", False)
             u = str(url)
             if "eastmoney.com" in u:
-                merged = dict(_EASTMONEY_HEADERS)
+                merged = _random_eastmoney_headers()
                 merged.setdefault("Connection", "close")
                 extra = kwargs.get("headers")
                 if isinstance(extra, dict):
@@ -89,9 +89,11 @@ from stock_store import (
     history_coverage_summary as load_history_coverage_summary,
     load_fund_flow as load_fund_flow_store,
     load_history as load_history_store,
+    load_history_meta as load_history_meta_store,
     load_universe as load_universe_store,
     save_fund_flow as save_fund_flow_store,
     save_history as save_history_store,
+    save_history_meta as save_history_meta_store,
     save_universe as save_universe_store,
 )
 from data_source_models import DATA_SOURCE_OPTIONS, DataProviderPlan, HistoryRequestPlan
@@ -227,6 +229,45 @@ def _history_block_cooldown_sec() -> float:
 _HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
 _HISTORY_REQUEST_RATE_LOCK = threading.Lock()
 _HISTORY_NEXT_REQUEST_AT = 0.0
+
+# ---- 自适应请求间隔 ----
+# 连续成功时逐步缩短间隔（加速），遇到限流时立即放大间隔（减速）。
+_ADAPTIVE_INTERVAL_LOCK = threading.Lock()
+_ADAPTIVE_INTERVAL_SEC = _history_min_request_interval_sec()  # 当前自适应间隔
+_ADAPTIVE_SUCCESS_STREAK = 0  # 连续成功计数
+_ADAPTIVE_MIN_INTERVAL = 0.3   # 自适应下限（秒）
+_ADAPTIVE_MAX_INTERVAL = 8.0   # 自适应上限（秒）
+
+
+def _adaptive_on_success() -> None:
+    """网络请求成功后调用，逐步缩短间隔。"""
+    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK
+    with _ADAPTIVE_INTERVAL_LOCK:
+        _ADAPTIVE_SUCCESS_STREAK += 1
+        # 每连续成功 10 次，间隔缩短 10%
+        if _ADAPTIVE_SUCCESS_STREAK % 10 == 0:
+            _ADAPTIVE_INTERVAL_SEC = max(
+                _ADAPTIVE_MIN_INTERVAL,
+                _ADAPTIVE_INTERVAL_SEC * 0.9,
+            )
+
+
+def _adaptive_on_rate_limit() -> None:
+    """遇到限流时调用，立即放大间隔。"""
+    global _ADAPTIVE_INTERVAL_SEC, _ADAPTIVE_SUCCESS_STREAK
+    with _ADAPTIVE_INTERVAL_LOCK:
+        _ADAPTIVE_SUCCESS_STREAK = 0
+        # 间隔翻倍（但不超过上限）
+        _ADAPTIVE_INTERVAL_SEC = min(
+            _ADAPTIVE_MAX_INTERVAL,
+            _ADAPTIVE_INTERVAL_SEC * 2.0,
+        )
+
+
+def _adaptive_current_interval() -> float:
+    """获取当前自适应间隔。"""
+    with _ADAPTIVE_INTERVAL_LOCK:
+        return _ADAPTIVE_INTERVAL_SEC
 _HISTORY_DIAGNOSTICS_LOCK = threading.Lock()
 _HISTORY_DIAGNOSTICS: Dict[str, int] = {
     "cache_hits": 0,
@@ -247,9 +288,21 @@ _EASTMONEY_HISTORY_MIRRORS = [
     "https://7.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://28.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://36.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://45.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://51.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://58.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://59.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://60.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://62.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://64.push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://72.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://81.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://85.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://90.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://95.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
 _HISTORY_MIRROR_HEALTH: Dict[str, float] = {}
 _HISTORY_MIRROR_HEALTH_LOCK = threading.Lock()
@@ -258,17 +311,155 @@ _HISTORY_BLOCKED_UNTIL = 0.0
 _HISTORY_BLOCK_EVENTS: List[float] = []
 
 # 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
-_EASTMONEY_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
-}
+# User-Agent 池：每次请求随机选取，降低指纹识别风险
+import random as _random
+
+_USER_AGENT_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+
+_REFERER_POOL = [
+    "https://quote.eastmoney.com/",
+    "https://data.eastmoney.com/",
+    "https://guba.eastmoney.com/",
+    "https://so.eastmoney.com/",
+    "https://www.eastmoney.com/",
+    "https://finance.eastmoney.com/",
+]
+
+
+def _random_eastmoney_headers() -> Dict[str, str]:
+    """每次请求生成随机化的请求头，降低指纹识别风险。"""
+    return {
+        "User-Agent": _random.choice(_USER_AGENT_POOL),
+        "Referer": _random.choice(_REFERER_POOL),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": _random.choice(["zh-CN,zh;q=0.9", "zh-CN,zh;q=0.9,en;q=0.8", "zh-CN,zh;q=0.8,en;q=0.6"]),
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "close",
+    }
+
+
+# 兼容旧引用
+_EASTMONEY_HEADERS = _random_eastmoney_headers()
+
+
+# ---- 可选免费代理池 ----
+# 启用方式：环境变量 GUPPIAO_USE_PROXY_POOL=1 或项目根目录创建 USE_PROXY_POOL 文件
+# 代理池会从多个免费源获取代理列表，验证后轮换使用，降低被封 IP 的风险。
+_PROXY_POOL_LOCK = threading.Lock()
+_PROXY_POOL: List[str] = []
+_PROXY_POOL_REFRESHED_AT: float = 0.0
+_PROXY_POOL_REFRESH_INTERVAL = 300.0  # 5 分钟刷新一次
+_PROXY_BLACKLIST: Dict[str, float] = {}  # proxy → blacklist_until
+
+
+def _use_proxy_pool() -> bool:
+    if os.environ.get("GUPPIAO_USE_PROXY_POOL", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    root = _project_root()
+    return (root / "USE_PROXY_POOL").is_file() or (root / ".gupiao_proxy_pool").is_file()
+
+
+def _fetch_free_proxies(logger: Optional[Callable[[str], None]] = None) -> List[str]:
+    """从多个免费代理源获取 HTTPS 代理列表。"""
+    import requests
+    proxies: List[str] = []
+    sources = [
+        # 免费代理 API（返回纯文本 ip:port）
+        ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=CN&ssl=yes&anonymity=all", "proxyscrape"),
+        ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "github-speedx"),
+        ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "github-clarketm"),
+    ]
+    for url, name in sources:
+        try:
+            resp = requests.get(url, timeout=8, headers={"User-Agent": _random.choice(_USER_AGENT_POOL)})
+            if resp.status_code == 200:
+                lines = resp.text.strip().splitlines()
+                for line in lines:
+                    addr = line.strip()
+                    if addr and ":" in addr and not addr.startswith("#"):
+                        proxies.append(f"http://{addr}")
+                if logger and lines:
+                    logger(f"代理池: 从 {name} 获取 {len(lines)} 条")
+        except Exception as e:
+            if logger:
+                logger(f"代理池: {name} 获取失败: {e}")
+    # 去重
+    return list(dict.fromkeys(proxies))
+
+
+def _validate_proxy(proxy: str, timeout: float = 5.0) -> bool:
+    """快速验证代理是否可用（用百度做测试目标）。"""
+    import requests
+    try:
+        resp = requests.get(
+            "https://www.baidu.com",
+            proxies={"http": proxy, "https": proxy},
+            timeout=timeout,
+            headers={"User-Agent": _random.choice(_USER_AGENT_POOL)},
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _refresh_proxy_pool(logger: Optional[Callable[[str], None]] = None) -> None:
+    """刷新代理池：获取 → 随机抽样验证 → 缓存。"""
+    global _PROXY_POOL, _PROXY_POOL_REFRESHED_AT
+    raw = _fetch_free_proxies(logger)
+    if not raw:
+        return
+    # 随机抽样验证（最多验证 20 个，避免太慢）
+    sample = _random.sample(raw, min(20, len(raw)))
+    valid: List[str] = []
+    for proxy in sample:
+        if _validate_proxy(proxy, timeout=4.0):
+            valid.append(proxy)
+            if len(valid) >= 8:  # 够用即停
+                break
+    # 将未验证的也加入（标记为低优先级），验证过的放前面
+    validated_set = set(valid)
+    remaining = [p for p in raw if p not in validated_set]
+    with _PROXY_POOL_LOCK:
+        _PROXY_POOL = valid + remaining[:50]  # 保留最多 50 + 8 个
+        _PROXY_POOL_REFRESHED_AT = time.time()
+    if logger:
+        logger(f"代理池: 刷新完成，验证可用 {len(valid)} 个，总计 {len(_PROXY_POOL)} 个")
+
+
+def _get_proxy() -> Optional[str]:
+    """获取一个可用代理地址。如果代理池为空或未启用，返回 None。"""
+    if not _use_proxy_pool():
+        return None
+    now = time.time()
+    with _PROXY_POOL_LOCK:
+        # 自动刷新
+        if now - _PROXY_POOL_REFRESHED_AT > _PROXY_POOL_REFRESH_INTERVAL:
+            # 在后台线程刷新，避免阻塞
+            threading.Thread(target=_refresh_proxy_pool, daemon=True).start()
+        pool = [p for p in _PROXY_POOL if _PROXY_BLACKLIST.get(p, 0) <= now]
+        if not pool:
+            return None
+        return _random.choice(pool)
+
+
+def _blacklist_proxy(proxy: str) -> None:
+    """将失败的代理加入黑名单 60 秒。"""
+    with _PROXY_POOL_LOCK:
+        _PROXY_BLACKLIST[proxy] = time.time() + 60.0
+
 
 # 拉取全市场列表分页时写入 GUI 日志（由 get_all_stocks 临时注册）
 _list_download_log: Optional[Callable[[str], None]] = None
@@ -370,21 +561,32 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
 
     _wait_for_history_request_slot()
     _increment_history_diagnostic("network_requests")
+
+    proxy = _get_proxy()
     with requests.Session() as session:
-        if _use_bypass_proxy():
+        if proxy:
+            session.proxies = {"http": proxy, "https": proxy}
+        elif _use_bypass_proxy():
             session.trust_env = False
             session.proxies = {"http": None, "https": None}
+        # 每次请求使用随机化请求头，降低被识别为机器人的风险
         req_kw: Dict[str, Any] = {
             "url": url,
             "params": params,
             "timeout": timeout,
-            "headers": dict(_EASTMONEY_HEADERS),
+            "headers": _random_eastmoney_headers(),
         }
         if _use_insecure_ssl():
             req_kw["verify"] = False
-        response = session.get(**req_kw)
+        try:
+            response = session.get(**req_kw)
+        except Exception:
+            if proxy:
+                _blacklist_proxy(proxy)
+            raise
         response_text = response.text or ""
         if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
+            _adaptive_on_rate_limit()
             _increment_history_diagnostic("rate_limit_events")
             _increment_history_diagnostic("network_failures")
             message = _record_history_block(
@@ -396,6 +598,7 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
             data_json = response.json()
         except ValueError as exc:
             if _looks_like_eastmoney_rate_limit(response.status_code, response_text):
+                _adaptive_on_rate_limit()
                 _increment_history_diagnostic("rate_limit_events")
                 _increment_history_diagnostic("network_failures")
                 message = _record_history_block("东方财富返回非 JSON 内容，疑似触发限流或封禁")
@@ -403,10 +606,12 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
             _increment_history_diagnostic("network_failures")
             raise
         if _eastmoney_json_indicates_rate_limit(data_json):
+            _adaptive_on_rate_limit()
             _increment_history_diagnostic("rate_limit_events")
             _increment_history_diagnostic("network_failures")
             message = _record_history_block("东方财富返回限流提示，进入冷却保护")
             raise EastmoneyRateLimitError(message)
+        _adaptive_on_success()
         _increment_history_diagnostic("network_success")
         return data_json
 
@@ -432,7 +637,7 @@ def _fetch_eastmoney_auction_snapshot(
             "url": url,
             "params": params,
             "timeout": 8.0,
-            "headers": dict(_EASTMONEY_HEADERS),
+            "headers": _random_eastmoney_headers(),
         }
         if _use_insecure_ssl():
             req_kw["verify"] = False
@@ -572,6 +777,23 @@ def _normalize_intraday_source_frame(
             normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
         else:
             normalized[col] = None
+
+    # ---- 过滤竞价时段数据，避免与竞价标记重叠 ----
+    # 东方财富分时接口可能返回 09:25~09:29 的竞价撮合数据，
+    # 这些数据会和独立获取的竞价快照在图表上产生时间重叠。
+    # 正式连续竞价从 09:30 开始，午盘从 13:00 开始；
+    # 仅保留 [09:30, 11:30] ∪ [13:00, 15:00] 的有效交易分钟。
+    hhmm = normalized["time"].dt.strftime("%H:%M")
+    in_morning = (hhmm >= "09:30") & (hhmm <= "11:30")
+    in_afternoon = (hhmm >= "13:00") & (hhmm <= "15:00")
+    before_filter_len = len(normalized)
+    normalized = normalized[in_morning | in_afternoon].reset_index(drop=True)
+    if normalized.empty:
+        return pd.DataFrame()
+    filtered_count = before_filter_len - len(normalized)
+    if filtered_count > 0 and logger:
+        logger(f"分时行情 {stock_code} 过滤 {filtered_count} 条非交易时段数据（竞价/午休）")
+
     return normalized[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]]
 
 
@@ -687,7 +909,8 @@ def _record_history_block(reason: str) -> str:
 
 
 def _wait_for_history_request_slot() -> None:
-    min_interval = _history_min_request_interval_sec()
+    # 使用自适应间隔：连续成功则加速，遇到限流则减速
+    min_interval = _adaptive_current_interval()
     while True:
         blocked_until = _history_access_blocked_until()
         now = time.time()
@@ -880,7 +1103,125 @@ def _normalize_history_frame(df: "pd.DataFrame") -> "pd.DataFrame":
     return out[keep_cols].dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
 
 
+# ---- 腾讯证券镜像池 ----
+_TENCENT_HISTORY_MIRRORS = [
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
+    "https://web.ifzqgtimg.cn/appstock/app/fqkline/get",
+]
+_TENCENT_MIRROR_HEALTH: Dict[str, float] = {}
+_TENCENT_MIRROR_HEALTH_LOCK = threading.Lock()
+
+
+def _mark_tencent_mirror_failed(url: str) -> None:
+    host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
+    if not host:
+        return
+    with _TENCENT_MIRROR_HEALTH_LOCK:
+        _TENCENT_MIRROR_HEALTH[host] = time.time() + 120.0
+
+
+def _mark_tencent_mirror_ok(url: str) -> None:
+    host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
+    with _TENCENT_MIRROR_HEALTH_LOCK:
+        _TENCENT_MIRROR_HEALTH.pop(host, None)
+
+
+def _get_healthy_tencent_mirrors() -> List[str]:
+    now = time.time()
+    result: List[str] = []
+    with _TENCENT_MIRROR_HEALTH_LOCK:
+        for url in _TENCENT_HISTORY_MIRRORS:
+            host = re.sub(r"^https?://", "", str(url or "").strip()).split("/", 1)[0]
+            cooldown_until = _TENCENT_MIRROR_HEALTH.get(host, 0)
+            if cooldown_until <= now:
+                result.append(url)
+    return result if result else list(_TENCENT_HISTORY_MIRRORS)
+
+
+def _fetch_tencent_hist_direct(
+    stock_code: str,
+    start_date: str,
+    end_date: str,
+    log: Optional[Callable[[str], None]] = None,
+) -> "pd.DataFrame":
+    """直接抓腾讯证券历史日线，带镜像轮换和 UA 随机化。"""
+    import requests
+    from akshare.utils import demjson
+
+    symbol = _market_prefixed_code(stock_code)
+    range_start = max(int(start_date[:4]), 2000)
+    range_end = int(end_date[:4]) + 1
+
+    mirrors = _get_healthy_tencent_mirrors()
+    big_df = pd.DataFrame()
+
+    for year in range(range_start, range_end):
+        params = {
+            "_var": f"kline_day{year}",
+            "param": f"{symbol},day,{year}-01-01,{year + 1}-12-31,640,",
+            "r": f"0.{_random.randint(1000000000, 9999999999)}",
+        }
+        last_error = None
+        for mirror_url in mirrors:
+            try:
+                time.sleep(_random.uniform(0.1, 0.4))  # 小随机延时
+                resp = requests.get(
+                    mirror_url,
+                    params=params,
+                    timeout=(5, 10),
+                    headers={
+                        "User-Agent": _random.choice(_USER_AGENT_POOL),
+                        "Referer": "https://gu.qq.com/",
+                    },
+                )
+                if resp.status_code != 200:
+                    _mark_tencent_mirror_failed(mirror_url)
+                    last_error = RuntimeError(f"tencent HTTP {resp.status_code}")
+                    continue
+                data_text = resp.text
+                idx = data_text.find("={")
+                if idx < 0:
+                    _mark_tencent_mirror_failed(mirror_url)
+                    last_error = RuntimeError("tencent: bad response format")
+                    continue
+                data_json = demjson.decode(data_text[idx + 1:])["data"][symbol]
+                if "day" in data_json:
+                    temp_df = pd.DataFrame(data_json["day"])
+                else:
+                    temp_df = pd.DataFrame()
+                if not temp_df.empty:
+                    big_df = pd.concat([big_df, temp_df], ignore_index=True)
+                _mark_tencent_mirror_ok(mirror_url)
+                break
+            except Exception as e:
+                last_error = e
+                _mark_tencent_mirror_failed(mirror_url)
+                if log:
+                    host = re.sub(r"^https?://", "", mirror_url).split("/", 1)[0]
+                    log(f"腾讯 {stock_code} 镜像 {host} 年份 {year} 失败: {e}")
+        # 单个年份全部镜像失败，继续下一年
+
+    if big_df.empty:
+        return pd.DataFrame()
+
+    big_df = big_df.iloc[:, :6]
+    big_df.columns = ["date", "open", "close", "high", "low", "amount"]
+    for col in ["open", "close", "high", "low", "amount"]:
+        big_df[col] = pd.to_numeric(big_df[col], errors="coerce")
+    big_df["date"] = pd.to_datetime(big_df["date"], errors="coerce").dt.date.astype(str)
+    big_df = big_df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+    return _normalize_history_frame(big_df)
+
+
 def _fetch_tencent_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """腾讯历史日线：优先使用自建直连（带镜像轮换），失败回退 akshare。"""
+    try:
+        df = _fetch_tencent_hist_direct(stock_code, start_date, end_date)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
+    # 回退到 akshare
     symbol = _market_prefixed_code(stock_code)
     df = _retry_ak_call(
         ak.stock_zh_a_hist_tx,
@@ -892,16 +1233,64 @@ def _fetch_tencent_hist_frame(stock_code: str, start_date: str, end_date: str) -
     return _normalize_history_frame(df)
 
 
+# ---- 新浪财经反封保护 ----
+_SINA_HISTORY_MIRRORS = [
+    "https://finance.sina.com.cn",
+    "https://hq.sinajs.cn",
+]
+_SINA_REQUEST_LOCK = threading.Lock()
+_SINA_NEXT_REQUEST_AT = 0.0
+_SINA_MIN_INTERVAL = 1.5  # 新浪对频率更敏感
+
+
+def _sina_throttle() -> None:
+    """新浪专用节流阀，确保请求间隔。"""
+    global _SINA_NEXT_REQUEST_AT
+    while True:
+        with _SINA_REQUEST_LOCK:
+            now = time.time()
+            wait = _SINA_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _SINA_NEXT_REQUEST_AT = now + _SINA_MIN_INTERVAL
+                return
+        time.sleep(min(wait, 0.5))
+
+
 def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """新浪历史日线：带 UA 随机化 + 独立节流 + 重试。"""
     symbol = _market_prefixed_code(stock_code)
-    df = _retry_ak_call(
-        ak.stock_zh_a_daily,
-        symbol=symbol,
-        start_date=start_date,
-        end_date=end_date,
-        adjust="",
-    )
-    return _normalize_history_frame(df)
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            _sina_throttle()
+            # 临时 patch requests headers
+            import requests
+            old_get = requests.get
+
+            def _patched_get(url, **kwargs):
+                if "sina.com.cn" in str(url) or "sinajs.cn" in str(url):
+                    kwargs.setdefault("headers", {})
+                    kwargs["headers"]["User-Agent"] = _random.choice(_USER_AGENT_POOL)
+                    kwargs["headers"]["Referer"] = "https://finance.sina.com.cn/"
+                return old_get(url, **kwargs)
+
+            requests.get = _patched_get
+            try:
+                df = ak.stock_zh_a_daily(
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="",
+                )
+            finally:
+                requests.get = old_get
+            return _normalize_history_frame(df)
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
 
 
 def _probe_history_mirror(url: str) -> Tuple[bool, str]:
@@ -1030,7 +1419,7 @@ def _apply_network_patches() -> None:
                 kwargs.setdefault("verify", False)
             u = str(url)
             if "eastmoney.com" in u:
-                merged = dict(_EASTMONEY_HEADERS)
+                merged = _random_eastmoney_headers()
                 merged.setdefault("Connection", "close")
                 extra = kwargs.get("headers")
                 if isinstance(extra, dict):
@@ -1167,14 +1556,19 @@ def _load_history_store(
     return df
 
 
-def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 40) -> None:
+def _save_history_store(stock_code: str, df: pd.DataFrame, keep_rows: int = 0) -> None:
+    """保存历史数据到本地 SQLite。
+    keep_rows=0 表示保存全部行（企业级策略：不截断，保证任意天数查询都能命中缓存）。
+    """
     if df is None or df.empty:
         return
     if "date" not in df.columns:
         return
     out = df.copy()
     out["date"] = out["date"].astype(str).str.strip()
-    out = out.sort_values("date").tail(max(keep_rows, 10)).reset_index(drop=True)
+    out = out.sort_values("date").reset_index(drop=True)
+    if keep_rows > 0:
+        out = out.tail(max(keep_rows, 10)).reset_index(drop=True)
     save_history_store(stock_code, out)
 
 
@@ -1218,12 +1612,24 @@ def _eastmoney_request_mirror_urls(url: str) -> List[str]:
     hosts = [
         "push2.eastmoney.com",
         original,
-        "82.push2.eastmoney.com",
-        "33.push2.eastmoney.com",
         "7.push2.eastmoney.com",
-        "81.push2.eastmoney.com",
-        "72.push2.eastmoney.com",
         "28.push2.eastmoney.com",
+        "33.push2.eastmoney.com",
+        "36.push2.eastmoney.com",
+        "40.push2.eastmoney.com",
+        "45.push2.eastmoney.com",
+        "51.push2.eastmoney.com",
+        "58.push2.eastmoney.com",
+        "59.push2.eastmoney.com",
+        "60.push2.eastmoney.com",
+        "62.push2.eastmoney.com",
+        "64.push2.eastmoney.com",
+        "72.push2.eastmoney.com",
+        "81.push2.eastmoney.com",
+        "82.push2.eastmoney.com",
+        "85.push2.eastmoney.com",
+        "90.push2.eastmoney.com",
+        "95.push2.eastmoney.com",
     ]
     seen: set[str] = set()
     out: List[str] = []
@@ -1444,6 +1850,74 @@ def _should_refresh_today_row(df: Optional[pd.DataFrame], date_col: str = "date"
     return now.hour < 15 or (now.hour == 15 and now.minute < 30)
 
 
+def _estimate_last_trade_date() -> str:
+    """估算最近一个交易日（不考虑节假日，仅排除周末）。
+    周一~周五 15:30 前返回上一个交易日，15:30 后返回当天。
+    周六/周日返回最近的周五。
+    """
+    now = datetime.now()
+    today = now.date()
+    weekday = today.weekday()  # 0=Mon ... 6=Sun
+    if weekday == 5:  # Saturday
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    if weekday == 6:  # Sunday
+        return (today - timedelta(days=2)).strftime("%Y-%m-%d")
+    # Weekday
+    market_closed = now.hour > 15 or (now.hour == 15 and now.minute >= 30)
+    if market_closed:
+        return today.strftime("%Y-%m-%d")
+    # Market not yet closed today → last trade date is previous working day
+    if weekday == 0:  # Monday before close → Friday
+        return (today - timedelta(days=3)).strftime("%Y-%m-%d")
+    return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _is_history_cache_fresh(
+    stock_code: str,
+    min_rows: int,
+    log: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """判断本地历史缓存是否足够新鲜，可以跳过网络请求。
+
+    策略：
+    1. 读取 history_meta 表中的 refreshed_at 和 latest_trade_date
+    2. 如果 latest_trade_date >= 估算的最近交易日，并且 row_count >= min_rows → 新鲜
+    3. 如果 refreshed_at 在今天 15:30 之后 → 新鲜（当天收盘后已刷新过）
+    """
+    meta = load_history_meta_store(stock_code)
+    if meta is None:
+        return False
+    latest_td = str(meta.get("latest_trade_date") or "").strip()
+    row_count = int(meta.get("row_count") or 0)
+    refreshed_at = str(meta.get("refreshed_at") or "").strip()
+    if not latest_td or row_count < min_rows:
+        return False
+
+    estimated_last_td = _estimate_last_trade_date()
+
+    # 缓存的最新交易日 >= 估算的最近交易日 → 数据足够新
+    if latest_td >= estimated_last_td:
+        if log:
+            log(f"历史 {stock_code} 缓存新鲜 (latest={latest_td} >= estimated={estimated_last_td}, rows={row_count})")
+        return True
+
+    # 今天已经刷新过（收盘后），即使 latest_trade_date 较旧也信任
+    if refreshed_at:
+        try:
+            refreshed_dt = datetime.strptime(refreshed_at, "%Y-%m-%d %H:%M:%S")
+            now = datetime.now()
+            if refreshed_dt.date() == now.date() and (
+                refreshed_dt.hour > 15 or (refreshed_dt.hour == 15 and refreshed_dt.minute >= 30)
+            ):
+                if log:
+                    log(f"历史 {stock_code} 今日收盘后已刷新 (refreshed={refreshed_at}), 跳过网络请求")
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    return False
+
+
 def _build_a_share_universe(log: Optional[Callable[[str], None]] = None) -> pd.DataFrame:
     """深交所 + 上交所（含科创板）官方列表，不含北交所；少量 HTTP，无东方财富 clist 分页。"""
     parts: List[pd.DataFrame] = []
@@ -1524,6 +1998,9 @@ class StockDataFetcher:
         self._default_intraday_source: str = "auto"
         self._default_fund_flow_source: str = "auto"
         self._default_limit_up_reason_source: str = "auto"
+        # 启动时预加载代理池（后台线程，不阻塞初始化）
+        if _use_proxy_pool():
+            threading.Thread(target=_refresh_proxy_pool, daemon=True).start()
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
@@ -1565,6 +2042,48 @@ class StockDataFetcher:
     def set_default_limit_up_reason_source(self, source: str) -> None:
         self._default_limit_up_reason_source = self.normalize_limit_up_reason_source(source)
 
+    def _build_multi_source_plans(self, source: str) -> List[HistoryRequestPlan]:
+        """构建多源并行请求计划列表，用于批量更新时分流。
+        将可用的 eastmoney 镜像各自作为一个独立 plan，
+        再加上 tencent 和 sina 作为补充源，实现负载均衡。
+        """
+        normalized = self.normalize_history_source(source)
+
+        plans: List[HistoryRequestPlan] = []
+
+        # 东方财富：每个健康镜像作为独立通道
+        if normalized in ("auto", "eastmoney"):
+            mirrors = self.get_available_history_mirrors()
+            for mirror in mirrors:
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("eastmoney",),
+                    mirror_urls=(mirror,),
+                    reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
+                ))
+
+        # 腾讯/新浪：作为补充分流通道（auto 模式或指定模式）
+        if normalized in ("auto", "tencent"):
+            plans.append(HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("tencent",),
+                mirror_urls=(),
+                reason="multi-source-tencent",
+            ))
+        if normalized in ("auto", "sina"):
+            plans.append(HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("sina",),
+                mirror_urls=(),
+                reason="multi-source-sina",
+            ))
+
+        # 兜底：至少保证一个 auto plan
+        if not plans:
+            plans.append(self.build_history_request_plan(source=source, force_refresh=False))
+
+        return plans
+
     def update_history_cache(
         self,
         max_stocks: int = 0,
@@ -1590,38 +2109,65 @@ class StockDataFetcher:
         if total <= 0:
             return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
 
-        plan = self.build_history_request_plan(source=source or self._default_history_source, force_refresh=False)
+        # ---- 多源并行分流策略 ----
+        # 将可用数据源构建为多个 plan，按轮转方式分配给不同股票，
+        # 避免所有请求打到同一个源上导致封 IP。
+        source_str = source or self._default_history_source
+        multi_plans = self._build_multi_source_plans(source_str)
+        plan_count = len(multi_plans)
+
+        if self._log:
+            plan_names = [p.reason for p in multi_plans]
+            self._log(f"多源分流策略：{plan_count} 个通道 → {', '.join(plan_names)}")
+
+        # 打乱股票顺序，避免同板块集中请求
+        _random.shuffle(rows)
+
         worker_count = max(
             1,
             min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
         )
+        # 多源模式下适当提高并发：通道数 × 基础并发（但受环境变量上限约束）
+        if plan_count > 1:
+            worker_count = max(worker_count, min(plan_count + 1, 6))
+
         updated = 0
         failed = 0
         skipped = 0
 
-        def _work(item: Dict[str, Any]) -> tuple[str, str, bool]:
+        def _work(item: Dict[str, Any], assigned_plan: HistoryRequestPlan) -> tuple[str, str, bool, bool]:
+            """返回 (code, name, success, skipped)"""
             code = str(item.get("code", "")).strip().zfill(6)
             name = str(item.get("name", "") or "")
             if should_stop and should_stop():
-                return code, name, False
+                return code, name, False, True
+            # 智能刷新：如果本地缓存已经足够新鲜，跳过网络请求
+            if _is_history_cache_fresh(code, max(1, days), self._log):
+                return code, name, True, True
             df = self.get_history_data(
                 code,
                 days=days,
                 force_refresh=True,
-                request_plan=plan,
+                request_plan=assigned_plan,
             )
-            return code, name, bool(df is not None and not df.empty)
+            return code, name, bool(df is not None and not df.empty), False
 
         with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
-            futures = [executor.submit(_work, item) for item in rows]
+            # 轮转分配 plan 给每只股票
+            futures = [
+                executor.submit(_work, item, multi_plans[idx % plan_count])
+                for idx, item in enumerate(rows)
+            ]
             completed = 0
             for fut in as_completed(futures):
                 completed += 1
-                code, name, ok = fut.result()
+                code, name, ok, was_skipped = fut.result()
                 if should_stop and should_stop():
                     skipped = max(0, total - completed)
                     break
-                if ok:
+                if was_skipped:
+                    skipped += 1
+                elif ok:
                     updated += 1
                 else:
                     failed += 1
@@ -1633,7 +2179,7 @@ class StockDataFetcher:
             "updated": updated,
             "failed": failed,
             "skipped": skipped,
-            "plan": "/".join(plan.provider_sequence),
+            "plan": f"multi-source/{plan_count}channels",
         }
 
     def build_intraday_request_plan(self, source: str = "auto") -> DataProviderPlan:
@@ -2175,6 +2721,13 @@ class StockDataFetcher:
                 request_plan = self.build_history_request_plan(source=self._default_history_source, force_refresh=False)
 
             if not force_refresh:
+                # ---- 企业级缓存策略：先查 meta 判断新鲜度，再查数据 ----
+                if _is_history_cache_fresh(stock_code, min_rows, self._log):
+                    history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
+                    if history_df is not None and not history_df.empty:
+                        _increment_history_diagnostic("cache_hits")
+                        return history_df.tail(days).reset_index(drop=True)
+
                 history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
                 if history_df is not None and not history_df.empty:
                     _increment_history_diagnostic("cache_hits")
@@ -2274,7 +2827,12 @@ class StockDataFetcher:
                     last_error = RuntimeError(f"{provider}-empty-history")
                     continue
 
-                _save_history_store(stock_code, df, keep_rows=max(40, days + 10))
+                _save_history_store(stock_code, df)
+                # 保存缓存元数据，用于后续新鲜度判断
+                latest_td = ""
+                if "date" in df.columns and not df.empty:
+                    latest_td = str(df["date"].iloc[-1]).strip()
+                save_history_meta_store(stock_code, latest_td, len(df), source=provider)
                 return df.tail(days).reset_index(drop=True)
 
             if history_df is not None and not history_df.empty:
