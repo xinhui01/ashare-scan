@@ -1232,12 +1232,74 @@ class StockFilter:
 
         return result
 
+    def _prefetch_history_for_pool(
+        self,
+        codes: List[str],
+        days: int = 65,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> None:
+        """批量预取涨停池股票的历史数据到本地缓存。
+        已有缓存的跳过，缺失的并行拉取，确保后续分类时不再逐只走网络。
+        """
+        from stock_data import _is_history_cache_fresh
+        need_fetch: List[str] = []
+        for code in codes:
+            c = str(code).strip().zfill(6)
+            if not _is_history_cache_fresh(c, min(10, days)):
+                # 再检查 SQLite 有没有足够行数
+                from stock_store import load_history as _load_h
+                cached = _load_h(c, limit=days)
+                if cached is None or cached.empty or len(cached) < 10:
+                    need_fetch.append(c)
+
+        if not need_fetch:
+            if progress_callback:
+                progress_callback(len(codes), len(codes), "全部已有缓存")
+            return
+
+        total = len(need_fetch)
+        if self._log:
+            self._log(f"涨停分类：需预取 {total}/{len(codes)} 只股票的历史数据")
+
+        completed = 0
+        def _fetch_one(code: str) -> None:
+            nonlocal completed
+            self.fetcher.get_history_data(code, days=days, force_refresh=False)
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total, f"预取 {code}")
+
+        workers = min(4, max(1, total // 5))
+        executor = DaemonThreadPoolExecutor(max_workers=workers, thread_name_prefix="zt-prefetch")
+        try:
+            futures = [executor.submit(_fetch_one, c) for c in need_fetch]
+            from concurrent.futures import as_completed
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def classify_limit_up_pool(
         self,
         pool_records: List[Dict[str, Any]],
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, Any]]:
-        """对涨停池中的每只股票进行技术形态分类。"""
+        """对涨停池中的每只股票进行技术形态分类。
+        自动先批量预取缺失的历史数据，再逐只分类。
+        """
+        codes = [str(r.get("code", "")).strip().zfill(6) for r in pool_records]
+
+        # 阶段1：批量预取历史数据（缓存已有的秒过）
+        self._prefetch_history_for_pool(
+            codes, days=65,
+            progress_callback=lambda c, t, info:
+                progress_callback(c, t, f"[预取] {info}") if progress_callback else None,
+        )
+
+        # 阶段2：逐只分类（全部从本地缓存读取，秒出）
         results: List[Dict[str, Any]] = []
         total = len(pool_records)
         for idx, rec in enumerate(pool_records):
@@ -1251,7 +1313,6 @@ class StockFilter:
             )
             classification["name"] = name
             classification["industry"] = industry
-            # 保留原始池子信息
             for key in ("amount", "market_cap", "turnover", "first_board_time",
                          "last_board_time", "break_count", "board_amount"):
                 if key in rec:

@@ -2208,7 +2208,7 @@ class StockMonitorApp:
         self.price_ax.plot(x, closes, color="#2f6fd6", linewidth=1.0, alpha=0.35, label=close_label)
         self.price_ax.plot(x, ma, color="#f08a24", linewidth=1.4, label=ma_label)
         self.price_ax.plot(x, ma10, color="#7b52ab", linewidth=1.2, label=ma10_label)
-        self.price_ax.set_ylabel("价格")
+        self.price_ax.set_ylabel("价\n格", rotation=0, labelpad=14, va="center")
         self.price_ax.set_title("K线图（滚轮左右滑动，点击K线进入分时）")
         self.price_ax.legend(loc="upper left")
         self.price_ax.grid(True, alpha=0.25)
@@ -2253,7 +2253,7 @@ class StockMonitorApp:
             avg_volume = float(volume_compare_window.mean())
             if avg_volume > 0:
                 latest_volume_ratio_text = f"  最新 {self._format_volume(latest_volume_value)} / 均量 {latest_volume_value / avg_volume * 100.0:.1f}%"
-        self.volume_ax.set_ylabel("成交量")
+        self.volume_ax.set_ylabel("成\n交\n量", rotation=0, labelpad=14, va="center")
         self.volume_ax.set_title(f"成交量{latest_volume_ratio_text}" if latest_volume_ratio_text else "成交量")
         self.volume_ax.yaxis.set_major_formatter(FuncFormatter(self._format_axis_volume))
         self.volume_ax.yaxis.get_offset_text().set_visible(False)
@@ -2269,7 +2269,7 @@ class StockMonitorApp:
         self.flow_ax.set_visible(True)
         self.flow_ax.bar(chart_data["x"], flow_values, width=0.6, color=flow_colors, alpha=0.85)
         self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
-        self.flow_ax.set_ylabel("大单净额")
+        self.flow_ax.set_ylabel("大\n单\n净\n额", rotation=0, labelpad=14, va="center")
         self.flow_ax.set_xlabel("日期")
         self.flow_ax.grid(True, alpha=0.2)
 
