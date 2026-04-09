@@ -2715,104 +2715,6 @@ class StockDataFetcher:
 
         return plans
 
-    def _run_cache_batch(
-        self,
-        rows: List[Dict[str, Any]],
-        days: int,
-        source_str: str,
-        workers: Optional[int],
-        should_stop: Optional[Callable[[], bool]],
-        progress_callback: Optional[Callable[[int, int, str, str, int, int, int], None]],
-        total_offset: int = 0,
-        total_overall: int = 0,
-    ) -> Dict[str, Any]:
-        """执行一批股票的缓存更新，返回 {updated, failed, skipped, failed_items}。"""
-        multi_plans = self._build_multi_source_plans(source_str)
-        plan_count = len(multi_plans)
-
-        worker_count = max(
-            1,
-            min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
-        )
-        if plan_count > 1:
-            worker_count = max(worker_count, min(plan_count + 1, 6))
-
-        updated = 0
-        failed = 0
-        skipped = 0
-        failed_items: List[Dict[str, Any]] = []
-
-        def _work(item: Dict[str, Any], assigned_plan: HistoryRequestPlan) -> tuple[str, str, bool, bool]:
-            code = str(item.get("code", "")).strip().zfill(6)
-            name = str(item.get("name", "") or "")
-            if should_stop and should_stop():
-                return code, name, False, True
-            if _is_history_cache_fresh(code, max(1, days), self._log):
-                return code, name, True, True
-            df = self.get_history_data(
-                code,
-                days=days,
-                force_refresh=True,
-                request_plan=assigned_plan,
-            )
-            return code, name, bool(df is not None and not df.empty), False
-
-        with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
-            futures = [
-                executor.submit(_work, item, multi_plans[idx % plan_count])
-                for idx, item in enumerate(rows)
-            ]
-            completed = 0
-            for fut in as_completed(futures):
-                completed += 1
-                code, name, ok, was_skipped = fut.result()
-                if should_stop and should_stop():
-                    skipped = max(0, len(rows) - completed)
-                    break
-                if was_skipped:
-                    skipped += 1
-                elif ok:
-                    updated += 1
-                else:
-                    failed += 1
-                    failed_items.append({"code": code, "name": name})
-                if progress_callback:
-                    global_completed = total_offset + completed
-                    progress_callback(
-                        global_completed, total_overall or len(rows),
-                        code, name, updated, failed, skipped,
-                    )
-
-        return {"updated": updated, "failed": failed, "skipped": skipped, "failed_items": failed_items}
-
-    def _wait_for_cooldown_recovery(
-        self,
-        should_stop: Optional[Callable[[], bool]],
-        max_wait_sec: float = 120.0,
-    ) -> bool:
-        """等待数据源冷却恢复，最多等 max_wait_sec 秒。
-
-        返回 True 表示至少有一个源恢复，False 表示等待超时或被用户中断。
-        """
-        t0 = time.time()
-        while time.time() - t0 < max_wait_sec:
-            if should_stop and should_stop():
-                return False
-            # 检查是否有源恢复
-            has_available = False
-            blocked = _history_access_blocked_until()
-            if blocked <= time.time():
-                has_available = True
-            if not _global_host_on_cooldown("finance.sina.com.cn"):
-                has_available = True
-            plans = self._build_multi_source_plans(self._default_history_source)
-            if plans and not (len(plans) == 1 and plans[0].cache_only):
-                has_available = True
-            if has_available:
-                return True
-            time.sleep(5)
-        return False
-
     def update_history_cache(
         self,
         max_stocks: int = 0,
@@ -2838,85 +2740,72 @@ class StockDataFetcher:
         if total <= 0:
             return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
 
+        # ---- 多源并行分流策略 ----
         source_str = source or self._default_history_source
-
-        # ---- 分批处理 + 自动重试 ----
-        # 第一轮：打乱后全量跑
-        _random.shuffle(rows)
-
         multi_plans = self._build_multi_source_plans(source_str)
         plan_count = len(multi_plans)
+
         if self._log:
             plan_names = [p.reason for p in multi_plans]
             self._log(f"多源分流策略：{plan_count} 个通道 → {', '.join(plan_names)}")
 
-        batch_result = self._run_cache_batch(
-            rows, days, source_str, workers, should_stop,
-            progress_callback, total_offset=0, total_overall=total,
+        # 打乱股票顺序，避免同板块集中请求
+        _random.shuffle(rows)
+
+        worker_count = max(
+            1,
+            min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
         )
+        if plan_count > 1:
+            worker_count = max(worker_count, min(plan_count + 1, 6))
 
-        total_updated = batch_result["updated"]
-        total_failed = batch_result["failed"]
-        total_skipped = batch_result["skipped"]
-        pending_items = batch_result["failed_items"]
+        updated = 0
+        failed = 0
+        skipped = 0
 
-        # ---- 自动重试失败的股票（最多 3 轮）----
-        max_retries = 3
-        for retry_round in range(1, max_retries + 1):
-            if not pending_items:
-                break
+        def _work(item: Dict[str, Any], assigned_plan: HistoryRequestPlan) -> tuple[str, str, bool, bool]:
+            """返回 (code, name, success, skipped)"""
+            code = str(item.get("code", "")).strip().zfill(6)
+            name = str(item.get("name", "") or "")
             if should_stop and should_stop():
-                break
-
-            if self._log:
-                self._log(
-                    f"【重试 {retry_round}/{max_retries}】{len(pending_items)} 只股票待重试，"
-                    f"等待数据源冷却恢复..."
-                )
-
-            # 等待冷却恢复（最多等 2 分钟）
-            recovered = self._wait_for_cooldown_recovery(should_stop, max_wait_sec=120.0)
-            if not recovered:
-                if self._log:
-                    self._log(f"数据源仍在冷却中，跳过重试轮次 {retry_round}")
-                break
-
-            if self._log:
-                self._log(f"数据源已恢复，开始重试 {len(pending_items)} 只股票")
-
-            # 重试时降低并发，减轻服务器压力
-            retry_workers = max(1, (workers or 2) // 2)
-            retry_rows = [{"code": item["code"], "name": item["name"]} for item in pending_items]
-            _random.shuffle(retry_rows)
-
-            offset = total - len(pending_items)
-            retry_result = self._run_cache_batch(
-                retry_rows, days, source_str, retry_workers, should_stop,
-                progress_callback, total_offset=offset, total_overall=total,
+                return code, name, False, True
+            if _is_history_cache_fresh(code, max(1, days), self._log):
+                return code, name, True, True
+            df = self.get_history_data(
+                code,
+                days=days,
+                force_refresh=True,
+                request_plan=assigned_plan,
             )
+            return code, name, bool(df is not None and not df.empty), False
 
-            # 更新统计：重试成功的从 failed 挪到 updated
-            recovered_count = retry_result["updated"] + retry_result["skipped"]
-            total_updated += retry_result["updated"]
-            total_skipped += retry_result["skipped"]
-            total_failed = total_failed - recovered_count - retry_result["failed"] + retry_result["failed"]
-            # 简化：重新计算 failed
-            total_failed = total - total_updated - total_skipped
-            pending_items = retry_result["failed_items"]
-
-            if self._log:
-                self._log(
-                    f"重试轮次 {retry_round} 完成：本轮恢复 {recovered_count} 只，"
-                    f"仍失败 {len(pending_items)} 只"
-                )
+        with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
+            futures = [
+                executor.submit(_work, item, multi_plans[idx % plan_count])
+                for idx, item in enumerate(rows)
+            ]
+            completed = 0
+            for fut in as_completed(futures):
+                completed += 1
+                code, name, ok, was_skipped = fut.result()
+                if should_stop and should_stop():
+                    skipped = max(0, total - completed)
+                    break
+                if was_skipped:
+                    skipped += 1
+                elif ok:
+                    updated += 1
+                else:
+                    failed += 1
+                if progress_callback:
+                    progress_callback(completed, total, code, name, updated, failed, skipped)
 
         return {
             "total": total,
-            "updated": total_updated,
-            "failed": max(0, total_failed),
-            "skipped": total_skipped,
+            "updated": updated,
+            "failed": failed,
+            "skipped": skipped,
             "plan": f"multi-source/{plan_count}channels",
-            "retry_rounds": min(retry_round if pending_items or max_retries > 0 else 0, max_retries),
         }
 
     def build_intraday_request_plan(self, source: str = "auto") -> DataProviderPlan:
