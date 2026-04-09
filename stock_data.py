@@ -1453,6 +1453,380 @@ def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "
     return pd.DataFrame()
 
 
+# ---- 网易财经历史日线 ----
+# 格式：CSV 下载，非常稳定，反爬较弱
+# URL: http://quotes.money.163.com/service/chddata.html?code=CODE&start=START&end=END
+_NETEASE_REQUEST_LOCK = threading.Lock()
+_NETEASE_NEXT_REQUEST_AT = 0.0
+_NETEASE_MIN_INTERVAL = 1.0
+
+
+def _netease_throttle() -> None:
+    global _NETEASE_NEXT_REQUEST_AT
+    while True:
+        with _NETEASE_REQUEST_LOCK:
+            now = time.time()
+            wait = _NETEASE_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _NETEASE_NEXT_REQUEST_AT = now + _NETEASE_MIN_INTERVAL + _random.uniform(0.2, 0.8)
+                return
+        time.sleep(min(wait, 0.5))
+
+
+def _netease_stock_code(code: str) -> str:
+    """网易用 0+沪市代码 或 1+深市代码 的格式。"""
+    c = str(code).strip().zfill(6)
+    if c.startswith(("5", "6", "9")):
+        return f"0{c}"
+    return f"1{c}"
+
+
+def _fetch_netease_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """网易财经历史日线：CSV 格式下载，反爬较弱。"""
+    import requests
+    import io
+
+    if _global_host_on_cooldown("quotes.money.163.com"):
+        remain = _global_host_cooldown_remaining("quotes.money.163.com")
+        raise RuntimeError(f"netease host on cooldown ({int(remain)}s remaining)")
+
+    netease_code = _netease_stock_code(stock_code)
+    # 网易日期格式: YYYYMMDD
+    url = "https://quotes.money.163.com/service/chddata.html"
+    params = {
+        "code": netease_code,
+        "start": start_date,
+        "end": end_date,
+        "fields": "TCLOSE;HIGH;LOW;TOPEN;LCLOSE;CHG;PCHG;TURNOVER;VOTURNOVER;VATURNOVER",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            _netease_throttle()
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=(5, 15),
+                headers={
+                    "User-Agent": _random.choice(_USER_AGENT_POOL),
+                    "Referer": "https://quotes.money.163.com/",
+                },
+            )
+            if resp.status_code != 200:
+                last_error = RuntimeError(f"netease HTTP {resp.status_code}")
+                time.sleep(1.0 + _random.uniform(0.5, 1.5))
+                continue
+
+            # 网易返回 GBK 编码的 CSV
+            text = resp.content.decode("gbk", errors="replace")
+            df = pd.read_csv(io.StringIO(text), dtype=str)
+            if df.empty:
+                last_error = RuntimeError("netease: empty CSV")
+                continue
+
+            # 列名映射
+            col_map = {
+                "日期": "date",
+                "收盘价": "close",
+                "最高价": "high",
+                "最低价": "low",
+                "开盘价": "open",
+                "前收盘": "prev_close",
+                "涨跌额": "change_amount",
+                "涨跌幅": "change_pct",
+                "换手率": "turnover_rate",
+                "成交量": "volume",
+                "成交金额": "amount",
+            }
+            # 网易的列名可能带引号，需要 strip
+            df.columns = [c.strip().strip("'\"") for c in df.columns]
+            df = df.rename(columns=col_map)
+
+            for col in ("open", "close", "high", "low", "volume", "amount", "change_pct", "change_amount", "turnover_rate"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col].astype(str).str.strip(), errors="coerce")
+
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), errors="coerce").dt.date.astype(str)
+
+            # 去掉 None 或停牌数据
+            df = df.dropna(subset=["date", "close"])
+            df = df[df["close"] > 0]
+
+            _global_mark_host_ok("quotes.money.163.com")
+            return _normalize_history_frame(df)
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+
+    _global_mark_host_failed("quotes.money.163.com")
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
+
+
+# ---- 百度股市通历史日线 ----
+_BAIDU_REQUEST_LOCK = threading.Lock()
+_BAIDU_NEXT_REQUEST_AT = 0.0
+_BAIDU_MIN_INTERVAL = 1.2
+
+
+def _baidu_throttle() -> None:
+    global _BAIDU_NEXT_REQUEST_AT
+    while True:
+        with _BAIDU_REQUEST_LOCK:
+            now = time.time()
+            wait = _BAIDU_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _BAIDU_NEXT_REQUEST_AT = now + _BAIDU_MIN_INTERVAL + _random.uniform(0.2, 0.8)
+                return
+        time.sleep(min(wait, 0.5))
+
+
+def _baidu_stock_code(code: str) -> str:
+    """百度用 ab.sz000001 或 ab.sh600000 的格式。"""
+    c = str(code).strip().zfill(6)
+    market = "sh" if c.startswith(("5", "6", "9")) else "sz"
+    return f"ab.{market}{c}"
+
+
+def _fetch_baidu_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """百度股市通历史日线 API。"""
+    import requests
+
+    if _global_host_on_cooldown("gushitong.baidu.com"):
+        remain = _global_host_cooldown_remaining("gushitong.baidu.com")
+        raise RuntimeError(f"baidu host on cooldown ({int(remain)}s remaining)")
+
+    baidu_code = _baidu_stock_code(stock_code)
+    url = "https://finance.pae.baidu.com/vapi/v1/getquotation"
+    params = {
+        "srcid": "5353",
+        "pointType": "string",
+        "group": "quotation_kline_ab",
+        "query": baidu_code,
+        "code": baidu_code,
+        "market_type": "ab",
+        "newFormat": "1",
+        "is_498": "1",
+        "ktype": "day",
+        "finClientType": "pc",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            _baidu_throttle()
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=(5, 12),
+                headers={
+                    "User-Agent": _random.choice(_USER_AGENT_POOL),
+                    "Referer": "https://gushitong.baidu.com/",
+                    "Accept": "application/json",
+                },
+            )
+            if resp.status_code != 200:
+                last_error = RuntimeError(f"baidu HTTP {resp.status_code}")
+                time.sleep(1.0 + _random.uniform(0.5, 1.5))
+                continue
+
+            data = resp.json()
+            result = data.get("Result") or {}
+            # 百度接口结构层级较深
+            content_list = result.get("newMarketData") or result.get("priceinfo") or {}
+            if isinstance(content_list, dict):
+                content_list = content_list.get("marketData") or content_list.get("content") or {}
+            if isinstance(content_list, dict):
+                content_list = content_list.get("marketData") or ""
+
+            # 尝试从 keys 中获取 kline data
+            kline_data = None
+            if isinstance(result, dict):
+                for key in ("newMarketData", "priceinfo"):
+                    block = result.get(key)
+                    if isinstance(block, dict):
+                        md = block.get("marketData", "")
+                        if isinstance(md, str) and md.strip():
+                            kline_data = md
+                            break
+                        keys_data = block.get("keys", [])
+                        if keys_data:
+                            kline_data = block
+                            break
+
+            if not kline_data:
+                last_error = RuntimeError("baidu: no kline data found")
+                time.sleep(1.0)
+                continue
+
+            if isinstance(kline_data, str):
+                # 百度有时返回 "日期,开盘,收盘,最高,最低,成交量,成交额\n..." 格式
+                lines = kline_data.strip().split("\n")
+                rows = []
+                for line in lines:
+                    parts = line.split(",")
+                    if len(parts) >= 7:
+                        rows.append({
+                            "date": parts[0].strip(),
+                            "open": parts[1].strip(),
+                            "close": parts[2].strip(),
+                            "high": parts[3].strip(),
+                            "low": parts[4].strip(),
+                            "volume": parts[5].strip(),
+                            "amount": parts[6].strip(),
+                        })
+                df = pd.DataFrame(rows)
+            else:
+                last_error = RuntimeError("baidu: unexpected data format")
+                continue
+
+            if df.empty:
+                last_error = RuntimeError("baidu: empty result")
+                continue
+
+            for col in ("open", "close", "high", "low", "volume", "amount"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
+            df = df.dropna(subset=["date", "close"])
+
+            _global_mark_host_ok("gushitong.baidu.com")
+            return _normalize_history_frame(df)
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+
+    _global_mark_host_failed("gushitong.baidu.com")
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
+
+
+# ---- 搜狐财经历史日线 ----
+_SOHU_REQUEST_LOCK = threading.Lock()
+_SOHU_NEXT_REQUEST_AT = 0.0
+_SOHU_MIN_INTERVAL = 0.8
+
+
+def _sohu_throttle() -> None:
+    global _SOHU_NEXT_REQUEST_AT
+    while True:
+        with _SOHU_REQUEST_LOCK:
+            now = time.time()
+            wait = _SOHU_NEXT_REQUEST_AT - now
+            if wait <= 0:
+                _SOHU_NEXT_REQUEST_AT = now + _SOHU_MIN_INTERVAL + _random.uniform(0.1, 0.5)
+                return
+        time.sleep(min(wait, 0.5))
+
+
+def _sohu_stock_code(code: str) -> str:
+    """搜狐用 cn_000001 或 cn_600000 的格式。"""
+    c = str(code).strip().zfill(6)
+    return f"cn_{c}"
+
+
+def _fetch_sohu_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
+    """搜狐财经历史日线：JSONP 格式。"""
+    import requests
+
+    if _global_host_on_cooldown("q.stock.sohu.com"):
+        remain = _global_host_cooldown_remaining("q.stock.sohu.com")
+        raise RuntimeError(f"sohu host on cooldown ({int(remain)}s remaining)")
+
+    sohu_code = _sohu_stock_code(stock_code)
+    # 搜狐日期格式 YYYYMMDD
+    s = start_date.replace("-", "")
+    e = end_date.replace("-", "")
+    url = f"https://q.stock.sohu.com/hisHq"
+    params = {
+        "code": sohu_code,
+        "start": s,
+        "end": e,
+        "stat": "1",
+        "order": "D",
+        "period": "d",
+        "callback": f"historySearchHandler",
+        "rt": f"jsonp{_random.randint(1000, 9999)}",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        try:
+            _sohu_throttle()
+            resp = requests.get(
+                url,
+                params=params,
+                timeout=(5, 12),
+                headers={
+                    "User-Agent": _random.choice(_USER_AGENT_POOL),
+                    "Referer": "https://q.stock.sohu.com/",
+                },
+            )
+            if resp.status_code != 200:
+                last_error = RuntimeError(f"sohu HTTP {resp.status_code}")
+                time.sleep(1.0 + _random.uniform(0.5, 1.5))
+                continue
+
+            # JSONP 剥离
+            import json as _json
+            text = _strip_jsonp_wrapper(resp.text)
+            data = _json.loads(text)
+
+            if not isinstance(data, list) or not data:
+                last_error = RuntimeError("sohu: empty or invalid response")
+                continue
+
+            # 搜狐返回 [{status: 0, hq: [[date, open, close, change, change_pct, low, high, volume, amount, turnover], ...]}]
+            hq = data[0].get("hq") or [] if isinstance(data[0], dict) else []
+            if not hq:
+                last_error = RuntimeError("sohu: no hq data")
+                continue
+
+            rows = []
+            for item in hq:
+                if not isinstance(item, list) or len(item) < 9:
+                    continue
+                rows.append({
+                    "date": str(item[0]).strip(),
+                    "open": item[1],
+                    "close": item[2],
+                    # item[3] = 涨跌额, item[4] = 涨跌幅%
+                    "change_amount": item[3],
+                    "change_pct": str(item[4]).replace("%", ""),
+                    "low": item[5],
+                    "high": item[6],
+                    "volume": item[7],
+                    "amount": item[8],
+                    "turnover_rate": item[9] if len(item) > 9 else None,
+                })
+
+            df = pd.DataFrame(rows)
+            if df.empty:
+                last_error = RuntimeError("sohu: empty parsed result")
+                continue
+
+            for col in ("open", "close", "high", "low", "volume", "amount", "change_pct", "change_amount", "turnover_rate"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col].astype(str).str.replace("%", "").str.replace(",", ""), errors="coerce")
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
+            df = df.dropna(subset=["date", "close"])
+
+            _global_mark_host_ok("q.stock.sohu.com")
+            return _normalize_history_frame(df)
+        except Exception as e:
+            last_error = e
+            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
+
+    _global_mark_host_failed("q.stock.sohu.com")
+    if last_error is not None:
+        raise last_error
+    return pd.DataFrame()
+
+
 def _probe_history_mirror(url: str) -> Tuple[bool, str]:
     probe_code = "000001"
     end_date = datetime.now().strftime("%Y%m%d")
@@ -2292,7 +2666,7 @@ class StockDataFetcher:
                     reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
                 ))
 
-        # 腾讯/新浪：作为补充分流通道（跳过正在冷却的源）
+        # 腾讯/新浪/网易/百度/搜狐：作为补充分流通道（跳过正在冷却的源）
         if normalized in ("auto", "tencent"):
             tencent_healthy = _get_healthy_tencent_mirrors()
             if tencent_healthy:
@@ -2306,10 +2680,34 @@ class StockDataFetcher:
             if not _global_host_on_cooldown("finance.sina.com.cn"):
                 plans.append(HistoryRequestPlan(
                     mode="network",
-                provider_sequence=("sina",),
-                mirror_urls=(),
-                reason="multi-source-sina",
-            ))
+                    provider_sequence=("sina",),
+                    mirror_urls=(),
+                    reason="multi-source-sina",
+                ))
+        if normalized in ("auto", "netease"):
+            if not _global_host_on_cooldown("quotes.money.163.com"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("netease",),
+                    mirror_urls=(),
+                    reason="multi-source-netease",
+                ))
+        if normalized in ("auto", "baidu"):
+            if not _global_host_on_cooldown("gushitong.baidu.com"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("baidu",),
+                    mirror_urls=(),
+                    reason="multi-source-baidu",
+                ))
+        if normalized in ("auto", "sohu"):
+            if not _global_host_on_cooldown("q.stock.sohu.com"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("sohu",),
+                    mirror_urls=(),
+                    reason="multi-source-sohu",
+                ))
 
         # 兜底：至少保证一个 auto plan
         if not plans:
@@ -2559,6 +2957,27 @@ class StockDataFetcher:
                 mirror_urls=(),
                 reason="history-provider=sina",
             )
+        if normalized == "netease":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("netease",),
+                mirror_urls=(),
+                reason="history-provider=netease",
+            )
+        if normalized == "baidu":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("baidu",),
+                mirror_urls=(),
+                reason="history-provider=baidu",
+            )
+        if normalized == "sohu":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("sohu",),
+                mirror_urls=(),
+                reason="history-provider=sohu",
+            )
 
         mirrors = tuple(self.get_available_history_mirrors(force_refresh=force_refresh))
         if normalized == "eastmoney":
@@ -2585,7 +3004,7 @@ class StockDataFetcher:
         if mirrors:
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=("eastmoney", "tencent", "sina"),
+                provider_sequence=("eastmoney", "tencent", "sina", "netease", "baidu", "sohu"),
                 mirror_urls=mirrors,
                 reason="history-provider=auto",
             )
@@ -2597,7 +3016,7 @@ class StockDataFetcher:
             reason = "history-mirrors-unavailable"
         return HistoryRequestPlan(
             mode="network",
-            provider_sequence=("tencent", "sina"),
+            provider_sequence=("tencent", "sina", "netease", "baidu", "sohu"),
             mirror_urls=(),
             reason=reason,
         )
@@ -3461,6 +3880,36 @@ class StockDataFetcher:
                         last_error = e
                         if self._log:
                             self._log(f"历史 {stock_code} 使用新浪源失败: {e}")
+                        continue
+                elif provider == "netease":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用网易源补位。")
+                        df = _fetch_netease_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用网易源失败: {e}")
+                        continue
+                elif provider == "baidu":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用百度源补位。")
+                        df = _fetch_baidu_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用百度源失败: {e}")
+                        continue
+                elif provider == "sohu":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用搜狐源补位。")
+                        df = _fetch_sohu_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用搜狐源失败: {e}")
                         continue
                 else:
                     last_error = RuntimeError(f"unsupported-history-provider: {provider}")
