@@ -112,6 +112,15 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (code, trade_date)
         );
 
+        CREATE TABLE IF NOT EXISTS limit_up_pool (
+            trade_date TEXT NOT NULL,
+            pool_type TEXT NOT NULL DEFAULT 'today',
+            data_json TEXT NOT NULL DEFAULT '[]',
+            row_count INTEGER NOT NULL DEFAULT 0,
+            saved_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (trade_date, pool_type)
+        );
+
         CREATE TABLE IF NOT EXISTS watchlist (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
@@ -1022,3 +1031,47 @@ def import_watchlist_csv(file_path: str) -> int:
             imported += 1
     logger.info("自选股导入完成：%d 只 <- %s", imported, file_path)
     return imported
+
+
+# ============= 涨停池持久化 =============
+
+def save_limit_up_pool(trade_date: str, df: pd.DataFrame, pool_type: str = "today") -> None:
+    """将涨停池 DataFrame 按日期持久化到 SQLite。"""
+    date_key = str(trade_date or "").strip().replace("-", "")
+    if not date_key or df is None or df.empty:
+        return
+    data_json = df.to_json(orient="records", force_ascii=False)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _do():
+        with _DB_WRITE_LOCK, _connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO limit_up_pool (trade_date, pool_type, data_json, row_count, saved_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (date_key, pool_type, data_json, len(df), now),
+            )
+    _retry_locked(_do)
+
+
+def load_limit_up_pool(trade_date: str, pool_type: str = "today") -> Optional[pd.DataFrame]:
+    """从 SQLite 读取指定日期的涨停池，无数据返回 None。"""
+    date_key = str(trade_date or "").strip().replace("-", "")
+    if not date_key:
+        return None
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT data_json, row_count FROM limit_up_pool WHERE trade_date = ? AND pool_type = ?",
+                (date_key, pool_type),
+            ).fetchone()
+        if row is None:
+            return None
+        data_json = row["data_json"]
+        if not data_json or data_json == "[]":
+            return None
+        df = pd.read_json(data_json, orient="records")
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception as e:
+        logger.warning("读取涨停池 %s/%s 失败: %s", date_key, pool_type, e)
+        return None

@@ -2834,6 +2834,8 @@ class StockDataFetcher:
     def __init__(self):
         self._log: Optional[Callable[[str], None]] = None
         self._strong_pool_cache: Dict[str, pd.DataFrame] = {}
+        self._limit_up_pool_cache: Dict[str, pd.DataFrame] = {}
+        self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = {}
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
         self._history_mirror_cache: List[str] = []
@@ -3035,6 +3037,24 @@ class StockDataFetcher:
         failed = 0
         skipped = 0
 
+        # 构建一个包含全部备用源的 fallback plan，用于单源失败后重试
+        _all_fallback_providers = [
+            p for plan in multi_plans for p in plan.provider_sequence
+        ]
+        # 去重保序
+        _seen_providers: set[str] = set()
+        _unique_fallback: list[str] = []
+        for p in _all_fallback_providers:
+            if p not in _seen_providers:
+                _seen_providers.add(p)
+                _unique_fallback.append(p)
+        _fallback_plan = HistoryRequestPlan(
+            mode="network",
+            provider_sequence=tuple(_unique_fallback),
+            mirror_urls=(),
+            reason="multi-source-fallback",
+        ) if len(_unique_fallback) > 1 else None
+
         def _work(item: Dict[str, Any], assigned_plan: HistoryRequestPlan) -> tuple[str, str, bool, bool]:
             """返回 (code, name, success, skipped)"""
             code = str(item.get("code", "")).strip().zfill(6)
@@ -3043,12 +3063,30 @@ class StockDataFetcher:
                 return code, name, False, True
             if _is_history_cache_fresh(code, max(1, days), self._log):
                 return code, name, True, True
+
+            # 检查分配的源是否已冷却，是则直接用 fallback
+            _host_map = {
+                "sina": "finance.sina.com.cn", "netease": "quotes.money.163.com",
+                "baidu": "gushitong.baidu.com", "sohu": "q.stock.sohu.com",
+                "ths": "d.10jqka.com.cn", "wscn": "api-ddc-wscn.awtmt.com",
+            }
+            assigned_all_cooled = all(
+                _global_host_on_cooldown(_host_map[p])
+                for p in assigned_plan.provider_sequence
+                if p in _host_map
+            ) if assigned_plan.provider_sequence else False
+
+            use_plan = _fallback_plan if (assigned_all_cooled and _fallback_plan) else assigned_plan
             df = self.get_history_data(
-                code,
-                days=days,
-                force_refresh=True,
-                request_plan=assigned_plan,
+                code, days=days, force_refresh=True, request_plan=use_plan,
             )
+            if df is not None and not df.empty:
+                return code, name, True, False
+            # 如果用的是 assigned plan 失败了，再用 fallback 重试
+            if use_plan is assigned_plan and _fallback_plan is not None:
+                df = self.get_history_data(
+                    code, days=days, force_refresh=True, request_plan=_fallback_plan,
+                )
             return code, name, bool(df is not None and not df.empty), False
 
         with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
@@ -3439,32 +3477,73 @@ class StockDataFetcher:
         return reason
 
     def get_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
-        """获取指定日期的涨停板池（东方财富）。"""
+        """获取指定日期的涨停板池。
+
+        三级缓存：内存 → SQLite → 网络请求。
+        历史日期的数据一旦入库，后续永远从本地读取。
+        """
         date_key = self._normalize_trade_date(trade_date)
         if not date_key:
             return pd.DataFrame()
+
+        # 1. 内存缓存
+        mem_cached = self._limit_up_pool_cache.get(date_key)
+        if mem_cached is not None:
+            return mem_cached
+
+        # 2. SQLite 持久缓存
+        from stock_store import load_limit_up_pool, save_limit_up_pool
+        db_cached = load_limit_up_pool(date_key)
+        if db_cached is not None and not db_cached.empty:
+            self._limit_up_pool_cache[date_key] = db_cached
+            if self._log:
+                self._log(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
+            return db_cached
+
+        # 3. 网络请求
         try:
             df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
             if df is not None and not df.empty:
+                self._limit_up_pool_cache[date_key] = df
+                save_limit_up_pool(date_key, df)
+                if self._log:
+                    self._log(f"涨停池 {date_key} 网络获取 {len(df)} 只，已保存到本地")
                 return df
         except Exception as e:
             if self._log:
                 self._log(f"涨停池 {date_key} 获取失败: {e}")
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        self._limit_up_pool_cache[date_key] = empty
+        return empty
 
     def get_previous_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
-        """获取指定日期的昨日涨停板池（东方财富），即昨日涨停股今日表现。"""
+        """获取指定日期的昨日涨停板池。三级缓存：内存 → SQLite → 网络。"""
         date_key = self._normalize_trade_date(trade_date)
         if not date_key:
             return pd.DataFrame()
+
+        mem_cached = self._prev_limit_up_pool_cache.get(date_key)
+        if mem_cached is not None:
+            return mem_cached
+
+        from stock_store import load_limit_up_pool, save_limit_up_pool
+        db_cached = load_limit_up_pool(date_key, pool_type="previous")
+        if db_cached is not None and not db_cached.empty:
+            self._prev_limit_up_pool_cache[date_key] = db_cached
+            return db_cached
+
         try:
             df = _retry_ak_call(ak.stock_zt_pool_previous_em, date=date_key)
             if df is not None and not df.empty:
+                self._prev_limit_up_pool_cache[date_key] = df
+                save_limit_up_pool(date_key, df, pool_type="previous")
                 return df
         except Exception as e:
             if self._log:
                 self._log(f"昨日涨停池 {date_key} 获取失败: {e}")
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        self._prev_limit_up_pool_cache[date_key] = empty
+        return empty
 
     def _recent_trade_dates(self, end_date: str, count: int) -> List[str]:
         date_key = self._normalize_trade_date(end_date)
@@ -3633,24 +3712,12 @@ class StockDataFetcher:
                 "summary": "未能解析有效交易日范围",
             }
 
-        # 先批量获取所有日期的涨停池到缓存，避免 compare_limit_up_pools 内部重复请求
-        pool_cache: Dict[str, pd.DataFrame] = {}
-        for td in trade_dates:
-            if td not in pool_cache:
-                pool_cache[td] = self.get_limit_up_pool(td)
-        # 临时 patch get_limit_up_pool 让 compare_limit_up_pools 复用缓存
-        _orig_get_pool = self.get_limit_up_pool
-        self.get_limit_up_pool = lambda date_str: pool_cache.get(  # type: ignore[assignment]
-            self._normalize_trade_date(date_str), _orig_get_pool(date_str)
-        )
-        try:
-            result = self.compare_limit_up_pools(trade_dates[-1], trade_dates[-2])
-        finally:
-            self.get_limit_up_pool = _orig_get_pool  # type: ignore[assignment]
+        # get_limit_up_pool 已有三级缓存（内存→SQLite→网络），直接调用即可
+        result = self.compare_limit_up_pools(trade_dates[-1], trade_dates[-2])
 
         daily_stats: List[Dict[str, Any]] = []
         for trade_date in trade_dates:
-            pool_df = pool_cache.get(trade_date, pd.DataFrame())
+            pool_df = self.get_limit_up_pool(trade_date)  # 命中缓存，不会重复请求
             first_df = pd.DataFrame()
             if not pool_df.empty and "连板数" in pool_df.columns:
                 first_df = pool_df[pool_df["连板数"] == 1].copy()
@@ -3995,8 +4062,23 @@ class StockDataFetcher:
             if not provider_sequence:
                 provider_sequence = ["eastmoney"]
 
+            _PROVIDER_HOST = {
+                "sina": "finance.sina.com.cn",
+                "netease": "quotes.money.163.com",
+                "baidu": "gushitong.baidu.com",
+                "sohu": "q.stock.sohu.com",
+                "ths": "d.10jqka.com.cn",
+                "wscn": "api-ddc-wscn.awtmt.com",
+            }
+
             last_error: Optional[BaseException] = None
             for provider in provider_sequence:
+                # 跳过正在冷却中的源，避免无意义的调用和日志刷屏
+                host = _PROVIDER_HOST.get(provider)
+                if host and _global_host_on_cooldown(host):
+                    last_error = RuntimeError(f"{provider} on cooldown, skipped")
+                    continue
+
                 if provider == "eastmoney":
                     if request_plan is not None:
                         raw_mirror_pool = list(request_plan.mirror_urls)

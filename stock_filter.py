@@ -1640,50 +1640,372 @@ class StockFilter:
 
     # ================= 涨停预测 =================
 
+    def _extract_pre_limit_up_features(
+        self,
+        code: str,
+        limit_up_date_idx: int,
+        df: pd.DataFrame,
+        close: pd.Series,
+        volume: pd.Series,
+        amount: pd.Series,
+        change_pct: pd.Series,
+    ) -> Optional[Dict[str, Any]]:
+        """提取某只股票在涨停日前一天（T-1）的特征快照。
+
+        返回特征字典，数据不足则返回 None。
+        """
+        t = limit_up_date_idx  # 涨停日在 df 中的行索引
+        if t < 6:
+            return None  # 至少需要前6天数据
+
+        feat: Dict[str, Any] = {}
+
+        # --- T-1 日（涨停前一天）的特征 ---
+        prev = t - 1
+
+        # 涨跌幅
+        feat["change_pct_t1"] = float(change_pct.iloc[prev]) if not pd.isna(change_pct.iloc[prev]) else None
+
+        # 收盘价
+        prev_close = float(close.iloc[prev]) if not pd.isna(close.iloc[prev]) else None
+        feat["close_t1"] = prev_close
+
+        # 成交量 / 成交额
+        feat["volume_t1"] = float(volume.iloc[prev]) if not pd.isna(volume.iloc[prev]) else None
+        feat["amount_t1"] = float(amount.iloc[prev]) if not pd.isna(amount.iloc[prev]) else None
+
+        # 量比：T-1 成交量 / 前5日均量
+        vol_window = volume.iloc[max(0, prev - 5):prev].dropna()
+        if feat["volume_t1"] and not vol_window.empty and float(vol_window.mean()) > 0:
+            feat["vol_ratio_t1"] = round(feat["volume_t1"] / float(vol_window.mean()), 2)
+        else:
+            feat["vol_ratio_t1"] = None
+
+        # 额比：T-1 成交额 / 前5日均额
+        amt_window = amount.iloc[max(0, prev - 5):prev].dropna()
+        if feat["amount_t1"] and not amt_window.empty and float(amt_window.mean()) > 0:
+            feat["amt_ratio_t1"] = round(feat["amount_t1"] / float(amt_window.mean()), 2)
+        else:
+            feat["amt_ratio_t1"] = None
+
+        # 缩量比：前3日均量 / 前5日均量（判断是否蓄势）
+        vol_3 = volume.iloc[max(0, prev - 3):prev].dropna()
+        vol_5 = volume.iloc[max(0, prev - 5):prev].dropna()
+        if not vol_3.empty and not vol_5.empty and float(vol_5.mean()) > 0:
+            feat["shrink_ratio_t1"] = round(float(vol_3.mean()) / float(vol_5.mean()), 2)
+        else:
+            feat["shrink_ratio_t1"] = None
+
+        # 均线距离
+        ma5 = close.rolling(5, min_periods=5).mean()
+        ma10 = close.rolling(10, min_periods=10).mean()
+        ma20 = close.rolling(20, min_periods=20).mean()
+
+        ma5_val = float(ma5.iloc[prev]) if not pd.isna(ma5.iloc[prev]) else None
+        ma10_val = float(ma10.iloc[prev]) if not pd.isna(ma10.iloc[prev]) else None
+        ma20_val = float(ma20.iloc[prev]) if not pd.isna(ma20.iloc[prev]) else None
+
+        if prev_close and ma5_val and ma5_val > 0:
+            feat["dist_ma5_pct"] = round((prev_close / ma5_val - 1) * 100, 2)
+        else:
+            feat["dist_ma5_pct"] = None
+        if prev_close and ma10_val and ma10_val > 0:
+            feat["dist_ma10_pct"] = round((prev_close / ma10_val - 1) * 100, 2)
+        else:
+            feat["dist_ma10_pct"] = None
+
+        # 多头排列
+        feat["ma_bullish"] = bool(
+            ma5_val is not None and ma10_val is not None and ma20_val is not None
+            and ma5_val > ma10_val > ma20_val
+        )
+
+        # 站上 MA5
+        feat["above_ma5"] = bool(prev_close is not None and ma5_val is not None and prev_close > ma5_val)
+
+        # 回踩MA5：收盘接近或略低于MA5（距MA5在 -3%~+1% 之间），且前几日曾在MA5之上
+        feat["ma5_pullback"] = False
+        if prev_close is not None and ma5_val is not None and ma5_val > 0:
+            dist = (prev_close / ma5_val - 1) * 100
+            if -3.0 <= dist <= 1.0:
+                # 检查前3~5日是否曾站上MA5（确认是回踩而非下跌趋势）
+                was_above = False
+                for lookback in range(2, min(6, prev + 1)):
+                    idx_back = prev - lookback
+                    if idx_back >= 0 and not pd.isna(close.iloc[idx_back]) and not pd.isna(ma5.iloc[idx_back]):
+                        if float(close.iloc[idx_back]) > float(ma5.iloc[idx_back]) * 1.01:
+                            was_above = True
+                            break
+                feat["ma5_pullback"] = was_above
+
+        # 5日涨幅
+        if prev >= 5 and not pd.isna(close.iloc[prev - 5]) and close.iloc[prev - 5] > 0:
+            feat["trend_5d"] = round((prev_close / float(close.iloc[prev - 5]) - 1) * 100, 2) if prev_close else None
+        else:
+            feat["trend_5d"] = None
+
+        # 10日涨幅
+        if prev >= 10 and not pd.isna(close.iloc[prev - 10]) and close.iloc[prev - 10] > 0:
+            feat["trend_10d"] = round((prev_close / float(close.iloc[prev - 10]) - 1) * 100, 2) if prev_close else None
+        else:
+            feat["trend_10d"] = None
+
+        # 60日位置分位
+        window = close.iloc[max(0, prev - 59):prev + 1].dropna()
+        if len(window) >= 10 and prev_close is not None:
+            feat["position_60d"] = round(float((window < prev_close).sum()) / len(window) * 100, 1)
+        else:
+            feat["position_60d"] = None
+
+        # 近10日振幅（波动率）
+        recent_close = close.iloc[max(0, prev - 10):prev].dropna()
+        if len(recent_close) >= 5 and recent_close.mean() > 0:
+            feat["volatility_10d"] = round(float(recent_close.std() / recent_close.mean() * 100), 2)
+        else:
+            feat["volatility_10d"] = None
+
+        # 换手率
+        turnover = pd.to_numeric(df.get("turnover_rate"), errors="coerce") if "turnover_rate" in df.columns else pd.Series(dtype=float)
+        feat["turnover_t1"] = float(turnover.iloc[prev]) if not turnover.empty and prev < len(turnover) and not pd.isna(turnover.iloc[prev]) else None
+
+        return feat
+
+    def analyze_pre_limit_up_profile(
+        self,
+        lookback_days: int = 5,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """回溯分析最近 N 个交易日涨停股在涨停前的特征。
+
+        步骤：
+        1. 获取最近 N 天的涨停池
+        2. 对每只首板涨停股，拉取历史数据，提取涨停前 T-1 日特征
+        3. 汇总统计各特征的分布（中位数、均值、分位）
+
+        返回:
+            feature_samples: 每只涨停股的特征样本列表
+            profile: 聚合的特征画像（中位数/均值/分位）
+            sample_count: 样本数量
+            trade_dates: 回溯的交易日期列表
+        """
+        if self._log:
+            self._log(f"涨停画像：回溯最近 {lookback_days} 个交易日涨停股特征...")
+
+        # 获取最近 N 个交易日
+        from datetime import datetime as _dt
+        today_str = _dt.now().strftime("%Y%m%d")
+        trade_dates = self.fetcher._recent_trade_dates(today_str, lookback_days)
+        if not trade_dates:
+            return {"feature_samples": [], "profile": {}, "sample_count": 0, "trade_dates": []}
+
+        # 收集所有首板涨停股
+        all_first_board: List[Dict[str, Any]] = []
+        for d in trade_dates:
+            pool = self.fetcher.get_limit_up_pool(d)
+            if pool is None or pool.empty:
+                continue
+            if "连板数" in pool.columns:
+                first = pool[pool["连板数"] == 1]
+            else:
+                first = pool
+            for _, row in first.iterrows():
+                code = str(row.get("代码", "")).strip().zfill(6)
+                name = str(row.get("名称", ""))
+                industry = str(row.get("所属行业", ""))
+                if "ST" in name.upper():
+                    continue
+                all_first_board.append({
+                    "code": code, "name": name, "industry": industry,
+                    "limit_up_date": d,
+                })
+
+        if not all_first_board:
+            return {"feature_samples": [], "profile": {}, "sample_count": 0, "trade_dates": trade_dates}
+
+        if self._log:
+            self._log(f"涨停画像：共 {len(all_first_board)} 只首板涨停股，正在提取涨停前特征...")
+
+        # 预取历史数据
+        codes = list({r["code"] for r in all_first_board})
+        self._prefetch_history_for_pool(codes, days=65, progress_callback=progress_callback)
+
+        # 逐只提取特征
+        feature_samples: List[Dict[str, Any]] = []
+        total = len(all_first_board)
+        for idx, rec in enumerate(all_first_board):
+            code = rec["code"]
+            limit_date = rec["limit_up_date"]
+
+            try:
+                history = self.fetcher.get_history_data(code, days=65)
+            except Exception:
+                history = None
+            if history is None or history.empty or len(history) < 10:
+                continue
+
+            df = history.sort_values("date").reset_index(drop=True)
+            df["date"] = df["date"].astype(str).str.strip().str.replace("-", "")
+            close = pd.to_numeric(df["close"], errors="coerce")
+            volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
+            change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+
+            # 找到涨停日在历史中的位置
+            match_idx = df.index[df["date"] == limit_date].tolist()
+            if not match_idx:
+                continue
+            t = match_idx[0]
+
+            feat = self._extract_pre_limit_up_features(code, t, df, close, volume, amount, change_pct)
+            if feat is None:
+                continue
+            feat["code"] = code
+            feat["name"] = rec["name"]
+            feat["industry"] = rec["industry"]
+            feat["limit_up_date"] = limit_date
+            feature_samples.append(feat)
+
+            if progress_callback:
+                progress_callback(idx + 1, total, f"画像 {code} {rec['name']}")
+
+        # 汇总统计
+        profile = self._aggregate_profile(feature_samples)
+
+        if self._log:
+            self._log(f"涨停画像：成功提取 {len(feature_samples)} 个样本的涨停前特征")
+
+        return {
+            "feature_samples": feature_samples,
+            "profile": profile,
+            "sample_count": len(feature_samples),
+            "trade_dates": trade_dates,
+        }
+
+    @staticmethod
+    def _aggregate_profile(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """汇总特征样本，计算各指标的中位数/均值/分位数分布。"""
+        if not samples:
+            return {}
+
+        numeric_keys = [
+            "change_pct_t1", "vol_ratio_t1", "amt_ratio_t1", "shrink_ratio_t1",
+            "dist_ma5_pct", "dist_ma10_pct", "trend_5d", "trend_10d",
+            "position_60d", "volatility_10d", "turnover_t1",
+        ]
+        bool_keys = ["ma_bullish", "above_ma5", "ma5_pullback"]
+
+        profile: Dict[str, Any] = {}
+        for key in numeric_keys:
+            values = [s[key] for s in samples if s.get(key) is not None]
+            if not values:
+                profile[key] = {"median": None, "mean": None, "p25": None, "p75": None, "count": 0}
+                continue
+            sorted_v = sorted(values)
+            n = len(sorted_v)
+            profile[key] = {
+                "median": round(sorted_v[n // 2], 2),
+                "mean": round(sum(sorted_v) / n, 2),
+                "p25": round(sorted_v[max(0, n // 4)], 2),
+                "p75": round(sorted_v[max(0, n * 3 // 4)], 2),
+                "min": round(sorted_v[0], 2),
+                "max": round(sorted_v[-1], 2),
+                "count": n,
+            }
+
+        for key in bool_keys:
+            true_count = sum(1 for s in samples if s.get(key))
+            profile[key] = {
+                "true_count": true_count,
+                "total": len(samples),
+                "ratio": round(true_count / max(len(samples), 1) * 100, 1),
+            }
+
+        return profile
+
     def predict_limit_up_candidates(
         self,
         trade_date: str,
+        lookback_days: int = 5,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Dict[str, Any]:
-        """基于今日涨停池 + 全量扫描结果，筛选明日涨停候选股。
+        """基于涨停前兆画像预测明日涨停候选。
 
-        两个维度：
-        1. 连板延续候选：今日涨停且连板>=1，根据封板强度/量能/板块热度打分
-        2. 首板候选：从今日强势股中筛选有涨停潜力的（量能蓄势、资金异动、技术共振、低位突破）
+        步骤：
+        1. 回溯分析最近 N 天涨停股的涨停前特征，形成画像
+        2. 连板延续候选：今日涨停股评分（封板强度/量能/板块热度）
+        3. 首板候选：用画像匹配今日强势股，越像涨停前夜的分越高
 
         返回:
+            profile: 涨停前兆画像
             continuation_candidates: 连板延续候选列表
             first_board_candidates: 首板候选列表
             hot_industries: 热门行业统计
             summary: 文字摘要
         """
+        # 阶段1：回溯分析涨停前兆画像
         if self._log:
-            self._log(f"涨停预测：正在获取 {trade_date} 涨停池数据...")
+            self._log(f"涨停预测：阶段1 - 回溯最近 {lookback_days} 天涨停股特征...")
+        if progress_callback:
+            progress_callback(0, 1, "回溯分析涨停前兆画像...")
 
-        # 获取今日涨停池（全量，不限首板）
+        profile_result = self.analyze_pre_limit_up_profile(
+            lookback_days=lookback_days, progress_callback=progress_callback,
+        )
+        profile = profile_result.get("profile", {})
+        feature_samples = profile_result.get("feature_samples", [])
+
+        # 阶段2：获取今日涨停池 + 全市场行情
+        if self._log:
+            self._log(f"涨停预测：阶段2 - 获取 {trade_date} 涨停池 + 全市场行情...")
+        if progress_callback:
+            progress_callback(0, 1, "获取今日涨停池...")
+
         today_pool_df = self.fetcher.get_limit_up_pool(trade_date)
         if today_pool_df is None or today_pool_df.empty:
             return {
                 "trade_date": trade_date,
+                "profile": profile,
+                "profile_samples": feature_samples,
                 "continuation_candidates": [],
                 "first_board_candidates": [],
                 "hot_industries": {},
                 "summary": f"{trade_date} 未获取到涨停池数据",
             }
 
-        # 解析涨停池为记录
         all_pool_records = self._parse_full_pool(today_pool_df)
         hot_industries = self._count_pool_industries(today_pool_df)
 
-        # ---------- 维度1: 连板延续候选 ----------
-        if self._log:
-            self._log(f"涨停预测：分析 {len(all_pool_records)} 只涨停股的延续潜力...")
-        if progress_callback:
-            progress_callback(0, len(all_pool_records), "分析连板延续...")
+        # 提前获取全市场行情（只调一次 API），用于阶段4
+        zt_codes = set()
+        if not today_pool_df.empty and "代码" in today_pool_df.columns:
+            zt_codes = set(today_pool_df["代码"].astype(str).str.strip().str.zfill(6))
+        spot_df = self._fetch_spot_snapshot()
 
-        # 预取历史数据
-        codes = [r["code"] for r in all_pool_records]
-        self._prefetch_history_for_pool(codes, days=65, progress_callback=progress_callback)
+        # 阶段3：统一预取所有需要的历史数据（一次搞定）
+        if self._log:
+            self._log("涨停预测：阶段3 - 统一预取历史数据...")
+
+        # 收集所有需要历史数据的股票代码
+        pool_codes = [r["code"] for r in all_pool_records]
+        candidate_codes: List[str] = []
+        if spot_df is not None and not spot_df.empty:
+            strong = self._filter_strong_stocks(spot_df, zt_codes)
+            pullback = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
+            seen = set()
+            for rec in strong + pullback:
+                if rec["code"] not in seen:
+                    seen.add(rec["code"])
+                    candidate_codes.append(rec["code"])
+
+        all_codes = list(set(pool_codes + candidate_codes))
+        if self._log:
+            self._log(f"涨停预测：统一预取 {len(all_codes)} 只股票历史数据"
+                      f"（涨停池{len(pool_codes)} + 候选{len(candidate_codes)}）")
+        self._prefetch_history_for_pool(all_codes, days=65, progress_callback=progress_callback)
+
+        # 阶段4：连板延续候选评分（历史数据已在缓存中）
+        if self._log:
+            self._log(f"涨停预测：阶段4 - 分析 {len(all_pool_records)} 只涨停股的延续潜力...")
 
         continuation_candidates = []
         for idx, rec in enumerate(all_pool_records):
@@ -1693,22 +2015,20 @@ class StockFilter:
             if progress_callback:
                 progress_callback(idx + 1, len(all_pool_records),
                                   f"连板分析 {rec['code']} {rec.get('name', '')}")
-
         continuation_candidates.sort(key=lambda x: -x["score"])
 
-        # ---------- 维度2: 首板候选（从非涨停的强势股中筛选） ----------
+        # 阶段5：首板候选 - 用画像匹配（历史数据 + 行情都已缓存）
         if self._log:
-            self._log("涨停预测：正在筛选首板候选...")
-        if progress_callback:
-            progress_callback(0, 1, "获取强势股列表...")
+            self._log("涨停预测：阶段5 - 用涨停前兆画像匹配候选股...")
 
-        first_board_candidates = self._scan_first_board_candidates(
-            trade_date, today_pool_df, hot_industries, progress_callback
+        first_board_candidates = self._scan_first_board_candidates_cached(
+            today_pool_df, hot_industries, profile, spot_df, zt_codes, progress_callback,
         )
 
         # 摘要
         summary_lines = [
             f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
+            f"回溯样本：最近 {lookback_days} 天共 {len(feature_samples)} 只首板涨停股",
             f"今日涨停总数：{len(all_pool_records)} 只",
             f"连板延续候选：{len(continuation_candidates)} 只（得分>=40）",
             f"首板候选：{len(first_board_candidates)} 只（得分>=50）",
@@ -1719,6 +2039,8 @@ class StockFilter:
 
         return {
             "trade_date": trade_date,
+            "profile": profile,
+            "profile_samples": feature_samples,
             "continuation_candidates": continuation_candidates,
             "first_board_candidates": first_board_candidates,
             "hot_industries": hot_industries,
@@ -1774,7 +2096,7 @@ class StockFilter:
         industry = rec.get("industry", "")
         turnover = rec.get("turnover")
 
-        # 1. 连板数基础分（连板越高，延续概率越高到一定程度后降低）
+        # 1. 连板数基础分
         if boards >= 5:
             score += 30
             reasons.append(f"{boards}连板+30")
@@ -1828,7 +2150,7 @@ class StockFilter:
             score += 5
             reasons.append(f"板块有{hot_industries[industry]}只+5")
 
-        # 4. 换手率（适中的换手更健康）
+        # 4. 换手率
         if turnover is not None:
             if 3 <= turnover <= 15:
                 score += 5
@@ -1837,13 +2159,11 @@ class StockFilter:
                 score -= 5
                 reasons.append(f"换手{turnover:.1f}%过高-5")
 
-        # 5. 从历史数据补充技术面信号
-        history = self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=65),
-            timeout_sec=8.0,
-            fallback=None,
-            task_name=f"预测历史 {code}",
-        )
+        # 5. 量能和均线（历史数据已预取到缓存，直接读取）
+        try:
+            history = self.fetcher.get_history_data(code, days=65)
+        except Exception:
+            history = None
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
             close = pd.to_numeric(df["close"], errors="coerce")
@@ -1852,18 +2172,16 @@ class StockFilter:
             ma5 = close.rolling(5, min_periods=5).mean()
             ma10 = close.rolling(10, min_periods=10).mean()
             ma20 = close.rolling(20, min_periods=20).mean()
-
             latest_ma5 = float(ma5.iloc[-1]) if not pd.isna(ma5.iloc[-1]) else None
             latest_ma10 = float(ma10.iloc[-1]) if not pd.isna(ma10.iloc[-1]) else None
             latest_ma20 = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else None
 
-            # 均线多头排列
             if (latest_ma5 is not None and latest_ma10 is not None and latest_ma20 is not None
                     and latest_ma5 > latest_ma10 > latest_ma20):
                 score += 10
                 reasons.append("多头排列+10")
 
-            # 量能：当日量/前5日均量
+            # 量能
             if len(volume) >= 6 and not pd.isna(volume.iloc[-1]):
                 prev_vol = volume.iloc[-6:-1].dropna()
                 if not prev_vol.empty and float(prev_vol.mean()) > 0:
@@ -1892,107 +2210,131 @@ class StockFilter:
             "predict_type": "连板延续",
         }
 
-    def _scan_first_board_candidates(
+    def _scan_first_board_candidates_cached(
         self,
-        trade_date: str,
         today_pool_df: pd.DataFrame,
         hot_industries: Dict[str, int],
+        profile: Dict[str, Any],
+        spot_df: Optional[pd.DataFrame],
+        zt_codes: set,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, Any]]:
-        """从涨停池之外的强势股中筛选首板候选。
-
-        筛选逻辑:
-        1. 获取当日涨幅 5%~9.5% 的股票（接近涨停但未涨停）
-        2. 结合量能、均线、位置等信号打分
-        """
-        # 取今日涨停的代码集合，排除已涨停的
-        zt_codes = set()
-        if not today_pool_df.empty and "代码" in today_pool_df.columns:
-            zt_codes = set(today_pool_df["代码"].astype(str).str.strip().str.zfill(6))
-
-        # 从已有扫描结果或涨停池相关板块的强势股中获取候选
-        # 优先使用涨停池的行业，获取同行业强势股
-        if self._log:
-            self._log("涨停预测：获取强势股列表（涨幅5%~9.5%）...")
-
-        strong_stocks = self._fetch_strong_stocks(trade_date, zt_codes)
-        if not strong_stocks:
-            if self._log:
-                self._log("涨停预测：未获取到符合条件的强势股")
+        """用画像匹配候选股（行情和历史数据均已提前缓存）。"""
+        if spot_df is None or spot_df.empty:
             return []
 
-        # 预取历史数据
-        codes = [r["code"] for r in strong_stocks]
-        self._prefetch_history_for_pool(codes, days=65, progress_callback=progress_callback)
+        strong_stocks = self._filter_strong_stocks(spot_df, zt_codes)
+        ma5_pullback_stocks = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
 
+        seen_codes = set()
+        merged: List[Dict[str, Any]] = []
+        for rec in strong_stocks:
+            if rec["code"] not in seen_codes:
+                seen_codes.add(rec["code"])
+                merged.append(rec)
+        for rec in ma5_pullback_stocks:
+            if rec["code"] not in seen_codes:
+                seen_codes.add(rec["code"])
+                merged.append(rec)
+
+        if not merged:
+            return []
+
+        if self._log:
+            self._log(f"涨停预测：强势股 {len(strong_stocks)} 只 + 回踩MA5 {len(ma5_pullback_stocks)} 只，"
+                      f"合并去重后 {len(merged)} 只")
+
+        # 历史数据已在阶段3统一预取，这里直接评分
         candidates = []
-        total = len(strong_stocks)
-        for idx, rec in enumerate(strong_stocks):
-            score_info = self._score_first_board_candidate(rec, hot_industries)
+        total = len(merged)
+        for idx, rec in enumerate(merged):
+            score_info = self._score_first_board_by_profile(rec, hot_industries, profile)
             if score_info["score"] >= 50:
                 candidates.append(score_info)
             if progress_callback:
-                progress_callback(idx + 1, total, f"首板分析 {rec['code']} {rec.get('name', '')}")
+                progress_callback(idx + 1, total, f"首板匹配 {rec['code']} {rec.get('name', '')}")
 
         candidates.sort(key=lambda x: -x["score"])
-        return candidates[:30]  # 最多返回30只
+        return candidates[:50]
 
-    def _fetch_strong_stocks(
-        self, trade_date: str, exclude_codes: set
-    ) -> List[Dict[str, Any]]:
-        """获取当日涨幅在 5%~9.5% 之间的强势股。"""
+    def _fetch_spot_snapshot(self) -> Optional[pd.DataFrame]:
+        """获取全市场实时行情快照（只调一次 API）。"""
         try:
             import akshare as ak
             from stock_data import _retry_ak_call
-            df = _retry_ak_call(ak.stock_zh_a_spot_em)
-            if df is None or df.empty:
-                return []
+            return _retry_ak_call(ak.stock_zh_a_spot_em)
         except Exception as e:
             if self._log:
                 self._log(f"涨停预测：获取实时行情失败: {e}")
-            return []
+            return None
 
+    @staticmethod
+    def _parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
+        """从实时行情行中解析基础记录，返回 None 表示需跳过。"""
+        code = str(row.get("代码", "")).strip().zfill(6)
+        if code in exclude_codes:
+            return None
+        name = str(row.get("名称", ""))
+        if "ST" in name.upper():
+            return None
+        close = float(row["最新价"]) if pd.notna(row.get("最新价")) else None
+        if close is None or close <= 0:
+            return None
+        change_pct = float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None
+        amount_val = float(row["成交额"]) if pd.notna(row.get("成交额")) else None
+        if amount_val is not None and amount_val < 5000_0000:
+            return None
+        volume_val = float(row["成交量"]) if pd.notna(row.get("成交量")) else None
+        turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
+        return {
+            "code": code, "name": name, "change_pct": change_pct,
+            "close": close, "volume": volume_val, "amount": amount_val,
+            "turnover": turnover, "industry": "",
+        }
+
+    def _filter_strong_stocks(
+        self, spot_df: pd.DataFrame, exclude_codes: set
+    ) -> List[Dict[str, Any]]:
+        """从行情快照中筛选涨幅 3%~9.5% 的强势股。"""
         records = []
-        for _, row in df.iterrows():
-            code = str(row.get("代码", "")).strip().zfill(6)
-            if code in exclude_codes:
+        for _, row in spot_df.iterrows():
+            rec = self._parse_spot_record(row, exclude_codes)
+            if rec is None:
                 continue
-            name = str(row.get("名称", ""))
-            # 排除 ST
-            if "ST" in name.upper():
+            chg = rec.get("change_pct")
+            if chg is None or chg < 3.0 or chg >= 9.5:
                 continue
-            change_pct = float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None
-            if change_pct is None or change_pct < 5.0 or change_pct >= 9.5:
-                continue
-            close = float(row["最新价"]) if pd.notna(row.get("最新价")) else None
-            if close is None or close <= 0:
-                continue
-            volume = float(row["成交量"]) if pd.notna(row.get("成交量")) else None
-            amount = float(row["成交额"]) if pd.notna(row.get("成交额")) else None
-            turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
-            # 排除成交额过小的（流动性差）
-            if amount is not None and amount < 5000_0000:
-                continue
-            records.append({
-                "code": code,
-                "name": name,
-                "change_pct": change_pct,
-                "close": close,
-                "volume": volume,
-                "amount": amount,
-                "turnover": turnover,
-                "industry": "",  # 后续从 universe 补充
-            })
-        # 按涨幅排序，取前 80 只分析
+            records.append(rec)
         records.sort(key=lambda x: -(x.get("change_pct") or 0))
-        return records[:80]
+        return records[:100]
 
-    def _score_first_board_candidate(
+    def _filter_ma5_pullback_stocks(
+        self, spot_df: pd.DataFrame, exclude_codes: set
+    ) -> List[Dict[str, Any]]:
+        """从行情快照中筛选涨跌幅 -3%~+3% 的回踩MA5候选。"""
+        records = []
+        for _, row in spot_df.iterrows():
+            rec = self._parse_spot_record(row, exclude_codes)
+            if rec is None:
+                continue
+            chg = rec.get("change_pct")
+            if chg is None or chg < -3.0 or chg >= 3.0:
+                continue
+            records.append(rec)
+        records.sort(key=lambda x: -(x.get("amount") or 0))
+        return records[:200]
+
+    def _score_first_board_by_profile(
         self,
         rec: Dict[str, Any],
         hot_industries: Dict[str, int],
+        profile: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """对非涨停强势股进行明日首板涨停潜力评分。满分100。"""
+        """用涨停前兆画像对强势股打分。
+
+        核心思路：把当前股票的特征和画像中涨停股 T-1 日特征对比，
+        越接近画像中位数/均值的，得分越高。
+        """
         code = rec["code"]
         name = rec.get("name", "")
         score = 0.0
@@ -2000,116 +2342,163 @@ class StockFilter:
         change_pct = rec.get("change_pct", 0)
         turnover = rec.get("turnover")
 
-        # 1. 当日涨幅越接近涨停越好
+        # 当日涨幅
         if change_pct is not None:
             if change_pct >= 8:
-                score += 20
-                reasons.append(f"涨{change_pct:.1f}%接近涨停+20")
-            elif change_pct >= 7:
-                score += 15
-                reasons.append(f"涨{change_pct:.1f}%+15")
-            elif change_pct >= 5:
-                score += 10
-                reasons.append(f"涨{change_pct:.1f}%+10")
+                score += 18
+                reasons.append(f"涨{change_pct:.1f}%接近涨停+18")
+            elif change_pct >= 6:
+                score += 12
+                reasons.append(f"涨{change_pct:.1f}%+12")
+            elif change_pct >= 3:
+                score += 6
+                reasons.append(f"涨{change_pct:.1f}%+6")
 
-        # 2. 技术面分析
-        history = self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=65),
-            timeout_sec=8.0,
-            fallback=None,
-            task_name=f"首板预测 {code}",
-        )
+        # 获取历史数据计算特征（已预取到缓存，直接读取）
+        try:
+            history = self.fetcher.get_history_data(code, days=65)
+        except Exception:
+            history = None
 
         industry = ""
-        ma_bullish = False
-        position_60d = None
         vol_ratio = None
+        position_60d = None
         trend_10d = None
+        ma_bullish = False
 
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
             close = pd.to_numeric(df["close"], errors="coerce")
             volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
-            change = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
+            latest_close = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+            t = len(df) - 1  # 当前最新一行
 
             ma5 = close.rolling(5, min_periods=5).mean()
             ma10 = close.rolling(10, min_periods=10).mean()
             ma20 = close.rolling(20, min_periods=20).mean()
+            ma5_val = float(ma5.iloc[t]) if not pd.isna(ma5.iloc[t]) else None
+            ma10_val = float(ma10.iloc[t]) if not pd.isna(ma10.iloc[t]) else None
+            ma20_val = float(ma20.iloc[t]) if not pd.isna(ma20.iloc[t]) else None
 
-            latest_ma5 = float(ma5.iloc[-1]) if not pd.isna(ma5.iloc[-1]) else None
-            latest_ma10 = float(ma10.iloc[-1]) if not pd.isna(ma10.iloc[-1]) else None
-            latest_ma20 = float(ma20.iloc[-1]) if not pd.isna(ma20.iloc[-1]) else None
-            latest_close = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
+            # --- 量比匹配 ---
+            if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
+                vol_window = volume.iloc[max(0, t - 5):t].dropna()
+                if not vol_window.empty and float(vol_window.mean()) > 0:
+                    vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+                    p = profile.get("vol_ratio_t1", {})
+                    p_med = p.get("median")
+                    p_p25 = p.get("p25")
+                    p_p75 = p.get("p75")
+                    if p_med is not None and p_p25 is not None and p_p75 is not None:
+                        if p_p25 <= vol_ratio <= p_p75:
+                            score += 15
+                            reasons.append(f"量比{vol_ratio:.1f}x吻合画像[{p_p25:.1f}~{p_p75:.1f}]+15")
+                        elif vol_ratio >= p_med * 0.6:
+                            score += 8
+                            reasons.append(f"量比{vol_ratio:.1f}x接近画像+8")
+                    elif vol_ratio >= 1.5:
+                        score += 8
+                        reasons.append(f"放量{vol_ratio:.1f}x+8")
 
-            # 均线多头排列
-            if (latest_ma5 is not None and latest_ma10 is not None and latest_ma20 is not None
-                    and latest_ma5 > latest_ma10 > latest_ma20):
-                score += 10
-                reasons.append("多头排列+10")
-                ma_bullish = True
+            # --- 额比匹配 ---
+            if len(amount) >= 6 and not pd.isna(amount.iloc[t]):
+                amt_window = amount.iloc[max(0, t - 5):t].dropna()
+                if not amt_window.empty and float(amt_window.mean()) > 0:
+                    amt_ratio = round(float(amount.iloc[t]) / float(amt_window.mean()), 2)
+                    p = profile.get("amt_ratio_t1", {})
+                    p_med = p.get("median")
+                    if p_med is not None and amt_ratio >= p_med * 0.8:
+                        score += 5
+                        reasons.append(f"额比{amt_ratio:.1f}x匹配+5")
+
+            # --- 均线匹配 ---
+            if ma5_val is not None and ma10_val is not None and ma20_val is not None:
+                if ma5_val > ma10_val > ma20_val:
+                    ma_bullish = True
+                    p_bull = profile.get("ma_bullish", {})
+                    if p_bull.get("ratio", 0) >= 50:
+                        score += 10
+                        reasons.append(f"多头排列(画像{p_bull['ratio']:.0f}%)+10")
+                    else:
+                        score += 5
+                        reasons.append("多头排列+5")
 
             # 站上MA5
-            if latest_close is not None and latest_ma5 is not None and latest_close > latest_ma5:
-                score += 5
-                reasons.append("站上MA5+5")
+            if latest_close is not None and ma5_val is not None and latest_close > ma5_val:
+                p_above = profile.get("above_ma5", {})
+                if p_above.get("ratio", 0) >= 60:
+                    score += 5
+                    reasons.append(f"站上MA5(画像{p_above['ratio']:.0f}%)+5")
 
-            # 60日位置分位
+            # --- MA5 距离匹配 ---
+            if latest_close and ma5_val and ma5_val > 0:
+                dist_ma5 = round((latest_close / ma5_val - 1) * 100, 2)
+                p = profile.get("dist_ma5_pct", {})
+                p_p25 = p.get("p25")
+                p_p75 = p.get("p75")
+                if p_p25 is not None and p_p75 is not None:
+                    if p_p25 <= dist_ma5 <= p_p75:
+                        score += 5
+                        reasons.append(f"距MA5 {dist_ma5:+.1f}%吻合+5")
+
+            # --- 回踩MA5检测 ---
+            # 收盘接近或略低于MA5（-3%~+1%），且前几日曾站上MA5
+            if latest_close and ma5_val and ma5_val > 0:
+                dist_ma5_now = (latest_close / ma5_val - 1) * 100
+                if -3.0 <= dist_ma5_now <= 1.0:
+                    was_above_ma5 = False
+                    for lb in range(2, min(6, t + 1)):
+                        idx_b = t - lb
+                        if idx_b >= 0 and not pd.isna(close.iloc[idx_b]) and not pd.isna(ma5.iloc[idx_b]):
+                            if float(close.iloc[idx_b]) > float(ma5.iloc[idx_b]) * 1.01:
+                                was_above_ma5 = True
+                                break
+                    if was_above_ma5:
+                        # 回踩MA5，这是涨停前常见形态
+                        p_pb = profile.get("ma5_pullback", {})
+                        pb_ratio = p_pb.get("ratio", 0)
+                        if pb_ratio >= 20:
+                            score += 15
+                            reasons.append(f"回踩MA5(画像{pb_ratio:.0f}%)+15")
+                        else:
+                            score += 10
+                            reasons.append(f"回踩MA5(距{dist_ma5_now:+.1f}%)+10")
+
+            # --- 60日位置匹配 ---
             if len(close) >= 20 and latest_close is not None:
                 window = close.tail(min(60, len(close))).dropna()
                 if len(window) >= 10:
-                    position_60d = float((window < latest_close).sum()) / len(window) * 100
-                    if position_60d < 30:
-                        score += 10
-                        reasons.append(f"低位{position_60d:.0f}%+10")
-                    elif position_60d > 80:
-                        score -= 5
-                        reasons.append(f"高位{position_60d:.0f}%-5")
-
-            # 10日趋势
-            if len(close) >= 11 and not pd.isna(close.iloc[-11]) and close.iloc[-11] > 0:
-                trend_10d = (float(close.iloc[-1]) / float(close.iloc[-11]) - 1) * 100
-                if 5 <= trend_10d <= 20:
-                    score += 5
-                    reasons.append(f"10日涨{trend_10d:.1f}%+5")
-
-            # 量能蓄势：近3日缩量后今日放量
-            if len(volume) >= 6 and not pd.isna(volume.iloc[-1]):
-                prev_3_vol = volume.iloc[-4:-1].dropna()
-                prev_5_vol = volume.iloc[-6:-1].dropna()
-                if not prev_5_vol.empty and float(prev_5_vol.mean()) > 0:
-                    vol_ratio = float(volume.iloc[-1]) / float(prev_5_vol.mean())
-                    if not prev_3_vol.empty and float(prev_3_vol.mean()) > 0:
-                        recent_shrink = float(prev_3_vol.mean()) / float(prev_5_vol.mean())
-                        # 前3日缩量（<0.8倍均量）且今日放量（>1.5倍）
-                        if recent_shrink < 0.8 and vol_ratio > 1.5:
-                            score += 15
-                            reasons.append(f"缩量蓄势后放量{vol_ratio:.1f}x+15")
-                        elif vol_ratio > 2.0:
-                            score += 10
-                            reasons.append(f"放量{vol_ratio:.1f}x+10")
-                        elif vol_ratio > 1.5:
+                    position_60d = round(float((window < latest_close).sum()) / len(window) * 100, 1)
+                    p = profile.get("position_60d", {})
+                    p_med = p.get("median")
+                    p_p25 = p.get("p25")
+                    p_p75 = p.get("p75")
+                    if p_med is not None and p_p25 is not None and p_p75 is not None:
+                        if p_p25 <= position_60d <= p_p75:
+                            score += 8
+                            reasons.append(f"位置{position_60d:.0f}%吻合画像[{p_p25:.0f}~{p_p75:.0f}]+8")
+                        elif position_60d < 30:
                             score += 5
-                            reasons.append(f"温和放量{vol_ratio:.1f}x+5")
+                            reasons.append(f"低位{position_60d:.0f}%+5")
 
-            # MACD金叉信号
-            try:
-                from stock_indicators import calc_macd
-                macd_data = calc_macd(close)
-                dif = macd_data["dif"]
-                dea = macd_data["dea"]
-                if (len(dif) >= 2 and not pd.isna(dif.iloc[-1]) and not pd.isna(dif.iloc[-2])
-                        and not pd.isna(dea.iloc[-1]) and not pd.isna(dea.iloc[-2])):
-                    # 今日DIF上穿DEA 或 DIF>DEA且差值扩大
-                    if dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]:
+            # --- 10日趋势 ---
+            if t >= 10 and not pd.isna(close.iloc[t - 10]) and close.iloc[t - 10] > 0:
+                trend_10d = round((float(close.iloc[t]) / float(close.iloc[t - 10]) - 1) * 100, 1)
+
+            # --- 缩量蓄势匹配 ---
+            if len(volume) >= 6:
+                vol_3 = volume.iloc[max(0, t - 3):t].dropna()
+                vol_5 = volume.iloc[max(0, t - 5):t].dropna()
+                if not vol_3.empty and not vol_5.empty and float(vol_5.mean()) > 0:
+                    shrink = round(float(vol_3.mean()) / float(vol_5.mean()), 2)
+                    p = profile.get("shrink_ratio_t1", {})
+                    p_med = p.get("median")
+                    if p_med is not None and shrink <= p_med and vol_ratio is not None and vol_ratio >= 1.5:
                         score += 10
-                        reasons.append("MACD金叉+10")
-                    elif dif.iloc[-1] > dea.iloc[-1] > 0:
-                        score += 5
-                        reasons.append("MACD多头+5")
-            except Exception:
-                pass
+                        reasons.append(f"缩量蓄势后放量(缩{shrink:.2f}/量比{vol_ratio:.1f}x)+10")
 
-        # 3. 板块热度
+        # 板块热度
         if industry and hot_industries.get(industry, 0) >= 3:
             score += 10
             reasons.append(f"热门板块({hot_industries[industry]}只)+10")
@@ -2117,12 +2506,19 @@ class StockFilter:
             score += 5
             reasons.append(f"板块有{hot_industries[industry]}只+5")
 
-        # 4. 换手率
+        # 换手率
         if turnover is not None:
-            if 5 <= turnover <= 20:
-                score += 5
-                reasons.append(f"换手{turnover:.1f}%适中+5")
-            elif turnover > 40:
+            p = profile.get("turnover_t1", {})
+            p_p25 = p.get("p25")
+            p_p75 = p.get("p75")
+            if p_p25 is not None and p_p75 is not None:
+                if p_p25 <= turnover <= p_p75:
+                    score += 5
+                    reasons.append(f"换手{turnover:.1f}%吻合画像+5")
+            elif 3 <= turnover <= 20:
+                score += 3
+                reasons.append(f"换手{turnover:.1f}%适中+3")
+            if turnover > 40:
                 score -= 5
                 reasons.append(f"换手{turnover:.1f}%过高-5")
 
@@ -2134,9 +2530,9 @@ class StockFilter:
             "close": rec.get("close"),
             "change_pct": change_pct,
             "turnover": turnover,
-            "vol_ratio": round(vol_ratio, 2) if vol_ratio is not None else None,
-            "position_60d": round(position_60d, 1) if position_60d is not None else None,
-            "trend_10d": round(trend_10d, 1) if trend_10d is not None else None,
+            "vol_ratio": vol_ratio,
+            "position_60d": position_60d,
+            "trend_10d": trend_10d,
             "ma_bullish": ma_bullish,
             "score": final_score,
             "reasons": " / ".join(reasons[:8]),

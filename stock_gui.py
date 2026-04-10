@@ -1443,7 +1443,10 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
         self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(基于该日数据预测次日涨停候选)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(action_bar, text="回溯天数:").pack(side=tk.LEFT, padx=(10, 2))
+        self._predict_lookback_var = tk.StringVar(value="5")
+        ttk.Entry(action_bar, textvariable=self._predict_lookback_var, width=4).pack(side=tk.LEFT)
+        ttk.Label(action_bar, text="(回溯N天涨停股特征→匹配今日强势股)").pack(side=tk.LEFT, padx=6)
         self._predict_status_label = ttk.Label(action_bar, text="")
         self._predict_status_label.pack(side=tk.RIGHT, padx=8)
 
@@ -1457,15 +1460,19 @@ class StockMonitorApp:
         self._predict_summary_text.pack(fill=tk.BOTH, expand=True)
         self._predict_summary_text.insert(tk.END,
             "点击「开始预测」分析明日涨停候选\n\n"
+            "思路：先分析最近N天涨停股在涨停前是\n"
+            "什么状态（量能、均线、位置等），提炼\n"
+            "出「涨停前兆画像」，再用画像匹配今日\n"
+            "的强势股，越像涨停前夜的分越高。\n\n"
             "预测维度:\n"
-            "  1. 连板延续: 今日涨停股明日继续封板概率\n"
+            "  1. 连板延续: 今日涨停股延续概率\n"
             "     - 连板数、封板时间、炸板次数\n"
             "     - 板块热度、均线排列、量能\n\n"
-            "  2. 首板候选: 今日强势股明日冲击涨停\n"
-            "     - 涨幅接近涨停(5%~9.5%)\n"
-            "     - 缩量蓄势后放量、MACD金叉\n"
-            "     - 均线多头、低位突破\n"
-            "     - 板块联动效应\n\n"
+            "  2. 首板候选: 画像匹配今日强势股\n"
+            "     - 量比/额比 vs 画像区间\n"
+            "     - 均线距离、多头排列\n"
+            "     - 缩量蓄势后放量\n"
+            "     - 60日位置分位、板块联动\n\n"
             "说明: 预测仅供参考，请结合盘面综合判断")
         self._predict_summary_text.config(state=tk.DISABLED)
         body.add(summary_frame, weight=2)
@@ -1549,27 +1556,33 @@ class StockMonitorApp:
         if not trade_date:
             trade_date = datetime.now().strftime("%Y%m%d")
             self._predict_date_var.set(trade_date)
+        try:
+            lookback = max(2, min(int(self._predict_lookback_var.get().strip() or "5"), 15))
+        except ValueError:
+            lookback = 5
+        self._predict_lookback_var.set(str(lookback))
 
         self._predict_summary_text.config(state=tk.NORMAL)
         self._predict_summary_text.delete("1.0", tk.END)
-        self._predict_summary_text.insert(tk.END, f"正在基于 {trade_date} 数据预测明日涨停候选...\n")
+        self._predict_summary_text.insert(tk.END,
+            f"正在回溯最近 {lookback} 天涨停股特征，基于 {trade_date} 数据预测...\n")
         self._predict_summary_text.config(state=tk.DISABLED)
-        self._predict_status_label.config(text="正在获取数据...")
+        self._predict_status_label.config(text="正在回溯涨停前兆画像...")
         self.status_var.set("正在执行涨停预测...")
 
         self._predict_thread = threading.Thread(
-            target=self._load_predict, args=(trade_date,), daemon=True
+            target=self._load_predict, args=(trade_date, lookback), daemon=True
         )
         self._predict_thread.start()
 
-    def _load_predict(self, trade_date: str):
+    def _load_predict(self, trade_date: str, lookback_days: int):
         try:
             def _progress(cur, tot, info):
                 self.root.after(0, lambda c=cur, t=tot, i=info:
                     self._predict_status_label.config(text=f"预测分析 {c}/{t}: {i}"))
 
             result = self.stock_filter.predict_limit_up_candidates(
-                trade_date, progress_callback=_progress,
+                trade_date, lookback_days=lookback_days, progress_callback=_progress,
             )
             self.root.after(0, lambda r=result: self._apply_predict_result(r))
         except Exception as e:
@@ -1584,11 +1597,26 @@ class StockMonitorApp:
         self._predict_status_label.config(text="")
         self.status_var.set("涨停预测失败")
 
+    _PROFILE_LABELS = {
+        "change_pct_t1": "T-1涨跌幅%",
+        "vol_ratio_t1": "T-1量比",
+        "amt_ratio_t1": "T-1额比",
+        "shrink_ratio_t1": "前3日/前5日缩量比",
+        "dist_ma5_pct": "距MA5%",
+        "dist_ma10_pct": "距MA10%",
+        "trend_5d": "5日涨幅%",
+        "trend_10d": "10日涨幅%",
+        "position_60d": "60日位置%",
+        "volatility_10d": "10日波动率%",
+        "turnover_t1": "T-1换手率%",
+    }
+
     def _apply_predict_result(self, result: Dict[str, Any]):
         self._predict_result = result
         cont_list = result.get("continuation_candidates", [])
         first_list = result.get("first_board_candidates", [])
         hot_industries = result.get("hot_industries", {})
+        profile = result.get("profile", {})
 
         # ---- 填充摘要 ----
         self._predict_summary_text.config(state=tk.NORMAL)
@@ -1597,7 +1625,32 @@ class StockMonitorApp:
 
         txt.insert(tk.END, result.get("summary", "") + "\n")
 
-        # 连板延续分数分布
+        # 涨停前兆画像
+        if profile:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  涨停前兆画像（T-1日特征统计）\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for key, label in self._PROFILE_LABELS.items():
+                p = profile.get(key, {})
+                if not p or p.get("count", 0) == 0:
+                    continue
+                txt.insert(tk.END,
+                    f"  {label:14s}  中位={p['median']:>7s}  "
+                    f"区间=[{p['p25']}, {p['p75']}]  "
+                    f"均值={p['mean']}  样本={p['count']}\n".format_map({})
+                    if False else
+                    f"  {label:14s}  中位={p.get('median', '-')}  "
+                    f"[{p.get('p25', '-')}~{p.get('p75', '-')}]  "
+                    f"均值={p.get('mean', '-')}  n={p.get('count', 0)}\n")
+            # 布尔特征
+            for key, label in [("ma_bullish", "多头排列"), ("above_ma5", "站上MA5"), ("ma5_pullback", "回踩MA5")]:
+                p = profile.get(key, {})
+                if p:
+                    txt.insert(tk.END,
+                        f"  {label:14s}  {p.get('true_count', 0)}/{p.get('total', 0)}只  "
+                        f"占比={p.get('ratio', 0):.1f}%\n")
+
+        # 连板延续 TOP10
         if cont_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
             txt.insert(tk.END, f"  连板延续候选 TOP10\n")
@@ -1629,9 +1682,9 @@ class StockMonitorApp:
                 txt.insert(tk.END, f"  {k:10s}  {v:2d} 只  {bar}\n")
 
         txt.insert(tk.END, f"\n{'='*36}\n")
-        txt.insert(tk.END, "说明：预测得分仅供参考，请结合次日\n"
-                           "竞价、盘口、板块情绪综合判断。\n"
-                           "高分不代表必涨停，低分也可能超预期。\n")
+        txt.insert(tk.END, "说明：预测基于历史涨停股的涨停前特征\n"
+                           "画像匹配，仅供参考。请结合次日竞价、\n"
+                           "盘口、板块情绪综合判断。\n")
         self._predict_summary_text.config(state=tk.DISABLED)
 
         # ---- 填充连板延续表格 ----
