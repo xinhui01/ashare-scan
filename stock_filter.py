@@ -11,6 +11,8 @@ import weakref
 import pandas as pd
 
 from scan_models import FilterSettings, HistoryRequestPlan
+from src.models.analysis_models import HistoryAnalysisConfig
+from src.services.history_analysis_service import HistoryAnalysisService
 from stock_data import StockDataFetcher
 from stock_logger import get_logger
 
@@ -256,243 +258,57 @@ class StockFilter:
     def check_close_above_ma(
         self, history_data: pd.DataFrame, streak_days: int, ma_period: int
     ) -> bool:
-        if history_data is None or history_data.empty:
-            return False
-        if "close" not in history_data.columns:
-            return False
-
-        df = (
-            history_data.sort_values("date").reset_index(drop=True)
-            if "date" in history_data.columns
-            else history_data.reset_index(drop=True)
+        return self._build_analysis_service().check_close_above_ma(
+            history_data,
+            streak_days=streak_days,
+            ma_period=ma_period,
         )
-        need = streak_days + ma_period - 1
-        if len(df) < need:
-            return False
 
-        close = pd.to_numeric(df["close"], errors="coerce")
-        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
-        recent_close = close.tail(streak_days)
-        recent_ma = ma.tail(streak_days)
-        if recent_close.isna().any() or recent_ma.isna().any():
-            return False
-        return bool((recent_close.values > recent_ma.values).all())
+    def _resolve_analysis_config(
+        self,
+        *,
+        streak_days: Optional[int] = None,
+        ma_period: Optional[int] = None,
+        limit_up_lookback_days: Optional[int] = None,
+        volume_lookback_days: Optional[int] = None,
+        volume_expand_enabled: Optional[bool] = None,
+        volume_expand_factor: Optional[float] = None,
+    ) -> HistoryAnalysisConfig:
+        return HistoryAnalysisConfig.from_filter_settings(
+            self.get_settings(),
+            trend_days=streak_days,
+            ma_period=ma_period,
+            limit_up_lookback_days=limit_up_lookback_days,
+            volume_lookback_days=volume_lookback_days,
+            volume_expand_enabled=volume_expand_enabled,
+            volume_expand_factor=volume_expand_factor,
+        )
+
+    def _build_analysis_service(
+        self,
+        *,
+        streak_days: Optional[int] = None,
+        ma_period: Optional[int] = None,
+        limit_up_lookback_days: Optional[int] = None,
+        volume_lookback_days: Optional[int] = None,
+        volume_expand_enabled: Optional[bool] = None,
+        volume_expand_factor: Optional[float] = None,
+    ) -> HistoryAnalysisService:
+        config = self._resolve_analysis_config(
+            streak_days=streak_days,
+            ma_period=ma_period,
+            limit_up_lookback_days=limit_up_lookback_days,
+            volume_lookback_days=volume_lookback_days,
+            volume_expand_enabled=volume_expand_enabled,
+            volume_expand_factor=volume_expand_factor,
+        )
+        return HistoryAnalysisService(config)
 
     def _limit_up_threshold(self, board: str = "", stock_name: str = "") -> float:
-        name = str(stock_name or "").upper().strip()
-        if name.startswith("ST") or name.startswith("*ST"):
-            return 5.0
-        b = str(board or "").strip()
-        if b in ("创业板", "科创板"):
-            return 20.0
-        return 10.0
-
-    def _create_empty_analysis_result(
-        self,
-        volume_days: int,
-        volume_enabled: bool,
-        volume_factor: float,
-    ) -> Dict[str, Any]:
-        return {
-            "passed": False,
-            "latest_date": None,
-            "latest_close": None,
-            "latest_ma": None,
-            "latest_ma10": None,
-            "latest_change_pct": None,
-            "five_day_return": None,
-            "recent_closes": [],
-            "recent_ma": [],
-            "volume_lookback_days": volume_days,
-            "volume_expand_enabled": volume_enabled,
-            "volume_expand_factor": volume_factor,
-            "volume_min": None,
-            "volume_max": None,
-            "volume_expand_ratio": None,
-            "latest_volume_ratio": None,
-            "volume_expand": False,
-            "limit_up_threshold": None,
-            "limit_up": False,
-            "limit_up_within_days": False,
-            "limit_up_hit_dates": [],
-            "limit_up_streak": 0,
-            "broken_limit_up": False,
-            "broken_streak_count": 0,
-            "volume_break_limit_up": False,
-            "after_two_limit_up": False,
-            "score": 0,
-            "score_breakdown": "",
-            "summary": "",
-        }
-
-    def _populate_price_metrics(
-        self,
-        result: Dict[str, Any],
-        df: pd.DataFrame,
-        close: pd.Series,
-        ma: pd.Series,
-        streak_days: int,
-        ma_period: int,
-    ) -> None:
-        recent = df.tail(streak_days).copy()
-        recent_close = pd.to_numeric(recent["close"], errors="coerce")
-        recent_ma = ma.tail(streak_days)
-
-        result["latest_date"] = str(df["date"].iloc[-1])
-        result["latest_close"] = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
-        result["latest_ma"] = float(ma.iloc[-1]) if not pd.isna(ma.iloc[-1]) else None
-        ma10 = close.rolling(window=10, min_periods=10).mean()
-        result["latest_ma10"] = float(ma10.iloc[-1]) if not pd.isna(ma10.iloc[-1]) else None
-        result["recent_closes"] = [float(v) if not pd.isna(v) else None for v in recent_close.tolist()]
-        result["recent_ma"] = [float(v) if not pd.isna(v) else None for v in recent_ma.tolist()]
-
-        if "change_pct" in df.columns:
-            change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
-            if not change_pct.empty and not pd.isna(change_pct.iloc[-1]):
-                result["latest_change_pct"] = float(change_pct.iloc[-1])
-
-        if len(df) >= streak_days and not pd.isna(close.iloc[-1]) and not pd.isna(close.iloc[-streak_days]):
-            prev_close = close.iloc[-streak_days]
-            if not pd.isna(prev_close) and prev_close != 0:
-                result["five_day_return"] = (float(close.iloc[-1]) / float(prev_close) - 1.0) * 100.0
-
-        if len(df) >= streak_days + ma_period - 1 and not recent_close.isna().any() and not recent_ma.isna().any():
-            result["passed"] = bool((recent_close.values > recent_ma.values).all())
-
-    def _apply_volume_analysis(
-        self,
-        result: Dict[str, Any],
-        df: pd.DataFrame,
-        volume_days: int,
-        volume_enabled: bool,
-        volume_factor: float,
-    ) -> Optional[pd.Series]:
-        if "volume" not in df.columns or len(df) < volume_days:
-            return None
-
-        volume = pd.to_numeric(df["volume"], errors="coerce")
-        recent_volume = volume.tail(volume_days).dropna()
-        if not recent_volume.empty:
-            vmin = float(recent_volume.min())
-            vmax = float(recent_volume.max())
-            ratio = None
-            if vmin > 0:
-                ratio = float(vmax / vmin)
-            result["volume_min"] = vmin
-            result["volume_max"] = vmax
-            result["volume_expand_ratio"] = ratio
-            result["volume_expand"] = bool(volume_enabled and ratio is not None and ratio >= volume_factor)
-
-        compare_window = volume.iloc[-(volume_days + 1):-1].dropna() if len(volume) > 1 else pd.Series(dtype=float)
-        if compare_window.empty:
-            compare_window = recent_volume
-        latest_volume = volume.iloc[-1] if not volume.empty else None
-        if latest_volume is not None and not pd.isna(latest_volume) and not compare_window.empty:
-            avg_volume = float(compare_window.mean())
-            if avg_volume > 0:
-                result["latest_volume_ratio"] = float(float(latest_volume) / avg_volume * 100.0)
-        return volume
-
-    def _calculate_limit_up_streak(self, mask: pd.Series) -> int:
-        streak = 0
-        for flag in reversed(mask.tolist()):
-            if bool(flag):
-                streak += 1
-            else:
-                break
-        return streak
-
-    def _calculate_broken_limit_up_streak(self, mask: pd.Series) -> int:
-        if len(mask) < 2 or bool(mask.iloc[-1]) or not bool(mask.iloc[-2]):
-            return 0
-        broken_streak = 0
-        idx = len(mask) - 2
-        while idx >= 0 and bool(mask.iloc[idx]):
-            broken_streak += 1
-            idx -= 1
-        return broken_streak
-
-    def _apply_limit_up_analysis(
-        self,
-        result: Dict[str, Any],
-        df: pd.DataFrame,
-        board: str,
-        stock_name: str,
-        lookback_days: int,
-        volume: Optional[pd.Series],
-        volume_enabled: bool,
-        volume_factor: float,
-    ) -> None:
-        threshold = self._limit_up_threshold(board=board, stock_name=stock_name)
-        result["limit_up_threshold"] = threshold
-        if "change_pct" not in df.columns:
-            return
-
-        change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
-        full_limit_up_mask = (change_pct >= (threshold - 0.2)).fillna(False)
-        limit_up_mask = change_pct.tail(max(lookback_days, 1)) >= (threshold - 0.2)
-        recent_dates = df.tail(max(lookback_days, 1))["date"].astype(str).tolist()
-        hit_dates = [d for d, hit in zip(recent_dates, limit_up_mask.tolist()) if bool(hit)]
-        result["limit_up_hit_dates"] = hit_dates
-        result["limit_up_within_days"] = bool(hit_dates)
-        result["limit_up"] = bool(
-            not pd.isna(result["latest_change_pct"])
-            and result["latest_change_pct"] >= (threshold - 0.2)
+        return self._build_analysis_service().limit_up_threshold(
+            board=board,
+            stock_name=stock_name,
         )
-        result["limit_up_streak"] = self._calculate_limit_up_streak(full_limit_up_mask)
-
-        broken_streak = self._calculate_broken_limit_up_streak(full_limit_up_mask)
-        result["broken_limit_up"] = broken_streak > 0
-        result["broken_streak_count"] = broken_streak
-        result["after_two_limit_up"] = bool(result["broken_limit_up"] and broken_streak >= 2)
-
-        if not result["broken_limit_up"] or volume is None or not volume_enabled:
-            return
-
-        break_volume = volume.iloc[-1] if len(volume) >= 1 else None
-        streak_volumes = volume.iloc[-1 - broken_streak:-1] if broken_streak > 0 else pd.Series(dtype=float)
-        streak_volumes = streak_volumes.dropna()
-        if (
-            break_volume is None
-            or pd.isna(break_volume)
-            or float(break_volume) <= 0
-            or streak_volumes.empty
-        ):
-            return
-        base_volume = float(streak_volumes.min())
-        if base_volume > 0:
-            break_ratio = float(break_volume) / base_volume
-            result["volume_break_limit_up"] = bool(break_ratio >= volume_factor)
-
-    def _build_analysis_summary(
-        self,
-        result: Dict[str, Any],
-        streak_days: int,
-        ma_period: int,
-        volume_days: int,
-        volume_enabled: bool,
-    ) -> str:
-        if result["passed"]:
-            summary = (
-                f"最近{streak_days}日收盘全部高于MA{ma_period}，"
-                f"最新收盘 {result['latest_close']:.2f} / MA{ma_period} {result['latest_ma']:.2f}"
-            )
-        else:
-            summary = f"未满足最近{streak_days}日收盘全部高于MA{ma_period}"
-
-        if volume_enabled and result["volume_expand"]:
-            ratio_text = "-" if result["volume_expand_ratio"] is None else f"{result['volume_expand_ratio']:.2f}倍"
-            summary = f"{summary}；近{volume_days}日放量 {ratio_text}"
-        elif not volume_enabled:
-            summary = f"{summary}；放量倍数检测已关闭"
-
-        if result["limit_up_streak"] >= 2:
-            summary = f"{summary}；连板 {result['limit_up_streak']} 板"
-        if result["broken_limit_up"]:
-            summary = f"{summary}；断板，前序连板 {result['broken_streak_count']} 板"
-        if result["volume_break_limit_up"]:
-            summary = f"{summary}；放量后断板"
-        return summary
 
     def _calculate_trade_score(
         self,
@@ -501,81 +317,11 @@ class StockFilter:
         ma_period: int,
         volume_enabled: bool,
     ) -> tuple[int, str]:
-        score = 50.0
-        reasons: List[str] = []
-
-        if result.get("passed"):
-            score += 18
-            reasons.append(f"站上MA{ma_period}+18")
-        else:
-            score -= 10
-            reasons.append(f"跌破MA{ma_period}-10")
-
-        five_day_return = result.get("five_day_return")
-        if five_day_return is not None:
-            if five_day_return >= 15:
-                score += 12
-                reasons.append("5日强势+12")
-            elif five_day_return >= 5:
-                score += 8
-                reasons.append("5日偏强+8")
-            elif five_day_return <= -8:
-                score -= 8
-                reasons.append("5日转弱-8")
-
-        latest_change_pct = result.get("latest_change_pct")
-        if latest_change_pct is not None:
-            if latest_change_pct >= 9.5:
-                score += 14
-                reasons.append("当日涨停+14")
-            elif latest_change_pct >= 5:
-                score += 6
-                reasons.append("当日走强+6")
-            elif latest_change_pct <= -5:
-                score -= 8
-                reasons.append("当日大跌-8")
-
-        limit_up_streak = int(result.get("limit_up_streak") or 0)
-        if limit_up_streak >= 3:
-            score += 10
-            reasons.append("高连板+10")
-        elif limit_up_streak == 2:
-            score += 7
-            reasons.append("二连板+7")
-        elif result.get("limit_up_within_days"):
-            score += 4
-            reasons.append(f"{streak_days}日内有涨停+4")
-
-        if volume_enabled and result.get("volume_expand"):
-            score += 8
-            reasons.append("放量有效+8")
-        elif volume_enabled and result.get("volume_expand_ratio") is not None:
-            ratio = float(result["volume_expand_ratio"])
-            if ratio < max(1.2, self.volume_expand_factor * 0.8):
-                score -= 4
-                reasons.append("量能偏弱-4")
-
-        latest_volume_ratio = result.get("latest_volume_ratio")
-        if latest_volume_ratio is not None:
-            if latest_volume_ratio >= 180:
-                score += 6
-                reasons.append("量比活跃+6")
-            elif latest_volume_ratio < 80:
-                score -= 3
-                reasons.append("量比不足-3")
-
-        if result.get("broken_limit_up"):
-            score -= 10
-            reasons.append("断板-10")
-        if result.get("after_two_limit_up"):
-            score -= 6
-            reasons.append("二板后断板-6")
-        if result.get("volume_break_limit_up"):
-            score -= 5
-            reasons.append("放量断板-5")
-
-        final_score = max(0, min(100, int(round(score))))
-        return final_score, " / ".join(reasons[:6])
+        return self._build_analysis_service(
+            streak_days=streak_days,
+            ma_period=ma_period,
+            volume_expand_enabled=volume_enabled,
+        ).calculate_trade_score(result)
 
     def analyze_history(
         self,
@@ -590,51 +336,19 @@ class StockFilter:
         stock_name: str = "",
         stock_code: str = "",
     ) -> Dict[str, Any]:
-        streak_days = int(streak_days or self.trend_days)
-        ma_period = int(ma_period or self.ma_period)
-        lookback_days = int(limit_up_lookback_days or self.limit_up_lookback_days)
-        volume_days = int(volume_lookback_days or self.volume_lookback_days)
-        volume_enabled = self.volume_expand_enabled if volume_expand_enabled is None else bool(volume_expand_enabled)
-        volume_factor = float(volume_expand_factor or self.volume_expand_factor)
-        result = self._create_empty_analysis_result(volume_days, volume_enabled, volume_factor)
-        if history_data is None or history_data.empty:
-            result["summary"] = "无历史数据"
-            return result
-        if "date" not in history_data.columns or "close" not in history_data.columns:
-            result["summary"] = "历史数据缺少 date/close"
-            return result
-
-        df = history_data.sort_values("date").reset_index(drop=True)
-        close = pd.to_numeric(df["close"], errors="coerce")
-        ma = close.rolling(window=ma_period, min_periods=ma_period).mean()
-        self._populate_price_metrics(result, df, close, ma, streak_days, ma_period)
-        volume = self._apply_volume_analysis(result, df, volume_days, volume_enabled, volume_factor)
-        self._apply_limit_up_analysis(
-            result,
-            df,
-            board,
-            stock_name,
-            lookback_days,
-            volume,
-            volume_enabled,
-            volume_factor,
+        return self._build_analysis_service(
+            streak_days=streak_days,
+            ma_period=ma_period,
+            limit_up_lookback_days=limit_up_lookback_days,
+            volume_lookback_days=volume_lookback_days,
+            volume_expand_enabled=volume_expand_enabled,
+            volume_expand_factor=volume_expand_factor,
+        ).analyze_history(
+            history_data,
+            board=board,
+            stock_name=stock_name,
+            stock_code=stock_code,
         )
-        result["summary"] = self._build_analysis_summary(
-            result,
-            streak_days,
-            ma_period,
-            volume_days,
-            volume_enabled,
-        )
-        score, score_breakdown = self._calculate_trade_score(
-            result,
-            streak_days,
-            ma_period,
-            volume_enabled,
-        )
-        result["score"] = score
-        result["score_breakdown"] = score_breakdown
-        return result
 
     def _build_filter_result_shell(
         self,
