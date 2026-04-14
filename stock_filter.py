@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, TimeoutError as FutureTimeoutError
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import threading
 import weakref
@@ -310,6 +310,17 @@ class StockFilter:
             stock_name=stock_name,
         )
 
+    @staticmethod
+    def _calculate_limit_up_streak(mask: pd.Series) -> int:
+        """计算从最新交易日往前数的连续涨停天数。"""
+        streak = 0
+        for flag in reversed(mask.tolist()):
+            if bool(flag):
+                streak += 1
+            else:
+                break
+        return streak
+
     def _calculate_trade_score(
         self,
         result: Dict[str, Any],
@@ -518,6 +529,15 @@ class StockFilter:
         return self.fetcher.build_history_request_plan(
             source=history_source,
             force_refresh=False,
+        )
+
+    @staticmethod
+    def _build_local_cache_history_plan(reason: str = "local-cache-only") -> HistoryRequestPlan:
+        return HistoryRequestPlan(
+            mode="cache_only",
+            provider_sequence=("local-cache",),
+            mirror_urls=(),
+            reason=reason,
         )
 
     def _assign_scan_jobs(
@@ -1175,24 +1195,45 @@ class StockFilter:
         codes: List[str],
         days: int = 65,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        cache_only: bool = False,
     ) -> None:
         """批量预取涨停池股票的历史数据到本地缓存。
         已有缓存的跳过，缺失的并行拉取，确保后续分类时不再逐只走网络。
+        
+        参数:
+            cache_only: True=只使用本地缓存，不发起网络请求；False=允许网络请求补全缓存
         """
         from stock_data import _is_history_cache_fresh
         need_fetch: List[str] = []
+        cached_count = 0
         for code in codes:
             c = str(code).strip().zfill(6)
-            if not _is_history_cache_fresh(c, min(10, days)):
-                # 再检查 SQLite 有没有足够行数
-                from stock_store import load_history as _load_h
-                cached = _load_h(c, limit=days)
-                if cached is None or cached.empty or len(cached) < 10:
-                    need_fetch.append(c)
+            # 检查缓存是否新鲜（至少需要10行数据）
+            if _is_history_cache_fresh(c, min(10, days)):
+                cached_count += 1
+                continue
+            # 再检查 SQLite 有没有足够行数
+            from stock_store import load_history as _load_h
+            cached = _load_h(c, limit=days)
+            if cached is not None and not cached.empty and len(cached) >= min(10, days):
+                cached_count += 1
+            else:
+                need_fetch.append(c)
+
+        if self._log:
+            self._log(f"涨停分类：缓存命中 {cached_count}/{len(codes)}，需预取 {len(need_fetch)} 只")
 
         if not need_fetch:
             if progress_callback:
                 progress_callback(len(codes), len(codes), "全部已有缓存")
+            return
+
+        # 如果只使用缓存，跳过网络请求
+        if cache_only:
+            if self._log:
+                self._log(f"涨停分类：cache-only 模式，跳过 {len(need_fetch)} 只无缓存股票的网络请求")
+            if progress_callback:
+                progress_callback(len(codes) - len(need_fetch), len(codes), f"cache-only: {len(need_fetch)}只无缓存")
             return
 
         total = len(need_fetch)
@@ -1200,25 +1241,36 @@ class StockFilter:
             self._log(f"涨停分类：需预取 {total}/{len(codes)} 只股票的历史数据")
 
         completed = 0
+        completed_lock = threading.Lock()
+
         def _fetch_one(code: str) -> None:
             nonlocal completed
-            self.fetcher.get_history_data(code, days=days, force_refresh=False)
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total, f"预取 {code}")
+            try:
+                self.fetcher.get_history_data(code, days=days, force_refresh=False)
+            except Exception:
+                pass
+            finally:
+                with completed_lock:
+                    completed += 1
+                if progress_callback:
+                    progress_callback(completed, total, f"预取 {code}")
 
-        workers = min(4, max(1, total // 5))
+        # 根据股票数量动态调整并发数，上限不超过历史接口并发限制
+        history_limit = self.fetcher.history_request_concurrency_limit()
+        workers = min(max(4, total // 3), history_limit, 8)
+        workers = max(1, min(workers, total))
+
         executor = DaemonThreadPoolExecutor(max_workers=workers, thread_name_prefix="zt-prefetch")
         try:
             futures = [executor.submit(_fetch_one, c) for c in need_fetch]
             from concurrent.futures import as_completed
             for fut in as_completed(futures):
                 try:
-                    fut.result()
+                    fut.result(timeout=15.0)  # 单只股票最多15秒
                 except Exception:
                     pass
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True)  # 等待所有任务完成，不取消
 
     def classify_limit_up_pool(
         self,
@@ -1487,6 +1539,7 @@ class StockFilter:
     def analyze_pre_limit_up_profile(
         self,
         lookback_days: int = 5,
+        trade_date: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Dict[str, Any]:
         """回溯分析最近 N 个交易日涨停股在涨停前的特征。
@@ -1507,8 +1560,8 @@ class StockFilter:
 
         # 获取最近 N 个交易日
         from datetime import datetime as _dt
-        today_str = _dt.now().strftime("%Y%m%d")
-        trade_dates = self.fetcher._recent_trade_dates(today_str, lookback_days)
+        base_trade_date = str(trade_date or "").strip() or _dt.now().strftime("%Y%m%d")
+        trade_dates = self.fetcher._recent_trade_dates(base_trade_date, lookback_days)
         if not trade_dates:
             return {"feature_samples": [], "profile": {}, "sample_count": 0, "trade_dates": []}
 
@@ -1539,30 +1592,47 @@ class StockFilter:
         if self._log:
             self._log(f"涨停画像：共 {len(all_first_board)} 只首板涨停股，正在提取涨停前特征...")
 
-        # 预取历史数据
+        # 预取历史数据（只使用本地缓存，不发起网络请求）
         codes = list({r["code"] for r in all_first_board})
-        self._prefetch_history_for_pool(codes, days=65, progress_callback=progress_callback)
+        self._prefetch_history_for_pool(codes, days=65, progress_callback=progress_callback, cache_only=True)
+        local_cache_plan = self._build_local_cache_history_plan(reason="predict-profile-cache-only")
 
-        # 逐只提取特征
+        # 逐只提取特征（只从本地缓存读取）
         feature_samples: List[Dict[str, Any]] = []
         total = len(all_first_board)
+        prepared_history: Dict[str, Optional[Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series, pd.Series]]] = {}
         for idx, rec in enumerate(all_first_board):
             code = rec["code"]
             limit_date = rec["limit_up_date"]
 
-            try:
-                history = self.fetcher.get_history_data(code, days=65)
-            except Exception:
-                history = None
-            if history is None or history.empty or len(history) < 10:
+            if code not in prepared_history:
+                try:
+                    # 只使用本地缓存，不发起网络请求
+                    history = self.fetcher.get_history_data(
+                        code,
+                        days=65,
+                        force_refresh=False,
+                        request_plan=local_cache_plan,
+                    )
+                except Exception:
+                    history = None
+
+                if history is None or history.empty or len(history) < 10:
+                    prepared_history[code] = None
+                else:
+                    df = history.sort_values("date").reset_index(drop=True)
+                    df["date"] = df["date"].astype(str).str.strip().str.replace("-", "")
+                    close = pd.to_numeric(df["close"], errors="coerce")
+                    volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+                    amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
+                    change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+                    prepared_history[code] = (df, close, volume, amount, change_pct)
+
+            prepared = prepared_history.get(code)
+            if prepared is None:
                 continue
 
-            df = history.sort_values("date").reset_index(drop=True)
-            df["date"] = df["date"].astype(str).str.strip().str.replace("-", "")
-            close = pd.to_numeric(df["close"], errors="coerce")
-            volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
-            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
-            change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
+            df, close, volume, amount, change_pct = prepared
 
             # 找到涨停日在历史中的位置
             match_idx = df.index[df["date"] == limit_date].tolist()
@@ -1663,7 +1733,9 @@ class StockFilter:
             progress_callback(0, 1, "回溯分析涨停前兆画像...")
 
         profile_result = self.analyze_pre_limit_up_profile(
-            lookback_days=lookback_days, progress_callback=progress_callback,
+            trade_date=trade_date,
+            lookback_days=lookback_days,
+            progress_callback=progress_callback,
         )
         profile = profile_result.get("profile", {})
         feature_samples = profile_result.get("feature_samples", [])
@@ -1674,7 +1746,50 @@ class StockFilter:
         if progress_callback:
             progress_callback(0, 1, "获取今日涨停池...")
 
-        today_pool_df = self.fetcher.get_limit_up_pool(trade_date)
+        # 并行获取涨停池和全市场行情快照
+        today_pool_df: Optional[pd.DataFrame] = None
+        spot_df: Optional[pd.DataFrame] = None
+        zt_codes: set = set()
+
+        def _fetch_pool():
+            nonlocal today_pool_df
+            today_pool_df = self.fetcher.get_limit_up_pool(trade_date)
+
+        def _fetch_spot():
+            nonlocal spot_df
+            spot_df = self._fetch_spot_snapshot()
+
+        # 使用线程池并行获取两个数据源。这里不能用 `with`，否则退出上下文时会 wait=True，
+        # 即使 result(timeout=...) 超时了，仍然会继续等待后台任务跑完。
+        executor = DaemonThreadPoolExecutor(max_workers=2, thread_name_prefix="stage2")
+        try:
+            future_pool = executor.submit(_fetch_pool)
+            future_spot = executor.submit(_fetch_spot)
+
+            try:
+                # 设置超时：涨停池最多30秒
+                future_pool.result(timeout=30.0)
+            except FutureTimeoutError as e:
+                if self._log:
+                    self._log(f"涨停预测：获取涨停池超时 (get_limit_up_pool): {e}")
+            except Exception as e:
+                if self._log:
+                    self._log(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
+
+            try:
+                # 全市场行情最多20秒（这个接口很慢，快速跳过）
+                future_spot.result(timeout=20.0)
+            except FutureTimeoutError as e:
+                if self._log:
+                    self._log(f"涨停预测：获取全市场行情超时 (ak.stock_zh_a_spot_em, 5000+只股票): {e}")
+                    self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
+            except Exception as e:
+                if self._log:
+                    self._log(f"涨停预测：获取全市场行情失败 (ak.stock_zh_a_spot_em): {e}")
+                    self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
         if today_pool_df is None or today_pool_df.empty:
             return {
                 "trade_date": trade_date,
@@ -1687,13 +1802,16 @@ class StockFilter:
             }
 
         all_pool_records = self._parse_full_pool(today_pool_df)
+        if self._log:
+            self._log(f"涨停预测：解析涨停池完成，共 {len(all_pool_records)} 只")
         hot_industries = self._count_pool_industries(today_pool_df)
+        if self._log:
+            self._log(f"涨停预测：统计热门行业完成，共 {len(hot_industries)} 个行业")
 
-        # 提前获取全市场行情（只调一次 API），用于阶段4
-        zt_codes = set()
         if not today_pool_df.empty and "代码" in today_pool_df.columns:
             zt_codes = set(today_pool_df["代码"].astype(str).str.strip().str.zfill(6))
-        spot_df = self._fetch_spot_snapshot()
+            if self._log:
+                self._log(f"涨停预测：提取涨停股代码 {len(zt_codes)} 只")
 
         # 阶段3：统一预取所有需要的历史数据（一次搞定）
         if self._log:
@@ -1703,19 +1821,31 @@ class StockFilter:
         pool_codes = [r["code"] for r in all_pool_records]
         candidate_codes: List[str] = []
         if spot_df is not None and not spot_df.empty:
+            if self._log:
+                self._log(f"涨停预测：开始筛选强势股（全市场 {len(spot_df)} 只）...")
             strong = self._filter_strong_stocks(spot_df, zt_codes)
+            if self._log:
+                self._log(f"涨停预测：筛选强势股完成，共 {len(strong)} 只")
             pullback = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
+            if self._log:
+                self._log(f"涨停预测：筛选回踩MA5完成，共 {len(pullback)} 只")
             seen = set()
             for rec in strong + pullback:
                 if rec["code"] not in seen:
                     seen.add(rec["code"])
                     candidate_codes.append(rec["code"])
+        else:
+            if self._log:
+                self._log("涨停预测：无全市场行情，跳过强势股筛选（首板候选将不可用）")
 
         all_codes = list(set(pool_codes + candidate_codes))
         if self._log:
             self._log(f"涨停预测：统一预取 {len(all_codes)} 只股票历史数据"
                       f"（涨停池{len(pool_codes)} + 候选{len(candidate_codes)}）")
-        self._prefetch_history_for_pool(all_codes, days=65, progress_callback=progress_callback)
+        # 只使用本地缓存，不发起网络请求
+        self._prefetch_history_for_pool(all_codes, days=65, progress_callback=progress_callback, cache_only=True)
+        if self._log:
+            self._log("涨停预测：阶段3完成 - 历史数据预取结束")
 
         # 阶段4：连板延续候选评分（历史数据已在缓存中）
         if self._log:
@@ -1875,7 +2005,11 @@ class StockFilter:
 
         # 5. 量能和均线（历史数据已预取到缓存，直接读取）
         try:
-            history = self.fetcher.get_history_data(code, days=65)
+            # 只使用本地缓存，不发起网络请求
+            history = self.fetcher.get_history_data(
+                code, days=65, force_refresh=False,
+                request_plan=self._build_local_cache_history_plan(reason="predict-continuation-cache-only"),
+            )
         except Exception:
             history = None
         if history is not None and not history.empty and len(history) >= 10:
@@ -1976,10 +2110,12 @@ class StockFilter:
         try:
             import akshare as ak
             from stock_data import _retry_ak_call
+            if self._log:
+                self._log("涨停预测：正在调用 ak.stock_zh_a_spot_em() 获取全市场实时行情快照（5000+只股票）...")
             return _retry_ak_call(ak.stock_zh_a_spot_em)
         except Exception as e:
             if self._log:
-                self._log(f"涨停预测：获取实时行情失败: {e}")
+                self._log(f"涨停预测：获取实时行情失败 (ak.stock_zh_a_spot_em): {e}")
             return None
 
     @staticmethod
@@ -2070,7 +2206,11 @@ class StockFilter:
 
         # 获取历史数据计算特征（已预取到缓存，直接读取）
         try:
-            history = self.fetcher.get_history_data(code, days=65)
+            # 只使用本地缓存，不发起网络请求
+            history = self.fetcher.get_history_data(
+                code, days=65, force_refresh=False,
+                request_plan=self._build_local_cache_history_plan(reason="predict-first-board-cache-only"),
+            )
         except Exception:
             history = None
 

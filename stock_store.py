@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1068,7 +1069,7 @@ def load_limit_up_pool(trade_date: str, pool_type: str = "today") -> Optional[pd
         data_json = row["data_json"]
         if not data_json or data_json == "[]":
             return None
-        df = pd.read_json(data_json, orient="records")
+        df = pd.read_json(StringIO(data_json), orient="records")
         if df is None or df.empty:
             return None
         return df

@@ -2744,11 +2744,22 @@ def _is_history_cache_fresh(
     meta = load_history_meta_store(stock_code)
     if meta is None:
         return False
-    latest_td = str(meta.get("latest_trade_date") or "").strip()
+    latest_td_raw = str(meta.get("latest_trade_date") or "").strip()
     row_count = int(meta.get("row_count") or 0)
     refreshed_at = str(meta.get("refreshed_at") or "").strip()
-    if not latest_td or row_count < min_rows:
+    if not latest_td_raw or row_count < min_rows:
         return False
+
+    # 统一日期格式为 YYYY-MM-DD，避免字符串比较出错
+    try:
+        # 支持多种日期格式：2024-01-15, 20240115, 2024/01/15
+        normalized = latest_td_raw.replace("/", "-").replace(".", "-")
+        if len(normalized) == 8 and normalized.isdigit():
+            latest_td = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+        else:
+            latest_td = normalized
+    except Exception:
+        latest_td = latest_td_raw
 
     estimated_last_td = _estimate_last_trade_date()
 
@@ -4200,7 +4211,16 @@ class StockDataFetcher:
                 # 保存缓存元数据，用于后续新鲜度判断
                 latest_td = ""
                 if "date" in df.columns and not df.empty:
-                    latest_td = str(df["date"].iloc[-1]).strip()
+                    raw_date = str(df["date"].iloc[-1]).strip()
+                    # 统一日期格式为 YYYY-MM-DD，避免后续比较出错
+                    try:
+                        normalized = raw_date.replace("/", "-").replace(".", "-")
+                        if len(normalized) == 8 and normalized.isdigit():
+                            latest_td = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+                        else:
+                            latest_td = normalized
+                    except Exception:
+                        latest_td = raw_date
                 save_history_meta_store(stock_code, latest_td, len(df), source=provider)
                 return df.tail(days).reset_index(drop=True)
 
