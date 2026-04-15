@@ -938,7 +938,7 @@ def _normalize_intraday_source_frame(
 
     source_columns = [str(col) for col in raw_frame.columns.tolist()]
     rename_map: Dict[str, str] = {}
-    time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time"])
+    time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time", "day"])
     open_col = _first_existing_column(source_columns, ["开盘", "open"])
     close_col = _first_existing_column(source_columns, ["收盘", "close", "最新价"])
     high_col = _first_existing_column(source_columns, ["最高", "high"])
@@ -4325,7 +4325,9 @@ class StockDataFetcher:
                         self._log(f"分时行情(东财) {code} 获取失败: {e}")
             elif provider == "sina":
                 try:
-                    raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=code, period="1")
+                    # 新浪接口要求 symbol 带 sh/sz 前缀（如 sh600519）
+                    sina_symbol = _market_prefixed_code(code)
+                    raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=sina_symbol, period="1")
                 except Exception as e:
                     last_error = e
                     if self._log:
