@@ -21,6 +21,7 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 
 from scan_models import FilterSettings, ScanRequest
 from data_source_models import DATA_SOURCE_OPTIONS
+from src.utils.cancel_token import CancelToken
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import (
@@ -35,6 +36,7 @@ from stock_store import (
     load_scan_snapshot,
     load_watchlist,
     load_watchlist_item,
+    reset_all_connections,
     restore_database,
     save_app_config,
     save_scan_snapshot,
@@ -93,6 +95,11 @@ class StockMonitorApp:
         self.sort_reverse = True
         self.is_scanning = False
         self.is_updating_cache = False
+        self._scan_cancel_token: Optional[CancelToken] = None
+        self._cache_cancel_token: Optional[CancelToken] = None
+        # 保护 detail / intraday / limit-up 线程的取消入口，统一经此集合广播
+        self._all_cancel_tokens: "set[CancelToken]" = set()
+        self._cancel_tokens_lock = threading.Lock()
         self._scan_thread: Optional[threading.Thread] = None
         self._cache_thread: Optional[threading.Thread] = None
         self._active_scan_request: Optional[ScanRequest] = None
@@ -1153,14 +1160,14 @@ class StockMonitorApp:
                 result["compare_days"] = 2
                 result["trade_dates"] = [result.get("yesterday_date", ""), result.get("today_date", "")]
                 result["daily_stats"] = []
-            self.root.after(0, lambda: self._zt_status_label.config(
+            self._post_to_ui(lambda: self._zt_status_label.config(
                 text=f"涨停池获取完成，正在分析今日 {len(result.get('today_first', []))} 只首板形态..."
             ))
 
             # 阶段2：对今日首板做技术形态分类
             today_first = result.get("today_first", [])
             def _progress(cur, tot, info):
-                self.root.after(0, lambda c=cur, t=tot, i=info:
+                self._post_to_ui(lambda c=cur, t=tot, i=info:
                     self._zt_status_label.config(text=f"分类今日首板 {c}/{t}: {i}"))
             today_classified = self.stock_filter.classify_limit_up_pool(today_first, progress_callback=_progress)
             result["today_classified"] = today_classified
@@ -1168,18 +1175,18 @@ class StockMonitorApp:
             # 阶段3：对昨日首板做技术形态分类
             yesterday_first = result.get("yesterday_first", [])
             if yesterday_first:
-                self.root.after(0, lambda: self._zt_status_label.config(
+                self._post_to_ui(lambda: self._zt_status_label.config(
                     text=f"正在分析上一交易日 {len(yesterday_first)} 只首板形态..."))
                 def _progress2(cur, tot, info):
-                    self.root.after(0, lambda c=cur, t=tot, i=info:
+                    self._post_to_ui(lambda c=cur, t=tot, i=info:
                         self._zt_status_label.config(text=f"分类上一交易日首板 {c}/{t}: {i}"))
                 yesterday_classified = self.stock_filter.classify_limit_up_pool(yesterday_first, progress_callback=_progress2)
                 result["yesterday_classified"] = yesterday_classified
 
-            self.root.after(0, lambda r=result: self._apply_limit_up_compare(r))
+            self._post_to_ui(lambda r=result: self._apply_limit_up_compare(r))
         except Exception as e:
             err = str(e)
-            self.root.after(0, lambda: self._zt_show_error(f"涨停对比失败: {err}"))
+            self._post_to_ui(lambda: self._zt_show_error(f"涨停对比失败: {err}"))
 
     def _zt_show_error(self, msg: str):
         self._zt_summary_text.config(state=tk.NORMAL)
@@ -1570,16 +1577,16 @@ class StockMonitorApp:
     def _load_predict(self, trade_date: str, lookback_days: int):
         try:
             def _progress(cur, tot, info):
-                self.root.after(0, lambda c=cur, t=tot, i=info:
+                self._post_to_ui(lambda c=cur, t=tot, i=info:
                     self._predict_status_label.config(text=f"预测分析 {c}/{t}: {i}"))
 
             result = self.stock_filter.predict_limit_up_candidates(
                 trade_date, lookback_days=lookback_days, progress_callback=_progress,
             )
-            self.root.after(0, lambda r=result: self._apply_predict_result(r))
+            self._post_to_ui(lambda r=result: self._apply_predict_result(r))
         except Exception as e:
             err = str(e)
-            self.root.after(0, lambda: self._predict_show_error(f"涨停预测失败: {err}"))
+            self._post_to_ui(lambda: self._predict_show_error(f"涨停预测失败: {err}"))
 
     def _predict_show_error(self, msg: str):
         self._predict_summary_text.config(state=tk.NORMAL)
@@ -1865,6 +1872,27 @@ class StockMonitorApp:
                 self.root.after(delay_ms, callback)
         except tk.TclError:
             pass
+
+    def _post_to_ui(self, callback) -> None:
+        """后台线程专用：把 UI 更新推到主线程。窗口已关时直接丢弃。"""
+        self._safe_after(0, callback)
+
+    def _register_cancel_token(self, token: CancelToken) -> None:
+        with self._cancel_tokens_lock:
+            self._all_cancel_tokens.add(token)
+
+    def _unregister_cancel_token(self, token: CancelToken) -> None:
+        with self._cancel_tokens_lock:
+            self._all_cancel_tokens.discard(token)
+
+    def _cancel_all_background(self, reason: str = "") -> None:
+        """广播取消到所有注册过的 token；扫描/缓存也同步失效。"""
+        self.is_scanning = False
+        self.is_updating_cache = False
+        with self._cancel_tokens_lock:
+            tokens = list(self._all_cancel_tokens)
+        for tk_ in tokens:
+            tk_.cancel(reason)
 
     def _selected_boards(self) -> List[str]:
         boards = [board for board, var in self.board_filter_vars.items() if var.get()]
@@ -2302,7 +2330,12 @@ class StockMonitorApp:
         self.progress_var.set(0)
         self._set_progress_text(0, 0)
 
-        self._scan_thread = threading.Thread(target=self.scan_stocks, args=(request,), daemon=True)
+        token = CancelToken()
+        self._scan_cancel_token = token
+        self._register_cancel_token(token)
+        self._scan_thread = threading.Thread(
+            target=self.scan_stocks, args=(request, token), daemon=True
+        )
         self._scan_thread.start()
 
     def start_history_cache_update(self):
@@ -2322,17 +2355,27 @@ class StockMonitorApp:
         self.progress_var.set(0)
         self._set_progress_text(0, 0, "准备中")
         self._set_progressbar_indeterminate(True)
-        self._cache_thread = threading.Thread(target=self.update_history_cache, args=(request,), daemon=True)
+        token = CancelToken()
+        self._cache_cancel_token = token
+        self._register_cancel_token(token)
+        self._cache_thread = threading.Thread(
+            target=self.update_history_cache, args=(request, token), daemon=True
+        )
         self._cache_thread.start()
 
     def stop_scan(self):
+        # 布尔标记保留做兼容；CancelToken 才是真正可传播的停止信号
         self.is_scanning = False
         self.is_updating_cache = False
+        for token in (self._scan_cancel_token, self._cache_cancel_token):
+            if token is not None:
+                token.cancel("user_stop")
         self.status_var.set("正在停止...")
         self._log("已请求停止，正在等待当前任务结束。")
 
-    def scan_stocks(self, request: ScanRequest):
+    def scan_stocks(self, request: ScanRequest, cancel_token: Optional[CancelToken] = None):
         import time as _time
+        token = cancel_token or CancelToken()
         try:
             scan_filter = StockFilter()
             scan_filter.apply_settings(request.filter_settings)
@@ -2344,7 +2387,7 @@ class StockMonitorApp:
             scan_t0 = _time.time()
 
             def progress_callback(current, total, code, name):
-                if not self.is_scanning:
+                if token.is_cancelled() or not self.is_scanning:
                     raise StopIteration
                 progress = (current / total) * 100 if total else 0
                 elapsed = _time.time() - scan_t0
@@ -2355,9 +2398,9 @@ class StockMonitorApp:
                 else:
                     eta_text = f"{int(eta_sec)}秒"
                 status_text = f"扫描中 {current}/{total} ({progress:.0f}%) | {speed:.1f}只/秒 | 剩余 {eta_text}"
-                self.root.after(0, lambda: self.progress_var.set(progress))
-                self.root.after(0, lambda c=current, t=total: self._set_progress_text(c, t))
-                self.root.after(0, lambda s=status_text: self.status_var.set(s))
+                self._post_to_ui(lambda: self.progress_var.set(progress))
+                self._post_to_ui(lambda c=current, t=total: self._set_progress_text(c, t))
+                self._post_to_ui(lambda s=status_text: self.status_var.set(s))
 
             results = scan_filter.scan_all_stocks(
                 max_stocks=request.max_stocks,
@@ -2365,29 +2408,33 @@ class StockMonitorApp:
                 max_workers=request.scan_workers,
                 history_source=request.history_source,
                 local_history_only=True,
+                cancel_token=token,
                 should_stop=lambda: not self.is_scanning,
                 refresh_universe=request.refresh_universe,
                 allowed_boards=list(request.allowed_boards),
             )
-            if not self.is_scanning:
-                self.root.after(0, lambda: self._log("扫描已停止。"))
-                self.root.after(0, lambda: self.scan_finished("扫描已停止"))
+            if token.is_cancelled() or not self.is_scanning:
+                self._post_to_ui(lambda: self._log("扫描已停止。"))
+                self._post_to_ui(lambda: self.scan_finished("扫描已停止"))
                 return
             self.all_scan_results = results
-            self.root.after(0, lambda res=results, req=request: self.update_result_table(res, request=req))
-            self.root.after(0, self._sync_watchlist_with_scan_results)
-            self.root.after(0, lambda count=len(results): self.scan_finished(f"扫描完成，命中 {count} 只。"))
+            self._post_to_ui(lambda res=results, req=request: self.update_result_table(res, request=req))
+            self._post_to_ui(self._sync_watchlist_with_scan_results)
+            self._post_to_ui(lambda count=len(results): self.scan_finished(f"扫描完成，命中 {count} 只。"))
         except StopIteration:
-            self.root.after(0, lambda: self._log("扫描已停止。"))
-            self.root.after(0, lambda: self.scan_finished("扫描已停止"))
+            self._post_to_ui(lambda: self._log("扫描已停止。"))
+            self._post_to_ui(lambda: self.scan_finished("扫描已停止"))
         except Exception as e:
             error_text = str(e)
-            self.root.after(0, lambda: self._log(f"扫描出错: {error_text}"))
-            self.root.after(0, lambda: self.scan_finished(f"扫描失败: {error_text}"))
-            self.root.after(0, lambda et=error_text: self._show_network_error_alert(et))
+            self._post_to_ui(lambda: self._log(f"扫描出错: {error_text}"))
+            self._post_to_ui(lambda: self.scan_finished(f"扫描失败: {error_text}"))
+            self._post_to_ui(lambda et=error_text: self._show_network_error_alert(et))
+        finally:
+            self._unregister_cancel_token(token)
 
-    def update_history_cache(self, request: ScanRequest):
+    def update_history_cache(self, request: ScanRequest, cancel_token: Optional[CancelToken] = None):
         import time as _time
+        token = cancel_token or CancelToken()
         try:
             scan_filter = StockFilter()
             scan_filter.apply_settings(request.filter_settings)
@@ -2397,11 +2444,15 @@ class StockMonitorApp:
                 f"缓存更新参数：数量={'全量' if request.max_stocks <= 0 else request.max_stocks}，并发线程={request.scan_workers}，历史源={request.history_source}"
             )
 
-            self.root.after(0, lambda: self.status_var.set("正在加载股票池并统计总数..."))
+            self._post_to_ui(lambda: self.status_var.set("正在加载股票池并统计总数..."))
             universe = scan_filter.fetcher.get_all_stocks(force_refresh=request.refresh_universe)
+            if token.is_cancelled():
+                self._post_to_ui(lambda: self._set_progressbar_indeterminate(False))
+                self._post_to_ui(lambda: self.scan_finished("历史缓存更新已停止"))
+                return
             if universe is None or universe.empty:
-                self.root.after(0, lambda: self._set_progressbar_indeterminate(False))
-                self.root.after(0, lambda: self.scan_finished("历史缓存更新失败: 股票池为空"))
+                self._post_to_ui(lambda: self._set_progressbar_indeterminate(False))
+                self._post_to_ui(lambda: self.scan_finished("历史缓存更新失败: 股票池为空"))
                 return
             if request.allowed_boards and "board" in universe.columns:
                 allowed = {str(x).strip() for x in request.allowed_boards if str(x).strip()}
@@ -2411,14 +2462,12 @@ class StockMonitorApp:
                 universe = universe.head(request.max_stocks).reset_index(drop=True)
             estimated_total = int(len(universe))
 
-            self.root.after(0, lambda: self._set_progressbar_indeterminate(False))
-            self.root.after(0, lambda: self.progress_var.set(0))
-            self.root.after(
-                0,
+            self._post_to_ui(lambda: self._set_progressbar_indeterminate(False))
+            self._post_to_ui(lambda: self.progress_var.set(0))
+            self._post_to_ui(
                 lambda total=estimated_total: self._set_progress_text(0, total, "等待任务启动"),
             )
-            self.root.after(
-                0,
+            self._post_to_ui(
                 lambda total=estimated_total: self.status_var.set(f"准备更新历史缓存，共 {total} 只股票..."),
             )
 
@@ -2432,7 +2481,7 @@ class StockMonitorApp:
 
             def progress_callback(current, total, code, name, updated, failed, skipped):
                 nonlocal last_updated, last_failed, last_skipped
-                if not self.is_updating_cache:
+                if token.is_cancelled() or not self.is_updating_cache:
                     raise StopIteration
                 progress = (current / total) * 100 if total else 0
                 elapsed = _time.time() - cache_t0
@@ -2463,13 +2512,12 @@ class StockMonitorApp:
                     f"缓存进度 {current}/{total}，剩余 {remaining} 只，"
                     f"{outcome_text} {code} {name}；成功{updated} 跳过{skipped} 失败{failed}"
                 )
-                self.root.after(0, lambda: self.progress_var.set(progress))
-                self.root.after(
-                    0,
+                self._post_to_ui(lambda: self.progress_var.set(progress))
+                self._post_to_ui(
                     lambda c=current, t=total, u=updated, s=skipped, f=failed:
                         self._set_progress_text(c, t, f"成功{u} 跳过{s} 失败{f}"),
                 )
-                self.root.after(0, lambda s=status_text: self.status_var.set(s))
+                self._post_to_ui(lambda s=status_text: self.status_var.set(s))
 
             result = scan_filter.fetcher.update_history_cache(
                 max_stocks=request.max_stocks,
@@ -2477,16 +2525,16 @@ class StockMonitorApp:
                 source=request.history_source,
                 workers=request.scan_workers,
                 progress_callback=progress_callback,
-                should_stop=lambda: not self.is_updating_cache,
+                should_stop=lambda: token.is_cancelled() or not self.is_updating_cache,
                 refresh_universe=request.refresh_universe,
                 allowed_boards=list(request.allowed_boards),
             )
             cache_updated = result.get("updated", 0)
             cache_failed = result.get("failed", 0)
             cache_skipped = result.get("skipped", 0)
-            if not self.is_updating_cache:
-                self.root.after(0, lambda: self._log("历史缓存更新已停止。"))
-                self.root.after(0, lambda: self.scan_finished("历史缓存更新已停止"))
+            if token.is_cancelled() or not self.is_updating_cache:
+                self._post_to_ui(lambda: self._log("历史缓存更新已停止。"))
+                self._post_to_ui(lambda: self.scan_finished("历史缓存更新已停止"))
                 return
             total_time = _time.time() - cache_t0
             if total_time >= 60:
@@ -2498,17 +2546,19 @@ class StockMonitorApp:
                 f"成功 {cache_updated}，跳过(已新鲜) {cache_skipped}，失败 {cache_failed}，"
                 f"耗时 {time_text}。"
             )
-            self.root.after(0, lambda m=summary_msg: self._log(m))
-            self.root.after(0, lambda: self._log(self._history_cache_summary_text()))
-            self.root.after(0, lambda: self.scan_finished("历史缓存更新完成"))
+            self._post_to_ui(lambda m=summary_msg: self._log(m))
+            self._post_to_ui(lambda: self._log(self._history_cache_summary_text()))
+            self._post_to_ui(lambda: self.scan_finished("历史缓存更新完成"))
         except StopIteration:
-            self.root.after(0, lambda: self._log("历史缓存更新已停止。"))
-            self.root.after(0, lambda: self.scan_finished("历史缓存更新已停止"))
+            self._post_to_ui(lambda: self._log("历史缓存更新已停止。"))
+            self._post_to_ui(lambda: self.scan_finished("历史缓存更新已停止"))
         except Exception as e:
             error_text = str(e)
-            self.root.after(0, lambda: self._log(f"历史缓存更新出错: {error_text}"))
-            self.root.after(0, lambda: self.scan_finished(f"历史缓存更新失败: {error_text}"))
-            self.root.after(0, lambda et=error_text: self._show_network_error_alert(et))
+            self._post_to_ui(lambda: self._log(f"历史缓存更新出错: {error_text}"))
+            self._post_to_ui(lambda: self.scan_finished(f"历史缓存更新失败: {error_text}"))
+            self._post_to_ui(lambda et=error_text: self._show_network_error_alert(et))
+        finally:
+            self._unregister_cancel_token(token)
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         data = item.get("data", {}) or {}
@@ -2901,7 +2951,13 @@ class StockMonitorApp:
     def _schedule_show_stock_detail(self, stock_code: str, delay_ms: int = 180) -> None:
         code = str(stock_code).strip().zfill(6)
         self._cancel_scheduled_detail()
-        self._detail_after_id = self.root.after(delay_ms, lambda c=code: self.show_stock_detail(c))
+        if self._is_closing:
+            return
+        try:
+            if self.root.winfo_exists():
+                self._detail_after_id = self.root.after(delay_ms, lambda c=code: self.show_stock_detail(c))
+        except tk.TclError:
+            self._detail_after_id = None
 
     def show_stock_detail(self, stock_code: str, force_refresh: bool = False):
         code = str(stock_code).strip().zfill(6)
@@ -2958,16 +3014,16 @@ class StockMonitorApp:
             if isinstance(quick_detail, dict):
                 quick_history = quick_detail.get("history")
                 if quick_history is not None and not getattr(quick_history, "empty", True):
-                    self.root.after(0, lambda: self._apply_quick_detail_if_current(stock_code, quick_detail))
+                    self._post_to_ui(lambda: self._apply_quick_detail_if_current(stock_code, quick_detail))
 
             detail = self.stock_filter.get_stock_detail(stock_code, preloaded_history=quick_history)
-            self.root.after(0, lambda: self._apply_detail_if_current(stock_code, detail))
+            self._post_to_ui(lambda: self._apply_detail_if_current(stock_code, detail))
         except Exception as e:
             error_text = str(e)
-            self.root.after(0, lambda: self._log(f"查询详情出错: {error_text}"))
-            self.root.after(0, lambda: self._show_detail_error(stock_code, f"详情加载失败: {error_text}"))
+            self._post_to_ui(lambda: self._log(f"查询详情出错: {error_text}"))
+            self._post_to_ui(lambda: self._show_detail_error(stock_code, f"详情加载失败: {error_text}"))
         finally:
-            self.root.after(0, lambda: self._finish_detail_status(stock_code))
+            self._post_to_ui(lambda: self._finish_detail_status(stock_code))
 
     def _apply_quick_detail_if_current(self, stock_code: str, detail: Dict[str, Any]) -> None:
         if str(stock_code).strip().zfill(6) != self._detail_request_code:
@@ -3493,8 +3549,7 @@ class StockMonitorApp:
 
     def _load_more_detail_history(self, stock_code: str, request_days: int, previous_rows: int) -> None:
         history = self.stock_filter.get_stock_detail_history(stock_code, request_days)
-        self.root.after(
-            0,
+        self._post_to_ui(
             lambda: self._apply_more_detail_history_if_current(stock_code, history, request_days, previous_rows),
         )
 
@@ -3695,12 +3750,12 @@ class StockMonitorApp:
                 day_offset=day_offset,
                 target_trade_date=target_trade_date,
             )
-            self.root.after(0, lambda: self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload))
+            self._post_to_ui(lambda: self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload))
         except Exception as e:
-            self.root.after(0, lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
-            self.root.after(0, lambda: self._log(f"分时加载失败 {stock_code}: {e}"))
+            self._post_to_ui(lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
+            self._post_to_ui(lambda: self._log(f"分时加载失败 {stock_code}: {e}"))
         finally:
-            self.root.after(0, lambda: self._finish_intraday_status(stock_code, day_offset))
+            self._post_to_ui(lambda: self._finish_intraday_status(stock_code, day_offset))
 
     def _apply_intraday_if_current(self, stock_code: str, day_offset: int, target_trade_date: str, payload: Dict[str, Any]) -> None:
         code = str(stock_code).strip().zfill(6)
@@ -4439,6 +4494,12 @@ class StockMonitorApp:
             messagebox.showerror("备份失败", str(exc))
 
     def _on_restore_database(self) -> None:
+        if self.is_scanning or self.is_updating_cache:
+            messagebox.showwarning(
+                "恢复前请先停止",
+                "检测到扫描或缓存更新仍在进行。请先点“停止”并等待任务结束后再执行恢复。",
+            )
+            return
         file_path = filedialog.askopenfilename(
             title="选择备份文件",
             filetypes=[("SQLite 数据库", "*.sqlite3")],
@@ -4452,8 +4513,21 @@ class StockMonitorApp:
         )
         if not confirm:
             return
+
+        # 恢复前主动广播取消，防止任何仍在后台跑的任务在恢复期间写库
+        self._cancel_all_background("database_restore")
+        # 等待活跃的 scan/cache 线程收尾，最多 5 秒
+        for t in (self._scan_thread, self._cache_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=5.0)
+
         ok = restore_database(file_path)
         if ok:
+            # restore_database 内部已经 reset 过了，再显式调一次，
+            # 保证主线程本地连接也被清掉，之后任何查询都会走新文件。
+            reset_all_connections()
+            self.all_scan_results = []
+            self.filtered_stocks = []
             messagebox.showinfo("恢复成功", "数据库已恢复。建议重启应用以确保数据一致。")
             self._log(f"数据库恢复完成：{file_path}")
         else:
@@ -4461,8 +4535,8 @@ class StockMonitorApp:
 
     def on_close(self):
         self._is_closing = True
-        self.is_scanning = False
-        self.is_updating_cache = False
+        # 广播取消到所有后台任务，让它们尽快退出
+        self._cancel_all_background("window_close")
         self._detail_request_code = ""
         self._detail_loading_code = ""
         self._intraday_request_code = ""

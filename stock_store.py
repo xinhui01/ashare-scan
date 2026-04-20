@@ -24,6 +24,12 @@ _SCHEMA_INITIALIZED_PATH = ""
 _SCHEMA_LOCK = threading.Lock()
 _THREAD_LOCAL = threading.local()
 
+# 已发放的所有线程本地连接。restore 时需要统一关闭，避免其他线程继续握着旧 fd。
+_OPEN_CONNECTIONS: "set[sqlite3.Connection]" = set()
+_OPEN_CONNECTIONS_LOCK = threading.Lock()
+# 每次恢复/重置后自增，线程可以据此判断手上连接是否过期。
+_CONNECTION_GENERATION = 0
+
 
 def _ensure_dir() -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,12 +40,20 @@ def _connect() -> sqlite3.Connection:
     # 线程本地连接复用：同一线程内复用连接，避免每次操作都创建新连接
     conn = getattr(_THREAD_LOCAL, "conn", None)
     conn_path = getattr(_THREAD_LOCAL, "conn_path", None)
-    if conn is not None and conn_path == str(_DB_PATH):
+    conn_gen = getattr(_THREAD_LOCAL, "conn_gen", None)
+    if (
+        conn is not None
+        and conn_path == str(_DB_PATH)
+        and conn_gen == _CONNECTION_GENERATION
+    ):
         try:
             conn.execute("SELECT 1")
             return conn
         except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-            _THREAD_LOCAL.conn = None
+            _drop_thread_local_connection()
+    elif conn is not None:
+        # 路径变了或代数升了：主动关闭旧连接，避免悬挂句柄
+        _drop_thread_local_connection()
     db_path_str = str(_DB_PATH)
     conn = sqlite3.connect(_DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -58,7 +72,54 @@ def _connect() -> sqlite3.Connection:
         _init_schema(conn)
     _THREAD_LOCAL.conn = conn
     _THREAD_LOCAL.conn_path = db_path_str
+    _THREAD_LOCAL.conn_gen = _CONNECTION_GENERATION
+    with _OPEN_CONNECTIONS_LOCK:
+        _OPEN_CONNECTIONS.add(conn)
     return conn
+
+
+def _drop_thread_local_connection() -> None:
+    conn = getattr(_THREAD_LOCAL, "conn", None)
+    _THREAD_LOCAL.conn = None
+    _THREAD_LOCAL.conn_path = None
+    _THREAD_LOCAL.conn_gen = None
+    if conn is None:
+        return
+    with _OPEN_CONNECTIONS_LOCK:
+        _OPEN_CONNECTIONS.discard(conn)
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def reset_all_connections() -> None:
+    """Invalidate every outstanding SQLite connection and mark schema uninitialized.
+
+    Callers must hold `_DB_WRITE_LOCK` (or otherwise guarantee no concurrent
+    writers) for the reset to be meaningful. Other threads' next `_connect()`
+    will create a fresh connection.
+    """
+    global _SCHEMA_INITIALIZED, _SCHEMA_INITIALIZED_PATH, _CONNECTION_GENERATION
+    _CONNECTION_GENERATION += 1
+    with _OPEN_CONNECTIONS_LOCK:
+        conns = list(_OPEN_CONNECTIONS)
+        _OPEN_CONNECTIONS.clear()
+    for conn in conns:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    # 主动清掉当前线程本地引用，防止调用方立刻 _connect() 时命中死引用
+    try:
+        _THREAD_LOCAL.conn = None
+        _THREAD_LOCAL.conn_path = None
+        _THREAD_LOCAL.conn_gen = None
+    except Exception:
+        pass
+    with _SCHEMA_LOCK:
+        _SCHEMA_INITIALIZED = False
+        _SCHEMA_INITIALIZED_PATH = ""
 
 
 def _init_schema(conn: sqlite3.Connection) -> None:
@@ -348,16 +409,15 @@ def save_universe(df: pd.DataFrame) -> None:
     out["exchange"] = out["exchange"].astype(str).fillna("")
     out["board"] = out["board"].astype(str).fillna("")
     out["concepts"] = out["concepts"].astype(str).fillna("")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    codes = out["code"].tolist()
+    names = out["name"].tolist()
+    exchanges = out["exchange"].tolist()
+    boards = out["board"].tolist()
+    concepts = out["concepts"].tolist()
     rows = [
-        (
-            str(row["code"]),
-            str(row.get("name", "") or ""),
-            str(row.get("exchange", "") or ""),
-            str(row.get("board", "") or ""),
-            str(row.get("concepts", "") or ""),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-        for _, row in out.iterrows()
+        (codes[i], names[i], exchanges[i], boards[i], concepts[i], now_str)
+        for i in range(len(codes))
     ]
     def _write():
         with _connect() as conn:
@@ -418,23 +478,35 @@ def save_history(stock_code: str, df: pd.DataFrame) -> None:
         if col not in out.columns:
             out[col] = None
     out = out.sort_values("date").reset_index(drop=True)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_series = out["date"].tolist()
+    open_vals = out["open"].tolist()
+    close_vals = out["close"].tolist()
+    high_vals = out["high"].tolist()
+    low_vals = out["low"].tolist()
+    volume_vals = out["volume"].tolist()
+    amount_vals = out["amount"].tolist()
+    amplitude_vals = out["amplitude"].tolist()
+    change_pct_vals = out["change_pct"].tolist()
+    change_amount_vals = out["change_amount"].tolist()
+    turnover_vals = out["turnover_rate"].tolist()
     rows = [
         (
             code,
-            str(row["date"]),
-            _to_float(row.get("open")),
-            _to_float(row.get("close")),
-            _to_float(row.get("high")),
-            _to_float(row.get("low")),
-            _to_float(row.get("volume")),
-            _to_float(row.get("amount")),
-            _to_float(row.get("amplitude")),
-            _to_float(row.get("change_pct")),
-            _to_float(row.get("change_amount")),
-            _to_float(row.get("turnover_rate")),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(date_series[i]),
+            _to_float(open_vals[i]),
+            _to_float(close_vals[i]),
+            _to_float(high_vals[i]),
+            _to_float(low_vals[i]),
+            _to_float(volume_vals[i]),
+            _to_float(amount_vals[i]),
+            _to_float(amplitude_vals[i]),
+            _to_float(change_pct_vals[i]),
+            _to_float(change_amount_vals[i]),
+            _to_float(turnover_vals[i]),
+            now_str,
         )
-        for _, row in out.iterrows()
+        for i in range(len(date_series))
     ]
     def _write():
         with _connect() as conn:
@@ -689,21 +761,31 @@ def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
         if col not in out.columns:
             out[col] = None
     out = out.sort_values("date").reset_index(drop=True)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_series = out["date"].tolist()
+    close_vals = out["close"].tolist()
+    change_pct_vals = out["change_pct"].tolist()
+    main_force_amount = out["main_force_amount"].tolist()
+    main_force_ratio = out["main_force_ratio"].tolist()
+    big_order_amount = out["big_order_amount"].tolist()
+    big_order_ratio = out["big_order_ratio"].tolist()
+    super_big_order_amount = out["super_big_order_amount"].tolist()
+    super_big_order_ratio = out["super_big_order_ratio"].tolist()
     rows = [
         (
             code,
-            str(row["date"]),
-            _to_float(row.get("close")),
-            _to_float(row.get("change_pct")),
-            _to_float(row.get("main_force_amount")),
-            _to_float(row.get("main_force_ratio")),
-            _to_float(row.get("big_order_amount")),
-            _to_float(row.get("big_order_ratio")),
-            _to_float(row.get("super_big_order_amount")),
-            _to_float(row.get("super_big_order_ratio")),
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(date_series[i]),
+            _to_float(close_vals[i]),
+            _to_float(change_pct_vals[i]),
+            _to_float(main_force_amount[i]),
+            _to_float(main_force_ratio[i]),
+            _to_float(big_order_amount[i]),
+            _to_float(big_order_ratio[i]),
+            _to_float(super_big_order_amount[i]),
+            _to_float(super_big_order_ratio[i]),
+            now_str,
         )
-        for _, row in out.iterrows()
+        for i in range(len(date_series))
     ]
 
     def _write():
@@ -974,8 +1056,15 @@ def backup_database(backup_dir: Optional[str] = None) -> Path:
 def restore_database(backup_path: str) -> bool:
     """从备份文件恢复数据库。
 
-    恢复前会自动创建当前数据库的备份。
-    返回 True 表示成功。
+    恢复流程：
+    1. 取写锁，阻塞并发写入。
+    2. 关闭所有已发放的 SQLite 连接，防止覆盖到“活”文件后还在被读写。
+    3. 先备份当前数据库（尽力而为，失败只记录不中断）。
+    4. copy2 覆盖 DB 文件。
+    5. 重置连接状态/schema 初始化标记，下次 `_connect()` 自动重建。
+
+    失败分两类：备份文件缺失直接返回 False；覆盖阶段失败会尝试把“恢复前备份”
+    回滚为当前 DB，保证用户手里的数据库至少不是半损坏状态。
     """
     import shutil
     src = Path(backup_path)
@@ -983,20 +1072,35 @@ def restore_database(backup_path: str) -> bool:
         logger.error("备份文件不存在：%s", backup_path)
         return False
 
-    # 先备份当前数据库
-    try:
-        backup_database()
-    except Exception as exc:
-        logger.warning("恢复前备份失败：%s", exc)
+    with _DB_WRITE_LOCK:
+        # 在覆盖数据库文件前关掉所有连接，避免 Windows 上句柄被占。
+        reset_all_connections()
 
-    # 替换
-    try:
-        shutil.copy2(str(src), str(_DB_PATH))
+        pre_restore_backup: Optional[Path] = None
+        try:
+            pre_restore_backup = backup_database()
+        except Exception as exc:
+            logger.warning("恢复前备份失败：%s", exc)
+
+        try:
+            shutil.copy2(str(src), str(_DB_PATH))
+        except Exception as exc:
+            logger.error("数据库恢复失败：%s", exc)
+            # 覆盖失败时，尝试用“恢复前备份”回滚，避免当前 DB 处于半写状态。
+            if pre_restore_backup is not None and pre_restore_backup.is_file():
+                try:
+                    shutil.copy2(str(pre_restore_backup), str(_DB_PATH))
+                    logger.info("已使用恢复前备份回滚：%s", pre_restore_backup)
+                except Exception as rollback_exc:
+                    logger.error("恢复前备份回滚失败：%s", rollback_exc)
+            # 不管有没有成功，都重置一次连接，避免旧状态被复用。
+            reset_all_connections()
+            return False
+
+        # 覆盖成功：再次确认连接状态干净，下次访问将重建并跑 schema check。
+        reset_all_connections()
         logger.info("数据库恢复完成，来源：%s", backup_path)
         return True
-    except Exception as exc:
-        logger.error("数据库恢复失败：%s", exc)
-        return False
 
 
 def list_backups(backup_dir: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -12,6 +12,7 @@ import pandas as pd
 from scan_models import FilterSettings, HistoryRequestPlan
 from src.models.analysis_models import HistoryAnalysisConfig
 from src.services.history_analysis_service import HistoryAnalysisService
+from src.utils.cancel_token import CancelToken, coerce_should_stop
 from stock_data import StockDataFetcher, DaemonThreadPoolExecutor
 from stock_logger import get_logger
 
@@ -215,11 +216,30 @@ class StockFilter:
         timeout_sec: float,
         fallback: Any = None,
         task_name: str = "任务",
+        cancel_token: Optional[CancelToken] = None,
     ) -> Any:
+        # 已取消：直接跳过，连调度都不做
+        if cancel_token is not None and cancel_token.is_cancelled():
+            return fallback
         pool = self._get_timeout_pool()
         future = pool.submit(task)
+        deadline = time.time() + max(0.5, float(timeout_sec))
         try:
-            return future.result(timeout=max(0.5, float(timeout_sec)))
+            # 用短轮询等待，这样取消信号到来时最多等一个 poll 间隔
+            if cancel_token is None:
+                return future.result(timeout=max(0.5, float(timeout_sec)))
+            poll = 0.2
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise FutureTimeoutError()
+                if cancel_token.is_cancelled():
+                    future.cancel()
+                    return fallback
+                try:
+                    return future.result(timeout=min(poll, remaining))
+                except FutureTimeoutError:
+                    continue
         except FutureTimeoutError:
             future.cancel()
             if self._log:
@@ -780,7 +800,10 @@ class StockFilter:
         refresh_universe: bool = False,
         allowed_boards: Optional[List[str]] = None,
         allowed_exchanges: Optional[List[str]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> List[Dict[str, Any]]:
+        # 兼容旧接口：将 should_stop 回调与 CancelToken 合并成同一个谓词
+        should_stop = coerce_should_stop(cancel_token, should_stop)
         log = self._log
         t0 = time.time()
         if log:
@@ -820,6 +843,10 @@ class StockFilter:
         last_report = time.time()
         report_every = 25
 
+        # 提交前再检查一次：用户可能在加载股票池阶段就点了停止
+        if self._should_stop_scan(should_stop, log):
+            return results
+
         executor = DaemonThreadPoolExecutor(max_workers=workers)
         try:
             future_to_meta = self._submit_scan_tasks(executor, assigned_jobs, available_mirrors, history_plan)
@@ -828,9 +855,16 @@ class StockFilter:
 
             pending = set(future_to_meta)
             while pending:
-                done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+                # 更短的轮询周期，让取消信号更快生效；同时在每轮起点主动检查一次
+                if self._should_stop_scan(should_stop, log):
+                    for fut in pending:
+                        fut.cancel()
+                    break
+                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                 if not done:
                     if self._should_stop_scan(should_stop, log):
+                        for fut in pending:
+                            fut.cancel()
                         break
                     last_report = self._log_pending_scan_wait(
                         log,
@@ -846,6 +880,8 @@ class StockFilter:
 
                 for fut in done:
                     if self._should_stop_scan(should_stop, log):
+                        for p in pending:
+                            p.cancel()
                         pending.clear()
                         break
                     code, name, board, exchange, mirror, filter_result = self._resolve_scan_future_result(
