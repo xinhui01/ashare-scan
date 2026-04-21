@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import queue
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +20,9 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 
 from scan_models import FilterSettings, ScanRequest
 from data_source_models import DATA_SOURCE_OPTIONS
-from src.utils.cancel_token import CancelToken
+from src.gui.log_drainer import LogDrainer
+from src.gui.ui_dispatch import UIDispatcher
+from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from stock_store import (
@@ -97,9 +98,9 @@ class StockMonitorApp:
         self.is_updating_cache = False
         self._scan_cancel_token: Optional[CancelToken] = None
         self._cache_cancel_token: Optional[CancelToken] = None
-        # 保护 detail / intraday / limit-up 线程的取消入口，统一经此集合广播
-        self._all_cancel_tokens: "set[CancelToken]" = set()
-        self._cancel_tokens_lock = threading.Lock()
+        # 所有后台任务（扫描、缓存、详情、分时、涨停对比、涨停预测）的取消令牌
+        # 统一登记在 registry 中，on_close / restore_database 触发 broadcast_cancel
+        self._cancel_registry = CancelTokenRegistry()
         self._scan_thread: Optional[threading.Thread] = None
         self._cache_thread: Optional[threading.Thread] = None
         self._active_scan_request: Optional[ScanRequest] = None
@@ -113,9 +114,14 @@ class StockMonitorApp:
         self.result_column_order: List[str] = []
         self.default_result_display_columns: tuple[str, ...] = ()
         # GUI 设置统一存储在 SQLite app_config 表中（key: result_column_layout / board_filter_layout / app_settings / limit_up_compare_snapshot）
-        self._log_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
         self._main_thread_id = threading.get_ident()
-        self._is_closing = False
+        self._ui = UIDispatcher(self.root)
+        self._log_drainer = LogDrainer(
+            dispatcher=self._ui,
+            main_thread_id=self._main_thread_id,
+            sink=self._log,
+            poll_interval_ms=100,
+        )
 
         self.setup_ui()
         self._load_app_settings()
@@ -126,7 +132,7 @@ class StockMonitorApp:
         self._load_last_results()
         self._load_last_limit_up_compare()
         self._load_watchlist_items()
-        self.root.after(100, self._drain_log_queue)
+        self._log_drainer.start()
 
     def _set_initial_window_geometry(self) -> None:
         default_width = 1440
@@ -1145,13 +1151,16 @@ class StockMonitorApp:
         self._zt_status_label.config(text="获取涨停池...")
         self.status_var.set("正在获取涨停对比...")
 
-        self._zt_compare_thread = threading.Thread(
-            target=self._load_limit_up_compare, args=(today, yesterday, compare_days), daemon=True
+        self._zt_compare_thread, _ = self._start_background_job(
+            self._load_limit_up_compare,
+            name="limit-up-compare",
+            args=(today, yesterday, compare_days),
         )
-        self._zt_compare_thread.start()
 
-    def _load_limit_up_compare(self, today: str, yesterday: str, compare_days: int):
+    def _load_limit_up_compare(self, today: str, yesterday: str, compare_days: int, cancel_token: CancelToken):
         try:
+            if cancel_token.is_cancelled():
+                return
             # 阶段1：获取涨停池对比数据
             if compare_days > 2:
                 result = self.stock_filter.fetcher.compare_limit_up_pools_window(today, compare_days)
@@ -1160,6 +1169,8 @@ class StockMonitorApp:
                 result["compare_days"] = 2
                 result["trade_dates"] = [result.get("yesterday_date", ""), result.get("today_date", "")]
                 result["daily_stats"] = []
+            if cancel_token.is_cancelled():
+                return
             self._post_to_ui(lambda: self._zt_status_label.config(
                 text=f"涨停池获取完成，正在分析今日 {len(result.get('today_first', []))} 只首板形态..."
             ))
@@ -1167,10 +1178,14 @@ class StockMonitorApp:
             # 阶段2：对今日首板做技术形态分类
             today_first = result.get("today_first", [])
             def _progress(cur, tot, info):
+                if cancel_token.is_cancelled():
+                    raise StopIteration
                 self._post_to_ui(lambda c=cur, t=tot, i=info:
                     self._zt_status_label.config(text=f"分类今日首板 {c}/{t}: {i}"))
             today_classified = self.stock_filter.classify_limit_up_pool(today_first, progress_callback=_progress)
             result["today_classified"] = today_classified
+            if cancel_token.is_cancelled():
+                return
 
             # 阶段3：对昨日首板做技术形态分类
             yesterday_first = result.get("yesterday_first", [])
@@ -1178,12 +1193,18 @@ class StockMonitorApp:
                 self._post_to_ui(lambda: self._zt_status_label.config(
                     text=f"正在分析上一交易日 {len(yesterday_first)} 只首板形态..."))
                 def _progress2(cur, tot, info):
+                    if cancel_token.is_cancelled():
+                        raise StopIteration
                     self._post_to_ui(lambda c=cur, t=tot, i=info:
                         self._zt_status_label.config(text=f"分类上一交易日首板 {c}/{t}: {i}"))
                 yesterday_classified = self.stock_filter.classify_limit_up_pool(yesterday_first, progress_callback=_progress2)
                 result["yesterday_classified"] = yesterday_classified
 
+            if cancel_token.is_cancelled():
+                return
             self._post_to_ui(lambda r=result: self._apply_limit_up_compare(r))
+        except StopIteration:
+            self._post_to_ui(lambda: self._zt_status_label.config(text="已取消"))
         except Exception as e:
             err = str(e)
             self._post_to_ui(lambda: self._zt_show_error(f"涨停对比失败: {err}"))
@@ -1569,21 +1590,30 @@ class StockMonitorApp:
         self._predict_status_label.config(text="正在回溯涨停前兆画像...")
         self.status_var.set("正在执行涨停预测...")
 
-        self._predict_thread = threading.Thread(
-            target=self._load_predict, args=(trade_date, lookback), daemon=True
+        self._predict_thread, _ = self._start_background_job(
+            self._load_predict,
+            name="limit-up-predict",
+            args=(trade_date, lookback),
         )
-        self._predict_thread.start()
 
-    def _load_predict(self, trade_date: str, lookback_days: int):
+    def _load_predict(self, trade_date: str, lookback_days: int, cancel_token: CancelToken):
         try:
+            if cancel_token.is_cancelled():
+                return
             def _progress(cur, tot, info):
+                if cancel_token.is_cancelled():
+                    raise StopIteration
                 self._post_to_ui(lambda c=cur, t=tot, i=info:
                     self._predict_status_label.config(text=f"预测分析 {c}/{t}: {i}"))
 
             result = self.stock_filter.predict_limit_up_candidates(
                 trade_date, lookback_days=lookback_days, progress_callback=_progress,
             )
+            if cancel_token.is_cancelled():
+                return
             self._post_to_ui(lambda r=result: self._apply_predict_result(r))
+        except StopIteration:
+            self._post_to_ui(lambda: self._predict_status_label.config(text="已取消"))
         except Exception as e:
             err = str(e)
             self._post_to_ui(lambda: self._predict_show_error(f"涨停预测失败: {err}"))
@@ -1845,54 +1875,70 @@ class StockMonitorApp:
                 f.write(line)
 
     def _log_async(self, message: str) -> None:
-        if self._is_closing:
-            return
-        if threading.get_ident() == self._main_thread_id:
-            self._log(message)
-            return
-        self._log_queue.put(message)
+        self._log_drainer.enqueue(message)
 
     def _drain_log_queue(self) -> None:
-        if self._is_closing or not self.root.winfo_exists():
-            return
-        while True:
-            try:
-                message = self._log_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._log(message)
-        if not self._is_closing and self.root.winfo_exists():
-            self.root.after(100, self._drain_log_queue)
+        """保留公开方法名以便外部调用；实际转发到 LogDrainer。"""
+        self._log_drainer.drain_once()
+
+    @property
+    def _is_closing(self) -> bool:
+        """只读视图：真正的"关闭中"状态由 self._ui 独占管理。
+
+        进入关闭流程请显式调用 `self._ui.mark_closing()`；不提供 setter，
+        避免出现 `self._is_closing = False` 这种把关闭状态误"复活"的写法。
+        """
+        return self._ui.is_closing
 
     def _safe_after(self, delay_ms: int, callback) -> None:
-        if self._is_closing:
-            return
-        try:
-            if self.root.winfo_exists():
-                self.root.after(delay_ms, callback)
-        except tk.TclError:
-            pass
+        self._ui.safe_after(delay_ms, callback)
 
     def _post_to_ui(self, callback) -> None:
         """后台线程专用：把 UI 更新推到主线程。窗口已关时直接丢弃。"""
-        self._safe_after(0, callback)
+        self._ui.post(callback)
 
     def _register_cancel_token(self, token: CancelToken) -> None:
-        with self._cancel_tokens_lock:
-            self._all_cancel_tokens.add(token)
+        self._cancel_registry.issue(token)
 
     def _unregister_cancel_token(self, token: CancelToken) -> None:
-        with self._cancel_tokens_lock:
-            self._all_cancel_tokens.discard(token)
+        self._cancel_registry.retire(token)
 
     def _cancel_all_background(self, reason: str = "") -> None:
         """广播取消到所有注册过的 token；扫描/缓存也同步失效。"""
         self.is_scanning = False
         self.is_updating_cache = False
-        with self._cancel_tokens_lock:
-            tokens = list(self._all_cancel_tokens)
-        for tk_ in tokens:
-            tk_.cancel(reason)
+        self._cancel_registry.broadcast_cancel(reason)
+
+    def _start_background_job(
+        self,
+        target,
+        *,
+        name: str = "",
+        args: tuple = (),
+        include_token: bool = True,
+    ) -> tuple[threading.Thread, CancelToken]:
+        """为通用后台任务（详情/分时/涨停对比/涨停预测）创建并启动线程。
+
+        返回 (thread, token)。线程会在 target 结束后自动摘掉 token。
+        target 签名：如果 include_token=True，则要求最后一个参数接受 token。
+        """
+        token = self._cancel_registry.issue()
+
+        def _runner():
+            try:
+                if include_token:
+                    target(*args, token)
+                else:
+                    target(*args)
+            finally:
+                self._cancel_registry.retire(token)
+
+        thread_kwargs = {"target": _runner, "daemon": True}
+        if name:
+            thread_kwargs["name"] = name
+        t = threading.Thread(**thread_kwargs)
+        t.start()
+        return t, token
 
     def _selected_boards(self) -> List[str]:
         boards = [board for board, var in self.board_filter_vars.items() if var.get()]
@@ -2994,8 +3040,9 @@ class StockMonitorApp:
                 return
             self.status_var.set(f"正在刷新 {code} 最新详情...")
             self._detail_loading_code = code
-            detail_thread = threading.Thread(target=self._load_detail, args=(code,), daemon=True)
-            detail_thread.start()
+            self._start_background_job(
+                self._load_detail, name=f"detail-{code}", args=(code,)
+            )
             return
 
         if not force_refresh and self._detail_loading_code == code:
@@ -3005,10 +3052,13 @@ class StockMonitorApp:
         self._log(f"查询股票 {code} 的历史详情...")
         self.status_var.set(f"正在查询 {code}...")
         self._detail_loading_code = code
-        detail_thread = threading.Thread(target=self._load_detail, args=(code,), daemon=True)
-        detail_thread.start()
-    def _load_detail(self, stock_code: str):
+        self._start_background_job(
+            self._load_detail, name=f"detail-{code}", args=(code,)
+        )
+    def _load_detail(self, stock_code: str, cancel_token: CancelToken):
         try:
+            if cancel_token.is_cancelled():
+                return
             quick_detail = self.stock_filter.get_stock_detail_quick(stock_code)
             quick_history = None
             if isinstance(quick_detail, dict):
@@ -3016,7 +3066,11 @@ class StockMonitorApp:
                 if quick_history is not None and not getattr(quick_history, "empty", True):
                     self._post_to_ui(lambda: self._apply_quick_detail_if_current(stock_code, quick_detail))
 
+            if cancel_token.is_cancelled():
+                return
             detail = self.stock_filter.get_stock_detail(stock_code, preloaded_history=quick_history)
+            if cancel_token.is_cancelled():
+                return
             self._post_to_ui(lambda: self._apply_detail_if_current(stock_code, detail))
         except Exception as e:
             error_text = str(e)
@@ -3541,14 +3595,24 @@ class StockMonitorApp:
         request_days = max(120, self._detail_chart_loaded_days + 120, current_rows + 120)
         self._detail_chart_loading_more = True
         self.detail_chart_status_var.set("历史K线补载中...")
-        threading.Thread(
-            target=self._load_more_detail_history,
+        self._start_background_job(
+            self._load_more_detail_history,
+            name=f"detail-history-{code}",
             args=(code, request_days, current_rows),
-            daemon=True,
-        ).start()
+        )
 
-    def _load_more_detail_history(self, stock_code: str, request_days: int, previous_rows: int) -> None:
+    def _load_more_detail_history(
+        self,
+        stock_code: str,
+        request_days: int,
+        previous_rows: int,
+        cancel_token: CancelToken,
+    ) -> None:
+        if cancel_token.is_cancelled():
+            return
         history = self.stock_filter.get_stock_detail_history(stock_code, request_days)
+        if cancel_token.is_cancelled():
+            return
         self._post_to_ui(
             lambda: self._apply_more_detail_history_if_current(stock_code, history, request_days, previous_rows),
         )
@@ -3741,15 +3805,23 @@ class StockMonitorApp:
         self._intraday_loading_code = code
         self._intraday_loading_offset = requested_offset
         self._intraday_loading_target_date = normalized_target_date
-        threading.Thread(target=self._load_intraday, args=(code, requested_offset, normalized_target_date), daemon=True).start()
+        self._start_background_job(
+            self._load_intraday,
+            name=f"intraday-{code}",
+            args=(code, requested_offset, normalized_target_date),
+        )
 
-    def _load_intraday(self, stock_code: str, day_offset: int, target_trade_date: str = ""):
+    def _load_intraday(self, stock_code: str, day_offset: int, target_trade_date: str, cancel_token: CancelToken):
         try:
+            if cancel_token.is_cancelled():
+                return
             payload = self.stock_filter.get_stock_intraday(
                 stock_code,
                 day_offset=day_offset,
                 target_trade_date=target_trade_date,
             )
+            if cancel_token.is_cancelled():
+                return
             self._post_to_ui(lambda: self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload))
         except Exception as e:
             self._post_to_ui(lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
@@ -4514,18 +4586,14 @@ class StockMonitorApp:
         if not confirm:
             return
 
-        # 恢复前主动广播取消，防止任何仍在后台跑的任务在恢复期间写库
-        self._cancel_all_background("database_restore")
-        # 等待活跃的 scan/cache 线程收尾，最多 5 秒
-        for t in (self._scan_thread, self._cache_thread):
-            if t is not None and t.is_alive():
-                t.join(timeout=5.0)
-
-        ok = restore_database(file_path)
+        from src.services.db_admin_service import SafeRestoreOrchestrator
+        orchestrator = SafeRestoreOrchestrator(
+            broadcast_cancel=lambda: self._cancel_all_background("database_restore"),
+            thread_sources=lambda: (self._scan_thread, self._cache_thread),
+            wait_timeout_sec=5.0,
+        )
+        ok = orchestrator.execute(file_path)
         if ok:
-            # restore_database 内部已经 reset 过了，再显式调一次，
-            # 保证主线程本地连接也被清掉，之后任何查询都会走新文件。
-            reset_all_connections()
             self.all_scan_results = []
             self.filtered_stocks = []
             messagebox.showinfo("恢复成功", "数据库已恢复。建议重启应用以确保数据一致。")
@@ -4534,7 +4602,7 @@ class StockMonitorApp:
             messagebox.showerror("恢复失败", "恢复过程出错，请检查日志。")
 
     def on_close(self):
-        self._is_closing = True
+        self._ui.mark_closing()
         # 广播取消到所有后台任务，让它们尽快退出
         self._cancel_all_background("window_close")
         self._detail_request_code = ""

@@ -6,8 +6,7 @@ import time
 import re
 import warnings
 import threading
-import weakref
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
@@ -106,36 +105,12 @@ from stock_store import (
     save_universe as save_universe_store,
 )
 from data_source_models import DATA_SOURCE_OPTIONS, DataProviderPlan, HistoryRequestPlan
-from concurrent.futures.thread import _worker, _threads_queues
 
 T = TypeVar("T")
 
-
-class DaemonThreadPoolExecutor(ThreadPoolExecutor):
-    def _adjust_thread_count(self):
-        if self._idle_semaphore.acquire(timeout=0):
-            return
-
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
-
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            t.start()
-            self._threads.add(t)
-            _threads_queues[t] = self._work_queue
+# DaemonThreadPoolExecutor 已迁移到 src/utils/daemon_executor.py；
+# 此处重新导出，保持 `from stock_data import DaemonThreadPoolExecutor` 零修改。
+from src.utils.daemon_executor import DaemonThreadPoolExecutor
 def _history_request_concurrency() -> int:
     raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
     try:
@@ -373,51 +348,22 @@ def _global_host_cooldown_remaining(url_or_host: str) -> float:
 
 
 # ---- 东方财富全局熔断器 ----
-# 当 _gupiao_request_with_retry 连续失败达到阈值时触发熔断，
-# 在冷却期内所有东财请求直接快速失败，避免无意义的超长等待。
-_EM_CIRCUIT_BREAKER_LOCK = threading.Lock()
-_EM_CIRCUIT_FAIL_COUNT = 0          # 连续失败次数
-_EM_CIRCUIT_OPEN_UNTIL = 0.0        # 熔断截止时间戳
-_EM_CIRCUIT_FAIL_THRESHOLD = 3      # 连续失败几次触发熔断
-_EM_CIRCUIT_COOLDOWN_SEC = 30.0     # 初始熔断冷却秒数
-_EM_CIRCUIT_MAX_COOLDOWN_SEC = 600.0  # 最大熔断冷却（10分钟，应对IP封禁）
+# 实现已迁移到 src/utils/em_circuit_breaker.py；此处保留原名的薄薄转发，
+# 以便 stock_data / stock_filter 中几十处 `_eastmoney_circuit_breaker_*` 调用
+# 零修改。真正的状态存在 EMCircuitBreaker 单例里。
+from src.utils import em_circuit_breaker as _em_circuit_breaker
 
 
 def _eastmoney_circuit_breaker_open() -> bool:
-    """检查东方财富熔断器是否处于开启（拒绝请求）状态。"""
-    with _EM_CIRCUIT_BREAKER_LOCK:
-        if _EM_CIRCUIT_OPEN_UNTIL > time.time():
-            return True
-        return False
+    return _em_circuit_breaker.is_open()
 
-
-_EM_CIRCUIT_CONSECUTIVE_TRIPS = 0  # 连续触发熔断的次数（用于指数退避）
 
 def _eastmoney_circuit_breaker_record_failure() -> None:
-    """记录一次东财请求失败。连续失败达阈值时开启熔断，冷却时间指数递增。"""
-    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL, _EM_CIRCUIT_CONSECUTIVE_TRIPS
-    with _EM_CIRCUIT_BREAKER_LOCK:
-        _EM_CIRCUIT_FAIL_COUNT += 1
-        if _EM_CIRCUIT_FAIL_COUNT >= _EM_CIRCUIT_FAIL_THRESHOLD:
-            _EM_CIRCUIT_CONSECUTIVE_TRIPS += 1
-            cooldown = min(
-                _EM_CIRCUIT_COOLDOWN_SEC * (2 ** (_EM_CIRCUIT_CONSECUTIVE_TRIPS - 1)),
-                _EM_CIRCUIT_MAX_COOLDOWN_SEC,
-            )
-            _EM_CIRCUIT_OPEN_UNTIL = time.time() + cooldown
-            logger.warning(
-                "东方财富熔断器已开启：连续 %d 次失败，冷却 %.0fs（第 %d 次触发）",
-                _EM_CIRCUIT_FAIL_COUNT, cooldown, _EM_CIRCUIT_CONSECUTIVE_TRIPS,
-            )
+    _em_circuit_breaker.record_failure()
 
 
 def _eastmoney_circuit_breaker_record_success() -> None:
-    """记录一次东财请求成功，重置计数。"""
-    global _EM_CIRCUIT_FAIL_COUNT, _EM_CIRCUIT_OPEN_UNTIL, _EM_CIRCUIT_CONSECUTIVE_TRIPS
-    with _EM_CIRCUIT_BREAKER_LOCK:
-        _EM_CIRCUIT_FAIL_COUNT = 0
-        _EM_CIRCUIT_OPEN_UNTIL = 0.0
-        _EM_CIRCUIT_CONSECUTIVE_TRIPS = 0
+    _em_circuit_breaker.record_success()
 
 
 def _global_filter_healthy_urls(urls: List[str]) -> List[str]:
@@ -3667,11 +3613,11 @@ class StockDataFetcher:
             prev_pool_codes["_code"] = prev_pool_codes["代码"].astype(str).str.strip().str.zfill(6)
             match = prev_pool_codes[prev_pool_codes["_code"].isin(yesterday_codes)]
             if not match.empty:
-                for _, row in match.iterrows():
-                    code = str(row.get("代码", "")).strip().zfill(6)
+                for row in match.to_dict("records"):
+                    code = str(row.get("代码", "") or "").strip().zfill(6)
                     yesterday_first_today_perf.append({
                         "code": code,
-                        "name": str(row.get("名称", "")),
+                        "name": str(row.get("名称", "") or ""),
                         "change_pct": float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None,
                         "close": float(row["最新价"]) if pd.notna(row.get("最新价")) else None,
                         "still_limit_up": code in today_all_codes,
@@ -3776,26 +3722,38 @@ class StockDataFetcher:
         return result
 
     def _pool_to_records(self, df: pd.DataFrame, tag: str) -> List[Dict[str, Any]]:
-        """将涨停池 DataFrame 转为标准记录列表。"""
-        records = []
+        """将涨停池 DataFrame 转为标准记录列表。
+
+        把 iterrows 换成 `to_dict("records")`：pandas 一次性向量化拷贝成纯 dict，
+        循环里只做字段取值/类型转换，CPU 开销比 iterrows 明显低。
+        """
         if df.empty:
-            return records
-        for _, row in df.iterrows():
+            return []
+
+        def _opt_float(v: Any) -> Optional[float]:
+            return float(v) if pd.notna(v) else None
+
+        def _opt_int(v: Any) -> int:
+            return int(v) if pd.notna(v) else 0
+
+        raw_rows = df.to_dict("records")
+        records: List[Dict[str, Any]] = []
+        for row in raw_rows:
             rec: Dict[str, Any] = {
-                "code": str(row.get("代码", "")).strip().zfill(6),
-                "name": str(row.get("名称", "")),
-                "change_pct": float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None,
-                "close": float(row["最新价"]) if pd.notna(row.get("最新价")) else None,
-                "industry": str(row.get("所属行业", "")),
-                "amount": float(row["成交额"]) if pd.notna(row.get("成交额")) else None,
-                "market_cap": float(row["流通市值"]) if pd.notna(row.get("流通市值")) else None,
-                "turnover": float(row["换手率"]) if pd.notna(row.get("换手率")) else None,
+                "code": str(row.get("代码", "") or "").strip().zfill(6),
+                "name": str(row.get("名称", "") or ""),
+                "change_pct": _opt_float(row.get("涨跌幅")),
+                "close": _opt_float(row.get("最新价")),
+                "industry": str(row.get("所属行业", "") or ""),
+                "amount": _opt_float(row.get("成交额")),
+                "market_cap": _opt_float(row.get("流通市值")),
+                "turnover": _opt_float(row.get("换手率")),
             }
             if tag == "today":
-                rec["first_board_time"] = str(row.get("首次封板时间", ""))
-                rec["last_board_time"] = str(row.get("最后封板时间", ""))
-                rec["break_count"] = int(row["炸板次数"]) if pd.notna(row.get("炸板次数")) else 0
-                rec["board_amount"] = float(row["封板资金"]) if pd.notna(row.get("封板资金")) else None
+                rec["first_board_time"] = str(row.get("首次封板时间", "") or "")
+                rec["last_board_time"] = str(row.get("最后封板时间", "") or "")
+                rec["break_count"] = _opt_int(row.get("炸板次数"))
+                rec["board_amount"] = _opt_float(row.get("封板资金"))
             records.append(rec)
         return records
 

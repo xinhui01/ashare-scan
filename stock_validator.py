@@ -93,14 +93,19 @@ def validate_change_pct(
     if df is None or df.empty or "change_pct" not in df.columns:
         return issues
 
-    for idx, row in df.iterrows():
-        date_str = str(row.get("date", idx))
+    pct_values = df["change_pct"].tolist()
+    date_values = df["date"].tolist() if "date" in df.columns else list(range(len(pct_values)))
+    for idx, raw_pct in enumerate(pct_values):
         try:
-            pct = float(row["change_pct"])
+            pct = float(raw_pct)
         except (TypeError, ValueError):
             continue
         if abs(pct) > max_change_pct:
-            issues.append({"date": date_str, "issue": "涨跌幅异常", "detail": f"change_pct={pct:.2f}%"})
+            issues.append({
+                "date": str(date_values[idx]),
+                "issue": "涨跌幅异常",
+                "detail": f"change_pct={pct:.2f}%",
+            })
 
     if issues and stock_code:
         logger.warning("%s 存在 %d 条涨跌幅异常 (>%.0f%%)", stock_code, len(issues), max_change_pct)

@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -180,7 +180,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             latest_trade_date TEXT NOT NULL DEFAULT '',
             row_count INTEGER NOT NULL DEFAULT 0,
             refreshed_at TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL DEFAULT ''
+            source TEXT NOT NULL DEFAULT '',
+            partial_fields TEXT NOT NULL DEFAULT '',
+            needs_repair INTEGER NOT NULL DEFAULT 0,
+            source_failure_streak INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS app_config (
@@ -227,6 +230,16 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     }
     if "concepts" not in existing_columns:
         conn.execute("ALTER TABLE universe ADD COLUMN concepts TEXT NOT NULL DEFAULT ''")
+
+    meta_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(history_meta)").fetchall()
+    }
+    if "partial_fields" not in meta_columns:
+        conn.execute("ALTER TABLE history_meta ADD COLUMN partial_fields TEXT NOT NULL DEFAULT ''")
+    if "needs_repair" not in meta_columns:
+        conn.execute("ALTER TABLE history_meta ADD COLUMN needs_repair INTEGER NOT NULL DEFAULT 0")
+    if "source_failure_streak" not in meta_columns:
+        conn.execute("ALTER TABLE history_meta ADD COLUMN source_failure_streak INTEGER NOT NULL DEFAULT 0")
 
 
 def db_path() -> Path:
@@ -566,27 +579,68 @@ def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.Da
     return df.reset_index(drop=True)
 
 
-def save_history_meta(stock_code: str, latest_trade_date: str, row_count: int, source: str = "") -> None:
+def save_history_meta(
+    stock_code: str,
+    latest_trade_date: str,
+    row_count: int,
+    source: str = "",
+    *,
+    partial_fields: Optional[str] = None,
+    needs_repair: Optional[int] = None,
+    source_failure_streak: Optional[int] = None,
+) -> None:
     code = str(stock_code).strip().zfill(6)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pf = "" if partial_fields is None else str(partial_fields)
+    nr = 0 if needs_repair is None else int(bool(needs_repair))
+    sfs = 0 if source_failure_streak is None else int(source_failure_streak)
 
     def _write():
         with _connect() as conn:
             conn.execute(
                 """
-                INSERT INTO history_meta(code, latest_trade_date, row_count, refreshed_at, source)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO history_meta(
+                    code, latest_trade_date, row_count, refreshed_at, source,
+                    partial_fields, needs_repair, source_failure_streak
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(code) DO UPDATE SET
                     latest_trade_date=excluded.latest_trade_date,
                     row_count=excluded.row_count,
                     refreshed_at=excluded.refreshed_at,
-                    source=excluded.source
+                    source=excluded.source,
+                    partial_fields=excluded.partial_fields,
+                    needs_repair=excluded.needs_repair,
+                    source_failure_streak=excluded.source_failure_streak
                 """,
-                (code, str(latest_trade_date).strip(), int(row_count), now, str(source)),
+                (code, str(latest_trade_date).strip(), int(row_count), now, str(source), pf, nr, sfs),
             )
 
     with _DB_WRITE_LOCK:
         _retry_locked(_write)
+
+
+_HISTORY_META_COLUMNS = (
+    "latest_trade_date",
+    "row_count",
+    "refreshed_at",
+    "source",
+    "partial_fields",
+    "needs_repair",
+    "source_failure_streak",
+)
+
+
+def _row_to_history_meta(row) -> Dict[str, Any]:
+    return {
+        "latest_trade_date": str(row["latest_trade_date"] or ""),
+        "row_count": int(row["row_count"] or 0),
+        "refreshed_at": str(row["refreshed_at"] or ""),
+        "source": str(row["source"] or ""),
+        "partial_fields": str(row["partial_fields"] or ""),
+        "needs_repair": int(row["needs_repair"] or 0),
+        "source_failure_streak": int(row["source_failure_streak"] or 0),
+    }
 
 
 def load_history_meta(stock_code: str) -> Optional[Dict[str, Any]]:
@@ -597,19 +651,235 @@ def load_history_meta(stock_code: str) -> Optional[Dict[str, Any]]:
     def _read():
         with _connect() as conn:
             return conn.execute(
-                "SELECT latest_trade_date, row_count, refreshed_at, source FROM history_meta WHERE code = ?",
+                f"SELECT {', '.join(_HISTORY_META_COLUMNS)} FROM history_meta WHERE code = ?",
                 (code,),
             ).fetchone()
 
     row = _retry_locked(_read)
     if row is None:
         return None
-    return {
-        "latest_trade_date": str(row["latest_trade_date"] or ""),
-        "row_count": int(row["row_count"] or 0),
-        "refreshed_at": str(row["refreshed_at"] or ""),
-        "source": str(row["source"] or ""),
-    }
+    return _row_to_history_meta(row)
+
+
+def load_all_history_meta_map() -> Dict[str, Dict[str, Any]]:
+    """一次性读取全部 history_meta，返回 {code: meta_dict}。
+
+    用于历史缓存同步启动时预加载，避免在主循环中对每只股票单独 SELECT。
+    """
+    if not _DB_PATH.is_file():
+        return {}
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                f"SELECT code, {', '.join(_HISTORY_META_COLUMNS)} FROM history_meta"
+            ).fetchall()
+
+    rows = _retry_locked(_read)
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        code = str(row["code"] or "").strip().zfill(6)
+        if not code:
+            continue
+        out[code] = _row_to_history_meta(row)
+    return out
+
+
+def save_history_rows_batch(
+    rows_by_code: Dict[str, pd.DataFrame],
+    batch_size: int = 500,
+) -> Tuple[List[str], List[str]]:
+    """批量写入多只股票的 history 行。
+
+    - 每个批独立事务，失败的批整批进入 `failed_codes`，不影响其他批。
+    - 返回 `(success_codes, failed_codes)`，供调度层沉淀 repair 清单。
+
+    参数 `rows_by_code`: `{code: DataFrame}`，DataFrame 至少要有 `date` 列。
+    空 DataFrame 会被跳过且**不**计入 success/failed。
+    """
+    if not rows_by_code:
+        return [], []
+    batch_size = max(1, int(batch_size))
+
+    prepared: List[Tuple[str, List[tuple]]] = []
+    for raw_code, df in rows_by_code.items():
+        raw = str(raw_code or "").strip()
+        if not raw or df is None or df.empty or "date" not in df.columns:
+            continue
+        code = raw.zfill(6)
+        prepared.append((code, _build_history_rows(code, df)))
+
+    success: List[str] = []
+    failed: List[str] = []
+
+    for start in range(0, len(prepared), batch_size):
+        batch = prepared[start : start + batch_size]
+        flat_rows: List[tuple] = []
+        for _, rows in batch:
+            flat_rows.extend(rows)
+        if not flat_rows:
+            # 理论上入口已过滤 df.empty；若走到这里说明上游给了空 DataFrame，
+            # 既没真正写入也没失败，直接跳过不计入 success/failed。
+            continue
+
+        def _write(rows=flat_rows):
+            with _connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO history(
+                        code, trade_date, open, close, high, low, volume, amount,
+                        amplitude, change_pct, change_amount, turnover_rate, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(code, trade_date) DO UPDATE SET
+                        open=excluded.open,
+                        close=excluded.close,
+                        high=excluded.high,
+                        low=excluded.low,
+                        volume=excluded.volume,
+                        amount=excluded.amount,
+                        amplitude=excluded.amplitude,
+                        change_pct=excluded.change_pct,
+                        change_amount=excluded.change_amount,
+                        turnover_rate=excluded.turnover_rate,
+                        updated_at=excluded.updated_at
+                    """,
+                    rows,
+                )
+
+        try:
+            with _DB_WRITE_LOCK:
+                _retry_locked(_write)
+        except sqlite3.Error:
+            logger.exception("save_history_rows_batch 写入失败，批 size=%d", len(batch))
+            failed.extend(code for code, _ in batch)
+            continue
+        success.extend(code for code, _ in batch)
+
+    return success, failed
+
+
+def _build_history_rows(code: str, df: pd.DataFrame) -> List[tuple]:
+    """复用 save_history 的字段规整逻辑，但只产出行元组，不直接写库。
+
+    与 save_history 保持相同的 tolist()-预取模式：一次性把每列转成 Python list，
+    循环里只做索引访问，避免 .iloc[i] 每次都走 pandas 的属性查找链。
+    """
+    out = df.copy()
+    out["date"] = out["date"].astype(str).str.strip()
+    for col in [
+        "open", "close", "high", "low", "volume", "amount",
+        "amplitude", "change_pct", "change_amount", "turnover_rate",
+    ]:
+        if col not in out.columns:
+            out[col] = None
+    out = out.sort_values("date").reset_index(drop=True)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_series = out["date"].tolist()
+    open_vals = out["open"].tolist()
+    close_vals = out["close"].tolist()
+    high_vals = out["high"].tolist()
+    low_vals = out["low"].tolist()
+    volume_vals = out["volume"].tolist()
+    amount_vals = out["amount"].tolist()
+    amplitude_vals = out["amplitude"].tolist()
+    change_pct_vals = out["change_pct"].tolist()
+    change_amount_vals = out["change_amount"].tolist()
+    turnover_vals = out["turnover_rate"].tolist()
+    return [
+        (
+            code,
+            str(date_series[i]),
+            _to_float(open_vals[i]),
+            _to_float(close_vals[i]),
+            _to_float(high_vals[i]),
+            _to_float(low_vals[i]),
+            _to_float(volume_vals[i]),
+            _to_float(amount_vals[i]),
+            _to_float(amplitude_vals[i]),
+            _to_float(change_pct_vals[i]),
+            _to_float(change_amount_vals[i]),
+            _to_float(turnover_vals[i]),
+            now_str,
+        )
+        for i in range(len(date_series))
+    ]
+
+
+def save_history_meta_batch(
+    metas: List[Dict[str, Any]],
+    batch_size: int = 500,
+) -> Tuple[List[str], List[str]]:
+    """批量 upsert 多只股票的 history_meta。
+
+    - `metas` 每项至少包含 `code`；其余字段缺失会落为默认值。
+    - 每批独立事务，失败批进入 `failed_codes`。
+    """
+    if not metas:
+        return [], []
+    batch_size = max(1, int(batch_size))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    prepared: List[Tuple[str, tuple]] = []
+    for item in metas:
+        raw = str(item.get("code", "") or "").strip()
+        if not raw:
+            continue
+        code = raw.zfill(6)
+        prepared.append(
+            (
+                code,
+                (
+                    code,
+                    str(item.get("latest_trade_date", "") or "").strip(),
+                    int(item.get("row_count", 0) or 0),
+                    str(item.get("refreshed_at") or now),
+                    str(item.get("source", "") or ""),
+                    str(item.get("partial_fields", "") or ""),
+                    int(bool(item.get("needs_repair", 0))),
+                    int(item.get("source_failure_streak", 0) or 0),
+                ),
+            )
+        )
+
+    success: List[str] = []
+    failed: List[str] = []
+
+    for start in range(0, len(prepared), batch_size):
+        batch = prepared[start : start + batch_size]
+        flat_rows = [row for _, row in batch]
+
+        def _write(rows=flat_rows):
+            with _connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO history_meta(
+                        code, latest_trade_date, row_count, refreshed_at, source,
+                        partial_fields, needs_repair, source_failure_streak
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(code) DO UPDATE SET
+                        latest_trade_date=excluded.latest_trade_date,
+                        row_count=excluded.row_count,
+                        refreshed_at=excluded.refreshed_at,
+                        source=excluded.source,
+                        partial_fields=excluded.partial_fields,
+                        needs_repair=excluded.needs_repair,
+                        source_failure_streak=excluded.source_failure_streak
+                    """,
+                    rows,
+                )
+
+        try:
+            with _DB_WRITE_LOCK:
+                _retry_locked(_write)
+        except sqlite3.Error:
+            logger.exception("save_history_meta_batch 写入失败，批 size=%d", len(batch))
+            failed.extend(code for code, _ in batch)
+            continue
+        success.extend(code for code, _ in batch)
+
+    return success, failed
 
 
 def save_app_config(key: str, value: Any) -> None:
@@ -1009,165 +1279,36 @@ def cleanup_old_scan_snapshots(keep_count: int = 20) -> int:
     return deleted
 
 
-def cleanup_all(
-    history_keep_days: int = 365,
-    intraday_keep_days: int = 30,
-    snapshot_keep_count: int = 20,
-) -> Dict[str, int]:
-    """执行所有清理操作，返回各表删除行数汇总。"""
-    return {
-        "history": cleanup_old_history(history_keep_days),
-        "intraday": cleanup_old_intraday(intraday_keep_days),
-        "scan_snapshots": cleanup_old_scan_snapshots(snapshot_keep_count),
-    }
+# DB 管理员操作（备份/恢复/清理/CSV 导入导出）已迁移到 src/services/db_admin_service。
+# 为保持既有调用方（GUI、测试、脚本）无需改动，这里做薄薄的转发。
+def cleanup_all(*args, **kwargs) -> Dict[str, int]:
+    from src.services.db_admin_service import cleanup_all as _impl
+    return _impl(*args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# 数据库备份 / 恢复
-# ---------------------------------------------------------------------------
-
-def backup_database(backup_dir: Optional[str] = None) -> Path:
-    """备份数据库到指定目录，返回备份文件路径。
-
-    默认备份到 data/backups/ 下，文件名含时间戳。
-    """
-    import shutil
-    if backup_dir:
-        dest_dir = Path(backup_dir)
-    else:
-        dest_dir = _DATA_DIR / "backups"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest_file = dest_dir / f"stock_store_{stamp}.sqlite3"
-
-    # 使用 SQLite 的 backup API 保证一致性
-    import sqlite3
-    src_conn = sqlite3.connect(str(_DB_PATH), timeout=30.0)
-    dst_conn = sqlite3.connect(str(dest_file))
-    try:
-        src_conn.backup(dst_conn)
-        logger.info("数据库备份完成：%s", dest_file)
-    finally:
-        dst_conn.close()
-        src_conn.close()
-    return dest_file
+def backup_database(*args, **kwargs) -> Path:
+    from src.services.db_admin_service import backup_database as _impl
+    return _impl(*args, **kwargs)
 
 
-def restore_database(backup_path: str) -> bool:
-    """从备份文件恢复数据库。
-
-    恢复流程：
-    1. 取写锁，阻塞并发写入。
-    2. 关闭所有已发放的 SQLite 连接，防止覆盖到“活”文件后还在被读写。
-    3. 先备份当前数据库（尽力而为，失败只记录不中断）。
-    4. copy2 覆盖 DB 文件。
-    5. 重置连接状态/schema 初始化标记，下次 `_connect()` 自动重建。
-
-    失败分两类：备份文件缺失直接返回 False；覆盖阶段失败会尝试把“恢复前备份”
-    回滚为当前 DB，保证用户手里的数据库至少不是半损坏状态。
-    """
-    import shutil
-    src = Path(backup_path)
-    if not src.is_file():
-        logger.error("备份文件不存在：%s", backup_path)
-        return False
-
-    with _DB_WRITE_LOCK:
-        # 在覆盖数据库文件前关掉所有连接，避免 Windows 上句柄被占。
-        reset_all_connections()
-
-        pre_restore_backup: Optional[Path] = None
-        try:
-            pre_restore_backup = backup_database()
-        except Exception as exc:
-            logger.warning("恢复前备份失败：%s", exc)
-
-        try:
-            shutil.copy2(str(src), str(_DB_PATH))
-        except Exception as exc:
-            logger.error("数据库恢复失败：%s", exc)
-            # 覆盖失败时，尝试用“恢复前备份”回滚，避免当前 DB 处于半写状态。
-            if pre_restore_backup is not None and pre_restore_backup.is_file():
-                try:
-                    shutil.copy2(str(pre_restore_backup), str(_DB_PATH))
-                    logger.info("已使用恢复前备份回滚：%s", pre_restore_backup)
-                except Exception as rollback_exc:
-                    logger.error("恢复前备份回滚失败：%s", rollback_exc)
-            # 不管有没有成功，都重置一次连接，避免旧状态被复用。
-            reset_all_connections()
-            return False
-
-        # 覆盖成功：再次确认连接状态干净，下次访问将重建并跑 schema check。
-        reset_all_connections()
-        logger.info("数据库恢复完成，来源：%s", backup_path)
-        return True
+def restore_database(*args, **kwargs) -> bool:
+    from src.services.db_admin_service import restore_database as _impl
+    return _impl(*args, **kwargs)
 
 
-def list_backups(backup_dir: Optional[str] = None) -> List[Dict[str, Any]]:
-    """列出所有备份文件，返回 [{path, size_mb, created_at}]。"""
-    if backup_dir:
-        d = Path(backup_dir)
-    else:
-        d = _DATA_DIR / "backups"
-    if not d.is_dir():
-        return []
-    files = sorted(d.glob("stock_store_*.sqlite3"), reverse=True)
-    result = []
-    for f in files:
-        stat = f.stat()
-        result.append({
-            "path": str(f),
-            "size_mb": round(stat.st_size / (1024 * 1024), 2),
-            "created_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    return result
+def list_backups(*args, **kwargs) -> List[Dict[str, Any]]:
+    from src.services.db_admin_service import list_backups as _impl
+    return _impl(*args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# 自选股导入 / 导出
-# ---------------------------------------------------------------------------
-
-def export_watchlist_csv(file_path: str) -> int:
-    """导出自选股到 CSV，返回导出数量。"""
-    import csv
-    items = load_watchlist()
-    if not items:
-        return 0
-    fieldnames = ["code", "name", "status", "note", "board", "latest_close", "score", "score_breakdown", "added_at"]
-    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for item in items:
-            writer.writerow(item)
-    logger.info("自选股导出完成：%d 只 -> %s", len(items), file_path)
-    return len(items)
+def export_watchlist_csv(*args, **kwargs) -> int:
+    from src.services.db_admin_service import export_watchlist_csv as _impl
+    return _impl(*args, **kwargs)
 
 
-def import_watchlist_csv(file_path: str) -> int:
-    """从 CSV 导入自选股，返回导入数量。
-
-    CSV 至少需要 code 列，其他列可选。
-    """
-    import csv
-    imported = 0
-    with open(file_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            code = str(row.get("code", "") or "").strip()
-            if not code:
-                continue
-            item = {
-                "code": code,
-                "name": str(row.get("name", "") or ""),
-                "status": str(row.get("status", "") or ""),
-                "note": str(row.get("note", "") or ""),
-                "board": str(row.get("board", "") or ""),
-                "score": row.get("score"),
-            }
-            save_watchlist_item(item)
-            imported += 1
-    logger.info("自选股导入完成：%d 只 <- %s", imported, file_path)
-    return imported
+def import_watchlist_csv(*args, **kwargs) -> int:
+    from src.services.db_admin_service import import_watchlist_csv as _impl
+    return _impl(*args, **kwargs)
 
 
 # ============= 涨停池持久化 =============
