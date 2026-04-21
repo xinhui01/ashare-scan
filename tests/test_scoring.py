@@ -7,15 +7,12 @@ from stock_filter import StockFilter
 
 
 def _build_filter() -> StockFilter:
+    from scan_models import FilterSettings
     sf = StockFilter.__new__(StockFilter)
-    sf.trend_days = 5
-    sf.ma_period = 5
-    sf.limit_up_lookback_days = 5
-    sf.volume_lookback_days = 5
-    sf.volume_expand_enabled = True
-    sf.volume_expand_factor = 2.0
-    sf.require_limit_up_within_days = False
     sf._log = None
+    # 调 apply_settings 保证所有实例属性（包括 strong_ft_*）被正确初始化，
+    # 避免"忘了 apply_settings"的 bug 被类级默认值静默吃掉。
+    sf.apply_settings(FilterSettings())
     return sf
 
 

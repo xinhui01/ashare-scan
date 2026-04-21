@@ -21,6 +21,14 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 from scan_models import FilterSettings, ScanRequest
 from data_source_models import DATA_SOURCE_OPTIONS
 from src.gui.log_drainer import LogDrainer
+from src.gui.result_columns import (
+    RESULT_COLUMNS,
+    all_column_ids,
+    columns_by_id,
+    default_visible_ids,
+    desc_by_default_ids,
+)
+from src.gui import result_filters
 from src.gui.ui_dispatch import UIDispatcher
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from stock_filter import StockFilter
@@ -230,6 +238,12 @@ class StockMonitorApp:
         self.volume_expand_factor_var = tk.StringVar(value="2.0")
         ttk.Entry(row1, textvariable=self.volume_expand_factor_var, width=6).pack(side=tk.LEFT, padx=5)
 
+        # 承接强势形态相关的变量在这里先声明，实体控件放在"扫描参数"弹窗里（show_settings）。
+        self.strong_ft_enabled_var = tk.BooleanVar(value=False)
+        self.strong_ft_max_pullback_pct_var = tk.StringVar(value="3.0")
+        self.strong_ft_max_volume_ratio_var = tk.StringVar(value="0.7")
+        self.strong_ft_min_hold_days_var = tk.StringVar(value="1")
+
         row1_note = ttk.Frame(control_frame)
         row1_note.pack(fill=tk.X, pady=2)
         ttk.Label(
@@ -326,6 +340,75 @@ class StockMonitorApp:
         min_price_entry.bind("<Return>", self.on_price_filter_changed)
         max_price_entry.bind("<Return>", self.on_price_filter_changed)
 
+    def _build_control_quick_filter_row(self, control_frame) -> None:
+        """结果表客户端快速过滤：对扫描出来的几百条再细筛。"""
+        row5 = ttk.Frame(control_frame)
+        row5.pack(fill=tk.X, pady=5)
+
+        ttk.Label(row5, text="搜索:").pack(side=tk.LEFT, padx=(5, 2))
+        self.search_var = tk.StringVar(value="")
+        search_entry = ttk.Entry(row5, textvariable=self.search_var, width=14)
+        search_entry.pack(side=tk.LEFT, padx=(0, 10))
+        # 输入时即时过滤（debounce 交给 _schedule_quick_filter 的 after）
+        self.search_var.trace_add("write", lambda *_: self._schedule_quick_filter())
+
+        ttk.Label(row5, text="评分≥").pack(side=tk.LEFT, padx=(0, 2))
+        self.min_score_var = tk.StringVar(value="")
+        ttk.Entry(row5, textvariable=self.min_score_var, width=5).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(row5, text="5日涨幅≥").pack(side=tk.LEFT, padx=(0, 2))
+        self.min_five_day_var = tk.StringVar(value="")
+        ttk.Entry(row5, textvariable=self.min_five_day_var, width=5).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(row5, text="%").pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(row5, text="放量≥").pack(side=tk.LEFT, padx=(0, 2))
+        self.min_volume_ratio_var = tk.StringVar(value="")
+        ttk.Entry(row5, textvariable=self.min_volume_ratio_var, width=5).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(row5, text="倍").pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(row5, text="连板≥").pack(side=tk.LEFT, padx=(0, 2))
+        self.min_streak_var = tk.StringVar(value="")
+        ttk.Entry(row5, textvariable=self.min_streak_var, width=4).pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(row5, text="应用", command=self.on_quick_filter_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row5, text="清空全部", command=self.clear_all_result_filters).pack(side=tk.LEFT, padx=4)
+
+        row6 = ttk.Frame(control_frame)
+        row6.pack(fill=tk.X, pady=2)
+        ttk.Label(row6, text="只显示:").pack(side=tk.LEFT, padx=5)
+
+        self.only_watchlist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6, text="自选", variable=self.only_watchlist_var,
+            command=self.on_quick_filter_apply,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.only_limit_up_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6, text="涨停", variable=self.only_limit_up_var,
+            command=self.on_quick_filter_apply,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.only_broken_limit_up_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6, text="断板", variable=self.only_broken_limit_up_var,
+            command=self.on_quick_filter_apply,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.only_volume_expand_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6, text="放量", variable=self.only_volume_expand_var,
+            command=self.on_quick_filter_apply,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.only_strong_ft_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6, text="承接强势", variable=self.only_strong_ft_var,
+            command=self.on_quick_filter_apply,
+        ).pack(side=tk.LEFT, padx=4)
+
+        search_entry.bind("<Return>", lambda e: self.on_quick_filter_apply())
+
     def setup_control_panel(self, parent):
         control_frame = ttk.LabelFrame(parent, text="控制面板", padding="10")
         control_frame.pack(fill=tk.X, pady=5)
@@ -333,6 +416,7 @@ class StockMonitorApp:
         self._build_control_actions_row(control_frame)
         self._build_control_board_filter_row(control_frame)
         self._build_control_price_filter_row(control_frame)
+        self._build_control_quick_filter_row(control_frame)
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -361,24 +445,14 @@ class StockMonitorApp:
             text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
         ).pack(side=tk.RIGHT)
 
-        self.result_columns = (
-            "code",
-            "name",
-            "watch",
-            "score",
-            "board",
-            "latest_close",
-            "latest_ma",
-            "five_day_return",
-            "limit_up_streak",
-            "broken_limit_up",
-            "volume_expand_ratio",
-            "volume_expand",
-            "volume_break_limit_up",
-            "after_two_limit_up",
-            "limit_up",
-            "recent_closes",
-        )
+        # 列定义全部来自 src/gui/result_columns.py 的注册表
+        self._result_columns_map = columns_by_id()
+        self.result_columns = all_column_ids()
+        self.result_headings = {
+            col.id: (col.label, col.width) for col in RESULT_COLUMNS
+        }
+        default_visible_columns = default_visible_ids()
+
         tree_container = ttk.Frame(result_frame)
         tree_container.pack(fill=tk.BOTH, expand=True)
         tree_container.grid_rowconfigure(0, weight=1)
@@ -386,54 +460,20 @@ class StockMonitorApp:
 
         self.result_tree = ttk.Treeview(tree_container, columns=self.result_columns, show="headings", height=20)
 
-        self.result_headings = {
-            "code": ("代码", 90),
-            "name": ("名称", 140),
-            "watch": ("自选", 60),
-            "score": ("评分", 70),
-            "board": ("板块", 120),
-            "latest_close": ("最新收盘", 100),
-            "latest_ma": ("MA", 100),
-            "five_day_return": ("5日涨幅", 90),
-            "limit_up_streak": ("连板数", 80),
-            "broken_limit_up": ("断板", 70),
-            "volume_expand_ratio": ("放量倍数", 90),
-            "volume_expand": ("放量", 70),
-            "volume_break_limit_up": ("放量断板", 90),
-            "after_two_limit_up": ("二连板后", 90),
-            "limit_up": ("涨停", 70),
-            "recent_closes": ("最近收盘", 220),
-        }
-        default_visible_columns = (
-            "code",
-            "name",
-            "watch",
-            "score",
-            "board",
-            "latest_close",
-            "latest_ma",
-            "five_day_return",
-            "limit_up_streak",
-            "broken_limit_up",
-            "volume_expand_ratio",
-            "volume_expand",
-            "volume_break_limit_up",
-            "after_two_limit_up",
-            "limit_up",
-        )
         self.default_result_display_columns = default_visible_columns
         self.result_column_order = list(self.result_columns)
         self.result_column_vars = {
             col: tk.BooleanVar(value=(col in default_visible_columns))
             for col in self.result_columns
         }
-        for col in self.result_columns:
-            text, width = self.result_headings[col]
-            self.result_tree.heading(col, text=text, command=lambda c=col: self.on_result_heading_click(c))
-            anchor = tk.CENTER
-            if col == "name":
-                anchor = tk.W
-            self.result_tree.column(col, width=width, anchor=anchor)
+        for col_def in RESULT_COLUMNS:
+            self.result_tree.heading(
+                col_def.id,
+                text=col_def.label,
+                command=lambda c=col_def.id: self.on_result_heading_click(c),
+            )
+            anchor = tk.W if col_def.anchor == "w" else tk.CENTER
+            self.result_tree.column(col_def.id, width=col_def.width, anchor=anchor)
         self.result_tree.configure(displaycolumns=default_visible_columns)
 
         scrollbar = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.result_tree.yview)
@@ -589,31 +629,10 @@ class StockMonitorApp:
         ]
 
     def _format_result_row_values(self, result: Dict[str, Any]) -> Dict[str, str]:
-        data = result.get("data", {}) or {}
-        analysis = data.get("analysis") or {}
-        recent = analysis.get("recent_closes") or []
-        five_day_return = analysis.get("five_day_return")
-        volume_expand_ratio = analysis.get("volume_expand_ratio")
-        code = str(result.get("code", "") or "").strip().zfill(6)
-        watch_item = self.watchlist_items.get(code) or {}
-
+        context = {"watchlist_items": self.watchlist_items}
         return {
-            "code": str(result.get("code", "-") or "-"),
-            "name": str(result.get("name", "-") or "-"),
-            "watch": "自选" if watch_item else "",
-            "score": "-" if analysis.get("score") is None else str(int(analysis.get("score") or 0)),
-            "board": str(data.get("board") or data.get("exchange") or "-"),
-            "latest_close": "-" if analysis.get("latest_close") is None else f"{analysis['latest_close']:.2f}",
-            "latest_ma": "-" if analysis.get("latest_ma") is None else f"{analysis['latest_ma']:.2f}",
-            "five_day_return": "-" if five_day_return is None else f"{five_day_return:.2f}%",
-            "limit_up_streak": str(analysis.get("limit_up_streak") or 0),
-            "broken_limit_up": "是" if analysis.get("broken_limit_up") else "否",
-            "volume_expand_ratio": "-" if volume_expand_ratio is None else f"{volume_expand_ratio:.2f}x",
-            "volume_expand": "是" if analysis.get("volume_expand") else "否",
-            "volume_break_limit_up": "是" if analysis.get("volume_break_limit_up") else "否",
-            "after_two_limit_up": "是" if analysis.get("after_two_limit_up") else "否",
-            "limit_up": "是" if analysis.get("limit_up") else "否",
-            "recent_closes": ", ".join("-" if v is None else f"{v:.2f}" for v in recent),
+            col.id: col.format_cell(result, context)
+            for col in RESULT_COLUMNS
         }
 
     def _build_result_image_pages(self, rows: List[List[str]], page_size: int = 40) -> List[List[List[str]]]:
@@ -2019,6 +2038,26 @@ class StockMonitorApp:
                 maximum=50.0,
             ),
             require_limit_up_within_days=bool(self.require_limit_up_var.get()),
+            strong_ft_enabled=bool(self.strong_ft_enabled_var.get()),
+            strong_ft_max_pullback_pct=self._parse_float_value(
+                self.strong_ft_max_pullback_pct_var.get(),
+                "承接强势-最大回撤%",
+                minimum=0.0,
+                maximum=20.0,
+            ),
+            strong_ft_max_volume_ratio=self._parse_float_value(
+                self.strong_ft_max_volume_ratio_var.get(),
+                "承接强势-次日量能上限",
+                minimum=0.0,
+                maximum=2.0,
+            ),
+            strong_ft_min_hold_days=self._parse_int_value(
+                self.strong_ft_min_hold_days_var.get(),
+                "承接强势-至少站稳天数",
+                minimum=0,
+                maximum=30,
+                allow_zero=True,
+            ),
         )
 
     def _apply_filter_settings_from_ui(self, show_error: bool = True) -> Optional[FilterSettings]:
@@ -2199,7 +2238,156 @@ class StockMonitorApp:
     def _apply_result_filters(self, results: List[Dict[str, Any]], raise_price_error: bool = False) -> List[Dict[str, Any]]:
         filtered = self._filter_results_by_selected_boards(results)
         filtered = self._filter_results_by_price_range(filtered, raise_error=raise_price_error)
+        filtered = self._filter_results_by_quick_filters(filtered)
         return filtered
+
+    def _parse_optional_float(self, raw: str, field_name: str) -> Optional[float]:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是数字") from exc
+
+    def _parse_optional_int(self, raw: str, field_name: str) -> Optional[int]:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} 必须是整数") from exc
+
+    def _filter_results_by_quick_filters(
+        self,
+        results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """用"快速过滤"行的条件再筛一遍。
+
+        数值解析失败时忽略该条件（当作未填），同时通过 `status_var` 给用户
+        一个可见反馈——之前完全静默，用户填错数字会误以为自己的条件生效了。
+        """
+        parse_errors: List[str] = []
+
+        def _parse_float(name: str, raw_var) -> Optional[float]:
+            try:
+                return self._parse_optional_float(raw_var.get(), name)
+            except (ValueError, AttributeError) as exc:
+                if str(exc):
+                    parse_errors.append(str(exc))
+                return None
+
+        def _parse_int(name: str, raw_var) -> Optional[int]:
+            try:
+                return self._parse_optional_int(raw_var.get(), name)
+            except (ValueError, AttributeError) as exc:
+                if str(exc):
+                    parse_errors.append(str(exc))
+                return None
+
+        min_score = _parse_float("评分", self.min_score_var)
+        min_five_day = _parse_float("5日涨幅", self.min_five_day_var)
+        min_volume_ratio = _parse_float("放量倍数", self.min_volume_ratio_var)
+        min_streak = _parse_int("连板数", self.min_streak_var)
+        if parse_errors:
+            # 只在 status_var 里提示,不弹窗打断实时输入
+            try:
+                self.status_var.set(
+                    "快速过滤有非法输入(已忽略): " + "；".join(parse_errors[:3])
+                )
+            except (AttributeError, tk.TclError):
+                pass
+
+        def _get_bool_var(name: str) -> bool:
+            var = getattr(self, name, None)
+            try:
+                return bool(var.get()) if var is not None else False
+            except tk.TclError:
+                return False
+
+        needle = getattr(self, "search_var", None)
+        needle_str = needle.get() if needle is not None else ""
+
+        only_watch = _get_bool_var("only_watchlist_var")
+        only_lu = _get_bool_var("only_limit_up_var")
+        only_broken = _get_bool_var("only_broken_limit_up_var")
+        only_vol = _get_bool_var("only_volume_expand_var")
+        only_strong = _get_bool_var("only_strong_ft_var")
+
+        watchlist_codes = set(self.watchlist_items.keys())
+
+        output: List[Dict[str, Any]] = []
+        for item in results:
+            if not result_filters.matches_search(item, needle_str):
+                continue
+            if not result_filters.at_least_score(item, min_score):
+                continue
+            if not result_filters.at_least_five_day_return(item, min_five_day):
+                continue
+            if not result_filters.at_least_volume_ratio(item, min_volume_ratio):
+                continue
+            if not result_filters.at_least_limit_up_streak(item, min_streak):
+                continue
+            if not result_filters.only_in_watchlist(item, only_watch, watchlist_codes):
+                continue
+            if not result_filters.only_limit_up(item, only_lu):
+                continue
+            if not result_filters.only_broken_limit_up(item, only_broken):
+                continue
+            if not result_filters.only_volume_expand(item, only_vol):
+                continue
+            if not result_filters.only_strong_followthrough(item, only_strong):
+                continue
+            output.append(item)
+        return output
+
+    def _schedule_quick_filter(self) -> None:
+        """搜索框 debounce：输入时不立刻过滤，等 250ms 再统一刷新。"""
+        existing = getattr(self, "_quick_filter_after_id", None)
+        if existing is not None:
+            try:
+                self.root.after_cancel(existing)
+            except tk.TclError:
+                pass
+            self._quick_filter_after_id = None
+        self._quick_filter_after_id = self._safe_after(250, self._quick_filter_tick)
+
+    def _quick_filter_tick(self) -> None:
+        self._quick_filter_after_id = None
+        if not self.is_scanning:
+            self.on_quick_filter_apply()
+
+    def on_quick_filter_apply(self) -> None:
+        """用户点"应用"或勾选复选框时触发。"""
+        if self.is_scanning:
+            return
+        source = self.all_scan_results or self.filtered_stocks
+        if not source:
+            return
+        try:
+            self.update_result_table(source, announce=False, persist=False)
+            self.status_var.set(f"已应用快速过滤，当前显示 {len(self.filtered_stocks)} 只")
+        except ValueError as exc:
+            messagebox.showerror("错误", str(exc))
+
+    def clear_all_result_filters(self) -> None:
+        """一键清空所有结果表过滤（板块、价格、快速过滤）。"""
+        for board_var in self.board_filter_vars.values():
+            board_var.set(True)
+        self.min_price_var.set("")
+        self.max_price_var.set("")
+        self.search_var.set("")
+        self.min_score_var.set("")
+        self.min_five_day_var.set("")
+        self.min_volume_ratio_var.set("")
+        self.min_streak_var.set("")
+        self.only_watchlist_var.set(False)
+        self.only_limit_up_var.set(False)
+        self.only_broken_limit_up_var.set(False)
+        self.only_volume_expand_var.set(False)
+        self.only_strong_ft_var.set(False)
+        self.on_quick_filter_apply()
 
     def on_board_filter_changed(self):
         self._save_board_filter_layout()
@@ -2607,48 +2795,12 @@ class StockMonitorApp:
             self._unregister_cancel_token(token)
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
-        data = item.get("data", {}) or {}
-        analysis = data.get("analysis") or {}
-        code = str(item.get("code", "")).zfill(6)
-
-        if column == "code":
-            return code
-        if column == "name":
-            return str(item.get("name", ""))
-        if column == "watch":
-            return 1 if code in self.watchlist_items else 0
-        if column == "score":
-            value = analysis.get("score")
-            return float(value) if value is not None else float("-inf")
-        if column == "board":
-            return str(data.get("board") or data.get("exchange") or "")
-        if column == "latest_close":
-            value = analysis.get("latest_close")
-            return float(value) if value is not None else float("-inf")
-        if column == "latest_ma":
-            value = analysis.get("latest_ma")
-            return float(value) if value is not None else float("-inf")
-        if column == "five_day_return":
-            value = analysis.get("five_day_return")
-            return float(value) if value is not None else float("-inf")
-        if column == "limit_up_streak":
-            return int(analysis.get("limit_up_streak") or 0)
-        if column == "broken_limit_up":
-            return 1 if analysis.get("broken_limit_up") else 0
-        if column == "volume_expand_ratio":
-            value = analysis.get("volume_expand_ratio")
-            return float(value) if value is not None else float("-inf")
-        if column == "volume_expand":
-            return 1 if analysis.get("volume_expand") else 0
-        if column == "volume_break_limit_up":
-            return 1 if analysis.get("volume_break_limit_up") else 0
-        if column == "after_two_limit_up":
-            return 1 if analysis.get("after_two_limit_up") else 0
-        if column == "limit_up":
-            return 1 if analysis.get("limit_up") else 0
-        if column == "recent_closes":
-            recent = analysis.get("recent_closes") or []
-            return tuple("" if v is None else f"{float(v):010.4f}" for v in recent)
+        col_def = self._result_columns_map.get(column)
+        context = {"watchlist_items": self.watchlist_items}
+        if col_def is not None:
+            return col_def.sort_key(item, context)
+        # 未知列名：退回到 latest_change_pct，保持原先的兜底语义
+        analysis = (item.get("data", {}) or {}).get("analysis") or {}
         latest_change_pct = analysis.get("latest_change_pct")
         return float(latest_change_pct) if latest_change_pct is not None else float("-inf")
 
@@ -2686,20 +2838,7 @@ class StockMonitorApp:
             self.sort_reverse = not self.sort_reverse
         else:
             self.sort_column = column
-            self.sort_reverse = column in {
-                "score",
-                "watch",
-                "five_day_return",
-                "limit_up_streak",
-                "broken_limit_up",
-                "latest_close",
-                "latest_ma",
-                "volume_expand_ratio",
-                "volume_break_limit_up",
-                "after_two_limit_up",
-                "limit_up",
-                "volume_expand",
-            }
+            self.sort_reverse = column in desc_by_default_ids()
         if self.filtered_stocks:
             self.update_result_table(self.filtered_stocks, announce=False, persist=False)
 
@@ -4381,7 +4520,7 @@ class StockMonitorApp:
     def show_settings(self):
         settings_window = tk.Toplevel(self.root)
         settings_window.title("扫描参数")
-        settings_window.geometry("560x520")
+        settings_window.geometry("600x700")
         settings_window.transient(self.root)
         settings_window.grab_set()
 
@@ -4461,12 +4600,46 @@ class StockMonitorApp:
             values=DATA_SOURCE_OPTIONS["limit_up_reason"],
         ).grid(row=14, column=1, pady=8)
 
+        # ==== 承接强势形态 ====
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=15, column=0, columnspan=2, sticky="ew", pady=(12, 4)
+        )
+        ttk.Label(
+            frame,
+            text="承接强势：涨停 → 次日回落但缩量、且后续不破位",
+            foreground="#666",
+        ).grid(row=16, column=0, columnspan=2, pady=(0, 4))
+        ttk.Checkbutton(
+            frame,
+            text="启用承接强势过滤",
+            variable=self.strong_ft_enabled_var,
+        ).grid(row=17, column=0, columnspan=2, pady=4)
+
+        ttk.Label(frame, text="最大回撤%(次日最低 vs 涨停收盘):").grid(
+            row=18, column=0, sticky=tk.E, pady=4
+        )
+        ttk.Entry(frame, textvariable=self.strong_ft_max_pullback_pct_var, width=15).grid(
+            row=18, column=1, pady=4
+        )
+        ttk.Label(frame, text="次日量能上限(占涨停日):").grid(
+            row=19, column=0, sticky=tk.E, pady=4
+        )
+        ttk.Entry(frame, textvariable=self.strong_ft_max_volume_ratio_var, width=15).grid(
+            row=19, column=1, pady=4
+        )
+        ttk.Label(frame, text="至少站稳天数(0=允许次日就是今天):").grid(
+            row=20, column=0, sticky=tk.E, pady=4
+        )
+        ttk.Entry(frame, textvariable=self.strong_ft_min_hold_days_var, width=15).grid(
+            row=20, column=1, pady=4
+        )
+
         ttk.Button(
             frame,
             text="保存",
             command=lambda: (self._save_app_settings(), self._apply_source_preferences(), settings_window.destroy()),
         ).grid(
-            row=15, column=0, columnspan=2, pady=18
+            row=21, column=0, columnspan=2, pady=18
         )
 
     def show_about(self):

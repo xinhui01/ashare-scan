@@ -14,6 +14,11 @@ class FilterSettings:
     volume_expand_enabled: bool = True
     volume_expand_factor: float = 2.0
     require_limit_up_within_days: bool = False
+    # 涨停后承接强势形态（T 日涨停 → T+1 回落但抛压弱 → 后续不破位）
+    strong_ft_enabled: bool = False
+    strong_ft_max_pullback_pct: float = 3.0    # T+1 最大回撤（以 T 收盘价为基准，%）
+    strong_ft_max_volume_ratio: float = 0.7    # T+1 成交量 / T 成交量的上限，越小越缩量
+    strong_ft_min_hold_days: int = 1           # T+1 之后至少站稳几天（0 表示允许 T+1 就是最新一天）
 
     def to_signature(self) -> Dict[str, Any]:
         return {
@@ -24,6 +29,10 @@ class FilterSettings:
             "volume_expand_enabled": bool(self.volume_expand_enabled),
             "volume_expand_factor": float(self.volume_expand_factor),
             "require_limit_up_within_days": bool(self.require_limit_up_within_days),
+            "strong_ft_enabled": bool(self.strong_ft_enabled),
+            "strong_ft_max_pullback_pct": float(self.strong_ft_max_pullback_pct),
+            "strong_ft_max_volume_ratio": float(self.strong_ft_max_volume_ratio),
+            "strong_ft_min_hold_days": int(self.strong_ft_min_hold_days),
         }
 
 

@@ -14,16 +14,19 @@ class DummyFetcher:
 
 
 def build_filter(history_df, require_limit_up_within_days=False) -> StockFilter:
+    from scan_models import FilterSettings
     stock_filter = StockFilter.__new__(StockFilter)
     stock_filter.fetcher = DummyFetcher(history_df)
-    stock_filter.trend_days = 2
-    stock_filter.ma_period = 2
-    stock_filter.limit_up_lookback_days = 3
-    stock_filter.volume_lookback_days = 2
-    stock_filter.volume_expand_enabled = False
-    stock_filter.volume_expand_factor = 2.0
-    stock_filter.require_limit_up_within_days = require_limit_up_within_days
     stock_filter._log = None
+    stock_filter.apply_settings(FilterSettings(
+        trend_days=2,
+        ma_period=2,
+        limit_up_lookback_days=3,
+        volume_lookback_days=2,
+        volume_expand_enabled=False,
+        volume_expand_factor=2.0,
+        require_limit_up_within_days=require_limit_up_within_days,
+    ))
     return stock_filter
 
 

@@ -78,6 +78,9 @@ class HistoryAnalysisService:
             stock_name=stock_name,
             volume=volume,
         )
+        result["strong_followthrough"] = self.analyze_limit_up_followthrough(
+            df, board=board, stock_name=stock_name,
+        )
         result["summary"] = self._build_analysis_summary(result)
         score, score_breakdown = self.calculate_trade_score(result)
         result["score"] = score
@@ -85,6 +88,156 @@ class HistoryAnalysisService:
         if stock_code:
             result["stock_code"] = str(stock_code).strip().zfill(6)
         return result
+
+    def analyze_limit_up_followthrough(
+        self,
+        history_data: pd.DataFrame,
+        *,
+        board: str = "",
+        stock_name: str = "",
+    ) -> Dict[str, Any]:
+        """识别"涨停→次日回落→承接强势"形态。
+
+        在 `limit_up_lookback_days` 窗口内找**最近一次**涨停日 T（不要求是最后一天）。
+        形态命中需要同时满足:
+        1. T+1 存在，且 close[T+1] < close[T]（真的"回落"了）
+        2. (close[T] - low[T+1]) / close[T] * 100 ≤ max_pullback_pct（回撤可控）
+        3. volume[T+1] / volume[T] ≤ max_volume_ratio（缩量，抛压弱）
+        4. T+2 及之后每个收盘价都 ≥ low[T+1]（不破回落日最低点）
+        5. T+1 之后已经站稳的交易日数 ≥ min_hold_days
+
+        返回字典包含 `has_strong_followthrough`/`limit_up_date`/`pullback_*` 等指标。
+        未命中时各字段给出 None 或 0，方便上层展示原因。
+        """
+        empty = self._empty_followthrough_result()
+        if history_data is None or history_data.empty:
+            return empty
+        needed_cols = {"date", "close", "low", "volume"}
+        if not needed_cols.issubset(history_data.columns):
+            return empty
+        if "change_pct" not in history_data.columns:
+            return empty
+
+        df = self._sort_history(history_data)
+        if len(df) < 2:
+            return empty
+
+        threshold = self.limit_up_threshold(board=board, stock_name=stock_name)
+        change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
+        close = pd.to_numeric(df["close"], errors="coerce")
+        low = pd.to_numeric(df["low"], errors="coerce")
+        volume = pd.to_numeric(df["volume"], errors="coerce")
+        dates = df["date"].astype(str).tolist()
+        n = len(df)
+        lookback = max(1, int(self.config.limit_up_lookback_days))
+
+        # 从 lookback 窗口最新一天往回找，取"最近的、且后面至少还有一根 K 线"的涨停日
+        # 用户说"近 N 日",语义是"至少扫 N 根可能是 T 的 K 线"。
+        # T 不能是最后一天(后面必须有 T+1 才能判断回落),所以把窗口再往左扩 1。
+        # 示例:n=10、lookback=5 → 候选 T 的下标 [4,5,6,7,8],正好 5 根。
+        scan_start = max(0, n - lookback - 1)
+        t_idx: Optional[int] = None
+        for i in range(n - 2, scan_start - 1, -1):
+            pct = change_pct.iloc[i]
+            if pd.isna(pct):
+                continue
+            if float(pct) >= (threshold - LIMIT_UP_TOLERANCE):
+                t_idx = i
+                break
+        if t_idx is None:
+            # 特例:最后一天刚涨停,T+1 还没来。上层需要这个信号来区分
+            # "没有涨停过" 和 "涨停了但还没法判断承接"。
+            last_pct = change_pct.iloc[-1]
+            if not pd.isna(last_pct) and float(last_pct) >= (threshold - LIMIT_UP_TOLERANCE):
+                empty_with_hint = dict(empty)
+                empty_with_hint["limit_up_is_today"] = True
+                empty_with_hint["limit_up_date"] = dates[-1]
+                return empty_with_hint
+            return empty
+
+        t_close = close.iloc[t_idx]
+        t_volume = volume.iloc[t_idx]
+        if pd.isna(t_close) or pd.isna(t_volume) or float(t_close) <= 0 or float(t_volume) <= 0:
+            return empty
+
+        next_idx = t_idx + 1
+        next_close = close.iloc[next_idx]
+        next_low = low.iloc[next_idx]
+        next_volume = volume.iloc[next_idx]
+        if pd.isna(next_close) or pd.isna(next_low) or pd.isna(next_volume):
+            return empty
+
+        t_close_f = float(t_close)
+        t_volume_f = float(t_volume)
+        next_close_f = float(next_close)
+        next_low_f = float(next_low)
+        next_volume_f = float(next_volume)
+
+        # 规则 1：真的回落（次日收盘低于涨停日收盘）
+        is_pullback_day = next_close_f < t_close_f
+
+        # 规则 2：回撤可控（以最低价为准，更严格）
+        pullback_pct = (t_close_f - next_low_f) / t_close_f * 100.0
+        pullback_ok = pullback_pct <= float(self.config.strong_ft_max_pullback_pct)
+
+        # 规则 3：缩量
+        volume_ratio = next_volume_f / t_volume_f
+        volume_ok = volume_ratio <= float(self.config.strong_ft_max_volume_ratio)
+
+        # 规则 4 + 5：T+2 及之后守住 next_low，且已站稳够天数
+        hold_days = 0
+        holds_above_pullback_low = True
+        if next_idx + 1 < n:
+            follow_close = close.iloc[next_idx + 1:]
+            for val in follow_close.tolist():
+                if pd.isna(val):
+                    holds_above_pullback_low = False
+                    break
+                if float(val) < next_low_f:
+                    holds_above_pullback_low = False
+                    break
+                hold_days += 1
+        min_hold = int(self.config.strong_ft_min_hold_days)
+        hold_ok = holds_above_pullback_low and hold_days >= min_hold
+
+        has_strong = bool(is_pullback_day and pullback_ok and volume_ok and hold_ok)
+
+        return {
+            "has_strong_followthrough": has_strong,
+            "limit_up_date": dates[t_idx],
+            "limit_up_close": t_close_f,
+            "pullback_date": dates[next_idx],
+            "pullback_close": next_close_f,
+            "pullback_low": next_low_f,
+            "pullback_pct": pullback_pct,
+            "pullback_volume_ratio": volume_ratio,
+            "is_pullback_day": is_pullback_day,
+            "pullback_within_limit": pullback_ok,
+            "volume_shrunk": volume_ok,
+            "holds_above_pullback_low": holds_above_pullback_low,
+            "hold_days": hold_days,
+            "min_hold_days": min_hold,
+        }
+
+    @staticmethod
+    def _empty_followthrough_result() -> Dict[str, Any]:
+        return {
+            "has_strong_followthrough": False,
+            "limit_up_date": None,
+            "limit_up_close": None,
+            "pullback_date": None,
+            "pullback_close": None,
+            "pullback_low": None,
+            "pullback_pct": None,
+            "pullback_volume_ratio": None,
+            "is_pullback_day": False,
+            "pullback_within_limit": False,
+            "volume_shrunk": False,
+            "holds_above_pullback_low": False,
+            "hold_days": 0,
+            "min_hold_days": 0,
+            "limit_up_is_today": False,  # True: 最后一天刚涨停但 T+1 还没到,待验证
+        }
 
     def calculate_trade_score(self, result: Dict[str, Any]) -> tuple[int, str]:
         score = 50.0
@@ -160,6 +313,11 @@ class HistoryAnalysisService:
             score -= 5
             reasons.append("放量断板-5")
 
+        ft = result.get("strong_followthrough") or {}
+        if ft.get("has_strong_followthrough"):
+            score += 10
+            reasons.append("承接强势+10")
+
         final_score = max(0, min(100, int(round(score))))
         return final_score, " / ".join(reasons[:6])
 
@@ -191,6 +349,7 @@ class HistoryAnalysisService:
             "broken_streak_count": 0,
             "volume_break_limit_up": False,
             "after_two_limit_up": False,
+            "strong_followthrough": self._empty_followthrough_result(),
             "score": 0,
             "score_breakdown": "",
             "summary": "",
@@ -346,6 +505,12 @@ class HistoryAnalysisService:
             summary = f"{summary}；断板，前序连板 {result['broken_streak_count']} 板"
         if result["volume_break_limit_up"]:
             summary = f"{summary}；放量后断板"
+        ft = result.get("strong_followthrough") or {}
+        if ft.get("has_strong_followthrough"):
+            summary = (
+                f"{summary}；{ft['limit_up_date']} 涨停后回落 {ft['pullback_pct']:.1f}%、"
+                f"次日缩量至 {ft['pullback_volume_ratio']:.0%}，承接已守 {ft['hold_days']} 日"
+            )
         return summary
 
     @staticmethod

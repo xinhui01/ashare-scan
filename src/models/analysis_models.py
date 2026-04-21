@@ -14,6 +14,10 @@ class HistoryAnalysisConfig:
     volume_lookback_days: int
     volume_expand_enabled: bool
     volume_expand_factor: float
+    # 承接强势形态参数（配合 analyze_limit_up_followthrough）
+    strong_ft_max_pullback_pct: float = 3.0
+    strong_ft_max_volume_ratio: float = 0.7
+    strong_ft_min_hold_days: int = 1
 
     @classmethod
     def from_filter_settings(
@@ -26,6 +30,9 @@ class HistoryAnalysisConfig:
         volume_lookback_days: Optional[int] = None,
         volume_expand_enabled: Optional[bool] = None,
         volume_expand_factor: Optional[float] = None,
+        strong_ft_max_pullback_pct: Optional[float] = None,
+        strong_ft_max_volume_ratio: Optional[float] = None,
+        strong_ft_min_hold_days: Optional[int] = None,
     ) -> "HistoryAnalysisConfig":
         return cls(
             trend_days=max(1, int(settings.trend_days if trend_days is None else trend_days)),
@@ -57,6 +64,30 @@ class HistoryAnalysisConfig:
                     settings.volume_expand_factor
                     if volume_expand_factor is None
                     else volume_expand_factor
+                ),
+            ),
+            strong_ft_max_pullback_pct=max(
+                0.0,
+                float(
+                    settings.strong_ft_max_pullback_pct
+                    if strong_ft_max_pullback_pct is None
+                    else strong_ft_max_pullback_pct
+                ),
+            ),
+            strong_ft_max_volume_ratio=max(
+                0.0,
+                float(
+                    settings.strong_ft_max_volume_ratio
+                    if strong_ft_max_volume_ratio is None
+                    else strong_ft_max_volume_ratio
+                ),
+            ),
+            strong_ft_min_hold_days=max(
+                0,
+                int(
+                    settings.strong_ft_min_hold_days
+                    if strong_ft_min_hold_days is None
+                    else strong_ft_min_hold_days
                 ),
             ),
         )

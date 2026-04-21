@@ -186,6 +186,10 @@ class StockFilter:
             volume_expand_enabled=bool(self.volume_expand_enabled),
             volume_expand_factor=float(self.volume_expand_factor),
             require_limit_up_within_days=bool(self.require_limit_up_within_days),
+            strong_ft_enabled=bool(self.strong_ft_enabled),
+            strong_ft_max_pullback_pct=float(self.strong_ft_max_pullback_pct),
+            strong_ft_max_volume_ratio=float(self.strong_ft_max_volume_ratio),
+            strong_ft_min_hold_days=int(self.strong_ft_min_hold_days),
         )
 
     def apply_settings(self, settings: FilterSettings) -> None:
@@ -196,6 +200,10 @@ class StockFilter:
         self.volume_expand_enabled = bool(settings.volume_expand_enabled)
         self.volume_expand_factor = max(1.0, float(settings.volume_expand_factor))
         self.require_limit_up_within_days = bool(settings.require_limit_up_within_days)
+        self.strong_ft_enabled = bool(settings.strong_ft_enabled)
+        self.strong_ft_max_pullback_pct = max(0.0, float(settings.strong_ft_max_pullback_pct))
+        self.strong_ft_max_volume_ratio = max(0.0, float(settings.strong_ft_max_volume_ratio))
+        self.strong_ft_min_hold_days = max(0, int(settings.strong_ft_min_hold_days))
 
     _timeout_pool: Optional[ThreadPoolExecutor] = None
     _timeout_pool_lock = threading.Lock()
@@ -423,6 +431,47 @@ class StockFilter:
         result["reasons"].append(analysis["summary"])
         return True
 
+    def _apply_strong_followthrough_failure(
+        self,
+        result: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> bool:
+        """当开启"承接强势"过滤时，未命中形态的股票直接淘汰。"""
+        if not getattr(self, "strong_ft_enabled", False):
+            return False
+        ft = analysis.get("strong_followthrough") or {}
+        if ft.get("has_strong_followthrough"):
+            return False
+        reason = self._build_strong_ft_failure_reason(ft)
+        analysis["summary"] = (
+            f"{analysis['summary']}；{reason}" if analysis.get("summary") else reason
+        )
+        result["reasons"].append(reason)
+        return True
+
+    def _build_strong_ft_failure_reason(self, ft: Dict[str, Any]) -> str:
+        """把 followthrough 结果翻译成人类友好的失败原因。"""
+        if ft.get("limit_up_is_today"):
+            return f"{ft.get('limit_up_date')} 刚涨停，次日走势还未出现，无法判断承接"
+        if not ft.get("limit_up_date"):
+            return f"近{self.limit_up_lookback_days}日未找到可承接的涨停日"
+        parts = [f"{ft['limit_up_date']} 涨停后"]
+        if not ft.get("is_pullback_day"):
+            parts.append("次日未回落（未形成承接形态）")
+        if not ft.get("pullback_within_limit"):
+            parts.append(
+                f"回撤过深（{ft.get('pullback_pct', 0):.1f}% > {self.strong_ft_max_pullback_pct:.1f}%）"
+            )
+        if not ft.get("volume_shrunk"):
+            parts.append(
+                f"未缩量（次日量比 {ft.get('pullback_volume_ratio', 0):.0%} > {self.strong_ft_max_volume_ratio:.0%}）"
+            )
+        if not ft.get("holds_above_pullback_low"):
+            parts.append("后续跌破回落日最低价")
+        elif ft.get("hold_days", 0) < ft.get("min_hold_days", 0):
+            parts.append(f"站稳天数不足（{ft.get('hold_days', 0)} < {ft.get('min_hold_days', 0)}）")
+        return "；".join(parts)
+
     def _finalize_filter_result(
         self,
         result: Dict[str, Any],
@@ -457,6 +506,8 @@ class StockFilter:
 
         analysis = self._attach_filter_analysis(result, history_data, stock_code, stock_name, board)
         if self._apply_limit_up_requirement_failure(result, analysis):
+            return result
+        if self._apply_strong_followthrough_failure(result, analysis):
             return result
         return self._finalize_filter_result(result, analysis)
 
