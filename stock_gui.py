@@ -4149,27 +4149,16 @@ class StockMonitorApp:
             valid_pct_parts.append(pd.Series([(auction_context["price"] / base_price - 1.0) * 100.0]))
         valid_pct = pd.concat(valid_pct_parts, ignore_index=True)
         valid_pct = pd.to_numeric(valid_pct, errors="coerce").dropna()
-        if valid_pct.empty:
+        if valid_pct.empty or first_close.empty:
             self.intraday_price_ax.set_ylim(-2.0, 2.0)
-        elif not first_close.empty:
-            low = float(valid_pct.quantile(0.01))
-            high = float(valid_pct.quantile(0.99))
-            if low > high:
-                low, high = high, low
-            span = max(high - low, 0.4)
-            pad = max(span * 0.12, 0.08)
-            low = max(low - pad, -35.0)
-            high = min(high + pad, 35.0)
-            if low >= 0:
-                low = max(0.0, low - max(span * 0.04, 0.03))
-            if high <= 0:
-                high = min(0.0, high + max(span * 0.04, 0.03))
-            if abs(high - low) < 0.2:
-                mid = (high + low) / 2.0
-                low, high = mid - 0.1, mid + 0.1
-            self.intraday_price_ax.set_ylim(low, high)
         else:
-            self.intraday_price_ax.set_ylim(-2.0, 2.0)
+            # 同花顺风格：围绕 0%（昨收）对称，上下等幅
+            max_abs = float(valid_pct.abs().max())
+            pad = max(max_abs * 0.08, 0.1)
+            m = min(max_abs + pad, 35.0)
+            if m < 1.0:
+                m = 1.0
+            self.intraday_price_ax.set_ylim(-m, m)
 
         secax = self.intraday_price_ax.secondary_yaxis(
             "right",

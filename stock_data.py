@@ -859,6 +859,70 @@ def _fetch_eastmoney_auction_snapshot(
     }
 
 
+def _fetch_eastmoney_intraday_1min(
+    stock_code: str,
+    ndays: int = 5,
+    logger: Optional[Callable[[str], None]] = None,
+) -> "pd.DataFrame":
+    """直连东方财富 trends2 获取 1 分钟分时，容忍可变字段数。
+
+    akshare 的 stock_zh_a_hist_min_em 在接口返回字段数变动时会直接抛
+    "Length mismatch"，这里改为按实际列数截断列名，彻底绕开该脆弱点。
+    """
+    market_code = 1 if str(stock_code).startswith("6") else 0
+    url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "ndays": str(max(1, int(ndays or 1))),
+        "iscr": "0",
+        "secid": f"{market_code}.{stock_code}",
+    }
+    try:
+        response = _gupiao_request_with_retry(url, params=params, timeout=15)
+        data_json = response.json()
+    except Exception as exc:
+        if logger:
+            logger(f"分时行情(东财直连) {stock_code} 请求失败: {exc}")
+        raise
+
+    trends = (data_json.get("data") or {}).get("trends") or []
+    if not trends:
+        if logger:
+            logger(f"分时行情(东财直连) {stock_code} 无 trends 数据")
+        return pd.DataFrame()
+
+    rows = [str(item).split(",") for item in trends]
+    temp_df = pd.DataFrame(rows)
+    if temp_df.empty:
+        return pd.DataFrame()
+
+    canonical_cols = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
+    actual_col_count = len(temp_df.columns)
+    if actual_col_count >= len(canonical_cols):
+        temp_df = temp_df.iloc[:, : len(canonical_cols)]
+        temp_df.columns = canonical_cols
+    else:
+        temp_df.columns = canonical_cols[:actual_col_count]
+        # 若接口精简到不足 8 列但至少包含收盘，补齐缺失列为 NaN
+        for col in canonical_cols[actual_col_count:]:
+            temp_df[col] = pd.NA
+
+    if "时间" not in temp_df.columns:
+        if logger:
+            logger(
+                f"分时行情(东财直连) {stock_code} 缺少时间列，实际 {actual_col_count} 列"
+            )
+        return pd.DataFrame()
+
+    for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]:
+        if col in temp_df.columns:
+            temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
+    temp_df["时间"] = pd.to_datetime(temp_df["时间"], errors="coerce").astype(str)
+    return temp_df
+
+
 def _empty_intraday_meta_payload(
     selected_trade_date: str = "",
     available_trade_dates: Optional[List[str]] = None,
@@ -4267,7 +4331,12 @@ class StockDataFetcher:
         for provider in plan.provider_sequence:
             if provider == "eastmoney":
                 try:
-                    raw = _retry_ak_call(ak.stock_zh_a_hist_min_em, symbol=code, period="1", adjust="")
+                    raw = _retry_ak_call(
+                        _fetch_eastmoney_intraday_1min,
+                        code,
+                        ndays=5,
+                        logger=self._log,
+                    )
                     try:
                         auction_snapshot = _retry_ak_call(
                             _fetch_eastmoney_auction_snapshot,
