@@ -925,6 +925,26 @@ def load_app_config(key: str, default: Any = None) -> Any:
         return default
 
 
+def save_last_limit_up_prediction(payload: Dict[str, Any]) -> None:
+    """保存上次的涨停预测结果到 `app_config` 表，key 为 `last_limit_up_prediction`。
+
+    `payload` 应当是可序列化为 JSON 的字典。
+    """
+    try:
+        save_app_config("last_limit_up_prediction", payload)
+    except Exception:
+        logger.exception("保存上次涨停预测结果失败")
+
+
+def load_last_limit_up_prediction() -> Optional[Dict[str, Any]]:
+    """读取上次保存的涨停预测结果，若不存在返回 None。"""
+    try:
+        return load_app_config("last_limit_up_prediction", default=None)
+    except Exception:
+        logger.exception("读取上次涨停预测结果失败")
+        return None
+
+
 def save_intraday_cache(
     stock_code: str,
     trade_date: str,

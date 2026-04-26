@@ -15,6 +15,7 @@ from src.services.history_analysis_service import HistoryAnalysisService
 from src.utils.cancel_token import CancelToken, coerce_should_stop
 from stock_data import StockDataFetcher, DaemonThreadPoolExecutor
 from stock_logger import get_logger
+from stock_store import save_last_limit_up_prediction
 
 logger = get_logger(__name__)
 
@@ -1788,33 +1789,29 @@ class StockFilter:
         lookback_days: int = 5,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Dict[str, Any]:
-        """基于涨停前兆画像预测明日涨停候选。
+        """基于涨停对比 + 五日承接数据预测明日涨停候选。
 
         步骤：
-        1. 回溯分析最近 N 天涨停股的涨停前特征，形成画像
-        2. 连板延续候选：今日涨停股评分（封板强度/量能/板块热度）
-        3. 首板候选：用画像匹配今日强势股，越像涨停前夜的分越高
+        1. 回看最近 N 日涨停对比，统计昨日首板晋级率等环境数据
+        2. 保留涨停候选：对今日涨停股按封板质量 + 近期晋级环境评分
+        3. 五日承接候选：从今日强势股中挑出"涨停→回落缩量→站稳"的股票
 
-        返回:
-            profile: 涨停前兆画像
-            continuation_candidates: 连板延续候选列表
-            first_board_candidates: 首板候选列表
-            hot_industries: 热门行业统计
+        返回字段沿用旧结构，便于 GUI 直接复用：
+            profile: 兼容旧 UI，现固定为空
+            continuation_candidates: 保留涨停/连板候选
+            first_board_candidates: 五日承接候选
+            hot_industries: 今日涨停行业分布
             summary: 文字摘要
         """
-        # 阶段1：回溯分析涨停前兆画像
+        # 阶段1：回看最近 N 日涨停对比环境
         if self._log:
-            self._log(f"涨停预测：阶段1 - 回溯最近 {lookback_days} 天涨停股特征...")
+            self._log(f"涨停预测：阶段1 - 统计最近 {lookback_days} 日涨停对比环境...")
         if progress_callback:
-            progress_callback(0, 1, "回溯分析涨停前兆画像...")
+            progress_callback(0, 1, "统计最近涨停对比环境...")
 
-        profile_result = self.analyze_pre_limit_up_profile(
-            trade_date=trade_date,
-            lookback_days=lookback_days,
-            progress_callback=progress_callback,
-        )
-        profile = profile_result.get("profile", {})
-        feature_samples = profile_result.get("feature_samples", [])
+        profile: Dict[str, Any] = {}
+        feature_samples: List[Dict[str, Any]] = []
+        compare_context = self._build_compare_market_context(trade_date, lookback_days)
 
         # 阶段2：获取今日涨停池 + 全市场行情
         if self._log:
@@ -1869,7 +1866,7 @@ class StockFilter:
             executor.shutdown(wait=False, cancel_futures=True)
 
         if today_pool_df is None or today_pool_df.empty:
-            return {
+            result = {
                 "trade_date": trade_date,
                 "profile": profile,
                 "profile_samples": feature_samples,
@@ -1878,6 +1875,11 @@ class StockFilter:
                 "hot_industries": {},
                 "summary": f"{trade_date} 未获取到涨停池数据",
             }
+            try:
+                save_last_limit_up_prediction(result)
+            except Exception:
+                pass
+            return result
 
         all_pool_records = self._parse_full_pool(today_pool_df)
         if self._log:
@@ -1925,48 +1927,108 @@ class StockFilter:
         if self._log:
             self._log("涨停预测：阶段3完成 - 历史数据预取结束")
 
-        # 阶段4：连板延续候选评分（历史数据已在缓存中）
+        # 阶段4：保留涨停 / 连板延续候选评分
         if self._log:
-            self._log(f"涨停预测：阶段4 - 分析 {len(all_pool_records)} 只涨停股的延续潜力...")
+            self._log(f"涨停预测：阶段4 - 分析 {len(all_pool_records)} 只涨停股的保留涨停潜力...")
 
         continuation_candidates = []
         for idx, rec in enumerate(all_pool_records):
-            score_info = self._score_continuation(rec, hot_industries)
+            score_info = self._score_continuation_by_compare(rec, hot_industries, compare_context)
             if score_info["score"] >= 40:
                 continuation_candidates.append(score_info)
             if progress_callback:
                 progress_callback(idx + 1, len(all_pool_records),
-                                  f"连板分析 {rec['code']} {rec.get('name', '')}")
+                                  f"保留涨停分析 {rec['code']} {rec.get('name', '')}")
         continuation_candidates.sort(key=lambda x: -x["score"])
 
-        # 阶段5：首板候选 - 用画像匹配（历史数据 + 行情都已缓存）
+        # 阶段5：五日承接候选（历史数据 + 行情都已缓存）
         if self._log:
-            self._log("涨停预测：阶段5 - 用涨停前兆画像匹配候选股...")
+            self._log("涨停预测：阶段5 - 识别五日承接候选...")
 
-        first_board_candidates = self._scan_first_board_candidates_cached(
-            today_pool_df, hot_industries, profile, spot_df, zt_codes, progress_callback,
+        first_board_candidates = self._scan_followthrough_candidates_cached(
+            hot_industries, spot_df, zt_codes, progress_callback, lookback_days=lookback_days,
         )
 
         # 摘要
         summary_lines = [
             f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
-            f"回溯样本：最近 {lookback_days} 天共 {len(feature_samples)} 只首板涨停股",
+            f"环境样本：最近 {compare_context.get('pair_count', 0)} 组首板晋级对比",
             f"今日涨停总数：{len(all_pool_records)} 只",
-            f"连板延续候选：{len(continuation_candidates)} 只（得分>=40）",
-            f"首板候选：{len(first_board_candidates)} 只（得分>=50）",
+            f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
+            f"五日承接候选：{len(first_board_candidates)} 只（得分>=50）",
         ]
+        latest_cont_rate = compare_context.get("latest_continuation_rate")
+        avg_cont_rate = compare_context.get("avg_continuation_rate")
+        if latest_cont_rate is not None:
+            summary_lines.append(f"昨日首板最新晋级率：{latest_cont_rate:.1f}%")
+        if avg_cont_rate is not None:
+            summary_lines.append(f"近{compare_context.get('pair_count', 0)}组平均晋级率：{avg_cont_rate:.1f}%")
         if hot_industries:
             top3 = sorted(hot_industries.items(), key=lambda x: -x[1])[:3]
             summary_lines.append(f"热门行业：{'、'.join(f'{k}({v})' for k, v in top3)}")
 
-        return {
+        result = {
             "trade_date": trade_date,
             "profile": profile,
             "profile_samples": feature_samples,
             "continuation_candidates": continuation_candidates,
             "first_board_candidates": first_board_candidates,
             "hot_industries": hot_industries,
+            "compare_context": compare_context,
             "summary": "\n".join(summary_lines),
+        }
+        try:
+            save_last_limit_up_prediction(result)
+        except Exception:
+            pass
+        return result
+
+    def _build_compare_market_context(
+        self,
+        trade_date: str,
+        lookback_days: int,
+    ) -> Dict[str, Any]:
+        """从最近几组涨停对比中提炼市场环境。"""
+        window_days = max(2, int(lookback_days or 2) + 1)
+        trade_dates = self.fetcher._recent_trade_dates(trade_date, window_days)
+        pair_stats: List[Dict[str, Any]] = []
+
+        for idx in range(1, len(trade_dates)):
+            prev_date = trade_dates[idx - 1]
+            cur_date = trade_dates[idx]
+            try:
+                compare = self.fetcher.compare_limit_up_pools(cur_date, prev_date)
+            except Exception as exc:
+                logger.debug("涨停预测获取涨停对比 %s/%s 失败: %s", cur_date, prev_date, exc)
+                continue
+
+            yesterday_first = compare.get("yesterday_first", []) or []
+            continued = compare.get("continued_codes", []) or []
+            lost = compare.get("lost_codes", []) or []
+            first_count = len(yesterday_first)
+            rate = round(len(continued) / first_count * 100, 1) if first_count else None
+            pair_stats.append({
+                "today_date": cur_date,
+                "yesterday_date": prev_date,
+                "yesterday_first_count": first_count,
+                "continued_count": len(continued),
+                "lost_count": len(lost),
+                "continuation_rate": rate,
+                "today_first_count": len(compare.get("today_first", []) or []),
+            })
+
+        valid_rates = [item["continuation_rate"] for item in pair_stats if item.get("continuation_rate") is not None]
+        avg_rate = round(sum(valid_rates) / len(valid_rates), 1) if valid_rates else None
+        latest_rate = pair_stats[-1]["continuation_rate"] if pair_stats else None
+        latest_first_count = pair_stats[-1]["today_first_count"] if pair_stats else 0
+
+        return {
+            "trade_dates": trade_dates,
+            "pair_stats": pair_stats,
+            "pair_count": len(pair_stats),
+            "avg_continuation_rate": avg_rate,
+            "latest_continuation_rate": latest_rate,
+            "latest_first_count": latest_first_count,
         }
 
     def _parse_full_pool(self, pool_df: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -2137,6 +2199,340 @@ class StockFilter:
             "predict_type": "连板延续",
         }
 
+    def _score_continuation_by_compare(
+        self,
+        rec: Dict[str, Any],
+        hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """结合最近涨停对比环境，对今日涨停股评估次日保留涨停概率。"""
+        base = self._score_continuation(rec, hot_industries)
+        score = float(base.get("score", 0))
+        reasons = [r for r in str(base.get("reasons", "")).split(" / ") if r]
+
+        boards = int(rec.get("consecutive_boards") or 1)
+        latest_rate = compare_context.get("latest_continuation_rate")
+        avg_rate = compare_context.get("avg_continuation_rate")
+
+        ref_rate = latest_rate if latest_rate is not None else avg_rate
+        if ref_rate is not None:
+            if boards == 1:
+                if ref_rate >= 35:
+                    score += 15
+                    reasons.append(f"首板晋级环境强({ref_rate:.1f}%)+15")
+                elif ref_rate >= 25:
+                    score += 8
+                    reasons.append(f"首板晋级环境尚可({ref_rate:.1f}%)+8")
+                elif ref_rate < 15:
+                    score -= 10
+                    reasons.append(f"首板晋级环境弱({ref_rate:.1f}%)-10")
+            else:
+                if ref_rate >= 30:
+                    score += 8
+                    reasons.append(f"连板接力环境偏强({ref_rate:.1f}%)+8")
+                elif ref_rate < 12:
+                    score -= 5
+                    reasons.append(f"接力环境偏冷({ref_rate:.1f}%)-5")
+
+        if boards == 1:
+            pattern = self.classify_limit_up_pattern(
+                rec["code"],
+                stock_name=rec.get("name", ""),
+            ).get("pattern", "")
+            if pattern in {"回踩MA5涨停", "趋势加速涨停", "突破平台涨停"}:
+                score += 8
+                reasons.append(f"{pattern}+8")
+            elif pattern == "暴量涨停":
+                score -= 5
+                reasons.append("暴量首板次日分歧-5")
+
+        final_score = max(0, min(100, int(round(score))))
+        base["score"] = final_score
+        base["reasons"] = " / ".join(reasons[:8])
+        base["predict_type"] = "保留涨停"
+        return base
+
+    def _scan_followthrough_candidates_cached(
+        self,
+        hot_industries: Dict[str, int],
+        spot_df: Optional[pd.DataFrame],
+        zt_codes: set,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        *,
+        lookback_days: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """从今日强势股中识别五日承接候选。"""
+        if spot_df is None or spot_df.empty:
+            return []
+
+        strong_stocks = self._filter_strong_stocks(spot_df, zt_codes)
+        ma5_pullback_stocks = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
+
+        seen_codes = set()
+        merged: List[Dict[str, Any]] = []
+        for rec in strong_stocks + ma5_pullback_stocks:
+            if rec["code"] in seen_codes:
+                continue
+            seen_codes.add(rec["code"])
+            merged.append(rec)
+
+        if not merged:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        total = len(merged)
+        for idx, rec in enumerate(merged):
+            score_info = self._score_followthrough_candidate(
+                rec,
+                hot_industries,
+                lookback_days=lookback_days,
+            )
+            if score_info["score"] >= 50:
+                candidates.append(score_info)
+            if progress_callback:
+                progress_callback(idx + 1, total, f"五日承接 {rec['code']} {rec.get('name', '')}")
+
+        candidates.sort(key=lambda x: -x["score"])
+        return candidates[:50]
+
+    def _score_followthrough_candidate(
+        self,
+        rec: Dict[str, Any],
+        hot_industries: Dict[str, int],
+        *,
+        lookback_days: int = 5,
+    ) -> Dict[str, Any]:
+        """对"近期爆量后回落到 MA5 附近"的股票评分。"""
+        code = rec["code"]
+        name = rec.get("name", "")
+        change_pct = rec.get("change_pct")
+        turnover = rec.get("turnover")
+        industry = rec.get("industry", "")
+        score = 0.0
+        reasons: List[str] = []
+
+        try:
+            history = self.fetcher.get_history_data(
+                code,
+                days=65,
+                force_refresh=False,
+                request_plan=self._build_local_cache_history_plan(reason="predict-followthrough-cache-only"),
+            )
+        except Exception as exc:
+            logger.debug("预测五日承接获取历史 %s 失败: %s", code, exc)
+            history = None
+
+        latest_close = rec.get("close")
+        ma5_val = None
+        dist_ma5_pct = None
+        recent_burst_ratio = None
+        recent_burst_amount_ratio = None
+        burst_date = ""
+        days_since_burst = None
+        trend_10d = None
+        latest_low = None
+        touched_ma5 = False
+        recent_above_ma5 = False
+        trend_ok = False
+        pullback_day = False
+
+        if history is not None and not history.empty and len(history) >= 10:
+            df = history.sort_values("date").reset_index(drop=True)
+            close = pd.to_numeric(df["close"], errors="coerce")
+            low = pd.to_numeric(df.get("low"), errors="coerce") if "low" in df.columns else pd.Series(dtype=float)
+            volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
+
+            t = len(df) - 1
+            latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else latest_close
+            prev_close = float(close.iloc[t - 1]) if t >= 1 and not pd.isna(close.iloc[t - 1]) else None
+            latest_low = float(low.iloc[t]) if not low.empty and not pd.isna(low.iloc[t]) else None
+
+            ma5 = close.rolling(5, min_periods=5).mean()
+            ma10 = close.rolling(10, min_periods=10).mean()
+            ma20 = close.rolling(20, min_periods=20).mean()
+            ma5_val = float(ma5.iloc[t]) if not pd.isna(ma5.iloc[t]) else None
+            ma10_val = float(ma10.iloc[t]) if not pd.isna(ma10.iloc[t]) else None
+            ma20_val = float(ma20.iloc[t]) if not pd.isna(ma20.iloc[t]) else None
+
+            if latest_close is not None and ma5_val is not None and ma5_val > 0:
+                dist_ma5_pct = round((latest_close / ma5_val - 1) * 100, 2)
+            if latest_low is not None and ma5_val is not None and ma5_val > 0:
+                touched_ma5 = latest_low <= ma5_val * 1.01 and latest_low >= ma5_val * 0.97
+
+            burst_window = max(3, min(int(lookback_days or 5), 7))
+            burst_start = max(5, t - burst_window)
+            best_burst_idx = None
+            best_burst_score = 0.0
+            for idx in range(burst_start, t):
+                if pd.isna(volume.iloc[idx]):
+                    continue
+                prev_vol = volume.iloc[idx - 5:idx].dropna()
+                vol_ratio_i = None
+                amt_ratio_i = None
+                if not prev_vol.empty and float(prev_vol.mean()) > 0:
+                    vol_ratio_i = float(volume.iloc[idx]) / float(prev_vol.mean())
+                if not amount.empty and idx < len(amount) and not pd.isna(amount.iloc[idx]):
+                    prev_amt = amount.iloc[idx - 5:idx].dropna()
+                    if not prev_amt.empty and float(prev_amt.mean()) > 0:
+                        amt_ratio_i = float(amount.iloc[idx]) / float(prev_amt.mean())
+
+                score_i = max(
+                    vol_ratio_i if vol_ratio_i is not None else 0.0,
+                    amt_ratio_i if amt_ratio_i is not None else 0.0,
+                )
+                if score_i > best_burst_score:
+                    best_burst_score = score_i
+                    best_burst_idx = idx
+                    recent_burst_ratio = round(vol_ratio_i, 2) if vol_ratio_i is not None else None
+                    recent_burst_amount_ratio = round(amt_ratio_i, 2) if amt_ratio_i is not None else None
+
+            if best_burst_idx is not None:
+                burst_date = str(df.iloc[best_burst_idx].get("date", "") or "")
+                days_since_burst = t - best_burst_idx
+
+            if t >= 10 and not pd.isna(close.iloc[t - 10]) and close.iloc[t - 10] > 0 and latest_close is not None:
+                trend_10d = round((latest_close / float(close.iloc[t - 10]) - 1) * 100, 1)
+
+            if prev_close is not None and latest_close is not None:
+                pullback_day = latest_close <= prev_close
+            if ma5_val is not None and ma10_val is not None:
+                trend_ok = ma5_val >= ma10_val or (latest_close is not None and latest_close >= ma10_val)
+
+            if ma5_val is not None:
+                for lb in range(1, min(4, t + 1)):
+                    idx_b = t - lb
+                    if idx_b >= 0 and not pd.isna(close.iloc[idx_b]) and not pd.isna(ma5.iloc[idx_b]):
+                        if float(close.iloc[idx_b]) > float(ma5.iloc[idx_b]) * 1.01:
+                            recent_above_ma5 = True
+                            break
+
+        # 1. 先看最近几天是否出现过爆量
+        if recent_burst_ratio is not None:
+            if recent_burst_ratio >= 2.5:
+                score += 28
+                reasons.append(f"近期爆量{recent_burst_ratio:.1f}x+28")
+            elif recent_burst_ratio >= 1.8:
+                score += 18
+                reasons.append(f"近期放量{recent_burst_ratio:.1f}x+18")
+            elif recent_burst_ratio >= 1.5:
+                score += 8
+                reasons.append(f"近期量能活跃{recent_burst_ratio:.1f}x+8")
+            else:
+                score -= 12
+                reasons.append(f"近期无明显爆量{recent_burst_ratio:.1f}x-12")
+        else:
+            reasons.append("近几日量能数据不足")
+
+        if recent_burst_amount_ratio is not None and recent_burst_amount_ratio >= 2.0:
+            score += 8
+            reasons.append(f"近期额比{recent_burst_amount_ratio:.1f}x+8")
+
+        if days_since_burst is not None:
+            if 1 <= days_since_burst <= 3:
+                score += 12
+                reasons.append(f"爆量后{days_since_burst}日回踩+12")
+            elif 4 <= days_since_burst <= 5:
+                score += 6
+                reasons.append(f"爆量后{days_since_burst}日回踩+6")
+            elif days_since_burst >= 6:
+                score -= 5
+                reasons.append(f"距爆量已{days_since_burst}日-5")
+
+        # 2. 当日价格回落而非继续冲高
+        if change_pct is not None:
+            if -4.0 <= change_pct <= 1.5:
+                score += 20
+                reasons.append(f"当日回落{change_pct:.1f}%+20")
+            elif 1.5 < change_pct <= 3.5:
+                score += 8
+                reasons.append(f"回落不深{change_pct:.1f}%+8")
+            elif change_pct < -6.0:
+                score -= 15
+                reasons.append(f"回落过深{change_pct:.1f}%-15")
+        if pullback_day:
+            score += 8
+            reasons.append("收盘低于昨收+8")
+
+        # 3. 靠近 MA5 才叫五日承接
+        if dist_ma5_pct is not None:
+            if -1.5 <= dist_ma5_pct <= 1.0:
+                score += 25
+                reasons.append(f"贴近MA5 {dist_ma5_pct:+.1f}%+25")
+            elif -3.0 <= dist_ma5_pct <= 2.0:
+                score += 12
+                reasons.append(f"靠近MA5 {dist_ma5_pct:+.1f}%+12")
+            elif dist_ma5_pct < -4.0:
+                score -= 12
+                reasons.append(f"跌破MA5过深{dist_ma5_pct:+.1f}%-12")
+            elif dist_ma5_pct > 4.0:
+                score -= 8
+                reasons.append(f"离MA5过远{dist_ma5_pct:+.1f}%-8")
+
+        if touched_ma5:
+            score += 10
+            reasons.append("日内触及MA5+10")
+
+        # 4. 前面最好本来就在 MA5 上方，说明是强势回踩不是纯下跌
+        if recent_above_ma5:
+            score += 8
+            reasons.append("前几日曾强于MA5+8")
+        if trend_ok:
+            score += 8
+            reasons.append("趋势未坏+8")
+        elif dist_ma5_pct is not None and dist_ma5_pct < 0:
+            score -= 6
+            reasons.append("回落时趋势偏弱-6")
+
+        if trend_10d is not None:
+            if 5 <= trend_10d <= 25:
+                score += 6
+                reasons.append(f"10日仍强{trend_10d:.1f}%+6")
+            elif trend_10d < -5:
+                score -= 6
+                reasons.append(f"10日转弱{trend_10d:.1f}%-6")
+
+        if change_pct is not None:
+            if change_pct > 6:
+                score -= 8
+                reasons.append(f"当日仍过强{change_pct:.1f}%-8")
+
+        if industry and hot_industries.get(industry, 0) >= 3:
+            score += 10
+            reasons.append(f"热门板块({hot_industries[industry]}只)+10")
+        elif industry and hot_industries.get(industry, 0) >= 2:
+            score += 5
+            reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+
+        if turnover is not None:
+            if 3 <= turnover <= 20:
+                score += 5
+                reasons.append(f"换手{turnover:.1f}%适中+5")
+            elif turnover > 35:
+                score -= 5
+                reasons.append(f"换手{turnover:.1f}%过高-5")
+
+        final_score = max(0, min(100, int(round(score))))
+        return {
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "close": latest_close,
+            "change_pct": change_pct,
+            "turnover": turnover,
+            "ma5": ma5_val,
+            "dist_ma5_pct": dist_ma5_pct,
+            "volume_ratio": recent_burst_ratio,
+            "amount_ratio": recent_burst_amount_ratio,
+            "burst_date": burst_date,
+            "days_since_burst": days_since_burst,
+            "trend_10d": trend_10d,
+            "touched_ma5": touched_ma5,
+            "score": final_score,
+            "reasons": " / ".join(reasons[:8]),
+            "predict_type": "五日承接",
+        }
+
     def _scan_first_board_candidates_cached(
         self,
         today_pool_df: pd.DataFrame,
@@ -2232,10 +2628,13 @@ class StockFilter:
             return None
         volume_val = float(row["成交量"]) if pd.notna(row.get("成交量")) else None
         turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
+        industry = str(
+            row.get("所属行业", row.get("行业", row.get("板块", ""))) or ""
+        ).strip()
         return {
             "code": code, "name": name, "change_pct": change_pct,
             "close": close, "volume": volume_val, "amount": amount_val,
-            "turnover": turnover, "industry": "",
+            "turnover": turnover, "industry": industry,
         }
 
     def _filter_strong_stocks(

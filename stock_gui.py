@@ -41,6 +41,7 @@ from stock_store import (
     import_watchlist_csv,
     list_backups,
     load_app_config,
+    load_last_limit_up_prediction,
     load_latest_scan_snapshot,
     load_scan_snapshot,
     load_watchlist,
@@ -102,6 +103,10 @@ class StockMonitorApp:
         self._detail_flow_expanded = False
         self.sort_column = "score"
         self.sort_reverse = True
+        self._predict_cont_sort_column = "score"
+        self._predict_cont_sort_reverse = True
+        self._predict_first_sort_column = "score"
+        self._predict_first_sort_reverse = True
         self.is_scanning = False
         self.is_updating_cache = False
         self._scan_cancel_token: Optional[CancelToken] = None
@@ -139,6 +144,7 @@ class StockMonitorApp:
         self.apply_result_display_columns(save=False)
         self._load_last_results()
         self._load_last_limit_up_compare()
+        self._load_last_limit_up_prediction()
         self._load_watchlist_items()
         self._log_drainer.start()
 
@@ -580,6 +586,15 @@ class StockMonitorApp:
             self._zt_yesterday_var.set(yesterday_date)
         self._zt_compare_days_var.set(str(max(2, compare_days)))
         self._apply_limit_up_compare(result, persist=False, status_message="已从本地恢复涨停对比")
+
+    def _load_last_limit_up_prediction(self) -> None:
+        payload = load_last_limit_up_prediction()
+        if not isinstance(payload, dict):
+            return
+        trade_date = str(payload.get("trade_date") or "").strip()
+        if trade_date:
+            self._predict_date_var.set(trade_date)
+        self._apply_predict_result(payload)
 
     def _save_result_column_layout(self) -> None:
         payload = {
@@ -1485,7 +1500,7 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="回溯天数:").pack(side=tk.LEFT, padx=(10, 2))
         self._predict_lookback_var = tk.StringVar(value="5")
         ttk.Entry(action_bar, textvariable=self._predict_lookback_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(回溯N天涨停股特征→匹配今日强势股)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(action_bar, text="(回看N日涨停对比环境 + 识别五日承接)").pack(side=tk.LEFT, padx=6)
         self._predict_status_label = ttk.Label(action_bar, text="")
         self._predict_status_label.pack(side=tk.RIGHT, padx=8)
 
@@ -1499,19 +1514,18 @@ class StockMonitorApp:
         self._predict_summary_text.pack(fill=tk.BOTH, expand=True)
         self._predict_summary_text.insert(tk.END,
             "点击「开始预测」分析明日涨停候选\n\n"
-            "思路：先分析最近N天涨停股在涨停前是\n"
-            "什么状态（量能、均线、位置等），提炼\n"
-            "出「涨停前兆画像」，再用画像匹配今日\n"
-            "的强势股，越像涨停前夜的分越高。\n\n"
+            "思路：不再做“涨停前画像”，改为直接\n"
+            "使用最近N日的涨停对比数据，观察首板\n"
+            "晋级率、接力强弱，再结合“涨停→次日\n"
+            "回落缩量→站稳”的旧逻辑，现重点看\n"
+            "“近期爆量后回落到MA5附近”的承接。\n\n"
             "预测维度:\n"
-            "  1. 连板延续: 今日涨停股延续概率\n"
-            "     - 连板数、封板时间、炸板次数\n"
-            "     - 板块热度、均线排列、量能\n\n"
-            "  2. 首板候选: 画像匹配今日强势股\n"
-            "     - 量比/额比 vs 画像区间\n"
-            "     - 均线距离、多头排列\n"
-            "     - 缩量蓄势后放量\n"
-            "     - 60日位置分位、板块联动\n\n"
+            "  1. 保留涨停: 今日涨停股次日保板概率\n"
+            "     - 最近首板晋级率、炸板、封板时间\n"
+            "     - 板块热度、连板高度、涨停形态\n\n"
+            "  2. 五日承接: 近期先爆量，随后价格回落\n"
+            "     到 MA5 附近，重点看爆量倍数、距\n"
+            "     MA5 位置、回落是否温和、板块联动\n\n"
             "说明: 预测仅供参考，请结合盘面综合判断")
         self._predict_summary_text.config(state=tk.DISABLED)
         body.add(summary_frame, weight=2)
@@ -1523,7 +1537,7 @@ class StockMonitorApp:
 
         # 连板延续候选 Tab
         cont_tab = ttk.Frame(self._predict_table_nb)
-        self._predict_table_nb.add(cont_tab, text="连板延续候选")
+        self._predict_table_nb.add(cont_tab, text="保留涨停候选")
         cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
                      "seal_time", "breaks", "turnover", "score", "reasons")
         self._predict_cont_tree = ttk.Treeview(
@@ -1536,7 +1550,10 @@ class StockMonitorApp:
             "turnover": ("换手%", 65), "score": ("预测分", 65),
             "reasons": ("预测依据", 300),
         }.items():
-            self._predict_cont_tree.heading(col, text=heading)
+            self._predict_cont_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_predict_heading_click("cont", c),
+            )
             self._predict_cont_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
         sb_cont = ttk.Scrollbar(cont_tab, orient=tk.VERTICAL, command=self._predict_cont_tree.yview)
         self._predict_cont_tree.configure(yscrollcommand=sb_cont.set)
@@ -1551,20 +1568,23 @@ class StockMonitorApp:
 
         # 首板候选 Tab
         first_tab = ttk.Frame(self._predict_table_nb)
-        self._predict_table_nb.add(first_tab, text="首板候选")
+        self._predict_table_nb.add(first_tab, text="五日承接候选")
         first_cols = ("code", "name", "industry", "change_pct", "close",
-                      "vol_ratio", "pos_60d", "trend_10d", "turnover", "score", "reasons")
+                      "burst_date", "burst_ratio", "dist_ma5", "days_since_burst", "score", "reasons")
         self._predict_first_tree = ttk.Treeview(
             first_tab, columns=first_cols, show="headings", height=22, style="Predict.Treeview",
         )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
             "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
-            "vol_ratio": ("量比", 60), "pos_60d": ("60日分位%", 75),
-            "trend_10d": ("10日涨幅%", 75), "turnover": ("换手%", 65),
+            "burst_date": ("爆量日", 90), "burst_ratio": ("爆量倍数", 70),
+            "dist_ma5": ("距MA5%", 65), "days_since_burst": ("距爆量日", 65),
             "score": ("预测分", 65), "reasons": ("预测依据", 300),
         }.items():
-            self._predict_first_tree.heading(col, text=heading)
+            self._predict_first_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_predict_heading_click("first", c),
+            )
             self._predict_first_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
         sb_first = ttk.Scrollbar(first_tab, orient=tk.VERTICAL, command=self._predict_first_tree.yview)
         self._predict_first_tree.configure(yscrollcommand=sb_first.set)
@@ -1587,6 +1607,77 @@ class StockMonitorApp:
         elif score >= 50:
             return "score_mid"
         return "score_low"
+
+    @staticmethod
+    def _predict_sort_value(record: Dict[str, Any], column: str):
+        value_map = {
+            "code": record.get("code"),
+            "name": record.get("name"),
+            "industry": record.get("industry"),
+            "boards": record.get("consecutive_boards"),
+            "change_pct": record.get("change_pct"),
+            "close": record.get("close"),
+            "seal_time": record.get("first_board_time"),
+            "breaks": record.get("break_count"),
+            "turnover": record.get("turnover"),
+            "score": record.get("score"),
+            "reasons": record.get("reasons"),
+            "burst_date": record.get("burst_date"),
+            "burst_ratio": record.get("volume_ratio"),
+            "dist_ma5": record.get("dist_ma5_pct"),
+            "days_since_burst": record.get("days_since_burst"),
+        }
+        value = value_map.get(column)
+        if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code"}:
+            return str(value or "")
+        if value is None or value == "":
+            return float("-inf")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _sort_predict_records(
+        self,
+        records: List[Dict[str, Any]],
+        table_kind: str,
+    ) -> List[Dict[str, Any]]:
+        if table_kind == "cont":
+            column = self._predict_cont_sort_column
+            reverse = self._predict_cont_sort_reverse
+            secondary = ["score", "boards", "change_pct", "turnover"]
+        else:
+            column = self._predict_first_sort_column
+            reverse = self._predict_first_sort_reverse
+            secondary = ["score", "burst_ratio", "dist_ma5", "change_pct"]
+        if column in secondary:
+            secondary = [c for c in secondary if c != column]
+        return sorted(
+            records,
+            key=lambda rec: tuple(
+                [self._predict_sort_value(rec, column)]
+                + [self._predict_sort_value(rec, c) for c in secondary]
+                + [str(rec.get("code", ""))]
+            ),
+            reverse=reverse,
+        )
+
+    def _on_predict_heading_click(self, table_kind: str, column: str) -> None:
+        if table_kind == "cont":
+            if column == self._predict_cont_sort_column:
+                self._predict_cont_sort_reverse = not self._predict_cont_sort_reverse
+            else:
+                self._predict_cont_sort_column = column
+                self._predict_cont_sort_reverse = column in {"score", "boards", "change_pct", "close", "turnover", "breaks"}
+        else:
+            if column == self._predict_first_sort_column:
+                self._predict_first_sort_reverse = not self._predict_first_sort_reverse
+            else:
+                self._predict_first_sort_column = column
+                self._predict_first_sort_reverse = column in {"score", "burst_ratio", "change_pct", "close", "dist_ma5", "days_since_burst"}
+
+        if self._predict_result:
+            self._apply_predict_result(self._predict_result)
 
     def _start_predict(self):
         if self._predict_thread is not None and self._predict_thread.is_alive():
@@ -1661,10 +1752,11 @@ class StockMonitorApp:
 
     def _apply_predict_result(self, result: Dict[str, Any]):
         self._predict_result = result
-        cont_list = result.get("continuation_candidates", [])
-        first_list = result.get("first_board_candidates", [])
+        cont_list = self._sort_predict_records(list(result.get("continuation_candidates", [])), "cont")
+        first_list = self._sort_predict_records(list(result.get("first_board_candidates", [])), "first")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
+        compare_context = result.get("compare_context", {})
 
         # ---- 填充摘要 ----
         self._predict_summary_text.config(state=tk.NORMAL)
@@ -1673,7 +1765,7 @@ class StockMonitorApp:
 
         txt.insert(tk.END, result.get("summary", "") + "\n")
 
-        # 涨停前兆画像
+        # 兼容旧结果：若存在画像字段则仍展示
         if profile:
             txt.insert(tk.END, f"\n{'='*36}\n")
             txt.insert(tk.END, "  涨停前兆画像（T-1日特征统计）\n")
@@ -1698,10 +1790,26 @@ class StockMonitorApp:
                         f"  {label:14s}  {p.get('true_count', 0)}/{p.get('total', 0)}只  "
                         f"占比={p.get('ratio', 0):.1f}%\n")
 
-        # 连板延续 TOP10
+        if compare_context.get("pair_stats"):
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  最近涨停对比环境\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for item in compare_context.get("pair_stats", [])[-5:]:
+                rate = item.get("continuation_rate")
+                rate_text = f"{rate:.1f}%" if rate is not None else "-"
+                txt.insert(
+                    tk.END,
+                    f"  {item.get('yesterday_date', '-')}"
+                    f"→{item.get('today_date', '-')}"
+                    f"  昨首板{item.get('yesterday_first_count', 0):2d}只  "
+                    f"晋级{item.get('continued_count', 0):2d}只  "
+                    f"晋级率={rate_text}\n",
+                )
+
+        # 保留涨停 TOP10
         if cont_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  连板延续候选 TOP10\n")
+            txt.insert(tk.END, f"  保留涨停候选 TOP10\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for rec in cont_list[:10]:
                 boards_text = f"{rec['consecutive_boards']}板" if rec.get("consecutive_boards", 1) > 1 else "首板"
@@ -1711,7 +1819,7 @@ class StockMonitorApp:
 
         if first_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  首板候选 TOP10\n")
+            txt.insert(tk.END, f"  五日承接候选 TOP10\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for rec in first_list[:10]:
                 chg = rec.get("change_pct")
@@ -1730,9 +1838,10 @@ class StockMonitorApp:
                 txt.insert(tk.END, f"  {k:10s}  {v:2d} 只  {bar}\n")
 
         txt.insert(tk.END, f"\n{'='*36}\n")
-        txt.insert(tk.END, "说明：预测基于历史涨停股的涨停前特征\n"
-                           "画像匹配，仅供参考。请结合次日竞价、\n"
-                           "盘口、板块情绪综合判断。\n")
+        txt.insert(tk.END, "说明：预测基于最近涨停对比环境，以及“近期爆量\n"
+                           "后回落到 MA5 附近”的五日承接形态，仅供参考。\n"
+                           "请结合次日竞价、盘口、板块情绪\n"
+                           "综合判断。\n")
         self._predict_summary_text.config(state=tk.DISABLED)
 
         # ---- 填充连板延续表格 ----
@@ -1764,21 +1873,21 @@ class StockMonitorApp:
                 rec.get("industry", ""),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
-                f"{rec['vol_ratio']:.2f}" if rec.get("vol_ratio") is not None else "-",
-                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
-                f"{rec['trend_10d']:.1f}" if rec.get("trend_10d") is not None else "-",
-                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
+                rec.get("burst_date", "-") or "-",
+                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
+                str(rec.get("days_since_burst", 0)) if rec.get("days_since_burst") is not None else "-",
                 str(rec.get("score", 0)),
                 rec.get("reasons", ""),
             )
             self._predict_first_tree.insert("", tk.END, values=vals, tags=(tag,))
 
         # 更新Tab标题显示数量
-        self._predict_table_nb.tab(0, text=f"连板延续候选({len(cont_list)})")
-        self._predict_table_nb.tab(1, text=f"首板候选({len(first_list)})")
+        self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
+        self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
 
         self._predict_status_label.config(text="")
-        self.status_var.set(f"涨停预测完成: 连板延续{len(cont_list)}只 / 首板候选{len(first_list)}只")
+        self.status_var.set(f"涨停预测完成: 保留涨停{len(cont_list)}只 / 五日承接{len(first_list)}只")
 
     def _on_predict_stock_select(self, event):
         tree = event.widget
