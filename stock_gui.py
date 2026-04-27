@@ -110,6 +110,7 @@ class StockMonitorApp:
         self._predict_first_sort_reverse = True
         self._predict_fresh_sort_column = "score"
         self._predict_fresh_sort_reverse = True
+        self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
         self._scan_cancel_token: Optional[CancelToken] = None
@@ -176,9 +177,40 @@ class StockMonitorApp:
         main_frame = ttk.Frame(self.root, padding="5")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        self._setup_top_header(main_frame)
         self.setup_control_panel(main_frame)
         self.setup_notebook(main_frame)
         self.setup_status_bar()
+
+    def _setup_top_header(self, parent) -> None:
+        """窗口最顶部一行，与系统标题栏 X 按钮大致同高度，用于在详情/分时页显示当前股票名称。"""
+        header = ttk.Frame(parent)
+        header.pack(side=tk.TOP, fill=tk.X)
+        self.top_header_var = tk.StringVar(value="")
+        # 右对齐 → 视觉上贴近窗口右上角的系统 X
+        self.top_header_label = ttk.Label(
+            header,
+            textvariable=self.top_header_var,
+            anchor=tk.E,
+            font=("Microsoft YaHei", 11, "bold"),
+            foreground="#1a4f8a",
+        )
+        self.top_header_label.pack(side=tk.RIGHT, padx=(0, 8))
+
+    def _set_top_header_for_code(self, code: str, name: str = "") -> None:
+        code = str(code or "").strip().zfill(6)
+        if not code:
+            self.top_header_var.set("")
+            return
+        name = (name or self._top_header_name_by_code.get(code, "")).strip()
+        if name:
+            self._top_header_name_by_code[code] = name
+            self.top_header_var.set(f"{code}  {name}")
+        else:
+            self.top_header_var.set(code)
+
+    def _clear_top_header(self) -> None:
+        self.top_header_var.set("")
 
     def setup_menu(self):
         menubar = tk.Menu(self.root)
@@ -438,6 +470,24 @@ class StockMonitorApp:
         self.setup_predict_tab()
         self.setup_watchlist_tab()
         self.setup_log_tab()
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+    def _on_notebook_tab_changed(self, _event=None) -> None:
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            return
+        if current is getattr(self, "detail_tab_frame", None):
+            self._set_top_header_for_code(getattr(self, "_current_detail_code", "") or "")
+        elif current is getattr(self, "intraday_tab", None):
+            self._set_top_header_for_code(
+                getattr(self, "_intraday_request_code", "")
+                or getattr(self, "_current_detail_code", "")
+                or ""
+            )
+        else:
+            self._clear_top_header()
 
     def setup_result_tab(self):
         result_frame = ttk.Frame(self.notebook, padding="5")
@@ -3350,6 +3400,13 @@ class StockMonitorApp:
         self._cancel_scheduled_detail()
         self._detail_request_code = code
         self._show_detail_loading(code)
+        # 进入详情前先用扫描结果中的名称占位（若有）
+        prefilled_name = ""
+        for result in self.filtered_stocks:
+            if str(result.get("code", "")).strip().zfill(6) == code:
+                prefilled_name = str(result.get("name", "") or "")
+                break
+        self._set_top_header_for_code(code, prefilled_name)
 
         detail_payload = None
         for result in self.filtered_stocks:
@@ -3518,6 +3575,7 @@ class StockMonitorApp:
         self._current_detail_code = str(detail.get("code", "") or "").strip().zfill(6)
         self._detail_chart_loading_more = False
         self._refresh_detail_metric_labels()
+        self._set_top_header_for_code(self._current_detail_code, str(detail.get("name", "") or ""))
 
         self.detail_labels["code"].config(text=detail.get("code", "-"))
         self.detail_labels["name"].config(text=detail.get("name", "-"))
@@ -4129,6 +4187,7 @@ class StockMonitorApp:
         self._intraday_request_offset = requested_offset
         self._intraday_day_offset = requested_offset
         self.intraday_title_var.set(f"分时图 - {code}")
+        self._set_top_header_for_code(code)
         self.intraday_day_var.set("交易日: 加载中...")
         self._refresh_intraday_nav_buttons()
         self._draw_intraday_loading(f"正在加载 {code} 分时...")
@@ -4233,7 +4292,9 @@ class StockMonitorApp:
         self.intraday_dist_ax.set_axis_off()
         self.intraday_canvas.draw()
     def _draw_intraday_error(self, stock_code: str, message: str):
-        self.intraday_title_var.set(f"分时图 - {str(stock_code).strip().zfill(6)}")
+        code = str(stock_code).strip().zfill(6)
+        self.intraday_title_var.set(f"分时图 - {code}")
+        self._set_top_header_for_code(code)
         if not self._intraday_selected_date:
             self.intraday_day_var.set("交易日: -")
         self.intraday_price_ax.clear()
@@ -4507,6 +4568,7 @@ class StockMonitorApp:
     ):
         code = str(stock_code).strip().zfill(6)
         self.intraday_title_var.set(f"分时图 - {code}")
+        self._set_top_header_for_code(code)
         self.intraday_price_ax.clear()
         self.intraday_volume_ax.clear()
         self.intraday_dist_ax.clear()
