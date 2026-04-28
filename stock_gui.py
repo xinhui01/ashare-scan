@@ -34,6 +34,17 @@ from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
+from llm_client import (
+    DEFAULT_MODEL as LLM_DEFAULT_MODEL,
+    LlmConfigError,
+    LlmRequestError,
+    has_api_key as llm_has_api_key,
+    save_api_key as llm_save_api_key,
+)
+from llm_theme_clustering import (
+    cluster_themes as llm_cluster_themes,
+    load_cached_themes as llm_load_cached_themes,
+)
 from stock_store import (
     backup_database,
     cleanup_all,
@@ -700,6 +711,179 @@ class StockMonitorApp:
         # 让 _start_limit_up_compare 自行根据 compare_days 决定是否使用 yesterday
         self._start_limit_up_compare()
 
+    # ============== AI 题材聚类（NVIDIA NIM）==============
+    def _open_nim_key_dialog(self) -> None:
+        """简易对话框：输入并保存 NVIDIA NIM API Key。"""
+        from llm_client import _resolve_api_key
+
+        try:
+            current = _resolve_api_key()
+            current_hint = f"当前已配置（末 4 位 ****{current[-4:]}）"
+        except LlmConfigError:
+            current_hint = "尚未配置"
+
+        new_key = simpledialog.askstring(
+            "NVIDIA NIM API Key",
+            f"在 build.nvidia.com 获取免费 API Key（前缀 nvapi-）。\n{current_hint}\n\n"
+            "粘贴 API Key（留空取消）：",
+            parent=self.root,
+            show="*",
+        )
+        if not new_key or not str(new_key).strip():
+            return
+        try:
+            llm_save_api_key(str(new_key).strip())
+            messagebox.showinfo("已保存", "NIM API Key 已保存到本地配置。", parent=self.root)
+        except Exception as e:
+            messagebox.showerror("保存失败", f"无法保存 API Key: {e}", parent=self.root)
+
+    def _start_ai_theme_clustering(self) -> None:
+        """从当前涨停对比结果里提取今日涨停股，调用 LLM 聚类题材。"""
+        if not llm_has_api_key():
+            messagebox.showwarning(
+                "未配置 API Key",
+                "请先点击「设置 NIM Key」配置 NVIDIA NIM API Key。",
+                parent=self.root,
+            )
+            return
+        if self._zt_compare_result is None:
+            messagebox.showinfo(
+                "无数据",
+                "请先点击「获取涨停对比」加载今日涨停股，再做 AI 题材聚类。",
+                parent=self.root,
+            )
+            return
+        today_date = str(self._zt_compare_result.get("today_date") or "").strip()
+        records = self._zt_compare_result.get("today_classified") or []
+        if not today_date or not records:
+            messagebox.showinfo("无数据", "今日涨停股清单为空。", parent=self.root)
+            return
+
+        self._zt_status_label.config(text=f"AI 题材聚类中（{today_date}，{len(records)} 只）...")
+        self.status_var.set("AI 题材聚类中...")
+
+        self._start_background_job(
+            self._load_ai_theme_clustering,
+            name="ai-theme-cluster",
+            args=(today_date, list(records)),
+        )
+
+    def _load_ai_theme_clustering(
+        self,
+        today_date: str,
+        records: List[Dict[str, Any]],
+        cancel_token: CancelToken,
+    ) -> None:
+        try:
+            # 先看缓存
+            cached = llm_load_cached_themes(today_date)
+            if cached is not None:
+                if cancel_token.is_cancelled():
+                    return
+                self._post_to_ui(
+                    lambda r=cached: self._apply_ai_theme_clustering(r, from_cache=True)
+                )
+                return
+
+            # 拉每只票的入选理由
+            stocks: List[Dict[str, Any]] = []
+            fetcher = self.stock_filter.fetcher
+            for rec in records:
+                if cancel_token.is_cancelled():
+                    return
+                code = str(rec.get("code") or "").strip().zfill(6)
+                if not code:
+                    continue
+                try:
+                    reason = fetcher.get_limit_up_reason(code, today_date)
+                except Exception:
+                    reason = ""
+                stocks.append({
+                    "code": code,
+                    "name": rec.get("name", ""),
+                    "industry": rec.get("industry", ""),
+                    "reason": reason,
+                    "consecutive_boards": rec.get("consecutive_boards") or 1,
+                })
+            if cancel_token.is_cancelled():
+                return
+
+            result = llm_cluster_themes(
+                stocks,
+                trade_date=today_date,
+                use_cache=False,
+            )
+            if cancel_token.is_cancelled():
+                return
+            self._post_to_ui(lambda r=result: self._apply_ai_theme_clustering(r))
+        except LlmConfigError as e:
+            err = str(e)
+            self._post_to_ui(
+                lambda: self._zt_status_label.config(text=f"AI 聚类失败：{err}")
+            )
+        except LlmRequestError as e:
+            err = str(e)
+            self._post_to_ui(
+                lambda: self._zt_status_label.config(text=f"AI 聚类失败：{err[:80]}")
+            )
+        except Exception as e:
+            err = str(e)
+            self._post_to_ui(
+                lambda: self._zt_status_label.config(text=f"AI 聚类异常：{err[:80]}")
+            )
+
+    def _apply_ai_theme_clustering(
+        self,
+        result: Dict[str, Any],
+        *,
+        from_cache: bool = False,
+    ) -> None:
+        themes = result.get("themes") or []
+        market_summary = str(result.get("market_summary") or "").strip()
+        model = str(result.get("model") or LLM_DEFAULT_MODEL)
+        td = str(result.get("trade_date") or "").strip()
+        suffix = "（缓存）" if from_cache else ""
+
+        # 构造代码 → 名称映射，便于在题材里展示名字
+        code_to_name: Dict[str, str] = {}
+        if self._zt_compare_result is not None:
+            for rec in (self._zt_compare_result.get("today_classified") or []):
+                code = str(rec.get("code") or "").strip().zfill(6)
+                if code:
+                    code_to_name[code] = str(rec.get("name") or "")
+
+        self._zt_summary_text.config(state=tk.NORMAL)
+        self._zt_summary_text.insert(tk.END, "\n" + "=" * 36 + "\n")
+        self._zt_summary_text.insert(tk.END, f"  🤖 AI 题材聚类 {td}{suffix}\n")
+        self._zt_summary_text.insert(tk.END, f"  模型：{model}\n")
+        self._zt_summary_text.insert(tk.END, "=" * 36 + "\n")
+        if market_summary:
+            self._zt_summary_text.insert(tk.END, f"\n概览：{market_summary}\n")
+        if not themes:
+            self._zt_summary_text.insert(tk.END, "\n（未识别出有效题材）\n")
+        for t in themes:
+            name = str(t.get("name") or "?")
+            codes = list(t.get("codes") or [])
+            core = str(t.get("core_concept") or "").strip()
+            leaders = list(t.get("leaders") or [])
+            self._zt_summary_text.insert(tk.END, f"\n· {name}（{len(codes)}只）")
+            if core:
+                self._zt_summary_text.insert(tk.END, f" — {core}")
+            self._zt_summary_text.insert(tk.END, "\n")
+            for c in codes[:12]:
+                tag = " 🔥" if c in leaders else ""
+                self._zt_summary_text.insert(
+                    tk.END, f"   {c} {code_to_name.get(c, '')}{tag}\n"
+                )
+            if len(codes) > 12:
+                self._zt_summary_text.insert(tk.END, f"   …还有 {len(codes) - 12} 只\n")
+        self._zt_summary_text.config(state=tk.DISABLED)
+        self._zt_summary_text.see(tk.END)
+        self._zt_status_label.config(
+            text=f"AI 题材聚类完成（{len(themes)} 个题材）"
+        )
+        self.status_var.set(f"AI 题材聚类完成: {len(themes)} 题材")
+
     def _load_last_limit_up_prediction(self) -> None:
         payload = load_last_limit_up_prediction()
         self._refresh_predict_history_dates()
@@ -1196,6 +1380,14 @@ class StockMonitorApp:
         self._zt_compare_days_var = tk.StringVar(value="2")
         ttk.Entry(action_bar, textvariable=self._zt_compare_days_var, width=4).pack(side=tk.LEFT)
         ttk.Label(action_bar, text="(>2 时自动回看最近N个交易日)").pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            action_bar, text="AI 聚类题材",
+            command=self._start_ai_theme_clustering,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            action_bar, text="设置 NIM Key",
+            command=self._open_nim_key_dialog,
+        ).pack(side=tk.LEFT, padx=(4, 0))
         self._zt_status_label = ttk.Label(action_bar, text="")
         self._zt_status_label.pack(side=tk.RIGHT, padx=8)
 
