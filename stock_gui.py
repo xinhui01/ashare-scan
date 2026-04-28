@@ -41,10 +41,12 @@ from stock_store import (
     export_watchlist_csv,
     import_watchlist_csv,
     list_backups,
+    list_limit_up_compare_dates,
     list_limit_up_prediction_dates,
     load_app_config,
     load_last_limit_up_prediction,
     load_latest_scan_snapshot,
+    load_limit_up_compare_by_date,
     load_limit_up_prediction_by_date,
     load_scan_snapshot,
     load_watchlist,
@@ -52,6 +54,7 @@ from stock_store import (
     reset_all_connections,
     restore_database,
     save_app_config,
+    save_limit_up_compare_record,
     save_scan_snapshot,
     save_watchlist_item,
     delete_watchlist_item,
@@ -624,9 +627,14 @@ class StockMonitorApp:
             "result": result,
         }
         save_app_config("limit_up_compare_snapshot", payload)
+        try:
+            save_limit_up_compare_record(result)
+        except Exception:
+            pass
 
     def _load_last_limit_up_compare(self) -> None:
         payload = load_app_config("limit_up_compare_snapshot")
+        self._refresh_compare_history_dates()
         if not isinstance(payload, dict):
             return
         result = payload.get("result")
@@ -637,10 +645,56 @@ class StockMonitorApp:
         compare_days = int(result.get("compare_days", 2) or 2)
         if today_date:
             self._zt_today_var.set(today_date)
+            if hasattr(self, "_zt_history_var"):
+                self._zt_history_var.set(today_date)
         if yesterday_date:
             self._zt_yesterday_var.set(yesterday_date)
         self._zt_compare_days_var.set(str(max(2, compare_days)))
         self._apply_limit_up_compare(result, persist=False, status_message="已从本地恢复涨停对比")
+
+    def _refresh_compare_history_dates(self, select: Optional[str] = None) -> None:
+        """刷新涨停对比的历史日期下拉框；可选地选中指定日期。"""
+        if not hasattr(self, "_zt_history_combo"):
+            return
+        try:
+            dates = list_limit_up_compare_dates()
+        except Exception:
+            dates = []
+        self._zt_history_combo["values"] = dates
+        if select and select in dates:
+            self._zt_history_var.set(select)
+        elif not self._zt_history_var.get() and dates:
+            self._zt_history_var.set(dates[0])
+
+    def _on_compare_history_selected(self, _event=None) -> None:
+        today_date = (self._zt_history_var.get() or "").strip()
+        if not today_date:
+            return
+        result = load_limit_up_compare_by_date(today_date)
+        if not isinstance(result, dict):
+            self._zt_status_label.config(text=f"无 {today_date} 的历史对比")
+            return
+        yesterday_date = str(result.get("yesterday_date") or "").strip()
+        compare_days = int(result.get("compare_days", 2) or 2)
+        self._zt_today_var.set(today_date)
+        if yesterday_date:
+            self._zt_yesterday_var.set(yesterday_date)
+        self._zt_compare_days_var.set(str(max(2, compare_days)))
+        self._apply_limit_up_compare(
+            result, persist=False, status_message=f"已加载 {today_date} 的涨停对比历史",
+        )
+
+    def _refresh_selected_compare_date(self) -> None:
+        """重新拉取下拉中选中的历史日期对比数据，覆盖原记录。"""
+        today_date = (self._zt_history_var.get() or "").strip()
+        if not today_date:
+            today_date = (self._zt_today_var.get() or "").strip()
+        if not today_date:
+            self._zt_status_label.config(text="请先选择要刷新的日期")
+            return
+        self._zt_today_var.set(today_date)
+        # 让 _start_limit_up_compare 自行根据 compare_days 决定是否使用 yesterday
+        self._start_limit_up_compare()
 
     def _load_last_limit_up_prediction(self) -> None:
         payload = load_last_limit_up_prediction()
@@ -1141,6 +1195,22 @@ class StockMonitorApp:
         self._zt_status_label = ttk.Label(action_bar, text="")
         self._zt_status_label.pack(side=tk.RIGHT, padx=8)
 
+        # 历史记录选择 + 刷新此日期
+        ttk.Button(
+            action_bar, text="刷新此日期",
+            command=self._refresh_selected_compare_date,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Label(action_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
+        self._zt_history_var = tk.StringVar(value="")
+        self._zt_history_combo = ttk.Combobox(
+            action_bar, textvariable=self._zt_history_var,
+            width=12, state="readonly", values=(),
+        )
+        self._zt_history_combo.pack(side=tk.RIGHT)
+        self._zt_history_combo.bind(
+            "<<ComboboxSelected>>", self._on_compare_history_selected,
+        )
+
         # ---- 主区域：左侧摘要 + 右侧表格 ----
         body = ttk.PanedWindow(compare_frame, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -1571,6 +1641,9 @@ class StockMonitorApp:
         self.status_var.set(status_message)
         if persist:
             self._save_limit_up_compare_snapshot(result)
+        # 同步刷新历史记录下拉，并选中当前结果对应的日期
+        current_today = str(result.get("today_date") or "").strip()
+        self._refresh_compare_history_dates(select=current_today or None)
 
     # ================= 涨停预测 Tab =================
     def setup_predict_tab(self):
