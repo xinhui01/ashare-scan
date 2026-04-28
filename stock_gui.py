@@ -1225,6 +1225,7 @@ class StockMonitorApp:
             "  - 超跌反弹涨停: 下跌趋势中突然涨停\n"
             "  - 趋势加速涨停: 均线多头中涨停加速\n"
             "  - 高位连板: 连续涨停\n"
+            "  - 断板反包: 近期涨停被打掉后今日反包阴线\n"
             "  - 突破平台涨停: 横盘整理后突破\n"
             "  - 首板低位涨停: 低位首次涨停\n")
         self._zt_summary_text.config(state=tk.DISABLED)
@@ -1270,6 +1271,7 @@ class StockMonitorApp:
         self._zt_pattern_tree.tag_configure("pat_breakout", background="#f3e5f5", foreground="#1f1f1f")
         self._zt_pattern_tree.tag_configure("pat_lowpos", background="#e0f7fa", foreground="#1f1f1f")
         self._zt_pattern_tree.tag_configure("pat_burst", background="#ffe9d6", foreground="#1f1f1f")
+        self._zt_pattern_tree.tag_configure("pat_wrap", background="#ffcdd2", foreground="#1f1f1f")
 
         # 昨日首板今日表现 Tab
         yest_tab = ttk.Frame(self._zt_table_nb)
@@ -1308,6 +1310,7 @@ class StockMonitorApp:
         "超跌反弹涨停": "pat_oversold",
         "趋势加速涨停": "pat_trend",
         "高位连板": "pat_streak",
+        "断板反包": "pat_wrap",
         "突破平台涨停": "pat_breakout",
         "首板低位涨停": "pat_lowpos",
     }

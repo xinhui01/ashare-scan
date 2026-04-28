@@ -1083,6 +1083,7 @@ class StockFilter:
         - 超跌反弹涨停: 近10日跌幅>10%，或收盘在MA20以下
         - 趋势加速涨停: MA5>MA10>MA20 多头排列，涨停加速
         - 高位连板: 连板数>=2
+        - 断板反包: 近5日内有过涨停但被打掉（>=3%阴线），今日重新涨停反包
         - 突破平台涨停: 近10日振幅小（横盘），涨停突破
         - 首板低位涨停: 股价在近60日低位（<30%分位）
         - 其他涨停: 不符合以上任何分类
@@ -1197,9 +1198,45 @@ class StockFilter:
         volume_burst = result["volume_burst_ratio"]
         amount_burst = result["amount_burst_ratio"]
 
+        # 断板反包检测：近期涨停被打回（明显阴线），今日重新涨停反包
+        short_board_wrap_detail: Optional[str] = None
+        if (
+            streak == 1
+            and not change_pct.empty
+            and len(close) >= 8
+            and latest_close is not None
+        ):
+            threshold_low = threshold - 0.2
+            lookback = min(5, len(close) - 1)
+            start = max(0, len(close) - 1 - lookback)
+            prior_lu_idx: Optional[int] = None
+            for i in range(len(close) - 2, start - 1, -1):
+                cp = change_pct.iloc[i]
+                if pd.notna(cp) and float(cp) >= threshold_low:
+                    prior_lu_idx = i
+                    break
+            if prior_lu_idx is not None and prior_lu_idx < len(close) - 2:
+                worst_drop: Optional[float] = None
+                for j in range(prior_lu_idx + 1, len(close) - 1):
+                    cp = change_pct.iloc[j]
+                    if pd.notna(cp) and float(cp) <= -3.0:
+                        if worst_drop is None or float(cp) < worst_drop:
+                            worst_drop = float(cp)
+                if worst_drop is not None:
+                    prior_lu_close = float(close.iloc[prior_lu_idx])
+                    if prior_lu_close > 0 and latest_close >= prior_lu_close * 0.99:
+                        gap_days = len(close) - 1 - prior_lu_idx
+                        short_board_wrap_detail = (
+                            f"前{gap_days}日涨停后被打回({worst_drop:.1f}%)，今反包"
+                        )
+
         if streak >= 2:
             result["pattern"] = "高位连板"
             result["pattern_detail"] = f"连板{streak}板"
+
+        elif short_board_wrap_detail:
+            result["pattern"] = "断板反包"
+            result["pattern_detail"] = short_board_wrap_detail
 
         elif result["is_volume_burst"]:
             result["pattern"] = "暴量涨停"
