@@ -1922,6 +1922,8 @@ class StockFilter:
                 "profile_samples": feature_samples,
                 "continuation_candidates": [],
                 "first_board_candidates": [],
+                "fresh_first_board_candidates": [],
+                "broken_board_wrap_candidates": [],
                 "hot_industries": {},
                 "summary": summary,
             }
@@ -2010,6 +2012,13 @@ class StockFilter:
             spot_df, zt_codes, hot_industries, compare_context, progress_callback,
         )
 
+        # 阶段7：断板反包候选（近期涨停被打掉，今日逼近反包）
+        if self._log:
+            self._log("涨停预测：阶段7 - 识别断板反包候选...")
+        broken_board_wrap_candidates = self._scan_broken_board_wrap_candidates_cached(
+            spot_df, zt_codes, hot_industries, compare_context, progress_callback,
+        )
+
         # 摘要
         summary_lines = [
             f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
@@ -2018,6 +2027,7 @@ class StockFilter:
             f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
             f"五日承接候选：{len(first_board_candidates)} 只（得分>=50）",
             f"首板涨停候选：{len(fresh_first_board_candidates)} 只（10日未涨停，得分>=50）",
+            f"断板反包候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉，得分>=50）",
         ]
         latest_cont_rate = compare_context.get("latest_continuation_rate")
         avg_cont_rate = compare_context.get("avg_continuation_rate")
@@ -2036,6 +2046,7 @@ class StockFilter:
             "continuation_candidates": continuation_candidates,
             "first_board_candidates": first_board_candidates,
             "fresh_first_board_candidates": fresh_first_board_candidates,
+            "broken_board_wrap_candidates": broken_board_wrap_candidates,
             "hot_industries": hot_industries,
             "compare_context": compare_context,
             "summary": "\n".join(summary_lines),
@@ -2852,6 +2863,253 @@ class StockFilter:
             "score": final_score,
             "reasons": " / ".join(reasons[:8]),
             "predict_type": "首板涨停",
+        }
+
+    def _scan_broken_board_wrap_candidates_cached(
+        self,
+        spot_df: Optional[pd.DataFrame],
+        zt_codes: set,
+        hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        *,
+        lookback_days: int = 5,
+        drop_threshold_pct: float = -3.0,
+    ) -> List[Dict[str, Any]]:
+        """识别"断板反包"候选：近 lookback_days 内有过涨停被打掉(>=3%阴线)，
+        今日价格接近前涨停日收盘，明日有望以涨停反包之前的下跌。
+        """
+        if spot_df is None or spot_df.empty:
+            return []
+
+        seen: set = set()
+        merged: List[Dict[str, Any]] = []
+        for rec in self._filter_strong_stocks(spot_df, zt_codes):
+            if rec["code"] in seen:
+                continue
+            seen.add(rec["code"])
+            merged.append(rec)
+        for rec in self._filter_ma5_pullback_stocks(spot_df, zt_codes):
+            if rec["code"] in seen:
+                continue
+            seen.add(rec["code"])
+            merged.append(rec)
+        if not merged:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        total = len(merged)
+        for idx, rec in enumerate(merged):
+            score_info = self._score_broken_board_wrap(
+                rec, hot_industries, compare_context,
+                lookback_days=lookback_days, drop_threshold_pct=drop_threshold_pct,
+            )
+            if score_info is not None and score_info["score"] >= 50:
+                candidates.append(score_info)
+            if progress_callback:
+                progress_callback(idx + 1, total, f"反包筛选 {rec['code']} {rec.get('name', '')}")
+
+        candidates.sort(key=lambda x: -x["score"])
+        return candidates[:50]
+
+    def _score_broken_board_wrap(
+        self,
+        rec: Dict[str, Any],
+        hot_industries: Dict[str, int],
+        compare_context: Dict[str, Any],
+        *,
+        lookback_days: int = 5,
+        drop_threshold_pct: float = -3.0,
+    ) -> Optional[Dict[str, Any]]:
+        """对断板反包候选评分。
+
+        触发条件（强制）：
+        1. 近 lookback_days 内存在涨停日（不含今日）
+        2. 该涨停日与今日之间至少出现一根 ≤ drop_threshold_pct 的阴线
+        3. 今日收盘 < 前涨停日收盘（否则已反包，归"保留涨停"路径）
+        4. 反包缺口 ≤ 11%（明日单板可覆盖）
+        """
+        code = rec["code"]
+        name = rec.get("name", "")
+        change_pct = rec.get("change_pct")
+        turnover = rec.get("turnover")
+        industry = rec.get("industry", "")
+
+        try:
+            history = self.fetcher.get_history_data(
+                code, days=65, force_refresh=False,
+                request_plan=self._build_local_cache_history_plan(reason="predict-broken-wrap-cache-only"),
+            )
+        except Exception as exc:
+            logger.debug("反包预测获取历史 %s 失败: %s", code, exc)
+            history = None
+
+        if history is None or history.empty or len(history) < 8:
+            return None
+
+        df = history.sort_values("date").reset_index(drop=True)
+        close = pd.to_numeric(df["close"], errors="coerce")
+        volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+
+        t = len(df) - 1
+        latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else rec.get("close")
+        if latest_close is None or latest_close <= 0:
+            return None
+
+        threshold = self._limit_up_threshold_pct(code)
+
+        # 1) 在 [t-lookback_days, t-1] 找最近一次涨停
+        start = max(1, t - lookback_days)
+        prior_lu_idx: Optional[int] = None
+        for i in range(t - 1, start - 1, -1):
+            if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
+                continue
+            chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+            if chg_i >= threshold - 0.3:
+                prior_lu_idx = i
+                break
+        if prior_lu_idx is None:
+            return None
+
+        # 2) 之间至少一根明显阴线
+        worst_drop: Optional[float] = None
+        bearish_days = 0
+        for j in range(prior_lu_idx + 1, t):
+            if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]) or float(close.iloc[j - 1]) <= 0:
+                continue
+            chg_j = (float(close.iloc[j]) / float(close.iloc[j - 1]) - 1) * 100
+            if chg_j <= drop_threshold_pct:
+                bearish_days += 1
+                if worst_drop is None or chg_j < worst_drop:
+                    worst_drop = chg_j
+        if worst_drop is None:
+            return None
+
+        prior_lu_close = float(close.iloc[prior_lu_idx])
+        if prior_lu_close <= 0:
+            return None
+
+        # 3) 今日不能已经反包（否则今日就该是涨停，归"保留涨停"分支）
+        wrap_gap_pct = (prior_lu_close / latest_close - 1) * 100
+        if wrap_gap_pct <= 0.0:
+            return None
+        # 4) 缺口太大单板覆盖不了
+        if wrap_gap_pct > 11.0:
+            return None
+
+        score = 0.0
+        reasons: List[str] = []
+
+        # 反包缺口（甜区 1~5%）
+        if wrap_gap_pct <= 2.0:
+            score += 26
+            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%临界+26")
+        elif wrap_gap_pct <= 5.0:
+            score += 22
+            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%甜区+22")
+        elif wrap_gap_pct <= 8.0:
+            score += 12
+            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%可达+12")
+        else:
+            score += 4
+            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%偏远+4")
+
+        # 今日动能
+        if change_pct is not None:
+            if change_pct >= 6.0:
+                score += 20
+                reasons.append(f"今涨{change_pct:.1f}%放量上攻+20")
+            elif change_pct >= 3.0:
+                score += 12
+                reasons.append(f"今涨{change_pct:.1f}%企稳+12")
+            elif change_pct >= 1.0:
+                score += 6
+                reasons.append(f"今涨{change_pct:.1f}%温和+6")
+            elif change_pct < -1.0:
+                score -= 10
+                reasons.append(f"今跌{change_pct:.1f}%-10")
+
+        # 量比
+        vol_ratio: Optional[float] = None
+        if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
+            vol_window = volume.iloc[max(0, t - 5):t].dropna()
+            if not vol_window.empty and float(vol_window.mean()) > 0:
+                vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+        if vol_ratio is not None:
+            if vol_ratio >= 2.0:
+                score += 18
+                reasons.append(f"量比{vol_ratio:.1f}x爆量+18")
+            elif vol_ratio >= 1.4:
+                score += 10
+                reasons.append(f"量比{vol_ratio:.1f}x放量+10")
+            elif vol_ratio < 0.8:
+                score -= 8
+                reasons.append(f"量比{vol_ratio:.1f}x缩量-8")
+
+        # 阴线深度（反包深阴更醒目）
+        if worst_drop <= -7.0:
+            score += 8
+            reasons.append(f"前阴{worst_drop:.1f}%深坑+8")
+        elif worst_drop <= -5.0:
+            score += 4
+            reasons.append(f"前阴{worst_drop:.1f}%+4")
+
+        # 距前涨停天数（1~3 天最佳）
+        days_since_lu = t - prior_lu_idx
+        if days_since_lu == 1:
+            score += 8
+            reasons.append("昨涨停今回踩+8")
+        elif days_since_lu in (2, 3):
+            score += 12
+            reasons.append(f"前{days_since_lu}日涨停+12")
+        elif days_since_lu <= 5:
+            score += 5
+            reasons.append(f"前{days_since_lu}日涨停+5")
+
+        # 行业
+        if industry and hot_industries.get(industry, 0) >= 3:
+            score += 10
+            reasons.append(f"热门板块({hot_industries[industry]}只)+10")
+        elif industry and hot_industries.get(industry, 0) >= 2:
+            score += 5
+            reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+
+        # 大盘环境
+        latest_cont_rate = compare_context.get("latest_continuation_rate")
+        if latest_cont_rate is not None:
+            if latest_cont_rate >= 60:
+                score += 4
+                reasons.append(f"晋级率{latest_cont_rate:.0f}%+4")
+            elif latest_cont_rate < 25:
+                score -= 4
+                reasons.append(f"晋级率{latest_cont_rate:.0f}%-4")
+
+        final_score = max(0, min(100, int(round(score))))
+
+        prior_lu_date: Optional[str] = None
+        if "date" in df.columns:
+            try:
+                prior_lu_date = str(df["date"].iloc[prior_lu_idx])
+            except Exception:
+                prior_lu_date = None
+
+        return {
+            "code": code,
+            "name": name,
+            "industry": industry,
+            "close": latest_close,
+            "change_pct": change_pct,
+            "turnover": turnover,
+            "prior_lu_date": prior_lu_date,
+            "prior_lu_close": prior_lu_close,
+            "days_since_lu": days_since_lu,
+            "wrap_gap_pct": round(wrap_gap_pct, 2),
+            "worst_drop": round(worst_drop, 2),
+            "bearish_days": bearish_days,
+            "volume_ratio": vol_ratio,
+            "score": final_score,
+            "reasons": " / ".join(reasons[:8]),
+            "predict_type": "断板反包",
         }
 
     def _scan_first_board_candidates_cached(

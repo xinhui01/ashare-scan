@@ -115,6 +115,8 @@ class StockMonitorApp:
         self._predict_first_sort_reverse = True
         self._predict_fresh_sort_column = "score"
         self._predict_fresh_sort_reverse = True
+        self._predict_wrap_sort_column = "score"
+        self._predict_wrap_sort_reverse = True
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -1815,6 +1817,38 @@ class StockMonitorApp:
         self._predict_fresh_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
         self._predict_fresh_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
 
+        # 断板反包候选 Tab（近期涨停被打掉，今日逼近反包）
+        wrap_tab = ttk.Frame(self._predict_table_nb)
+        self._predict_table_nb.add(wrap_tab, text="断板反包候选")
+        wrap_cols = ("code", "name", "industry", "change_pct", "close",
+                     "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
+                     "worst_drop", "volume_ratio", "score", "reasons")
+        self._predict_wrap_tree = ttk.Treeview(
+            wrap_tab, columns=wrap_cols, show="headings", height=22, style="Predict.Treeview",
+        )
+        for col, (heading, w) in {
+            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "prior_lu_date": ("前涨停日", 90), "prior_lu_close": ("前涨停价", 75),
+            "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
+            "worst_drop": ("最深阴线%", 80), "volume_ratio": ("量比", 60),
+            "score": ("预测分", 65), "reasons": ("预测依据", 300),
+        }.items():
+            self._predict_wrap_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_predict_heading_click("wrap", c),
+            )
+            self._predict_wrap_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+        sb_wrap = ttk.Scrollbar(wrap_tab, orient=tk.VERTICAL, command=self._predict_wrap_tree.yview)
+        self._predict_wrap_tree.configure(yscrollcommand=sb_wrap.set)
+        sb_wrap.pack(side=tk.RIGHT, fill=tk.Y)
+        self._predict_wrap_tree.pack(fill=tk.BOTH, expand=True)
+        self._predict_wrap_tree.bind("<<TreeviewSelect>>", self._on_predict_stock_select)
+        self._predict_wrap_tree.bind("<Double-1>", self._on_predict_stock_double_click)
+        self._predict_wrap_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
+        self._predict_wrap_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
+        self._predict_wrap_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
+
         body.add(table_frame, weight=4)
 
         self._predict_thread: Optional[threading.Thread] = None
@@ -1848,9 +1882,14 @@ class StockMonitorApp:
             "volume_ratio": record.get("volume_ratio"),
             "trend_5d": record.get("trend_5d"),
             "position_60d": record.get("position_60d"),
+            "prior_lu_date": record.get("prior_lu_date"),
+            "prior_lu_close": record.get("prior_lu_close"),
+            "wrap_gap": record.get("wrap_gap_pct"),
+            "days_since_lu": record.get("days_since_lu"),
+            "worst_drop": record.get("worst_drop"),
         }
         value = value_map.get(column)
-        if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code"}:
+        if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
             return str(value or "")
         if value is None or value == "":
             return float("-inf")
@@ -1872,6 +1911,10 @@ class StockMonitorApp:
             column = self._predict_fresh_sort_column
             reverse = self._predict_fresh_sort_reverse
             secondary = ["score", "volume_ratio", "change_pct", "turnover"]
+        elif table_kind == "wrap":
+            column = self._predict_wrap_sort_column
+            reverse = self._predict_wrap_sort_reverse
+            secondary = ["score", "wrap_gap", "change_pct", "volume_ratio"]
         else:
             column = self._predict_first_sort_column
             reverse = self._predict_first_sort_reverse
@@ -1901,6 +1944,13 @@ class StockMonitorApp:
             else:
                 self._predict_fresh_sort_column = column
                 self._predict_fresh_sort_reverse = column in {"score", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover"}
+        elif table_kind == "wrap":
+            if column == self._predict_wrap_sort_column:
+                self._predict_wrap_sort_reverse = not self._predict_wrap_sort_reverse
+            else:
+                self._predict_wrap_sort_column = column
+                # 反包缺口越小越好，因此 wrap_gap / days_since_lu 默认升序
+                self._predict_wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close"}
         else:
             if column == self._predict_first_sort_column:
                 self._predict_first_sort_reverse = not self._predict_first_sort_reverse
@@ -1996,6 +2046,7 @@ class StockMonitorApp:
         cont_list = self._sort_predict_records(list(result.get("continuation_candidates", [])), "cont")
         first_list = self._sort_predict_records(list(result.get("first_board_candidates", [])), "first")
         fresh_list = self._sort_predict_records(list(result.get("fresh_first_board_candidates", [])), "fresh")
+        wrap_list = self._sort_predict_records(list(result.get("broken_board_wrap_candidates", [])), "wrap")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
         compare_context = result.get("compare_context", {})
@@ -2081,6 +2132,19 @@ class StockMonitorApp:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
+        if wrap_list:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, f"  断板反包候选 TOP10\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for rec in wrap_list[:10]:
+                chg = rec.get("change_pct")
+                chg_text = f"{chg:.1f}%" if chg is not None else "-"
+                gap = rec.get("wrap_gap_pct")
+                gap_text = f"差{gap:.1f}%" if gap is not None else "-"
+                txt.insert(tk.END,
+                    f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {gap_text:7s}  "
+                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
+
         # 热门行业
         if hot_industries:
             txt.insert(tk.END, f"\n{'='*36}\n")
@@ -2155,14 +2219,37 @@ class StockMonitorApp:
             )
             self._predict_fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
 
+        # ---- 填充断板反包候选表格 ----
+        self._predict_wrap_tree.delete(*self._predict_wrap_tree.get_children())
+        for rec in wrap_list:
+            tag = self._score_tag(rec.get("score", 0))
+            vals = (
+                rec.get("code", ""),
+                rec.get("name", ""),
+                rec.get("industry", ""),
+                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
+                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
+                rec.get("prior_lu_date", "-") or "-",
+                f"{rec['prior_lu_close']:.2f}" if rec.get("prior_lu_close") is not None else "-",
+                f"{rec['wrap_gap_pct']:.1f}" if rec.get("wrap_gap_pct") is not None else "-",
+                str(rec.get("days_since_lu", "-")) if rec.get("days_since_lu") is not None else "-",
+                f"{rec['worst_drop']:.1f}" if rec.get("worst_drop") is not None else "-",
+                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                str(rec.get("score", 0)),
+                rec.get("reasons", ""),
+            )
+            self._predict_wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
+
         # 更新Tab标题显示数量
         self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
         self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
         self._predict_table_nb.tab(2, text=f"首板涨停候选({len(fresh_list)})")
+        self._predict_table_nb.tab(3, text=f"断板反包候选({len(wrap_list)})")
 
         self._predict_status_label.config(text="")
         self.status_var.set(
-            f"涨停预测完成: 保留涨停{len(cont_list)}只 / 五日承接{len(first_list)}只 / 首板{len(fresh_list)}只"
+            f"涨停预测完成: 保留涨停{len(cont_list)} / 五日承接{len(first_list)} / "
+            f"首板{len(fresh_list)} / 反包{len(wrap_list)}"
         )
 
         # 同步刷新历史记录下拉，并选中当前结果对应的日期
