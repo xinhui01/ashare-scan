@@ -1887,6 +1887,60 @@ class StockMonitorApp:
             "<<ComboboxSelected>>", self._on_predict_history_selected,
         )
 
+        # ---- 筛选栏 ----
+        filter_bar = ttk.Frame(predict_frame)
+        filter_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(filter_bar, text="最低分:").pack(side=tk.LEFT)
+        self._predict_filter_min_score = tk.IntVar(value=0)
+        ttk.Spinbox(
+            filter_bar, from_=0, to=100, increment=5, width=4,
+            textvariable=self._predict_filter_min_score,
+            command=self._on_predict_filter_changed,
+        ).pack(side=tk.LEFT, padx=(2, 10))
+
+        ttk.Label(filter_bar, text="关键词:").pack(side=tk.LEFT)
+        self._predict_filter_keyword = tk.StringVar(value="")
+        kw_entry = ttk.Entry(filter_bar, textvariable=self._predict_filter_keyword, width=14)
+        kw_entry.pack(side=tk.LEFT, padx=(2, 10))
+        kw_entry.bind("<KeyRelease>", lambda _e: self._on_predict_filter_changed())
+
+        ttk.Label(filter_bar, text="行业:").pack(side=tk.LEFT)
+        self._predict_filter_industry = tk.StringVar(value="全部")
+        self._predict_filter_industry_combo = ttk.Combobox(
+            filter_bar, textvariable=self._predict_filter_industry,
+            width=14, state="readonly", values=("全部",),
+        )
+        self._predict_filter_industry_combo.pack(side=tk.LEFT, padx=(2, 10))
+        self._predict_filter_industry_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._on_predict_filter_changed(),
+        )
+
+        self._predict_filter_lhb_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_bar, text="仅 LHB", variable=self._predict_filter_lhb_only,
+            command=self._on_predict_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._predict_filter_northbound_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_bar, text="仅北向加仓", variable=self._predict_filter_northbound_only,
+            command=self._on_predict_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self._predict_filter_theme_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_bar, text="仅命中题材", variable=self._predict_filter_theme_only,
+            command=self._on_predict_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(
+            filter_bar, text="重置筛选",
+            command=self._reset_predict_filters,
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        self._predict_filter_count_label = ttk.Label(filter_bar, text="", foreground="#666")
+        self._predict_filter_count_label.pack(side=tk.RIGHT, padx=8)
+
         # ---- 主区域：左侧摘要 + 右侧表格 ----
         body = ttk.PanedWindow(predict_frame, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -2421,6 +2475,130 @@ class StockMonitorApp:
                            "综合判断。\n")
         self._predict_summary_text.config(state=tk.DISABLED)
 
+        # 保存原始 5 类候选，供筛选实时重渲染
+        self._predict_lists = {
+            "cont": cont_list, "first": first_list, "fresh": fresh_list,
+            "wrap": wrap_list, "trend": trend_list,
+        }
+        self._predict_compare_context = compare_context
+
+        # 刷新行业下拉选项
+        self._refresh_predict_industry_options()
+
+        # 渲染 5 个候选表（应用当前筛选）
+        self._render_predict_trees()
+
+        # 同步刷新历史记录下拉，并选中当前结果对应的日期
+        current_date = str(result.get("trade_date") or "").strip()
+        self._refresh_predict_history_dates(select=current_date or None)
+
+        # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
+        # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
+        if (
+            len(cont_list) > 0
+            and len(first_list) == 0
+            and len(fresh_list) == 0
+            and len(wrap_list) == 0
+            and len(trend_list) == 0
+        ):
+            messagebox.showwarning(
+                "历史数据未就绪",
+                "本地历史 K 线缓存尚未预热，\n"
+                "「五日承接 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
+                "首次点击会触发后台缓存预取，\n"
+                "请稍等几秒后再次点击「预测涨停数据」按钮，\n"
+                "即可看到完整候选列表。",
+                parent=self.root,
+            )
+
+    # ============== 候选筛选与表格渲染 ==============
+    def _refresh_predict_industry_options(self) -> None:
+        """根据当前 5 类候选，刷新行业下拉选项。"""
+        industries: set = set()
+        for lst in (self._predict_lists or {}).values():
+            for rec in lst or []:
+                ind = (rec.get("industry") or "").strip()
+                if ind:
+                    industries.add(ind)
+        values = ("全部",) + tuple(sorted(industries))
+        try:
+            self._predict_filter_industry_combo.configure(values=values)
+        except Exception:
+            return
+        if self._predict_filter_industry.get() not in values:
+            self._predict_filter_industry.set("全部")
+
+    def _reset_predict_filters(self) -> None:
+        self._predict_filter_min_score.set(0)
+        self._predict_filter_keyword.set("")
+        self._predict_filter_industry.set("全部")
+        self._predict_filter_lhb_only.set(False)
+        self._predict_filter_northbound_only.set(False)
+        self._predict_filter_theme_only.set(False)
+        self._render_predict_trees()
+
+    def _on_predict_filter_changed(self) -> None:
+        """筛选条件变化时重渲染表格（不重跑预测）。"""
+        self._render_predict_trees()
+
+    def _matches_predict_filters(self, rec: Dict[str, Any]) -> bool:
+        """记录是否通过当前筛选条件。"""
+        try:
+            min_score = int(self._predict_filter_min_score.get() or 0)
+        except (TypeError, ValueError, tk.TclError):
+            min_score = 0
+        if int(rec.get("score") or 0) < min_score:
+            return False
+
+        kw = (self._predict_filter_keyword.get() or "").strip().lower()
+        if kw:
+            haystack = " ".join(str(rec.get(f, "") or "") for f in
+                                ("code", "name", "industry", "reasons", "predict_type"))
+            if kw not in haystack.lower():
+                return False
+
+        ind_filter = (self._predict_filter_industry.get() or "全部").strip()
+        if ind_filter and ind_filter != "全部":
+            if (rec.get("industry") or "").strip() != ind_filter:
+                return False
+
+        ctx = self._predict_compare_context or {}
+        code = (rec.get("code") or "").strip().zfill(6)
+
+        if self._predict_filter_lhb_only.get():
+            lhb = (ctx.get("lhb_map") or {}).get(code)
+            if not lhb or float((lhb or {}).get("net_buy") or 0) <= 0:
+                return False
+
+        if self._predict_filter_northbound_only.get():
+            nb = (ctx.get("northbound_map") or {}).get(code, 0)
+            if not isinstance(nb, (int, float)) or nb < 200:
+                return False
+
+        if self._predict_filter_theme_only.get():
+            theme_map = ctx.get("code_theme_map") or {}
+            industry_heat = ctx.get("industry_theme_heat") or {}
+            in_theme = code in theme_map
+            ind_heat = industry_heat.get((rec.get("industry") or ""), 0)
+            if not in_theme and ind_heat < 2:
+                return False
+
+        return True
+
+    def _filter_predict_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [r for r in (records or []) if self._matches_predict_filters(r)]
+
+    def _render_predict_trees(self) -> None:
+        """根据当前筛选条件渲染 5 个候选表。"""
+        if not getattr(self, "_predict_lists", None):
+            return
+
+        cont_list = self._filter_predict_records(self._predict_lists.get("cont", []))
+        first_list = self._filter_predict_records(self._predict_lists.get("first", []))
+        fresh_list = self._filter_predict_records(self._predict_lists.get("fresh", []))
+        wrap_list = self._filter_predict_records(self._predict_lists.get("wrap", []))
+        trend_list = self._filter_predict_records(self._predict_lists.get("trend", []))
+
         # ---- 填充连板延续表格 ----
         self._predict_cont_tree.delete(*self._predict_cont_tree.get_children())
         for rec in cont_list:
@@ -2479,7 +2657,7 @@ class StockMonitorApp:
             )
             self._predict_fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
 
-        # ---- 填充断板反包候选表格 ----
+        # ---- 填充反包/承接候选表格 ----
         self._predict_wrap_tree.delete(*self._predict_wrap_tree.get_children())
         _PATTERN_LABELS = {"wrap": "断板反包", "hold_strong": "强势承接"}
         for rec in wrap_list:
@@ -2524,41 +2702,33 @@ class StockMonitorApp:
             )
             self._predict_trend_tree.insert("", tk.END, values=vals, tags=(tag,))
 
-        # 更新Tab标题显示数量
-        self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
-        self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
-        self._predict_table_nb.tab(2, text=f"首板涨停候选({len(fresh_list)})")
-        self._predict_table_nb.tab(3, text=f"反包/承接候选({len(wrap_list)})")
-        self._predict_table_nb.tab(4, text=f"趋势涨停候选({len(trend_list)})")
+        # 更新 Tab 标题：显示「筛选后/总数」
+        raw = getattr(self, "_predict_lists", {}) or {}
+        total_cont = len(raw.get("cont", []))
+        total_first = len(raw.get("first", []))
+        total_fresh = len(raw.get("fresh", []))
+        total_wrap = len(raw.get("wrap", []))
+        total_trend = len(raw.get("trend", []))
+        def _label(name: str, shown: int, total: int) -> str:
+            return f"{name}({shown}/{total})" if shown != total else f"{name}({total})"
+        self._predict_table_nb.tab(0, text=_label("保留涨停候选", len(cont_list), total_cont))
+        self._predict_table_nb.tab(1, text=_label("五日承接候选", len(first_list), total_first))
+        self._predict_table_nb.tab(2, text=_label("首板涨停候选", len(fresh_list), total_fresh))
+        self._predict_table_nb.tab(3, text=_label("反包/承接候选", len(wrap_list), total_wrap))
+        self._predict_table_nb.tab(4, text=_label("趋势涨停候选", len(trend_list), total_trend))
+
+        shown_total = len(cont_list) + len(first_list) + len(fresh_list) + len(wrap_list) + len(trend_list)
+        raw_total = total_cont + total_first + total_fresh + total_wrap + total_trend
+        if shown_total != raw_total:
+            self._predict_filter_count_label.config(text=f"筛选后 {shown_total}/{raw_total}")
+        else:
+            self._predict_filter_count_label.config(text=f"共 {raw_total} 只")
 
         self._predict_status_label.config(text="")
         self.status_var.set(
-            f"涨停预测完成: 保留涨停{len(cont_list)} / 五日承接{len(first_list)} / "
-            f"首板{len(fresh_list)} / 反包{len(wrap_list)} / 趋势{len(trend_list)}"
+            f"涨停预测完成: 保留涨停{total_cont} / 五日承接{total_first} / "
+            f"首板{total_fresh} / 反包{total_wrap} / 趋势{total_trend}"
         )
-
-        # 同步刷新历史记录下拉，并选中当前结果对应的日期
-        current_date = str(result.get("trade_date") or "").strip()
-        self._refresh_predict_history_dates(select=current_date or None)
-
-        # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
-        # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
-        if (
-            len(cont_list) > 0
-            and len(first_list) == 0
-            and len(fresh_list) == 0
-            and len(wrap_list) == 0
-            and len(trend_list) == 0
-        ):
-            messagebox.showwarning(
-                "历史数据未就绪",
-                "本地历史 K 线缓存尚未预热，\n"
-                "「五日承接 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
-                "首次点击会触发后台缓存预取，\n"
-                "请稍等几秒后再次点击「预测涨停数据」按钮，\n"
-                "即可看到完整候选列表。",
-                parent=self.root,
-            )
 
     def _on_predict_stock_select(self, event):
         tree = event.widget
