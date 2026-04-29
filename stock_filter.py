@@ -1950,6 +1950,71 @@ class StockFilter:
             if self._log:
                 self._log(f"涨停预测：提取涨停股代码 {len(zt_codes)} 只")
 
+        # 阶段2.5：尝试读取已缓存的 AI 题材聚类，作为预测打分的题材热度维度
+        # 仅使用缓存，不主动触发 LLM 调用；缓存缺失则跳过题材加分
+        try:
+            from llm_theme_clustering import load_cached_themes
+            themes_payload = load_cached_themes(trade_date) or {}
+        except Exception as exc:
+            logger.debug("加载题材聚类缓存失败: %s", exc)
+            themes_payload = {}
+
+        themes = themes_payload.get("themes") or []
+        code_industry_map: Dict[str, str] = {
+            r["code"]: r.get("industry", "") for r in all_pool_records
+        }
+        code_theme_map: Dict[str, str] = {}
+        theme_size_map: Dict[str, int] = {}
+        industry_theme_heat: Dict[str, int] = {}
+        for theme in themes:
+            try:
+                name = str(theme.get("name", "")).strip()
+                codes_in_theme = [str(c).strip().zfill(6) for c in (theme.get("codes") or [])]
+            except Exception:
+                continue
+            if not name or len(codes_in_theme) < 2:
+                continue
+            size = len(codes_in_theme)
+            theme_size_map[name] = size
+            inds_in_theme: set = set()
+            for c in codes_in_theme:
+                code_theme_map[c] = name
+                ind = code_industry_map.get(c) or ""
+                if ind:
+                    inds_in_theme.add(ind)
+            for ind in inds_in_theme:
+                if industry_theme_heat.get(ind, 0) < size:
+                    industry_theme_heat[ind] = size
+
+        # 把题材信息塞进 compare_context，所有 scorer 共用
+        compare_context["industry_theme_heat"] = industry_theme_heat
+        compare_context["code_theme_map"] = code_theme_map
+        compare_context["theme_size_map"] = theme_size_map
+        if self._log and themes:
+            self._log(f"涨停预测：加载题材聚类缓存 {len(themes)} 个题材，"
+                      f"覆盖 {len(code_theme_map)} 只涨停股 / {len(industry_theme_heat)} 个行业")
+        elif self._log:
+            self._log("涨停预测：未找到题材聚类缓存（如需题材加分，请先在涨停对比 tab 跑一次 AI 题材聚类）")
+
+        # 阶段2.6：加载龙虎榜 + 北向资金（失败不影响预测）
+        if self._log:
+            self._log("涨停预测：正在加载龙虎榜 / 北向资金...")
+        try:
+            lhb_map = self._load_lhb_for_date(trade_date)
+        except Exception as exc:
+            logger.debug("龙虎榜加载异常: %s", exc)
+            lhb_map = {}
+        try:
+            northbound_map = self._load_northbound_accumulation()
+        except Exception as exc:
+            logger.debug("北向资金加载异常: %s", exc)
+            northbound_map = {}
+
+        compare_context["lhb_map"] = lhb_map
+        compare_context["northbound_map"] = northbound_map
+        if self._log:
+            self._log(f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 北向 3 日榜 {len(northbound_map)} 只")
+
         # 阶段3：统一预取所有需要的历史数据（一次搞定）
         if self._log:
             self._log("涨停预测：阶段3 - 统一预取历史数据...")
@@ -2034,8 +2099,8 @@ class StockFilter:
             f"今日涨停总数：{len(all_pool_records)} 只",
             f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
             f"五日承接候选：{len(first_board_candidates)} 只（得分>=50）",
-            f"首板涨停候选：{len(fresh_first_board_candidates)} 只（10日未涨停，得分>=50）",
-            f"断板反包候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉，得分>=50）",
+            f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=50）",
+            f"反包/承接候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉反包 / 不破前涨停价承接，得分>=50）",
             f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=50）",
         ]
         latest_cont_rate = compare_context.get("latest_continuation_rate")
@@ -2047,6 +2112,24 @@ class StockFilter:
         if hot_industries:
             top3 = sorted(hot_industries.items(), key=lambda x: -x[1])[:3]
             summary_lines.append(f"热门行业：{'、'.join(f'{k}({v})' for k, v in top3)}")
+        if theme_size_map:
+            top_themes = sorted(theme_size_map.items(), key=lambda x: -x[1])[:3]
+            summary_lines.append(
+                f"AI 题材聚类：{'、'.join(f'{k}({v}只)' for k, v in top_themes)}"
+            )
+        if lhb_map:
+            net_buys = [(c, v.get("net_buy", 0)) for c, v in lhb_map.items() if v.get("net_buy", 0) > 0]
+            net_buys.sort(key=lambda x: -x[1])
+            if net_buys:
+                top_lhb = net_buys[:3]
+                summary_lines.append(
+                    f"龙虎榜净买 TOP3：{'、'.join(f'{c}({v/1e8:.2f}亿)' for c, v in top_lhb)}"
+                )
+        if northbound_map:
+            top_nb = sorted(northbound_map.items(), key=lambda x: -x[1])[:3]
+            summary_lines.append(
+                f"北向 3 日加仓 TOP3：{'、'.join(f'{c}({v/1e4:.2f}亿)' for c, v in top_nb if v > 0)}"
+            )
 
         result = {
             "trade_date": trade_date,
@@ -2149,6 +2232,121 @@ class StockFilter:
             return {}
         counts = pool_df["所属行业"].astype(str).value_counts().to_dict()
         return {k: int(v) for k, v in counts.items() if k and k.lower() != "nan"}
+
+    def _theme_bonus(
+        self,
+        code: str,
+        industry: str,
+        compare_context: Dict[str, Any],
+    ) -> Tuple[float, Optional[str]]:
+        """根据 AI 题材聚类缓存返回题材热度加分。
+
+        优先级：
+        1. 候选 code 直接命中题材 → 用题材规模
+        2. 否则通过行业映射到最热题材 → 用题材规模
+        无缓存或不命中返回 (0, None)。
+        """
+        code_theme_map = compare_context.get("code_theme_map") or {}
+        theme_size_map = compare_context.get("theme_size_map") or {}
+        industry_theme_heat = compare_context.get("industry_theme_heat") or {}
+
+        theme_name = code_theme_map.get(code)
+        size = 0
+        direct_hit = False
+        if theme_name:
+            size = int(theme_size_map.get(theme_name, 0))
+            direct_hit = True
+        elif industry:
+            size = int(industry_theme_heat.get(industry, 0))
+
+        if size >= 6:
+            label = f"题材龙头{size}只" if direct_hit else f"题材族群{size}只"
+            return 8.0, f"{label}+8"
+        if size >= 4:
+            label = f"题材{size}只" if direct_hit else f"题材关联{size}只"
+            return 5.0, f"{label}+5"
+        if size >= 2 and direct_hit:
+            return 2.0, f"同题材+2"
+        return 0.0, None
+
+    def _capital_flow_bonus(
+        self,
+        code: str,
+        compare_context: Dict[str, Any],
+    ) -> Tuple[float, List[str]]:
+        """龙虎榜 + 北向资金加分。
+
+        - 龙虎榜净买入 ≥ 5000 万 → +8（强游资接力）
+        - 龙虎榜净买入 > 0 → +5
+        - 龙虎榜净卖出 ≤ -3000 万 → -5（机构出货）
+        - 龙虎榜净卖出 < 0 → -2
+        - 北向 3 日加仓 ≥ 5000 万元 → +5
+        - 北向 3 日加仓 ≥ 1000 万元 → +3
+        - 北向 3 日减仓 ≤ -3000 万元 → -3
+        """
+        bonus = 0.0
+        reasons: List[str] = []
+
+        lhb = (compare_context.get("lhb_map") or {}).get(code)
+        if isinstance(lhb, dict):
+            net = float(lhb.get("net_buy") or 0)
+            if net >= 5e7:
+                bonus += 8
+                reasons.append(f"龙虎榜净买{net/1e8:.2f}亿+8")
+            elif net > 0:
+                bonus += 5
+                reasons.append(f"龙虎榜净买{net/1e6:.0f}万+5")
+            elif net <= -3e7:
+                bonus -= 5
+                reasons.append(f"龙虎榜净卖{net/1e8:.2f}亿-5")
+            elif net < 0:
+                bonus -= 2
+                reasons.append(f"龙虎榜净卖{abs(net)/1e6:.0f}万-2")
+
+        nb_change = (compare_context.get("northbound_map") or {}).get(code)
+        if isinstance(nb_change, (int, float)):
+            # 单位：万元（akshare "3日增持估计-市值" 接口）
+            if nb_change >= 5000:
+                bonus += 5
+                reasons.append(f"北向加仓{nb_change/1e4:.1f}亿+5")
+            elif nb_change >= 1000:
+                bonus += 3
+                reasons.append(f"北向加仓{nb_change:.0f}万+3")
+            elif nb_change >= 200:
+                bonus += 1
+                reasons.append(f"北向小幅加仓{nb_change:.0f}万+1")
+            elif nb_change <= -3000:
+                bonus -= 3
+                reasons.append(f"北向减仓{abs(nb_change)/1e4:.1f}亿-3")
+            elif nb_change <= -500:
+                bonus -= 1
+                reasons.append(f"北向小幅减仓{abs(nb_change):.0f}万-1")
+
+        return bonus, reasons
+
+    def _vol_ratio_with_baseline(
+        self,
+        volume: pd.Series,
+        t: int,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """同时计算 5 日量比与 20 日量比。
+
+        20 日量比用于校验"5 日缩量调整后小放量"的假信号——
+        若 5 日量比看起来很大，但 20 日量比仍 < 1，说明只是相对前 5 天放量，
+        和真正爆量不是一回事。
+        """
+        if volume is None or volume.empty or t < 5 or pd.isna(volume.iloc[t]):
+            return None, None
+        cur = float(volume.iloc[t])
+        if cur <= 0:
+            return None, None
+
+        prev5 = volume.iloc[max(0, t - 5):t].dropna()
+        ratio5 = round(cur / float(prev5.mean()), 2) if not prev5.empty and float(prev5.mean()) > 0 else None
+
+        prev20 = volume.iloc[max(0, t - 20):t].dropna()
+        ratio20 = round(cur / float(prev20.mean()), 2) if not prev20.empty and float(prev20.mean()) > 0 else None
+        return ratio5, ratio20
 
     def _score_continuation(
         self,
@@ -2258,17 +2456,19 @@ class StockFilter:
                 score += 10
                 reasons.append("多头排列+10")
 
-            # 量能
-            if len(volume) >= 6 and not pd.isna(volume.iloc[-1]):
-                prev_vol = volume.iloc[-6:-1].dropna()
-                if not prev_vol.empty and float(prev_vol.mean()) > 0:
-                    vol_ratio = float(volume.iloc[-1]) / float(prev_vol.mean())
-                    if 1.0 <= vol_ratio <= 3.0:
-                        score += 5
-                        reasons.append(f"量比{vol_ratio:.1f}适中+5")
-                    elif vol_ratio > 5.0:
-                        score -= 5
-                        reasons.append(f"量比{vol_ratio:.1f}过大-5")
+            # 量能（5 日 + 20 日双校验）
+            t_idx = len(close) - 1
+            vol_ratio, vol_ratio_20 = self._vol_ratio_with_baseline(volume, t_idx)
+            if vol_ratio is not None:
+                if 1.0 <= vol_ratio <= 3.0:
+                    score += 5
+                    reasons.append(f"量比{vol_ratio:.1f}适中+5")
+                elif vol_ratio > 5.0:
+                    score -= 5
+                    reasons.append(f"量比{vol_ratio:.1f}过大-5")
+                if vol_ratio >= 1.5 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+                    score -= 4
+                    reasons.append(f"5d量比{vol_ratio:.1f}x但20d{vol_ratio_20:.1f}x假放量-4")
 
         final_score = max(0, min(100, int(round(score))))
         return {
@@ -2334,9 +2534,24 @@ class StockFilter:
                 score -= 5
                 reasons.append("暴量首板次日分歧-5")
 
+        # 题材热度加分（来自 AI 题材聚类缓存）
+        theme_bonus, theme_reason = self._theme_bonus(
+            rec.get("code", ""), rec.get("industry", ""), compare_context
+        )
+        if theme_bonus > 0:
+            score += theme_bonus
+            if theme_reason:
+                reasons.append(theme_reason)
+
+        # 资金面：龙虎榜 + 北向 3 日加仓
+        flow_bonus, flow_reasons = self._capital_flow_bonus(rec.get("code", ""), compare_context)
+        if flow_bonus != 0:
+            score += flow_bonus
+            reasons.extend(flow_reasons)
+
         final_score = max(0, min(100, int(round(score))))
         base["score"] = final_score
-        base["reasons"] = " / ".join(reasons[:8])
+        base["reasons"] = " / ".join(reasons[:10])
         base["predict_type"] = "保留涨停"
         return base
 
@@ -2613,6 +2828,19 @@ class StockFilter:
             score += 5
             reasons.append(f"板块联动({hot_industries[industry]}只)+5")
 
+        # 7b. 题材热度（来自 AI 题材聚类缓存，max 8）
+        theme_bonus, theme_reason = self._theme_bonus(code, industry, compare_context)
+        if theme_bonus > 0:
+            score += theme_bonus
+            if theme_reason:
+                reasons.append(theme_reason)
+
+        # 7c. 资金面：龙虎榜 + 北向 3 日加仓
+        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
+        if flow_bonus != 0:
+            score += flow_bonus
+            reasons.extend(flow_reasons)
+
         # 8. 换手率（max 5）
         if turnover is not None:
             if 3 <= turnover <= 18:
@@ -2661,7 +2889,7 @@ class StockFilter:
         compare_context: Dict[str, Any],
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         *,
-        cooldown_days: int = 10,
+        cooldown_days: int = 5,
     ) -> List[Dict[str, Any]]:
         """从全市场强势股中识别"近期未涨停、明日有望首封"的候选。
 
@@ -2706,7 +2934,7 @@ class StockFilter:
         hot_industries: Dict[str, int],
         compare_context: Dict[str, Any],
         *,
-        cooldown_days: int = 10,
+        cooldown_days: int = 5,
     ) -> Optional[Dict[str, Any]]:
         """对"近期未涨停、今日量价启动"的强势股评分。
 
@@ -2769,12 +2997,8 @@ class StockFilter:
                 score += 5
                 reasons.append(f"涨{change_pct:.1f}%温和启动+5")
 
-        # 2. 量比放大
-        vol_ratio = None
-        if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
-            vol_window = volume.iloc[max(0, t - 5):t].dropna()
-            if not vol_window.empty and float(vol_window.mean()) > 0:
-                vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+        # 2. 量比放大（叠加 20 日校验，剔除"缩量调整里的假放量"）
+        vol_ratio, vol_ratio_20 = self._vol_ratio_with_baseline(volume, t)
         if vol_ratio is not None:
             if vol_ratio >= 2.5:
                 score += 22
@@ -2788,6 +3012,10 @@ class StockFilter:
             elif vol_ratio < 1.0:
                 score -= 10
                 reasons.append(f"量比{vol_ratio:.1f}x缩量-10")
+
+            if vol_ratio >= 1.3 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+                score -= 8
+                reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-8")
 
         # 3. 均线位置：站上 MA5/MA10/MA20
         ma5 = close.rolling(5, min_periods=5).mean()
@@ -2855,6 +3083,19 @@ class StockFilter:
         elif industry and hot_industries.get(industry, 0) >= 2:
             score += 6
             reasons.append(f"板块联动({hot_industries[industry]}只)+6")
+
+        # 6b. 题材热度（来自 AI 题材聚类缓存）
+        theme_bonus, theme_reason = self._theme_bonus(code, industry, compare_context)
+        if theme_bonus > 0:
+            score += theme_bonus
+            if theme_reason:
+                reasons.append(theme_reason)
+
+        # 6c. 资金面：龙虎榜 + 北向 3 日加仓
+        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
+        if flow_bonus != 0:
+            score += flow_bonus
+            reasons.extend(flow_reasons)
 
         # 7. 换手率
         if turnover is not None:
@@ -2956,13 +3197,18 @@ class StockFilter:
         lookback_days: int = 5,
         drop_threshold_pct: float = -3.0,
     ) -> Optional[Dict[str, Any]]:
-        """对断板反包候选评分。
+        """对断板反包 / 强势承接候选评分。
 
-        触发条件（强制）：
-        1. 近 lookback_days 内存在涨停日（不含今日）
-        2. 该涨停日与今日之间至少出现一根 ≤ drop_threshold_pct 的阴线
-        3. 今日收盘 < 前涨停日收盘（否则已反包，归"保留涨停"路径）
-        4. 反包缺口 ≤ 11%（明日单板可覆盖）
+        近 lookback_days 内出现过涨停（不含今日），按今日相对前涨停价的位置分两路：
+
+        路径 A · 经典反包（今日收盘 < 前涨停价）：
+        1. 涨停日与今日之间至少出现一根 ≤ drop_threshold_pct 的阴线
+        2. 反包缺口 ≤ 11%（明日单板可覆盖）
+
+        路径 B · 强势承接 / 不破前涨停价（今日收盘 ≥ 前涨停价）：
+        1. 今日最低价 ≥ 前涨停价 × 0.99（盘中没真正跌破涨停价）
+        2. 今日收盘距前涨停价上方 ≤ 12%（再高就是趋势加速，归趋势分支）
+        3. 不要求中间出现阴线（昨涨停今承接也算）
         """
         code = rec["code"]
         name = rec.get("name", "")
@@ -2984,12 +3230,14 @@ class StockFilter:
 
         df = history.sort_values("date").reset_index(drop=True)
         close = pd.to_numeric(df["close"], errors="coerce")
+        low = pd.to_numeric(df.get("low"), errors="coerce") if "low" in df.columns else pd.Series(dtype=float)
         volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
 
         t = len(df) - 1
         latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else rec.get("close")
         if latest_close is None or latest_close <= 0:
             return None
+        latest_low = float(low.iloc[t]) if not low.empty and not pd.isna(low.iloc[t]) else None
 
         threshold = self._limit_up_threshold_pct(code)
 
@@ -3006,7 +3254,11 @@ class StockFilter:
         if prior_lu_idx is None:
             return None
 
-        # 2) 之间至少一根明显阴线
+        prior_lu_close = float(close.iloc[prior_lu_idx])
+        if prior_lu_close <= 0:
+            return None
+
+        # 2) 统计涨停日到今日之间的阴线（信息项，按路径决定是否强制）
         worst_drop: Optional[float] = None
         bearish_days = 0
         for j in range(prior_lu_idx + 1, t):
@@ -3017,39 +3269,69 @@ class StockFilter:
                 bearish_days += 1
                 if worst_drop is None or chg_j < worst_drop:
                     worst_drop = chg_j
-        if worst_drop is None:
-            return None
 
-        prior_lu_close = float(close.iloc[prior_lu_idx])
-        if prior_lu_close <= 0:
-            return None
-
-        # 3) 今日不能已经反包（否则今日就该是涨停，归"保留涨停"分支）
+        # 3) 路径划分
+        # wrap_gap_pct > 0 → 今日 < 前涨停价（经典反包）
+        # wrap_gap_pct ≤ 0 → 今日 ≥ 前涨停价（强势承接）
         wrap_gap_pct = (prior_lu_close / latest_close - 1) * 100
-        if wrap_gap_pct <= 0.0:
-            return None
-        # 4) 缺口太大单板覆盖不了
-        if wrap_gap_pct > 11.0:
-            return None
+
+        if wrap_gap_pct > 0:
+            pattern_kind = "wrap"
+            predict_type = "断板反包"
+            # 经典反包硬性条件
+            if worst_drop is None:
+                return None
+            if wrap_gap_pct > 11.0:
+                return None
+        else:
+            pattern_kind = "hold_strong"
+            predict_type = "强势承接"
+            # 强势承接硬性条件：低点没破前涨停价
+            if latest_low is None or latest_low < prior_lu_close * 0.99:
+                return None
+            # 离前涨停价上方过远（≥12%）就归趋势分支
+            if -wrap_gap_pct > 12.0:
+                return None
 
         score = 0.0
         reasons: List[str] = []
 
-        # 反包缺口（甜区 1~5%）
-        if wrap_gap_pct <= 2.0:
-            score += 26
-            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%临界+26")
-        elif wrap_gap_pct <= 5.0:
-            score += 22
-            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%甜区+22")
-        elif wrap_gap_pct <= 8.0:
-            score += 12
-            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%可达+12")
+        # ---- 位置/缺口分（按路径分别打分）----
+        if pattern_kind == "wrap":
+            # 反包缺口（甜区 1~5%）
+            if wrap_gap_pct <= 2.0:
+                score += 26
+                reasons.append(f"距前涨停{wrap_gap_pct:.1f}%临界+26")
+            elif wrap_gap_pct <= 5.0:
+                score += 22
+                reasons.append(f"距前涨停{wrap_gap_pct:.1f}%甜区+22")
+            elif wrap_gap_pct <= 8.0:
+                score += 12
+                reasons.append(f"距前涨停{wrap_gap_pct:.1f}%可达+12")
+            else:
+                score += 4
+                reasons.append(f"距前涨停{wrap_gap_pct:.1f}%偏远+4")
         else:
-            score += 4
-            reasons.append(f"距前涨停{wrap_gap_pct:.1f}%偏远+4")
+            # 强势承接：站在前涨停价上方多少
+            above_pct = -wrap_gap_pct
+            if above_pct <= 1.0:
+                score += 28
+                reasons.append(f"顶住前涨停价({above_pct:.1f}%)+28")
+            elif above_pct <= 3.0:
+                score += 24
+                reasons.append(f"涨停价上方{above_pct:.1f}%+24")
+            elif above_pct <= 6.0:
+                score += 18
+                reasons.append(f"涨停价上方{above_pct:.1f}%+18")
+            else:
+                score += 10
+                reasons.append(f"涨停价上方{above_pct:.1f}%偏远+10")
+            # 盘中是否回踩涨停价但不破（最低价贴近前涨停价）
+            if latest_low is not None and latest_low <= prior_lu_close * 1.01:
+                score += 8
+                reasons.append("盘中回踩涨停价不破+8")
 
-        # 今日动能
+        # ---- 今日动能（共用）----
         if change_pct is not None:
             if change_pct >= 6.0:
                 score += 20
@@ -3064,44 +3346,72 @@ class StockFilter:
                 score -= 10
                 reasons.append(f"今跌{change_pct:.1f}%-10")
 
-        # 量比
-        vol_ratio: Optional[float] = None
-        if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
-            vol_window = volume.iloc[max(0, t - 5):t].dropna()
-            if not vol_window.empty and float(vol_window.mean()) > 0:
-                vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+        # ---- 量比（5 日 + 20 日双校验）----
+        vol_ratio, vol_ratio_20 = self._vol_ratio_with_baseline(volume, t)
         if vol_ratio is not None:
-            if vol_ratio >= 2.0:
-                score += 18
-                reasons.append(f"量比{vol_ratio:.1f}x爆量+18")
-            elif vol_ratio >= 1.4:
-                score += 10
-                reasons.append(f"量比{vol_ratio:.1f}x放量+10")
-            elif vol_ratio < 0.8:
-                score -= 8
-                reasons.append(f"量比{vol_ratio:.1f}x缩量-8")
+            if pattern_kind == "wrap":
+                if vol_ratio >= 2.0:
+                    score += 18
+                    reasons.append(f"量比{vol_ratio:.1f}x爆量+18")
+                elif vol_ratio >= 1.4:
+                    score += 10
+                    reasons.append(f"量比{vol_ratio:.1f}x放量+10")
+                elif vol_ratio < 0.8:
+                    score -= 8
+                    reasons.append(f"量比{vol_ratio:.1f}x缩量-8")
+            else:
+                # 强势承接更看重缩量止跌（盘面没抛压）；爆量出货反而要警惕
+                if 0.6 <= vol_ratio <= 1.3:
+                    score += 14
+                    reasons.append(f"量比{vol_ratio:.1f}x缩量承接+14")
+                elif 1.3 < vol_ratio <= 2.0:
+                    score += 10
+                    reasons.append(f"量比{vol_ratio:.1f}x放量+10")
+                elif vol_ratio > 3.0:
+                    score -= 6
+                    reasons.append(f"量比{vol_ratio:.1f}x巨量警惕-6")
+                elif vol_ratio < 0.4:
+                    score -= 4
+                    reasons.append(f"量比{vol_ratio:.1f}x极缩-4")
 
-        # 阴线深度（反包深阴更醒目）
-        if worst_drop <= -7.0:
-            score += 8
-            reasons.append(f"前阴{worst_drop:.1f}%深坑+8")
-        elif worst_drop <= -5.0:
-            score += 4
-            reasons.append(f"前阴{worst_drop:.1f}%+4")
+            # 5 日量比看似放量、但 20 日量比仍 <0.9 → 假放量（缩量调整里的小反弹）
+            if vol_ratio >= 1.4 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+                score -= 6
+                reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
 
-        # 距前涨停天数（1~3 天最佳）
+        # ---- 阴线深度（仅经典反包）----
+        if pattern_kind == "wrap" and worst_drop is not None:
+            if worst_drop <= -7.0:
+                score += 8
+                reasons.append(f"前阴{worst_drop:.1f}%深坑+8")
+            elif worst_drop <= -5.0:
+                score += 4
+                reasons.append(f"前阴{worst_drop:.1f}%+4")
+
+        # ---- 距前涨停天数（共用，但 hold_strong 时 1 天最佳）----
         days_since_lu = t - prior_lu_idx
-        if days_since_lu == 1:
-            score += 8
-            reasons.append("昨涨停今回踩+8")
-        elif days_since_lu in (2, 3):
-            score += 12
-            reasons.append(f"前{days_since_lu}日涨停+12")
-        elif days_since_lu <= 5:
-            score += 5
-            reasons.append(f"前{days_since_lu}日涨停+5")
+        if pattern_kind == "hold_strong":
+            if days_since_lu == 1:
+                score += 15
+                reasons.append("昨涨停今承接+15")
+            elif days_since_lu in (2, 3):
+                score += 10
+                reasons.append(f"前{days_since_lu}日涨停今承接+10")
+            elif days_since_lu <= 5:
+                score += 5
+                reasons.append(f"前{days_since_lu}日涨停+5")
+        else:
+            if days_since_lu == 1:
+                score += 8
+                reasons.append("昨涨停今回踩+8")
+            elif days_since_lu in (2, 3):
+                score += 12
+                reasons.append(f"前{days_since_lu}日涨停+12")
+            elif days_since_lu <= 5:
+                score += 5
+                reasons.append(f"前{days_since_lu}日涨停+5")
 
-        # 行业
+        # ---- 行业（共用）----
         if industry and hot_industries.get(industry, 0) >= 3:
             score += 10
             reasons.append(f"热门板块({hot_industries[industry]}只)+10")
@@ -3109,7 +3419,20 @@ class StockFilter:
             score += 5
             reasons.append(f"板块联动({hot_industries[industry]}只)+5")
 
-        # 大盘环境
+        # ---- 题材热度（来自 AI 题材聚类缓存）----
+        theme_bonus, theme_reason = self._theme_bonus(code, industry, compare_context)
+        if theme_bonus > 0:
+            score += theme_bonus
+            if theme_reason:
+                reasons.append(theme_reason)
+
+        # ---- 资金面：龙虎榜 + 北向 3 日加仓 ----
+        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
+        if flow_bonus != 0:
+            score += flow_bonus
+            reasons.extend(flow_reasons)
+
+        # ---- 大盘环境（共用）----
         latest_cont_rate = compare_context.get("latest_continuation_rate")
         if latest_cont_rate is not None:
             if latest_cont_rate >= 60:
@@ -3138,13 +3461,16 @@ class StockFilter:
             "prior_lu_date": prior_lu_date,
             "prior_lu_close": prior_lu_close,
             "days_since_lu": days_since_lu,
+            # wrap_gap_pct 沿用旧含义：>0 表示今日低于前涨停价（经典反包缺口）；
+            # <0 表示今日高于前涨停价（强势承接），数值越接近 0 越紧贴涨停价。
             "wrap_gap_pct": round(wrap_gap_pct, 2),
-            "worst_drop": round(worst_drop, 2),
+            "worst_drop": round(worst_drop, 2) if worst_drop is not None else None,
             "bearish_days": bearish_days,
             "volume_ratio": vol_ratio,
+            "pattern_kind": pattern_kind,
             "score": final_score,
             "reasons": " / ".join(reasons[:8]),
-            "predict_type": "断板反包",
+            "predict_type": predict_type,
         }
 
     def _scan_trend_limit_up_candidates_cached(
@@ -3314,12 +3640,8 @@ class StockFilter:
                 score -= 6
                 reasons.append(f"今跌{change_pct:.1f}%-6")
 
-        # 量比：温和放量 (1.2~2.5) 最好；爆量(>3) 反而要警惕加速顶
-        vol_ratio: Optional[float] = None
-        if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
-            vol_window = volume.iloc[max(0, t - 5):t].dropna()
-            if not vol_window.empty and float(vol_window.mean()) > 0:
-                vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
+        # 量比：温和放量 (1.2~2.5) 最好；爆量(>3) 反而要警惕加速顶。叠加 20 日量比避免假放量
+        vol_ratio, vol_ratio_20 = self._vol_ratio_with_baseline(volume, t)
         if vol_ratio is not None:
             if 1.2 <= vol_ratio <= 2.5:
                 score += 14
@@ -3336,6 +3658,10 @@ class StockFilter:
             else:
                 score += 4
                 reasons.append(f"量比{vol_ratio:.1f}x+4")
+
+            if vol_ratio >= 1.2 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+                score -= 6
+                reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
 
         # 5/10 日趋势
         trend_5d = None
@@ -3381,6 +3707,19 @@ class StockFilter:
         elif industry and hot_industries.get(industry, 0) >= 2:
             score += 5
             reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+
+        # 题材热度（来自 AI 题材聚类缓存）
+        theme_bonus, theme_reason = self._theme_bonus(code, industry, compare_context)
+        if theme_bonus > 0:
+            score += theme_bonus
+            if theme_reason:
+                reasons.append(theme_reason)
+
+        # 资金面：龙虎榜 + 北向 3 日加仓
+        flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
+        if flow_bonus != 0:
+            score += flow_bonus
+            reasons.extend(flow_reasons)
 
         # 换手率
         if turnover is not None:
@@ -3474,6 +3813,135 @@ class StockFilter:
         candidates.sort(key=lambda x: -x["score"])
         return candidates[:50]
 
+    def _load_lhb_for_date(self, trade_date: str) -> Dict[str, Dict[str, float]]:
+        """加载指定交易日的龙虎榜数据。
+
+        返回 dict: code → {"net_buy": 净买入额, "buy": 买入额, "sell": 卖出额, "reason": 上榜原因}
+        网络失败/无数据返回空 dict（不阻塞预测）。
+
+        缓存键: stock_filter_lhb_<trade_date>
+        """
+        from stock_store import load_app_config, save_app_config
+        cache_key = f"stock_filter_lhb_{str(trade_date).strip()}"
+        cached = load_app_config(cache_key, default=None)
+        if isinstance(cached, dict) and cached:
+            return cached  # type: ignore[return-value]
+
+        try:
+            import akshare as ak
+            from stock_data import _retry_ak_call
+            df = _retry_ak_call(
+                ak.stock_lhb_detail_em,
+                start_date=str(trade_date).strip(),
+                end_date=str(trade_date).strip(),
+            )
+        except Exception as exc:
+            if self._log:
+                self._log(f"涨停预测：龙虎榜拉取失败 {exc}")
+            return {}
+
+        if df is None or df.empty:
+            return {}
+
+        result: Dict[str, Dict[str, float]] = {}
+        for _, row in df.iterrows():
+            try:
+                code = str(row.get("代码", "")).strip().zfill(6)
+                if not code or len(code) != 6:
+                    continue
+                net = float(row.get("龙虎榜净买额") or 0)
+                buy = float(row.get("龙虎榜买入额") or 0)
+                sell = float(row.get("龙虎榜卖出额") or 0)
+                reason = str(row.get("上榜原因") or "").strip()
+                # 同一天可能多次上榜，累加
+                if code in result:
+                    result[code]["net_buy"] += net
+                    result[code]["buy"] += buy
+                    result[code]["sell"] += sell
+                else:
+                    result[code] = {
+                        "net_buy": net, "buy": buy, "sell": sell, "reason": reason,
+                    }
+            except (TypeError, ValueError):
+                continue
+
+        if result:
+            try:
+                save_app_config(cache_key, result)
+            except Exception:
+                pass
+        return result
+
+    def _load_northbound_accumulation(self) -> Dict[str, float]:
+        """加载北向资金 3 日加仓榜（沪股通 + 深股通合并）。
+
+        返回 dict: code → 3 日持股市值变化（万元）
+        正值表示北向加仓，负值表示北向减仓。
+
+        北向数据 T+1 才公布，预测时只能取最近一个交易日的快照。
+        当日缓存 24h，避免重复拉取。
+        """
+        from stock_store import load_app_config, save_app_config
+        from datetime import datetime as _dt
+        today_key = _dt.now().strftime("%Y%m%d")
+        cache_key = f"stock_filter_northbound_{today_key}"
+        cached = load_app_config(cache_key, default=None)
+        if isinstance(cached, dict) and cached:
+            return cached  # type: ignore[return-value]
+
+        result: Dict[str, float] = {}
+        try:
+            import akshare as ak
+            from stock_data import _retry_ak_call
+            for market in ("沪股通", "深股通"):
+                try:
+                    df = _retry_ak_call(
+                        ak.stock_hsgt_hold_stock_em,
+                        market=market,
+                        indicator="3日排行",
+                    )
+                except Exception as exc:
+                    if self._log:
+                        self._log(f"涨停预测：北向 {market} 拉取失败 {exc}")
+                    continue
+                if df is None or df.empty:
+                    continue
+                # 列名形如 "3日增持估计-市值"（万元，正=北向加仓，负=减仓）
+                value_col = next(
+                    (c for c in df.columns
+                     if "增持" in str(c) and "市值" in str(c) and "增幅" not in str(c)),
+                    None,
+                )
+                if value_col is None:
+                    # 兼容旧版列名
+                    value_col = next(
+                        (c for c in df.columns if "市值变化" in str(c) and "3日" in str(c)),
+                        None,
+                    )
+                if value_col is None:
+                    continue
+                for _, row in df.iterrows():
+                    try:
+                        code = str(row.get("代码", "")).strip().zfill(6)
+                        if not code or len(code) != 6:
+                            continue
+                        change = float(row.get(value_col) or 0)
+                        # 同一只票如果在两个市场都有持股不会重复（沪/深分离），累加保险
+                        result[code] = result.get(code, 0.0) + change
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as exc:
+            if self._log:
+                self._log(f"涨停预测：北向资金加载失败 {exc}")
+            return {}
+
+        if result:
+            try:
+                save_app_config(cache_key, result)
+            except Exception:
+                pass
+        return result
+
     def _fetch_spot_snapshot(self) -> Optional[pd.DataFrame]:
         """获取全市场实时行情快照（只调一次 API）。
         优先东财，东财熔断时自动回退到新浪。
@@ -3534,34 +4002,40 @@ class StockFilter:
     def _filter_strong_stocks(
         self, spot_df: pd.DataFrame, exclude_codes: set
     ) -> List[Dict[str, Any]]:
-        """从行情快照中筛选涨幅 3%~9.5% 的强势股。"""
+        """从行情快照中筛选涨幅 3%~9.95% 的强势股（含擦边没封板的 9.x% 票）。
+
+        历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
+        """
         records = []
         for _, row in spot_df.iterrows():
             rec = self._parse_spot_record(row, exclude_codes)
             if rec is None:
                 continue
             chg = rec.get("change_pct")
-            if chg is None or chg < 3.0 or chg >= 9.5:
+            if chg is None or chg < 3.0 or chg >= 9.95:
                 continue
             records.append(rec)
         records.sort(key=lambda x: -(x.get("change_pct") or 0))
-        return records[:100]
+        return records
 
     def _filter_ma5_pullback_stocks(
         self, spot_df: pd.DataFrame, exclude_codes: set
     ) -> List[Dict[str, Any]]:
-        """从行情快照中筛选涨跌幅 -3%~+3% 的回踩MA5候选。"""
+        """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（覆盖五日承接需要的 -5~-3% 区间）。
+
+        历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
+        """
         records = []
         for _, row in spot_df.iterrows():
             rec = self._parse_spot_record(row, exclude_codes)
             if rec is None:
                 continue
             chg = rec.get("change_pct")
-            if chg is None or chg < -3.0 or chg >= 3.0:
+            if chg is None or chg < -5.0 or chg >= 3.0:
                 continue
             records.append(rec)
         records.sort(key=lambda x: -(x.get("amount") or 0))
-        return records[:200]
+        return records
 
     def _score_first_board_by_profile(
         self,

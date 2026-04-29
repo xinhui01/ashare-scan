@@ -2013,8 +2013,8 @@ class StockMonitorApp:
 
         # 断板反包候选 Tab（近期涨停被打掉，今日逼近反包）
         wrap_tab = ttk.Frame(self._predict_table_nb)
-        self._predict_table_nb.add(wrap_tab, text="断板反包候选")
-        wrap_cols = ("code", "name", "industry", "change_pct", "close",
+        self._predict_table_nb.add(wrap_tab, text="反包/承接候选")
+        wrap_cols = ("code", "name", "industry", "pattern_kind", "change_pct", "close",
                      "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
                      "worst_drop", "volume_ratio", "score", "reasons")
         self._predict_wrap_tree = ttk.Treeview(
@@ -2022,6 +2022,7 @@ class StockMonitorApp:
         )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "pattern_kind": ("形态", 70),
             "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
             "prior_lu_date": ("前涨停日", 90), "prior_lu_close": ("前涨停价", 75),
             "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
@@ -2380,7 +2381,7 @@ class StockMonitorApp:
 
         if wrap_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  断板反包候选 TOP10\n")
+            txt.insert(tk.END, f"  反包/承接候选 TOP10\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for rec in wrap_list[:10]:
                 chg = rec.get("change_pct")
@@ -2480,12 +2481,14 @@ class StockMonitorApp:
 
         # ---- 填充断板反包候选表格 ----
         self._predict_wrap_tree.delete(*self._predict_wrap_tree.get_children())
+        _PATTERN_LABELS = {"wrap": "断板反包", "hold_strong": "强势承接"}
         for rec in wrap_list:
             tag = self._score_tag(rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                _PATTERN_LABELS.get(rec.get("pattern_kind", ""), rec.get("predict_type", "-")),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
                 rec.get("prior_lu_date", "-") or "-",
@@ -2525,7 +2528,7 @@ class StockMonitorApp:
         self._predict_table_nb.tab(0, text=f"保留涨停候选({len(cont_list)})")
         self._predict_table_nb.tab(1, text=f"五日承接候选({len(first_list)})")
         self._predict_table_nb.tab(2, text=f"首板涨停候选({len(fresh_list)})")
-        self._predict_table_nb.tab(3, text=f"断板反包候选({len(wrap_list)})")
+        self._predict_table_nb.tab(3, text=f"反包/承接候选({len(wrap_list)})")
         self._predict_table_nb.tab(4, text=f"趋势涨停候选({len(trend_list)})")
 
         self._predict_status_label.config(text="")
@@ -2537,6 +2540,25 @@ class StockMonitorApp:
         # 同步刷新历史记录下拉，并选中当前结果对应的日期
         current_date = str(result.get("trade_date") or "").strip()
         self._refresh_predict_history_dates(select=current_date or None)
+
+        # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
+        # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
+        if (
+            len(cont_list) > 0
+            and len(first_list) == 0
+            and len(fresh_list) == 0
+            and len(wrap_list) == 0
+            and len(trend_list) == 0
+        ):
+            messagebox.showwarning(
+                "历史数据未就绪",
+                "本地历史 K 线缓存尚未预热，\n"
+                "「五日承接 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
+                "首次点击会触发后台缓存预取，\n"
+                "请稍等几秒后再次点击「预测涨停数据」按钮，\n"
+                "即可看到完整候选列表。",
+                parent=self.root,
+            )
 
     def _on_predict_stock_select(self, event):
         tree = event.widget
