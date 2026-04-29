@@ -7,7 +7,7 @@
     logger.info("xxx")
 
 日志同时输出到控制台和文件（data/logs/app.log），文件按天滚动保留 30 天。
-环境变量 GUPPIAO_LOG_LEVEL 可以覆盖日志级别（DEBUG / INFO / WARNING / ERROR）。
+环境变量 ASHARE_SCAN_LOG_LEVEL 可以覆盖日志级别（DEBUG / INFO / WARNING / ERROR）。
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _ensure_log_dir() -> None:
 
 
 def _resolve_level() -> int:
-    raw = os.environ.get("GUPPIAO_LOG_LEVEL", "").strip().upper()
+    raw = os.environ.get("ASHARE_SCAN_LOG_LEVEL", "").strip().upper()
     return getattr(logging, raw, logging.INFO)
 
 

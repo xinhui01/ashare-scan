@@ -558,7 +558,7 @@ class StockFilter:
     def _resolve_scan_workers(self, max_workers: Optional[int]) -> Tuple[int, int]:
         if max_workers is None:
             try:
-                max_workers = int(os.environ.get("GUPPIAO_SCAN_WORKERS", "3").strip() or "3")
+                max_workers = int(os.environ.get("ASHARE_SCAN_SCAN_WORKERS", "3").strip() or "3")
             except ValueError:
                 max_workers = 3
         requested_workers = max(1, min(int(max_workers), 16))

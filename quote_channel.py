@@ -9,7 +9,7 @@
 2. 对无法提供的字段（如量比）要么换筛选策略，要么该组仍回退东财；
 3. 注意各站点服务条款与请求频率。
 
-环境变量 ``GUPPIAO_QUOTE_SHARDS`` 仅保留为将来按代码哈希分片时使用（默认 1 = 不分片）。
+环境变量 ``ASHARE_SCAN_QUOTE_SHARDS`` 仅保留为将来按代码哈希分片时使用（默认 1 = 不分片）。
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def quote_shard_index(stock_code: str, num_shards: int) -> int:
 
 def quote_shard_count() -> int:
     try:
-        n = int(os.environ.get("GUPPIAO_QUOTE_SHARDS", "1").strip() or "1")
+        n = int(os.environ.get("ASHARE_SCAN_QUOTE_SHARDS", "1").strip() or "1")
     except ValueError:
         n = 1
     return max(1, min(n, 16))

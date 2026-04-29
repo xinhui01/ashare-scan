@@ -1,6 +1,6 @@
 """
-网络相关：SSL 校验见 USE_INSECURE_SSL / GUPPIAO_INSECURE_SSL；
-代理报错见 USE_BYPASS_PROXY / GUPPIAO_BYPASS_PROXY（见 README）。
+网络相关：SSL 校验见 USE_INSECURE_SSL / ASHARE_SCAN_INSECURE_SSL；
+代理报错见 USE_BYPASS_PROXY / ASHARE_SCAN_BYPASS_PROXY（见 README）。
 """
 import os
 import platform
@@ -25,9 +25,9 @@ def _check_runtime() -> None:
 def main():
     _check_runtime()
     if BYPASS_PROXY:
-        os.environ["GUPPIAO_BYPASS_PROXY"] = "1"
+        os.environ["ASHARE_SCAN_BYPASS_PROXY"] = "1"
     else:
-        os.environ.pop("GUPPIAO_BYPASS_PROXY", None)
+        os.environ.pop("ASHARE_SCAN_BYPASS_PROXY", None)
 
     from stock_logger import get_logger
     logger = get_logger(__name__)

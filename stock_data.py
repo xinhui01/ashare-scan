@@ -18,14 +18,14 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent
 
 def _use_insecure_ssl() -> bool:
-    if os.environ.get("GUPPIAO_INSECURE_SSL", "").strip().lower() in ("1", "true", "yes"):
+    if os.environ.get("ASHARE_SCAN_INSECURE_SSL", "").strip().lower() in ("1", "true", "yes"):
         return True
     root = _project_root()
     return (root / "USE_INSECURE_SSL").is_file() or (root / ".ashare_scan_insecure_ssl").is_file()
 
 def _use_bypass_proxy() -> bool:
     """不走 HTTP(S)_PROXY 等环境代理（避免公司代理对东方财富断开）。"""
-    if os.environ.get("GUPPIAO_BYPASS_PROXY", "").strip().lower() in ("1", "true", "yes"):
+    if os.environ.get("ASHARE_SCAN_BYPASS_PROXY", "").strip().lower() in ("1", "true", "yes"):
         return True
     root = _project_root()
     return (root / "USE_BYPASS_PROXY").is_file() or (root / ".ashare_scan_bypass_proxy").is_file()
@@ -111,103 +111,51 @@ T = TypeVar("T")
 # DaemonThreadPoolExecutor 已迁移到 src/utils/daemon_executor.py；
 # 此处重新导出，保持 `from stock_data import DaemonThreadPoolExecutor` 零修改。
 from src.utils.daemon_executor import DaemonThreadPoolExecutor
+from src.config import env_int, env_float
+
+
 def _history_request_concurrency() -> int:
-    raw = os.environ.get("GUPPIAO_HISTORY_CONCURRENCY", "").strip()
-    try:
-        value = int(raw) if raw else 2
-    except ValueError:
-        value = 2
-    return max(1, min(value, 10))
+    return env_int("ASHARE_SCAN_HISTORY_CONCURRENCY", default=2, lo=1, hi=10)
 
 
 def _history_min_request_interval_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_MIN_INTERVAL_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 2.5
-    except ValueError:
-        value = 2.5
-    return max(0.5, min(value, 15.0))
+    return env_float("ASHARE_SCAN_HISTORY_MIN_INTERVAL_SEC", default=2.5, lo=0.5, hi=15.0)
 
 
 def _history_connect_timeout_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_CONNECT_TIMEOUT_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 2.5
-    except ValueError:
-        value = 2.5
-    return max(0.5, min(value, 10.0))
+    return env_float("ASHARE_SCAN_HISTORY_CONNECT_TIMEOUT_SEC", default=2.5, lo=0.5, hi=10.0)
 
 
 def _history_read_timeout_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_READ_TIMEOUT_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 4.0
-    except ValueError:
-        value = 4.0
-    return max(1.0, min(value, 15.0))
+    return env_float("ASHARE_SCAN_HISTORY_READ_TIMEOUT_SEC", default=4.0, lo=1.0, hi=15.0)
 
 
 def _history_total_timeout_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_TOTAL_TIMEOUT_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 12.0
-    except ValueError:
-        value = 12.0
-    return max(3.0, min(value, 60.0))
+    return env_float("ASHARE_SCAN_HISTORY_TOTAL_TIMEOUT_SEC", default=12.0, lo=3.0, hi=60.0)
 
 
 def _history_host_cooldown_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_HOST_COOLDOWN_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 180.0
-    except ValueError:
-        value = 180.0
-    return max(10.0, min(value, 1800.0))
+    return env_float("ASHARE_SCAN_HISTORY_HOST_COOLDOWN_SEC", default=180.0, lo=10.0, hi=1800.0)
 
 
 def _history_max_mirrors_per_stock() -> int:
-    raw = os.environ.get("GUPPIAO_HISTORY_MAX_MIRRORS_PER_STOCK", "").strip()
-    try:
-        value = int(raw) if raw else 3
-    except ValueError:
-        value = 3
-    return max(1, min(value, 8))
+    return env_int("ASHARE_SCAN_HISTORY_MAX_MIRRORS_PER_STOCK", default=3, lo=1, hi=8)
 
 
 def _history_probe_success_target() -> int:
-    raw = os.environ.get("GUPPIAO_HISTORY_PROBE_SUCCESS_TARGET", "").strip()
-    try:
-        value = int(raw) if raw else 2
-    except ValueError:
-        value = 2
-    return max(1, min(value, 4))
+    return env_int("ASHARE_SCAN_HISTORY_PROBE_SUCCESS_TARGET", default=2, lo=1, hi=4)
 
 
 def _history_block_window_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_WINDOW_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 180.0
-    except ValueError:
-        value = 180.0
-    return max(30.0, min(value, 3600.0))
+    return env_float("ASHARE_SCAN_HISTORY_BLOCK_WINDOW_SEC", default=180.0, lo=30.0, hi=3600.0)
 
 
 def _history_block_threshold() -> int:
-    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_THRESHOLD", "").strip()
-    try:
-        value = int(raw) if raw else 3
-    except ValueError:
-        value = 3
-    return max(1, min(value, 10))
+    return env_int("ASHARE_SCAN_HISTORY_BLOCK_THRESHOLD", default=3, lo=1, hi=10)
 
 
 def _history_block_cooldown_sec() -> float:
-    raw = os.environ.get("GUPPIAO_HISTORY_BLOCK_COOLDOWN_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 900.0
-    except ValueError:
-        value = 900.0
-    return max(60.0, min(value, 7200.0))
+    return env_float("ASHARE_SCAN_HISTORY_BLOCK_COOLDOWN_SEC", default=900.0, lo=60.0, hi=7200.0)
 
 
 _HISTORY_REQUEST_SEMAPHORE = threading.BoundedSemaphore(_history_request_concurrency())
@@ -275,76 +223,16 @@ _EASTMONEY_HISTORY_MIRRORS = [
     "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
 # ---- 全局主机健康管理器 ----
-# 所有数据源（eastmoney / tencent / sina）共用同一个健康状态池，
-# 任何主机失败一次即进入冷却，冷却期间所有调用方自动跳过该主机。
-_GLOBAL_HOST_HEALTH: Dict[str, float] = {}  # host → cooldown_until timestamp
-_GLOBAL_HOST_HEALTH_LOCK = threading.Lock()
-_GLOBAL_HOST_FAIL_COUNT: Dict[str, int] = {}  # host → consecutive fail count
-
-
-def _global_host_cooldown_sec() -> float:
-    """全局主机冷却时间，默认 1 小时。可通过环境变量 GUPPIAO_HOST_COOLDOWN_SEC 配置。"""
-    raw = os.environ.get("GUPPIAO_HOST_COOLDOWN_SEC", "").strip()
-    if not raw:
-        raw = os.environ.get("GUPPIAO_HISTORY_HOST_COOLDOWN_SEC", "").strip()
-    try:
-        value = float(raw) if raw else 3600.0
-    except ValueError:
-        value = 3600.0
-    return max(60.0, min(value, 7200.0))
-
-
-def _global_mark_host_failed(url_or_host: str) -> None:
-    """标记主机失败，进入冷却。连续失败次数越多，冷却时间越长。"""
-    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
-    if not host:
-        return
-    base_cooldown = _global_host_cooldown_sec()
-    with _GLOBAL_HOST_HEALTH_LOCK:
-        count = _GLOBAL_HOST_FAIL_COUNT.get(host, 0) + 1
-        _GLOBAL_HOST_FAIL_COUNT[host] = count
-        # 首次失败: base_cooldown, 第二次: 2x, 第三次+: 3x (上限 3 小时)
-        multiplier = min(count, 3)
-        cooldown = min(base_cooldown * multiplier, 10800.0)
-        _GLOBAL_HOST_HEALTH[host] = time.time() + cooldown
-
-
-def _global_mark_host_ok(url_or_host: str) -> None:
-    """标记主机成功，清除冷却状态和失败计数。"""
-    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
-    if not host:
-        return
-    with _GLOBAL_HOST_HEALTH_LOCK:
-        _GLOBAL_HOST_HEALTH.pop(host, None)
-        _GLOBAL_HOST_FAIL_COUNT.pop(host, None)
-
-
-def _global_host_on_cooldown(url_or_host: str, now: Optional[float] = None) -> bool:
-    """检查主机是否正在冷却中。"""
-    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
-    if not host:
-        return False
-    if now is None:
-        now = time.time()
-    with _GLOBAL_HOST_HEALTH_LOCK:
-        cooldown_until = _GLOBAL_HOST_HEALTH.get(host, 0.0)
-        if cooldown_until <= now:
-            _GLOBAL_HOST_HEALTH.pop(host, None)
-            _GLOBAL_HOST_FAIL_COUNT.pop(host, None)
-            return False
-        return True
-
-
-def _global_host_cooldown_remaining(url_or_host: str) -> float:
-    """返回主机剩余冷却秒数，0 表示不在冷却中。"""
-    host = re.sub(r"^https?://", "", str(url_or_host or "").strip()).split("/", 1)[0].lower()
-    if not host:
-        return 0.0
-    now = time.time()
-    with _GLOBAL_HOST_HEALTH_LOCK:
-        cooldown_until = _GLOBAL_HOST_HEALTH.get(host, 0.0)
-        remain = cooldown_until - now
-        return max(0.0, remain)
+# 实现已迁移到 src/network/host_health.py；下面用别名保持调用方零修改。
+from src.network import host_health as _host_health
+_GLOBAL_HOST_HEALTH = _host_health._HOST_HEALTH
+_GLOBAL_HOST_HEALTH_LOCK = _host_health._HOST_HEALTH_LOCK
+_GLOBAL_HOST_FAIL_COUNT = _host_health._HOST_FAIL_COUNT
+_global_host_cooldown_sec = _host_health.cooldown_sec
+_global_mark_host_failed = _host_health.mark_failed
+_global_mark_host_ok = _host_health.mark_ok
+_global_host_on_cooldown = _host_health.on_cooldown
+_global_host_cooldown_remaining = _host_health.cooldown_remaining
 
 
 # ---- 东方财富全局熔断器 ----
@@ -366,226 +254,33 @@ def _eastmoney_circuit_breaker_record_success() -> None:
     _em_circuit_breaker.record_success()
 
 
-def _global_filter_healthy_urls(urls: List[str]) -> List[str]:
-    """从 URL 列表中过滤掉正在冷却的主机。"""
-    now = time.time()
-    return [u for u in urls if not _global_host_on_cooldown(u, now)]
+_global_filter_healthy_urls = _host_health.filter_healthy_urls
 
 
-# 兼容旧接口：将旧的分散变量指向全局管理器
-_HISTORY_MIRROR_HEALTH = _GLOBAL_HOST_HEALTH
-_HISTORY_MIRROR_HEALTH_LOCK = _GLOBAL_HOST_HEALTH_LOCK
 _HISTORY_BLOCK_LOCK = threading.Lock()
 _HISTORY_BLOCKED_UNTIL = 0.0
 _HISTORY_BLOCK_EVENTS: List[float] = []
 
-# 东方财富接口常校验 Referer / UA；缺省时易被直接断开连接
-# User-Agent 池：每次请求随机选取，降低指纹识别风险
+# 东方财富 / 通用 HTTP headers 实现已迁移到 src/network/headers.py。
 import random as _random
-
-_USER_AGENT_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-]
-
-_REFERER_POOL = [
-    "https://quote.eastmoney.com/",
-    "https://data.eastmoney.com/",
-    "https://guba.eastmoney.com/",
-    "https://so.eastmoney.com/",
-    "https://www.eastmoney.com/",
-    "https://finance.eastmoney.com/",
-]
-
-
-def _random_eastmoney_headers() -> Dict[str, str]:
-    """每次请求生成随机化的请求头，模拟真实浏览器行为。"""
-    # 随机 Accept-Encoding 组合，避免指纹固定
-    accept_encodings = [
-        "gzip, deflate, br",
-        "gzip, deflate",
-        "gzip, deflate, br, zstd",
-    ]
-    # sec-ch-ua 浏览器版本指纹，与 UA 池匹配
-    sec_ch_ua_pool = [
-        '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        '"Chromium";v="124", "Not(A:Brand";v="24", "Google Chrome";v="124"',
-        '"Chromium";v="126", "Not(A:Brand";v="8", "Google Chrome";v="126"',
-        '"Not)A;Brand";v="99", "Microsoft Edge";v="122", "Chromium";v="122"',
-    ]
-    headers = {
-        "User-Agent": _random.choice(_USER_AGENT_POOL),
-        "Referer": _random.choice(_REFERER_POOL),
-        "Accept": _random.choice([
-            "application/json, text/plain, */*",
-            "*/*",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        ]),
-        "Accept-Language": _random.choice([
-            "zh-CN,zh;q=0.9",
-            "zh-CN,zh;q=0.9,en;q=0.8",
-            "zh-CN,zh;q=0.8,en;q=0.6",
-            "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        ]),
-        "Accept-Encoding": _random.choice(accept_encodings),
-        "Connection": _random.choice(["keep-alive", "close"]),
-        "sec-ch-ua": _random.choice(sec_ch_ua_pool),
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": _random.choice(['"Windows"', '"macOS"']),
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-    }
-    # 随机 50% 概率加 DNT / Pragma 头，增加多样性
-    if _random.random() < 0.5:
-        headers["DNT"] = "1"
-    if _random.random() < 0.3:
-        headers["Pragma"] = "no-cache"
-        headers["Cache-Control"] = "no-cache"
-    # 模拟真实浏览器 cookie（东方财富依赖这些 cookie 判断是否为人类访问）
-    headers["Cookie"] = _random_eastmoney_cookie()
-    return headers
-
-
-def _random_eastmoney_cookie() -> str:
-    """生成伪随机的东方财富 cookie，模拟正常浏览器访问痕迹。"""
-    # qgqp_b_id: 设备指纹，32位十六进制
-    qgqp = "".join(_random.choices("0123456789abcdef", k=32))
-    # em_hq_fls: 访问标记
-    em_hq = "js"
-    # st_pvi / st_sp / st_inirUrl / st_sn: 站点统计字段
-    st_pvi = str(_random.randint(10000000000, 99999999999))
-    st_si = f"{int(time.time() * 1000)}-{_random.randint(100000, 999999)}"
-    parts = [
-        f"qgqp_b_id={qgqp}",
-        f"em_hq_fls={em_hq}",
-        f"st_pvi={st_pvi}",
-        f"st_si={st_si}",
-    ]
-    # 随机添加可选字段
-    if _random.random() < 0.6:
-        parts.append(f"HAList=a-sz-{_random.randint(1, 300):06d}")
-    return "; ".join(parts)
-
-
-# 兼容旧引用
+from src.sources import _common as _sources_common
+from src.network.headers import (
+    USER_AGENT_POOL as _USER_AGENT_POOL,
+    REFERER_POOL as _REFERER_POOL,
+    random_eastmoney_headers as _random_eastmoney_headers,
+    random_eastmoney_cookie as _random_eastmoney_cookie,
+)
 _EASTMONEY_HEADERS = _random_eastmoney_headers()
 
 
 # ---- 可选免费代理池 ----
-# 启用方式：环境变量 GUPPIAO_USE_PROXY_POOL=1 或项目根目录创建 USE_PROXY_POOL 文件
-# 代理池会从多个免费源获取代理列表，验证后轮换使用，降低被封 IP 的风险。
-_PROXY_POOL_LOCK = threading.Lock()
-_PROXY_POOL: List[str] = []
-_PROXY_POOL_REFRESHED_AT: float = 0.0
-_PROXY_POOL_REFRESH_INTERVAL = 300.0  # 5 分钟刷新一次
-_PROXY_BLACKLIST: Dict[str, float] = {}  # proxy → blacklist_until
-
-
-def _use_proxy_pool() -> bool:
-    if os.environ.get("GUPPIAO_USE_PROXY_POOL", "").strip().lower() in ("1", "true", "yes"):
-        return True
-    root = _project_root()
-    return (root / "USE_PROXY_POOL").is_file() or (root / ".ashare_scan_proxy_pool").is_file()
-
-
-def _fetch_free_proxies(logger: Optional[Callable[[str], None]] = None) -> List[str]:
-    """从多个免费代理源获取 HTTPS 代理列表。"""
-    import requests
-    proxies: List[str] = []
-    sources = [
-        # 免费代理 API（返回纯文本 ip:port）
-        ("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=CN&ssl=yes&anonymity=all", "proxyscrape"),
-        ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "github-speedx"),
-        ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "github-clarketm"),
-    ]
-    for url, name in sources:
-        try:
-            resp = requests.get(url, timeout=8, headers={"User-Agent": _random.choice(_USER_AGENT_POOL)})
-            if resp.status_code == 200:
-                lines = resp.text.strip().splitlines()
-                for line in lines:
-                    addr = line.strip()
-                    if addr and ":" in addr and not addr.startswith("#"):
-                        proxies.append(f"http://{addr}")
-                if logger and lines:
-                    logger(f"代理池: 从 {name} 获取 {len(lines)} 条")
-        except Exception as e:
-            if logger:
-                logger(f"代理池: {name} 获取失败: {e}")
-    # 去重
-    return list(dict.fromkeys(proxies))
-
-
-def _validate_proxy(proxy: str, timeout: float = 5.0) -> bool:
-    """快速验证代理是否可用（用百度做测试目标）。"""
-    import requests
-    try:
-        resp = requests.get(
-            "https://www.baidu.com",
-            proxies={"http": proxy, "https": proxy},
-            timeout=timeout,
-            headers={"User-Agent": _random.choice(_USER_AGENT_POOL)},
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _refresh_proxy_pool(logger: Optional[Callable[[str], None]] = None) -> None:
-    """刷新代理池：获取 → 随机抽样验证 → 缓存。"""
-    global _PROXY_POOL, _PROXY_POOL_REFRESHED_AT
-    raw = _fetch_free_proxies(logger)
-    if not raw:
-        return
-    # 随机抽样验证（最多验证 20 个，避免太慢）
-    sample = _random.sample(raw, min(20, len(raw)))
-    valid: List[str] = []
-    for proxy in sample:
-        if _validate_proxy(proxy, timeout=4.0):
-            valid.append(proxy)
-            if len(valid) >= 8:  # 够用即停
-                break
-    # 将未验证的也加入（标记为低优先级），验证过的放前面
-    validated_set = set(valid)
-    remaining = [p for p in raw if p not in validated_set]
-    with _PROXY_POOL_LOCK:
-        _PROXY_POOL = valid + remaining[:50]  # 保留最多 50 + 8 个
-        _PROXY_POOL_REFRESHED_AT = time.time()
-    if logger:
-        logger(f"代理池: 刷新完成，验证可用 {len(valid)} 个，总计 {len(_PROXY_POOL)} 个")
-
-
-def _get_proxy() -> Optional[str]:
-    """获取一个可用代理地址。如果代理池为空或未启用，返回 None。"""
-    if not _use_proxy_pool():
-        return None
-    now = time.time()
-    with _PROXY_POOL_LOCK:
-        # 自动刷新
-        if now - _PROXY_POOL_REFRESHED_AT > _PROXY_POOL_REFRESH_INTERVAL:
-            # 在后台线程刷新，避免阻塞
-            threading.Thread(target=_refresh_proxy_pool, daemon=True).start()
-        pool = [p for p in _PROXY_POOL if _PROXY_BLACKLIST.get(p, 0) <= now]
-        if not pool:
-            return None
-        return _random.choice(pool)
-
-
-def _blacklist_proxy(proxy: str) -> None:
-    """将失败的代理加入黑名单 60 秒。"""
-    with _PROXY_POOL_LOCK:
-        _PROXY_BLACKLIST[proxy] = time.time() + 60.0
+# 实现已迁移到 src/network/proxy_pool.py；下面用别名保持调用方零修改。
+from src.network.proxy_pool import (
+    use_proxy_pool as _use_proxy_pool,
+    get_proxy as _get_proxy,
+    blacklist_proxy as _blacklist_proxy,
+    refresh_proxy_pool as _refresh_proxy_pool,
+)
 
 
 # 拉取全市场列表分页时写入 GUI 日志（由 get_all_stocks 临时注册）
@@ -761,333 +456,21 @@ def _request_session_get_json(url: str, params: Dict[str, Any], timeout: Tuple[i
         return data_json
 
 
-def _fetch_eastmoney_auction_snapshot(
-    stock_code: str,
-    logger: Optional[Callable[[str], None]] = None,
-) -> Optional[Dict[str, Any]]:
-    market_code = 1 if str(stock_code).startswith("6") else 0
-    url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "ndays": "1",
-        "iscr": "1",
-        "iscca": "1",
-        "secid": f"{market_code}.{stock_code}",
-    }
-    # 竞价信息只作为分时页辅助标记，不能污染主分钟序列。
-    import requests
-    try:
-        req_kw = {
-            "url": url,
-            "params": params,
-            "timeout": 8.0,
-            "headers": _random_eastmoney_headers(),
-        }
-        if _use_insecure_ssl():
-            req_kw["verify"] = False
-        with requests.Session() as session:
-            if _use_bypass_proxy():
-                session.trust_env = False
-            r = session.get(**req_kw)
-            r.raise_for_status()
-            data_json = r.json()
-    except Exception as exc:
-        if logger:
-            logger(f"竞价数据网络请求失败 {stock_code}: {exc}")
-        return None
-    if not data_json or not data_json.get("data"):
-        return None
-
-    trends = (data_json.get("data") or {}).get("trends") or []
-    if not trends:
-        return None
-    temp_df = pd.DataFrame([str(item).split(",") for item in trends])
-    if temp_df.empty:
-        return None
-
-    available_cols = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
-    temp_df.columns = available_cols[:len(temp_df.columns)]
-    if "时间" not in temp_df.columns:
-        return None
-
-    temp_df["时间"] = pd.to_datetime(temp_df["时间"], errors="coerce")
-    temp_df = temp_df.dropna(subset=["时间"]).sort_values("时间").reset_index(drop=True)
-    if temp_df.empty:
-        return None
-
-    numeric_cols = [c for c in temp_df.columns if c != "时间"]
-    for col in numeric_cols:
-        temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
-
-    auction_rows = temp_df[temp_df["时间"].dt.strftime("%H:%M") == "09:25"].reset_index(drop=True)
-    if auction_rows.empty:
-        return None
-
-    row = auction_rows.iloc[-1]
-    price_candidates = [
-        row.get("收盘"),
-        row.get("开盘"),
-        row.get("均价"),
-        row.get("最高"),
-        row.get("最低"),
-    ]
-    auction_price = next(
-        (
-            float(value)
-            for value in price_candidates
-            if pd.notna(value) and float(value) > 0
-        ),
-        None,
-    )
-    if auction_price is None:
-        return None
-
-    amount = row.get("成交额")
-    volume = row.get("成交量")
-    avg_price = row.get("均价")
-    return {
-        "trade_date": row["时间"].date().isoformat(),
-        "time": row["时间"],
-        "price": auction_price,
-        "open": float(row["开盘"]) if pd.notna(row.get("开盘")) else None,
-        "high": float(row["最高"]) if pd.notna(row.get("最高")) else None,
-        "low": float(row["最低"]) if pd.notna(row.get("最低")) else None,
-        "avg_price": float(avg_price) if pd.notna(avg_price) and float(avg_price) > 0 else None,
-        "volume": float(volume) if pd.notna(volume) and float(volume) > 0 else None,
-        "amount": float(amount) if pd.notna(amount) and float(amount) > 0 else None,
-    }
+# 东财 intraday + auction snapshot 实现已迁移到 src/sources/eastmoney/intraday.py
+from src.sources.eastmoney import intraday as _em_intraday
+_fetch_eastmoney_auction_snapshot = _em_intraday.fetch_auction_snapshot
+_fetch_eastmoney_intraday_1min = _em_intraday.fetch_intraday_1min
+_empty_intraday_meta_payload = _em_intraday.empty_meta_payload
+_normalize_intraday_source_frame = _em_intraday.normalize_source_frame
+_resolve_intraday_trade_dates = _em_intraday.resolve_trade_dates
+_select_intraday_trade_date = _em_intraday.select_trade_date
+_slice_intraday_frame_by_trade_date = _em_intraday.slice_frame_by_trade_date
 
 
-def _fetch_eastmoney_intraday_1min(
-    stock_code: str,
-    ndays: int = 5,
-    logger: Optional[Callable[[str], None]] = None,
-) -> "pd.DataFrame":
-    """直连东方财富 trends2 获取 1 分钟分时，容忍可变字段数。
-
-    akshare 的 stock_zh_a_hist_min_em 在接口返回字段数变动时会直接抛
-    "Length mismatch"，这里改为按实际列数截断列名，彻底绕开该脆弱点。
-    """
-    market_code = 1 if str(stock_code).startswith("6") else 0
-    url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
-        "ut": "7eea3edcaed734bea9cbfc24409ed989",
-        "ndays": str(max(1, int(ndays or 1))),
-        "iscr": "0",
-        "secid": f"{market_code}.{stock_code}",
-    }
-    try:
-        response = _ashare_request_with_retry(url, params=params, timeout=15)
-        data_json = response.json()
-    except Exception as exc:
-        if logger:
-            logger(f"分时行情(东财直连) {stock_code} 请求失败: {exc}")
-        raise
-
-    trends = (data_json.get("data") or {}).get("trends") or []
-    if not trends:
-        if logger:
-            logger(f"分时行情(东财直连) {stock_code} 无 trends 数据")
-        return pd.DataFrame()
-
-    rows = [str(item).split(",") for item in trends]
-    temp_df = pd.DataFrame(rows)
-    if temp_df.empty:
-        return pd.DataFrame()
-
-    canonical_cols = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]
-    actual_col_count = len(temp_df.columns)
-    if actual_col_count >= len(canonical_cols):
-        temp_df = temp_df.iloc[:, : len(canonical_cols)]
-        temp_df.columns = canonical_cols
-    else:
-        temp_df.columns = canonical_cols[:actual_col_count]
-        # 若接口精简到不足 8 列但至少包含收盘，补齐缺失列为 NaN
-        for col in canonical_cols[actual_col_count:]:
-            temp_df[col] = pd.NA
-
-    if "时间" not in temp_df.columns:
-        if logger:
-            logger(
-                f"分时行情(东财直连) {stock_code} 缺少时间列，实际 {actual_col_count} 列"
-            )
-        return pd.DataFrame()
-
-    for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额", "均价"]:
-        if col in temp_df.columns:
-            temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
-    temp_df["时间"] = pd.to_datetime(temp_df["时间"], errors="coerce").astype(str)
-    return temp_df
-
-
-def _empty_intraday_meta_payload(
-    selected_trade_date: str = "",
-    available_trade_dates: Optional[List[str]] = None,
-    applied_day_offset: int = 0,
-    auction_snapshot: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    return {
-        "intraday": None,
-        "selected_trade_date": str(selected_trade_date or "").strip(),
-        "available_trade_dates": [str(item).strip() for item in (available_trade_dates or []) if str(item).strip()],
-        "applied_day_offset": int(applied_day_offset),
-        "auction": auction_snapshot if isinstance(auction_snapshot, dict) else None,
-    }
-
-
-def _normalize_intraday_source_frame(
-    raw_frame: "pd.DataFrame",
-    stock_code: str,
-    logger: Optional[Callable[[str], None]] = None,
-) -> "pd.DataFrame":
-    if raw_frame is None or getattr(raw_frame, "empty", True):
-        return pd.DataFrame()
-
-    source_columns = [str(col) for col in raw_frame.columns.tolist()]
-    rename_map: Dict[str, str] = {}
-    time_col = _first_existing_column(source_columns, ["时间", "日期时间", "datetime", "time", "day"])
-    open_col = _first_existing_column(source_columns, ["开盘", "open"])
-    close_col = _first_existing_column(source_columns, ["收盘", "close", "最新价"])
-    high_col = _first_existing_column(source_columns, ["最高", "high"])
-    low_col = _first_existing_column(source_columns, ["最低", "low"])
-    volume_col = _first_existing_column(source_columns, ["成交量", "volume"])
-    amount_col = _first_existing_column(source_columns, ["成交额", "amount"])
-    avg_price_col = _first_existing_column(source_columns, ["均价", "avg_price"])
-
-    for src, dst in [
-        (time_col, "time"),
-        (open_col, "open"),
-        (close_col, "close"),
-        (high_col, "high"),
-        (low_col, "low"),
-        (volume_col, "volume"),
-        (amount_col, "amount"),
-        (avg_price_col, "avg_price"),
-    ]:
-        if src:
-            rename_map[src] = dst
-
-    normalized = raw_frame.rename(columns=rename_map).copy()
-    if "time" not in normalized.columns:
-        if logger:
-            logger(f"分时行情 {stock_code} 缺少时间列，返回列: {', '.join(source_columns)}")
-        return pd.DataFrame()
-
-    normalized["time"] = pd.to_datetime(normalized["time"], errors="coerce")
-    normalized = normalized.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-    if normalized.empty:
-        return pd.DataFrame()
-
-    for col in ["open", "close", "high", "low", "volume", "amount", "avg_price"]:
-        if col in normalized.columns:
-            normalized[col] = pd.to_numeric(normalized[col], errors="coerce")
-        else:
-            normalized[col] = None
-
-    # ---- 过滤竞价时段数据，避免与竞价标记重叠 ----
-    # 东方财富分时接口可能返回 09:25~09:29 的竞价撮合数据，
-    # 这些数据会和独立获取的竞价快照在图表上产生时间重叠。
-    # 正式连续竞价从 09:30 开始，午盘从 13:00 开始；
-    # 仅保留 [09:30, 11:30] ∪ [13:00, 15:00] 的有效交易分钟。
-    hhmm = normalized["time"].dt.strftime("%H:%M")
-    in_morning = (hhmm >= "09:30") & (hhmm <= "11:30")
-    in_afternoon = (hhmm >= "13:00") & (hhmm <= "15:00")
-    before_filter_len = len(normalized)
-    normalized = normalized[in_morning | in_afternoon].reset_index(drop=True)
-    if normalized.empty:
-        return pd.DataFrame()
-    filtered_count = before_filter_len - len(normalized)
-    if filtered_count > 0 and logger:
-        logger(f"分时行情 {stock_code} 过滤 {filtered_count} 条非交易时段数据（竞价/午休）")
-
-    return normalized[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]]
-
-
-def _resolve_intraday_trade_dates(df: "pd.DataFrame") -> List[str]:
-    if df is None or df.empty or "time" not in df.columns:
-        return []
-    return sorted({d.isoformat() for d in df["time"].dt.date.dropna().tolist()})
-
-
-def _select_intraday_trade_date(
-    trade_dates: List[str],
-    day_offset: int = 0,
-    target_trade_date: str = "",
-) -> Tuple[str, int]:
-    if not trade_dates:
-        return "", 0
-
-    normalized_target = str(target_trade_date or "").strip()
-    if normalized_target:
-        selected_trade_date = ""
-        if normalized_target in trade_dates:
-            selected_trade_date = normalized_target
-        else:
-            for candidate in reversed(trade_dates):
-                if candidate <= normalized_target:
-                    selected_trade_date = candidate
-                    break
-            if not selected_trade_date:
-                selected_trade_date = trade_dates[0]
-        selected_index = trade_dates.index(selected_trade_date)
-        return selected_trade_date, selected_index - (len(trade_dates) - 1)
-
-    try:
-        request_offset = int(day_offset)
-    except (TypeError, ValueError):
-        request_offset = 0
-    max_back = len(trade_dates) - 1
-    applied_offset = max(-max_back, min(request_offset, 0))
-    selected_index = len(trade_dates) - 1 + applied_offset
-    return trade_dates[selected_index], applied_offset
-
-
-def _slice_intraday_frame_by_trade_date(df: "pd.DataFrame", selected_trade_date: str) -> "pd.DataFrame":
-    if df is None or df.empty or "time" not in df.columns or not selected_trade_date:
-        return pd.DataFrame()
-    target_date = pd.to_datetime(selected_trade_date, errors="coerce").date()
-    return df[df["time"].dt.date == target_date].reset_index(drop=True)
-
-
-def _looks_like_eastmoney_rate_limit(status_code: int, response_text: str) -> bool:
-    if int(status_code or 0) in (403, 418, 429, 451, 503):
-        return True
-    sample = str(response_text or "")[:400].lower()
-    if not sample:
-        return False
-    tokens = (
-        "访问过于频繁",
-        "访问频繁",
-        "请求过于频繁",
-        "频繁",
-        "forbidden",
-        "access denied",
-        "too many requests",
-        "rate limit",
-        "风控",
-        "验证码",
-    )
-    return any(token in sample for token in tokens)
-
-
-def _eastmoney_json_indicates_rate_limit(data_json: Any) -> bool:
-    if not isinstance(data_json, dict):
-        return False
-    texts: List[str] = []
-    for key in ("message", "msg", "rc", "rt", "code", "result", "reason"):
-        value = data_json.get(key)
-        if value is not None:
-            texts.append(str(value))
-    data_part = data_json.get("data")
-    if isinstance(data_part, dict):
-        for key in ("message", "msg", "tip", "reason"):
-            value = data_part.get(key)
-            if value is not None:
-                texts.append(str(value))
-    return any(_looks_like_eastmoney_rate_limit(200, text) for text in texts)
+# 限流检测实现已迁移到 src/sources/eastmoney/rate_limit.py
+from src.sources.eastmoney import rate_limit as _em_rate_limit
+_looks_like_eastmoney_rate_limit = _em_rate_limit.looks_like_rate_limit
+_eastmoney_json_indicates_rate_limit = _em_rate_limit.json_indicates_rate_limit
 
 
 def _history_access_blocked_until() -> float:
@@ -1141,21 +524,11 @@ def _wait_for_history_request_slot() -> None:
         time.sleep(min(wait_sec, 0.5))
 
 
-def _history_mirror_host(url: str) -> str:
-    text = re.sub(r"^https?://", "", str(url or "").strip())
-    return text.split("/", 1)[0]
-
-
-def _mark_history_mirror_failed(url: str) -> None:
-    _global_mark_host_failed(url)
-
-
-def _mark_history_mirror_ok(url: str) -> None:
-    _global_mark_host_ok(url)
-
-
-def _history_mirror_on_cooldown(url: str, now: Optional[float] = None) -> bool:
-    return _global_host_on_cooldown(url, now)
+# Mirror 包装：实现已迁移到 src/sources/eastmoney/rate_limit.py + src/network/host_health.py
+_history_mirror_host = _em_rate_limit.mirror_host_of
+_mark_history_mirror_failed = _host_health.mark_failed
+_mark_history_mirror_ok = _host_health.mark_ok
+_history_mirror_on_cooldown = _host_health.on_cooldown
 
 
 def _prioritize_history_mirrors(
@@ -1238,863 +611,52 @@ def _parse_eastmoney_hist_json(stock_code: str, data_json: Dict[str, Any]) -> "p
     ]
 
 
-def _normalize_history_frame(df: "pd.DataFrame") -> "pd.DataFrame":
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    rename_map = {
-        "日期": "date",
-        "时间": "date",
-        "开盘": "open",
-        "收盘": "close",
-        "最高": "high",
-        "最低": "low",
-        "成交量": "volume",
-        "成交额": "amount",
-        "振幅": "amplitude",
-        "涨跌幅": "change_pct",
-        "涨跌额": "change_amount",
-        "换手率": "turnover_rate",
-    }
-    out = out.rename(columns=rename_map)
-    if "date" not in out.columns:
-        return pd.DataFrame()
-    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date.astype(str)
-    for col in ("open", "close", "high", "low", "volume", "amount", "amplitude", "change_pct", "change_amount", "turnover_rate"):
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-    if "close" not in out.columns:
-        return pd.DataFrame()
-    close_series = pd.to_numeric(out["close"], errors="coerce")
-    prev_close = close_series.shift(1)
-    if "change_amount" not in out.columns:
-        out["change_amount"] = close_series - prev_close
-    if "change_pct" not in out.columns:
-        out["change_pct"] = ((close_series / prev_close) - 1.0) * 100.0
-    if "volume" not in out.columns and "amount" in out.columns:
-        out["volume"] = pd.to_numeric(out["amount"], errors="coerce")
-    if "amount" not in out.columns:
-        out["amount"] = pd.Series([None] * len(out), dtype="float64")
-    if "amplitude" not in out.columns and {"high", "low", "close"} <= set(out.columns):
-        base_close = prev_close.where(prev_close.notna() & (prev_close != 0), close_series)
-        out["amplitude"] = ((pd.to_numeric(out["high"], errors="coerce") - pd.to_numeric(out["low"], errors="coerce")) / base_close) * 100.0
-    if "turnover_rate" not in out.columns:
-        out["turnover_rate"] = pd.Series([None] * len(out), dtype="float64")
-    keep_cols = [
-        "date",
-        "open",
-        "close",
-        "high",
-        "low",
-        "volume",
-        "amount",
-        "amplitude",
-        "change_pct",
-        "change_amount",
-        "turnover_rate",
-    ]
-    return out[keep_cols].dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+_normalize_history_frame = _sources_common.normalize_history_frame
 
 
 # ---- 腾讯证券镜像池 ----
-_TENCENT_HISTORY_MIRRORS = [
-    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get",
-    "https://web.ifzqgtimg.cn/appstock/app/fqkline/get",
-]
-# 腾讯镜像健康状态：委托给全局主机管理器
-
-def _mark_tencent_mirror_failed(url: str) -> None:
-    _global_mark_host_failed(url)
-
-
-def _mark_tencent_mirror_ok(url: str) -> None:
-    _global_mark_host_ok(url)
-
-
-def _get_healthy_tencent_mirrors() -> List[str]:
-    healthy = _global_filter_healthy_urls(_TENCENT_HISTORY_MIRRORS)
-    return healthy if healthy else list(_TENCENT_HISTORY_MIRRORS)
-
-
-def _fetch_tencent_hist_direct(
-    stock_code: str,
-    start_date: str,
-    end_date: str,
-    log: Optional[Callable[[str], None]] = None,
-) -> "pd.DataFrame":
-    """直接抓腾讯证券历史日线，带镜像轮换和 UA 随机化。"""
-    import requests
-    from akshare.utils import demjson
-
-    symbol = _market_prefixed_code(stock_code)
-    range_start = max(int(start_date[:4]), 2000)
-    range_end = int(end_date[:4]) + 1
-
-    mirrors = _get_healthy_tencent_mirrors()
-    big_df = pd.DataFrame()
-
-    for year in range(range_start, range_end):
-        params = {
-            "_var": f"kline_day{year}",
-            "param": f"{symbol},day,{year}-01-01,{year}-12-31,640,",
-            "r": f"0.{_random.randint(1000000000, 9999999999)}",
-        }
-        last_error = None
-        for mirror_url in mirrors:
-            try:
-                time.sleep(_random.uniform(0.1, 0.4))  # 小随机延时
-                resp = requests.get(
-                    mirror_url,
-                    params=params,
-                    timeout=(5, 10),
-                    headers={
-                        "User-Agent": _random.choice(_USER_AGENT_POOL),
-                        "Referer": "https://gu.qq.com/",
-                    },
-                )
-                if resp.status_code != 200:
-                    _mark_tencent_mirror_failed(mirror_url)
-                    last_error = RuntimeError(f"tencent HTTP {resp.status_code}")
-                    continue
-                data_text = resp.text
-                idx = data_text.find("={")
-                if idx < 0:
-                    _mark_tencent_mirror_failed(mirror_url)
-                    last_error = RuntimeError("tencent: bad response format")
-                    continue
-                data_json = demjson.decode(data_text[idx + 1:])["data"][symbol]
-                if "day" in data_json:
-                    temp_df = pd.DataFrame(data_json["day"])
-                else:
-                    temp_df = pd.DataFrame()
-                if not temp_df.empty:
-                    big_df = pd.concat([big_df, temp_df], ignore_index=True)
-                _mark_tencent_mirror_ok(mirror_url)
-                break
-            except Exception as e:
-                last_error = e
-                _mark_tencent_mirror_failed(mirror_url)
-                if log:
-                    host = re.sub(r"^https?://", "", mirror_url).split("/", 1)[0]
-                    log(f"腾讯 {stock_code} 镜像 {host} 年份 {year} 失败: {e}")
-        # 单个年份全部镜像失败，继续下一年
-
-    if big_df.empty:
-        return pd.DataFrame()
-
-    big_df = big_df.iloc[:, :6]
-    big_df.columns = ["date", "open", "close", "high", "low", "amount"]
-    for col in ["open", "close", "high", "low", "amount"]:
-        big_df[col] = pd.to_numeric(big_df[col], errors="coerce")
-    big_df["date"] = pd.to_datetime(big_df["date"], errors="coerce").dt.date.astype(str)
-    big_df = big_df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
-    return _normalize_history_frame(big_df)
-
-
-def _fetch_tencent_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """腾讯历史日线：优先使用自建直连（带镜像轮换），失败回退 akshare。"""
-    try:
-        df = _fetch_tencent_hist_direct(stock_code, start_date, end_date)
-        if df is not None and not df.empty:
-            return df
-    except Exception:
-        pass
-    # 回退到 akshare
-    symbol = _market_prefixed_code(stock_code)
-    df = _retry_ak_call(
-        ak.stock_zh_a_hist_tx,
-        symbol=symbol,
-        start_date=start_date,
-        end_date=end_date,
-        adjust="",
-    )
-    return _normalize_history_frame(df)
+# 实现已迁移到 src/sources/tencent.py；下面用别名保持调用方零修改。
+from src.sources import tencent as _tencent
+_TENCENT_HISTORY_MIRRORS = _tencent.HISTORY_MIRRORS
+_get_healthy_tencent_mirrors = _tencent._get_healthy_mirrors
+_fetch_tencent_hist_direct = _tencent.fetch_hist_direct
+_fetch_tencent_hist_frame = _tencent.fetch_hist_frame
 
 
 # ---- 新浪财经反封保护 ----
-_SINA_HISTORY_MIRRORS = [
-    "https://finance.sina.com.cn",
-    "https://hq.sinajs.cn",
-]
-_SINA_REQUEST_LOCK = threading.Lock()
-_SINA_NEXT_REQUEST_AT = 0.0
-_SINA_MIN_INTERVAL = 1.5  # 新浪对频率更敏感
-
-
-def _sina_throttle() -> None:
-    """新浪专用节流阀，确保请求间隔。"""
-    global _SINA_NEXT_REQUEST_AT
-    while True:
-        with _SINA_REQUEST_LOCK:
-            now = time.time()
-            wait = _SINA_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _SINA_NEXT_REQUEST_AT = now + _SINA_MIN_INTERVAL
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _fetch_sina_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """新浪历史日线：带 UA 随机化 + 独立节流 + 重试 + 全局主机健康管理。"""
-    # 如果新浪主机正在冷却中，直接跳过
-    if _global_host_on_cooldown("finance.sina.com.cn"):
-        remain = _global_host_cooldown_remaining("finance.sina.com.cn")
-        raise RuntimeError(f"sina host on cooldown ({int(remain)}s remaining)")
-
-    symbol = _market_prefixed_code(stock_code)
-    last_error: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            _sina_throttle()
-            # sina 请求头已在 _apply_network_patches 的 Session.request 补丁中统一处理
-            df = ak.stock_zh_a_daily(
-                symbol=symbol,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="",
-            )
-
-            _global_mark_host_ok("finance.sina.com.cn")
-            return _normalize_history_frame(df)
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
-
-    # 全部重试失败 → 标记新浪主机进入冷却
-    _global_mark_host_failed("finance.sina.com.cn")
-    if last_error is not None:
-        raise last_error
-    return pd.DataFrame()
+# 实现已迁移到 src/sources/sina.py；下面是公共函数别名。
+from src.sources import sina as _src_sina
+_fetch_sina_hist_frame = _src_sina.fetch_hist_frame
 
 
 # ---- 网易财经历史日线 ----
-# 格式：CSV 下载，非常稳定，反爬较弱
-# URL: http://quotes.money.163.com/service/chddata.html?code=CODE&start=START&end=END
-_NETEASE_REQUEST_LOCK = threading.Lock()
-_NETEASE_NEXT_REQUEST_AT = 0.0
-_NETEASE_MIN_INTERVAL = 1.0
-
-
-def _netease_throttle() -> None:
-    global _NETEASE_NEXT_REQUEST_AT
-    while True:
-        with _NETEASE_REQUEST_LOCK:
-            now = time.time()
-            wait = _NETEASE_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _NETEASE_NEXT_REQUEST_AT = now + _NETEASE_MIN_INTERVAL + _random.uniform(0.2, 0.8)
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _netease_stock_code(code: str) -> str:
-    """网易用 0+沪市代码 或 1+深市代码 的格式。"""
-    c = str(code).strip().zfill(6)
-    if c.startswith(("5", "6", "9")):
-        return f"0{c}"
-    return f"1{c}"
-
-
-def _fetch_netease_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """网易财经历史日线：CSV 格式下载，反爬较弱。"""
-    import requests
-    import io
-
-    if _global_host_on_cooldown("quotes.money.163.com"):
-        remain = _global_host_cooldown_remaining("quotes.money.163.com")
-        raise RuntimeError(f"netease host on cooldown ({int(remain)}s remaining)")
-
-    netease_code = _netease_stock_code(stock_code)
-    # 网易日期格式: YYYYMMDD
-    url = "https://quotes.money.163.com/service/chddata.html"
-    params = {
-        "code": netease_code,
-        "start": start_date,
-        "end": end_date,
-        "fields": "TCLOSE;HIGH;LOW;TOPEN;LCLOSE;CHG;PCHG;TURNOVER;VOTURNOVER;VATURNOVER",
-    }
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            _netease_throttle()
-            resp = requests.get(
-                url,
-                params=params,
-                timeout=(5, 15),
-                headers={
-                    "User-Agent": _random.choice(_USER_AGENT_POOL),
-                    "Referer": "https://quotes.money.163.com/",
-                },
-            )
-            if resp.status_code != 200:
-                last_error = RuntimeError(f"netease HTTP {resp.status_code}")
-                time.sleep(1.0 + _random.uniform(0.5, 1.5))
-                continue
-
-            # 网易返回 GBK 编码的 CSV
-            text = resp.content.decode("gbk", errors="replace")
-            df = pd.read_csv(io.StringIO(text), dtype=str)
-            if df.empty:
-                last_error = RuntimeError("netease: empty CSV")
-                continue
-
-            # 列名映射
-            col_map = {
-                "日期": "date",
-                "收盘价": "close",
-                "最高价": "high",
-                "最低价": "low",
-                "开盘价": "open",
-                "前收盘": "prev_close",
-                "涨跌额": "change_amount",
-                "涨跌幅": "change_pct",
-                "换手率": "turnover_rate",
-                "成交量": "volume",
-                "成交金额": "amount",
-            }
-            # 网易的列名可能带引号，需要 strip
-            df.columns = [c.strip().strip("'\"") for c in df.columns]
-            df = df.rename(columns=col_map)
-
-            for col in ("open", "close", "high", "low", "volume", "amount", "change_pct", "change_amount", "turnover_rate"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col].astype(str).str.strip(), errors="coerce")
-
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), errors="coerce").dt.date.astype(str)
-
-            # 去掉 None 或停牌数据
-            df = df.dropna(subset=["date", "close"])
-            df = df[df["close"] > 0]
-
-            _global_mark_host_ok("quotes.money.163.com")
-            return _normalize_history_frame(df)
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
-
-    _global_mark_host_failed("quotes.money.163.com")
-    if last_error is not None:
-        raise last_error
-    return pd.DataFrame()
+# 实现已迁移到 src/sources/netease.py；下面是公共函数别名。
+from src.sources import netease as _src_netease
+_fetch_netease_hist_frame = _src_netease.fetch_hist_frame
 
 
 # ---- 百度股市通历史日线 ----
-_BAIDU_REQUEST_LOCK = threading.Lock()
-_BAIDU_NEXT_REQUEST_AT = 0.0
-_BAIDU_MIN_INTERVAL = 1.2
-
-
-def _baidu_throttle() -> None:
-    global _BAIDU_NEXT_REQUEST_AT
-    while True:
-        with _BAIDU_REQUEST_LOCK:
-            now = time.time()
-            wait = _BAIDU_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _BAIDU_NEXT_REQUEST_AT = now + _BAIDU_MIN_INTERVAL + _random.uniform(0.2, 0.8)
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _baidu_stock_code(code: str) -> str:
-    """百度用 ab.sz000001 或 ab.sh600000 的格式。"""
-    c = str(code).strip().zfill(6)
-    market = "sh" if c.startswith(("5", "6", "9")) else "sz"
-    return f"ab.{market}{c}"
-
-
-def _fetch_baidu_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """百度股市通历史日线 API。"""
-    import requests
-
-    if _global_host_on_cooldown("gushitong.baidu.com"):
-        remain = _global_host_cooldown_remaining("gushitong.baidu.com")
-        raise RuntimeError(f"baidu host on cooldown ({int(remain)}s remaining)")
-
-    baidu_code = _baidu_stock_code(stock_code)
-    url = "https://finance.pae.baidu.com/vapi/v1/getquotation"
-    params = {
-        "srcid": "5353",
-        "pointType": "string",
-        "group": "quotation_kline_ab",
-        "query": baidu_code,
-        "code": baidu_code,
-        "market_type": "ab",
-        "newFormat": "1",
-        "is_498": "1",
-        "ktype": "day",
-        "finClientType": "pc",
-    }
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            _baidu_throttle()
-            resp = requests.get(
-                url,
-                params=params,
-                timeout=(5, 12),
-                headers={
-                    "User-Agent": _random.choice(_USER_AGENT_POOL),
-                    "Referer": "https://gushitong.baidu.com/",
-                    "Accept": "application/json",
-                },
-            )
-            if resp.status_code != 200:
-                last_error = RuntimeError(f"baidu HTTP {resp.status_code}")
-                time.sleep(1.0 + _random.uniform(0.5, 1.5))
-                continue
-
-            data = resp.json()
-            result = data.get("Result") or {}
-            # 百度接口结构层级较深
-            content_list = result.get("newMarketData") or result.get("priceinfo") or {}
-            if isinstance(content_list, dict):
-                content_list = content_list.get("marketData") or content_list.get("content") or {}
-            if isinstance(content_list, dict):
-                content_list = content_list.get("marketData") or ""
-
-            # 尝试从 keys 中获取 kline data
-            kline_data = None
-            if isinstance(result, dict):
-                for key in ("newMarketData", "priceinfo"):
-                    block = result.get(key)
-                    if isinstance(block, dict):
-                        md = block.get("marketData", "")
-                        if isinstance(md, str) and md.strip():
-                            kline_data = md
-                            break
-                        keys_data = block.get("keys", [])
-                        if keys_data:
-                            kline_data = block
-                            break
-
-            if not kline_data:
-                last_error = RuntimeError("baidu: no kline data found")
-                time.sleep(1.0)
-                continue
-
-            if isinstance(kline_data, str):
-                # 百度有时返回 "日期,开盘,收盘,最高,最低,成交量,成交额\n..." 格式
-                lines = kline_data.strip().split("\n")
-                rows = []
-                for line in lines:
-                    parts = line.split(",")
-                    if len(parts) >= 7:
-                        rows.append({
-                            "date": parts[0].strip(),
-                            "open": parts[1].strip(),
-                            "close": parts[2].strip(),
-                            "high": parts[3].strip(),
-                            "low": parts[4].strip(),
-                            "volume": parts[5].strip(),
-                            "amount": parts[6].strip(),
-                        })
-                df = pd.DataFrame(rows)
-            else:
-                last_error = RuntimeError("baidu: unexpected data format")
-                continue
-
-            if df.empty:
-                last_error = RuntimeError("baidu: empty result")
-                continue
-
-            for col in ("open", "close", "high", "low", "volume", "amount"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-            df = df.dropna(subset=["date", "close"])
-
-            _global_mark_host_ok("gushitong.baidu.com")
-            return _normalize_history_frame(df)
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
-
-    _global_mark_host_failed("gushitong.baidu.com")
-    if last_error is not None:
-        raise last_error
-    return pd.DataFrame()
+# 实现已迁移到 src/sources/baidu.py；下面是公共函数别名。
+from src.sources import baidu as _src_baidu
+_fetch_baidu_hist_frame = _src_baidu.fetch_hist_frame
 
 
 # ---- 搜狐财经历史日线 ----
-_SOHU_REQUEST_LOCK = threading.Lock()
-_SOHU_NEXT_REQUEST_AT = 0.0
-_SOHU_MIN_INTERVAL = 0.8
-
-
-def _sohu_throttle() -> None:
-    global _SOHU_NEXT_REQUEST_AT
-    while True:
-        with _SOHU_REQUEST_LOCK:
-            now = time.time()
-            wait = _SOHU_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _SOHU_NEXT_REQUEST_AT = now + _SOHU_MIN_INTERVAL + _random.uniform(0.1, 0.5)
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _sohu_stock_code(code: str) -> str:
-    """搜狐用 cn_000001 或 cn_600000 的格式。"""
-    c = str(code).strip().zfill(6)
-    return f"cn_{c}"
-
-
-def _fetch_sohu_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """搜狐财经历史日线：JSONP 格式。"""
-    import requests
-
-    if _global_host_on_cooldown("q.stock.sohu.com"):
-        remain = _global_host_cooldown_remaining("q.stock.sohu.com")
-        raise RuntimeError(f"sohu host on cooldown ({int(remain)}s remaining)")
-
-    sohu_code = _sohu_stock_code(stock_code)
-    # 搜狐日期格式 YYYYMMDD
-    s = start_date.replace("-", "")
-    e = end_date.replace("-", "")
-    url = f"https://q.stock.sohu.com/hisHq"
-    params = {
-        "code": sohu_code,
-        "start": s,
-        "end": e,
-        "stat": "1",
-        "order": "D",
-        "period": "d",
-        "callback": f"historySearchHandler",
-        "rt": f"jsonp{_random.randint(1000, 9999)}",
-    }
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            _sohu_throttle()
-            resp = requests.get(
-                url,
-                params=params,
-                timeout=(5, 12),
-                headers={
-                    "User-Agent": _random.choice(_USER_AGENT_POOL),
-                    "Referer": "https://q.stock.sohu.com/",
-                },
-            )
-            if resp.status_code != 200:
-                last_error = RuntimeError(f"sohu HTTP {resp.status_code}")
-                time.sleep(1.0 + _random.uniform(0.5, 1.5))
-                continue
-
-            # JSONP 剥离
-            import json as _json
-            text = _strip_jsonp_wrapper(resp.text)
-            data = _json.loads(text)
-
-            if not isinstance(data, list) or not data:
-                last_error = RuntimeError("sohu: empty or invalid response")
-                continue
-
-            # 搜狐返回 [{status: 0, hq: [[date, open, close, change, change_pct, low, high, volume, amount, turnover], ...]}]
-            hq = data[0].get("hq") or [] if isinstance(data[0], dict) else []
-            if not hq:
-                last_error = RuntimeError("sohu: no hq data")
-                continue
-
-            rows = []
-            for item in hq:
-                if not isinstance(item, list) or len(item) < 9:
-                    continue
-                rows.append({
-                    "date": str(item[0]).strip(),
-                    "open": item[1],
-                    "close": item[2],
-                    # item[3] = 涨跌额, item[4] = 涨跌幅%
-                    "change_amount": item[3],
-                    "change_pct": str(item[4]).replace("%", ""),
-                    "low": item[5],
-                    "high": item[6],
-                    "volume": item[7],
-                    "amount": item[8],
-                    "turnover_rate": item[9] if len(item) > 9 else None,
-                })
-
-            df = pd.DataFrame(rows)
-            if df.empty:
-                last_error = RuntimeError("sohu: empty parsed result")
-                continue
-
-            for col in ("open", "close", "high", "low", "volume", "amount", "change_pct", "change_amount", "turnover_rate"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col].astype(str).str.replace("%", "").str.replace(",", ""), errors="coerce")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-            df = df.dropna(subset=["date", "close"])
-
-            _global_mark_host_ok("q.stock.sohu.com")
-            return _normalize_history_frame(df)
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
-
-    _global_mark_host_failed("q.stock.sohu.com")
-    if last_error is not None:
-        raise last_error
-    return pd.DataFrame()
+# 实现已迁移到 src/sources/sohu.py；下面是公共函数别名。
+from src.sources import sohu as _src_sohu
+_fetch_sohu_hist_frame = _src_sohu.fetch_hist_frame
 
 
 # ---- 同花顺 (THS / 10jqka) 历史日线 ----
-_THS_REQUEST_LOCK = threading.Lock()
-_THS_NEXT_REQUEST_AT = 0.0
-_THS_MIN_INTERVAL = 0.6
-
-
-def _ths_throttle() -> None:
-    global _THS_NEXT_REQUEST_AT
-    while True:
-        with _THS_REQUEST_LOCK:
-            now = time.time()
-            wait = _THS_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _THS_NEXT_REQUEST_AT = now + _THS_MIN_INTERVAL + _random.uniform(0.1, 0.4)
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _ths_stock_code(code: str) -> str:
-    """同花顺用 hs_000001 格式。"""
-    c = str(code).strip().zfill(6)
-    return f"hs_{c}"
-
-
-def _fetch_ths_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """同花顺 CDN 历史日线：JSONP 格式，按年请求后合并筛选。"""
-    import requests
-    import json as _json
-
-    host = "d.10jqka.com.cn"
-    if _global_host_on_cooldown(host):
-        remain = _global_host_cooldown_remaining(host)
-        raise RuntimeError(f"ths host on cooldown ({int(remain)}s remaining)")
-
-    ths_code = _ths_stock_code(stock_code)
-    # 确定需要请求的年份范围
-    start_year = int(start_date[:4])
-    end_year = int(end_date[:4])
-    years = list(range(start_year, end_year + 1))
-
-    all_rows = []
-    last_error = None
-    for year in years:
-        for attempt in range(2):
-            try:
-                _ths_throttle()
-                url = f"https://{host}/v6/line/{ths_code}/01/{year}.js"
-                resp = requests.get(
-                    url,
-                    timeout=(5, 12),
-                    verify=False,
-                    headers={
-                        "User-Agent": _random.choice(_USER_AGENT_POOL),
-                        "Referer": "https://www.10jqka.com.cn/",
-                    },
-                )
-                if resp.status_code != 200:
-                    last_error = RuntimeError(f"ths HTTP {resp.status_code}")
-                    time.sleep(0.5 + _random.uniform(0.3, 0.8))
-                    continue
-
-                text = resp.text
-                lp = text.find("(")
-                rp = text.rfind(")")
-                if lp < 0 or rp <= lp:
-                    last_error = RuntimeError("ths: invalid JSONP response")
-                    continue
-                data = _json.loads(text[lp + 1 : rp])
-                raw = data.get("data", "")
-                if not raw:
-                    last_error = RuntimeError("ths: empty data field")
-                    continue
-
-                # 格式: date,open,high,low,close,volume,amount,turnover_rate,,,flag;...
-                for line in raw.split(";"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split(",")
-                    if len(parts) < 7:
-                        continue
-                    all_rows.append({
-                        "date": parts[0],
-                        "open": parts[1],
-                        "high": parts[2],
-                        "low": parts[3],
-                        "close": parts[4],
-                        "volume": parts[5],
-                        "amount": parts[6],
-                        "turnover_rate": parts[7] if len(parts) > 7 and parts[7] else None,
-                    })
-                break  # 成功，跳出 retry 循环
-            except Exception as e:
-                last_error = e
-                time.sleep(1.0 + _random.uniform(0.3, 0.8))
-
-    if not all_rows:
-        _global_mark_host_failed(host)
-        if last_error is not None:
-            raise last_error
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_rows)
-    for col in ("open", "close", "high", "low", "volume", "amount", "turnover_rate"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d", errors="coerce").dt.date.astype(str)
-    df = df.dropna(subset=["date", "close"])
-    df = df[df["close"] > 0]
-
-    # 按日期范围筛选
-    sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
-    ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
-    df = df[(df["date"] >= sd) & (df["date"] <= ed)]
-
-    _global_mark_host_ok(host)
-    return _normalize_history_frame(df)
+# 实现已迁移到 src/sources/ths.py；下面是公共函数别名。
+from src.sources import ths as _src_ths
+_fetch_ths_hist_frame = _src_ths.fetch_hist_frame
 
 
 # ---- 华尔街见闻 (WallstreetCN) 历史日线 ----
-_WSCN_REQUEST_LOCK = threading.Lock()
-_WSCN_NEXT_REQUEST_AT = 0.0
-_WSCN_MIN_INTERVAL = 0.5
-
-
-def _wscn_throttle() -> None:
-    global _WSCN_NEXT_REQUEST_AT
-    while True:
-        with _WSCN_REQUEST_LOCK:
-            now = time.time()
-            wait = _WSCN_NEXT_REQUEST_AT - now
-            if wait <= 0:
-                _WSCN_NEXT_REQUEST_AT = now + _WSCN_MIN_INTERVAL + _random.uniform(0.1, 0.4)
-                return
-        time.sleep(min(wait, 0.5))
-
-
-def _wscn_stock_code(code: str) -> str:
-    """华尔街见闻用 000001.SZ / 600000.SS 格式。"""
-    c = str(code).strip().zfill(6)
-    market = "SS" if c.startswith(("5", "6", "9")) else "SZ"
-    return f"{c}.{market}"
-
-
-def _fetch_wscn_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """华尔街见闻历史日线 API：JSON 格式，国际 CDN 节点。"""
-    import requests
-    from datetime import datetime as _dt
-
-    host = "api-ddc-wscn.awtmt.com"
-    if _global_host_on_cooldown(host):
-        remain = _global_host_cooldown_remaining(host)
-        raise RuntimeError(f"wscn host on cooldown ({int(remain)}s remaining)")
-
-    wscn_code = _wscn_stock_code(stock_code)
-    # 计算需要的交易日数（粗略估算，日历天 * 0.7 + buffer）
-    sd = start_date.replace("-", "")
-    ed = end_date.replace("-", "")
-    try:
-        d1 = _dt.strptime(sd[:8], "%Y%m%d")
-        d2 = _dt.strptime(ed[:8], "%Y%m%d")
-        cal_days = (d2 - d1).days
-    except Exception:
-        cal_days = 120
-    tick_count = max(30, int(cal_days * 0.75) + 10)
-
-    url = f"https://{host}/market/kline"
-    params = {
-        "prod_code": wscn_code,
-        "tick_count": str(tick_count),
-        "period_type": "86400",
-        "fields": "tick_at,open_px,close_px,high_px,low_px,turnover_volume,turnover_value",
-    }
-
-    last_error = None
-    for attempt in range(3):
-        try:
-            _wscn_throttle()
-            resp = requests.get(
-                url,
-                params=params,
-                timeout=(5, 12),
-                verify=False,
-                headers={
-                    "User-Agent": _random.choice(_USER_AGENT_POOL),
-                    "Referer": "https://wallstreetcn.com/",
-                    "Origin": "https://wallstreetcn.com",
-                },
-            )
-            if resp.status_code != 200:
-                last_error = RuntimeError(f"wscn HTTP {resp.status_code}")
-                time.sleep(1.0 + _random.uniform(0.5, 1.0))
-                continue
-
-            data = resp.json()
-            if data.get("code") != 20000:
-                last_error = RuntimeError(f"wscn API error: {data.get('message', 'unknown')}")
-                continue
-
-            candle = data.get("data", {}).get("candle", {})
-            stock_data = candle.get(wscn_code, {})
-            lines = stock_data.get("lines", [])
-            if not lines:
-                last_error = RuntimeError("wscn: no kline data")
-                continue
-
-            # fields order: open_px, close_px, high_px, low_px, turnover_volume, turnover_value, tick_at
-            rows = []
-            for line in lines:
-                if len(line) < 7:
-                    continue
-                ts = line[6]  # tick_at is the last field
-                try:
-                    dt = _dt.fromtimestamp(ts)
-                    date_str = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    continue
-                rows.append({
-                    "date": date_str,
-                    "open": line[0],
-                    "close": line[1],
-                    "high": line[2],
-                    "low": line[3],
-                    "volume": line[4],
-                    "amount": line[5],
-                })
-
-            if not rows:
-                last_error = RuntimeError("wscn: empty parsed result")
-                continue
-
-            df = pd.DataFrame(rows)
-            for col in ("open", "close", "high", "low", "volume", "amount"):
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-            df = df.dropna(subset=["date", "close"])
-            df = df[df["close"] > 0]
-
-            # 按日期范围筛选
-            sd_fmt = f"{sd[:4]}-{sd[4:6]}-{sd[6:8]}"
-            ed_fmt = f"{ed[:4]}-{ed[4:6]}-{ed[6:8]}"
-            df = df[(df["date"] >= sd_fmt) & (df["date"] <= ed_fmt)]
-
-            _global_mark_host_ok(host)
-            return _normalize_history_frame(df)
-        except Exception as e:
-            last_error = e
-            time.sleep(1.5 * (attempt + 1) + _random.uniform(0.3, 1.0))
-
-    _global_mark_host_failed(host)
-    if last_error is not None:
-        raise last_error
-    return pd.DataFrame()
+# 实现已迁移到 src/sources/wscn.py；下面是公共函数别名。
+from src.sources import wscn as _src_wscn
+_fetch_wscn_hist_frame = _src_wscn.fetch_hist_frame
 
 
 def _probe_history_mirror(url: str) -> Tuple[bool, str]:
@@ -2213,13 +775,7 @@ def _call_akshare_quietly(fn: Callable[..., T], *args, **kwargs) -> T:
         return _retry_ak_call(fn, *args, **kwargs)
 
 
-def _first_existing_column(columns: List[str], candidates: List[str]) -> Optional[str]:
-    normalized = {str(col).strip(): col for col in columns}
-    for name in candidates:
-        key = str(name).strip()
-        if key in normalized:
-            return normalized[key]
-    return None
+_first_existing_column = _sources_common.first_existing_column
 
 
 def _find_fund_flow_column(columns: List[str], includes: List[str], excludes: Optional[List[str]] = None) -> Optional[str]:
@@ -2548,7 +1104,7 @@ _patch_akshare_request_layer()
 
 def _use_em_full_spot_for_list() -> bool:
     """设为 1 / em / eastmoney 时仍走东方财富分页全表（易卡死，不推荐）。"""
-    return os.environ.get("GUPPIAO_LIST_SOURCE", "").strip().lower() in (
+    return os.environ.get("ASHARE_SCAN_LIST_SOURCE", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -2614,16 +1170,8 @@ def _infer_exchange(code: str) -> str:
     return "上交所" if c.startswith(("5", "6", "9")) else "深交所"
 
 
-def _infer_market(code: str) -> str:
-    c = str(code).strip().zfill(6)
-    if c.startswith(("4", "8")):
-        return "bj"
-    return "sh" if c.startswith(("5", "6", "9")) else "sz"
-
-
-def _market_prefixed_code(code: str) -> str:
-    norm = str(code or "").strip().zfill(6)
-    return f"{_infer_market(norm)}{norm}"
+_infer_market = _sources_common.infer_market
+_market_prefixed_code = _sources_common.market_prefixed_code
 
 
 def _normalize_concepts_text(value: Any) -> str:
@@ -2830,12 +1378,12 @@ class StockDataFetcher:
         self._history_mirror_cache: List[str] = []
         self._history_mirror_checked_at: float = 0.0
         try:
-            configured_limit = int(os.environ.get("GUPPIAO_CONCEPT_BOARD_LIMIT", "20").strip() or "20")
+            configured_limit = int(os.environ.get("ASHARE_SCAN_CONCEPT_BOARD_LIMIT", "20").strip() or "20")
         except ValueError:
             configured_limit = 20
         self.concept_board_limit: int = max(5, min(configured_limit, 80))
         try:
-            configured_timeout = float(os.environ.get("GUPPIAO_CONCEPT_FILL_TIMEOUT_SEC", "25").strip() or "25")
+            configured_timeout = float(os.environ.get("ASHARE_SCAN_CONCEPT_FILL_TIMEOUT_SEC", "25").strip() or "25")
         except ValueError:
             configured_timeout = 25.0
         self.concept_fill_timeout_sec: float = max(5.0, configured_timeout)
@@ -3964,7 +2512,7 @@ class StockDataFetcher:
     def get_all_stocks(self, force_refresh: bool = False) -> pd.DataFrame:
         if _use_em_full_spot_for_list():
             return self._get_all_stocks_em_spot()
-        if os.environ.get("GUPPIAO_REFRESH_UNIVERSE", "").strip().lower() in (
+        if os.environ.get("ASHARE_SCAN_REFRESH_UNIVERSE", "").strip().lower() in (
             "1",
             "true",
             "yes",
@@ -3991,7 +2539,7 @@ class StockDataFetcher:
         _list_download_log = self._log
         try:
             if self._log:
-                self._log("已开启 GUPPIAO_LIST_SOURCE=em：东方财富分页全表（耗时长，易限流）…")
+                self._log("已开启 ASHARE_SCAN_LIST_SOURCE=em：东方财富分页全表（耗时长，易限流）…")
             stock_list = _retry_ak_call(ak.stock_zh_a_spot_em)
             stock_list = stock_list.rename(columns={
                 "代码": "code",
