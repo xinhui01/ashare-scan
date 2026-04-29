@@ -21,14 +21,14 @@ def _use_insecure_ssl() -> bool:
     if os.environ.get("GUPPIAO_INSECURE_SSL", "").strip().lower() in ("1", "true", "yes"):
         return True
     root = _project_root()
-    return (root / "USE_INSECURE_SSL").is_file() or (root / ".gupiao_insecure_ssl").is_file()
+    return (root / "USE_INSECURE_SSL").is_file() or (root / ".ashare_scan_insecure_ssl").is_file()
 
 def _use_bypass_proxy() -> bool:
     """不走 HTTP(S)_PROXY 等环境代理（避免公司代理对东方财富断开）。"""
     if os.environ.get("GUPPIAO_BYPASS_PROXY", "").strip().lower() in ("1", "true", "yes"):
         return True
     root = _project_root()
-    return (root / "USE_BYPASS_PROXY").is_file() or (root / ".gupiao_bypass_proxy").is_file()
+    return (root / "USE_BYPASS_PROXY").is_file() or (root / ".ashare_scan_bypass_proxy").is_file()
 
 # 须在 import akshare 之前执行：统一为 requests 补头；可选 SSL / 忽略环境代理
 def _apply_network_patches() -> None:
@@ -496,7 +496,7 @@ def _use_proxy_pool() -> bool:
     if os.environ.get("GUPPIAO_USE_PROXY_POOL", "").strip().lower() in ("1", "true", "yes"):
         return True
     root = _project_root()
-    return (root / "USE_PROXY_POOL").is_file() or (root / ".gupiao_proxy_pool").is_file()
+    return (root / "USE_PROXY_POOL").is_file() or (root / ".ashare_scan_proxy_pool").is_file()
 
 
 def _fetch_free_proxies(logger: Optional[Callable[[str], None]] = None) -> List[str]:
@@ -880,7 +880,7 @@ def _fetch_eastmoney_intraday_1min(
         "secid": f"{market_code}.{stock_code}",
     }
     try:
-        response = _gupiao_request_with_retry(url, params=params, timeout=15)
+        response = _ashare_request_with_retry(url, params=params, timeout=15)
         data_json = response.json()
     except Exception as exc:
         if logger:
@@ -2440,7 +2440,7 @@ def _eastmoney_request_mirror_urls(url: str) -> List[str]:
     return out if out else [raw]
 
 
-def _gupiao_request_with_retry(
+def _ashare_request_with_retry(
     url: str,
     params: Optional[Dict[str, Any]] = None,
     timeout: int = 15,
@@ -2539,8 +2539,8 @@ def _patch_akshare_request_layer() -> None:
     import akshare.utils.func as ak_func
     import akshare.utils.request as ak_req
 
-    ak_req.request_with_retry = _gupiao_request_with_retry
-    ak_func.request_with_retry = _gupiao_request_with_retry
+    ak_req.request_with_retry = _ashare_request_with_retry
+    ak_func.request_with_retry = _ashare_request_with_retry
 
 
 _patch_akshare_request_layer()

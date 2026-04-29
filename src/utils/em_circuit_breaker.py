@@ -1,6 +1,6 @@
 """东方财富请求熔断器。
 
-`_gupiao_request_with_retry` 连续失败达到阈值时开启熔断，冷却期内所有东财相关
+`_ashare_request_with_retry` 连续失败达到阈值时开启熔断，冷却期内所有东财相关
 请求立即快速失败，避免无意义的超长等待和 IP 被进一步封禁。
 
 对外暴露一个模块级的默认实例（用 `EMCircuitBreaker.instance()` 访问），以及

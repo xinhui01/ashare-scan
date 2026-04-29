@@ -1877,7 +1877,7 @@ class StockFilter:
             future_spot = executor.submit(_fetch_spot)
 
             try:
-                # 涨停池最多 15 秒（底层 _gupiao_request_with_retry 有 20s deadline 兜底）
+                # 涨停池最多 15 秒（底层 _ashare_request_with_retry 有 20s deadline 兜底）
                 future_pool.result(timeout=15.0)
             except FutureTimeoutError as e:
                 if self._log:

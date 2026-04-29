@@ -164,7 +164,7 @@ pip install pyinstaller
 Windows 打包示例：
 
 ```bash
-pyinstaller -w -F main.py -n gupiao
+pyinstaller -w -F main.py -n ashare-scan
 ```
 
 打包完成后，可执行文件会出现在 `dist/` 目录中。
