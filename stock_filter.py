@@ -2695,9 +2695,10 @@ class StockFilter:
 
         硬性过滤（缺一不返回）：
         1. 必须出现近期爆量（量比 ≥ 1.8x）
-        2. 当前价格离 MA5 ≤ ±3%（真正贴近 MA5）
+        2. 收盘价 > MA5 且距 MA5 ≤ +3%（真正贴近 MA5 上方）
         3. 当日涨幅 ∈ [-5%, +6%)（避免大跌或抢跑，>6% 让首板/趋势处理）
         4. 距爆量日 ≤ 7 个交易日（信号还有效）
+        5. 近 60 个交易日（不含今日）内出现过收盘涨停
         """
         code = rec["code"]
         name = rec.get("name", "")
@@ -2730,6 +2731,7 @@ class StockFilter:
         touched_ma5 = False
         recent_above_ma5 = False
         trend_ok = False
+        had_limit_up_60d = False
 
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
@@ -2808,14 +2810,30 @@ class StockFilter:
                             recent_above_ma5 = True
                             break
 
+            # 近 60 个交易日（不含今日）内是否有过收盘涨停
+            zt_threshold = self._limit_up_threshold_pct(code)
+            zt_start = max(1, t - 60)
+            for i in range(zt_start, t):
+                if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
+                    continue
+                prev_c = float(close.iloc[i - 1])
+                if prev_c <= 0:
+                    continue
+                chg_i = (float(close.iloc[i]) / prev_c - 1) * 100
+                if chg_i >= zt_threshold - 0.3:
+                    had_limit_up_60d = True
+                    break
+
         # ---- 硬性过滤：不满足"五日承接"形态的票直接淘汰 ----
         if recent_burst_ratio is None or recent_burst_ratio < 1.8:
             return None
-        if dist_ma5_pct is None or not (-3.0 <= dist_ma5_pct <= 3.0):
+        if dist_ma5_pct is None or not (0 < dist_ma5_pct <= 3.0):
             return None
         if change_pct is None or change_pct < -5.0 or change_pct >= 6.0:
             return None
         if days_since_burst is None or days_since_burst > 7:
+            return None
+        if not had_limit_up_60d:
             return None
 
         # 1. 爆量强度（max 22）

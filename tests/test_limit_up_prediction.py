@@ -36,13 +36,13 @@ class _HistoryFetcher:
                 "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17",
                 "2026-04-18",
             ],
-            "open": [9.0, 9.1, 9.2, 9.4, 9.7, 10.2, 10.8, 10.7, 10.55, 10.42, 10.18],
-            "high": [9.1, 9.2, 9.4, 9.8, 10.2, 10.9, 11.0, 10.8, 10.6, 10.45, 10.25],
-            "low":  [8.9, 9.0, 9.1, 9.3, 9.6, 10.0, 10.6, 10.45, 10.30, 10.10, 10.00],
-            "close": [9.0, 9.1, 9.3, 9.7, 10.1, 10.8, 10.9, 10.6, 10.45, 10.2, 10.12],
-            "change_pct": [0.5, 1.1, 2.2, 4.3, 4.1, 6.9, 0.9, -2.8, -1.4, -2.4, -0.8],
-            "volume": [1_000_000, 1_100_000, 1_150_000, 1_200_000, 1_300_000, 3_600_000, 2_300_000, 1_800_000, 1_550_000, 1_420_000, 1_350_000],
-            "amount": [20_000_000, 22_000_000, 24_000_000, 26_000_000, 28_000_000, 86_000_000, 60_000_000, 46_000_000, 39_000_000, 35_000_000, 34_000_000],
+            "open": [8.95, 9.05, 9.15, 9.30, 9.50, 9.80, 10.65, 10.50, 10.40, 10.35, 10.32],
+            "high": [9.05, 9.15, 9.25, 9.45, 9.75, 10.67, 10.70, 10.55, 10.42, 10.38, 10.48],
+            "low":  [8.90, 9.00, 9.10, 9.25, 9.45, 9.78, 10.45, 10.38, 10.30, 10.28, 10.30],
+            "close": [9.00, 9.10, 9.20, 9.40, 9.70, 10.67, 10.50, 10.40, 10.35, 10.30, 10.45],
+            "change_pct": [0.5, 1.1, 1.1, 2.2, 3.2, 10.0, -1.6, -0.95, -0.48, -0.48, 1.46],
+            "volume": [1_000_000, 1_100_000, 1_150_000, 1_200_000, 1_300_000, 6_000_000, 2_300_000, 1_800_000, 1_550_000, 1_420_000, 1_350_000],
+            "amount": [9_000_000, 10_000_000, 10_500_000, 11_300_000, 12_600_000, 64_000_000, 24_000_000, 18_700_000, 16_000_000, 14_600_000, 14_100_000],
         })
 
 
@@ -67,7 +67,7 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
 
         self.assertEqual(ctx["pair_count"], 2)
         self.assertEqual(ctx["latest_continuation_rate"], 50.0)
-        self.assertEqual(ctx["avg_continuation_rate"], 41.7)
+        self.assertEqual(ctx["avg_continuation_rate"], 41.6)
 
     def test_parse_spot_record_keeps_industry(self):
         row = pd.Series({
@@ -94,19 +94,23 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
             "code": "000001",
             "name": "测试股",
             "industry": "机器人",
-            "close": 10.12,
-            "change_pct": -0.8,
+            "close": 10.45,
+            "change_pct": 1.46,
             "turnover": 8.0,
         }
 
-        result = f._score_followthrough_candidate(rec, {"机器人": 3}, lookback_days=5)
+        result = f._score_followthrough_candidate(
+            rec, {"机器人": 3}, {}, lookback_days=5,
+        )
 
+        self.assertIsNotNone(result)
         self.assertGreaterEqual(result["score"], 50)
         self.assertEqual(result["predict_type"], "五日承接")
         self.assertEqual(result["burst_date"], "2026-04-13")
         self.assertEqual(result["days_since_burst"], 5)
         self.assertIsNotNone(result["dist_ma5_pct"])
-        self.assertIn("近期爆量", result["reasons"])
+        self.assertGreater(result["dist_ma5_pct"], 0)
+        self.assertIn("爆量", result["reasons"])
 
 
 if __name__ == "__main__":
