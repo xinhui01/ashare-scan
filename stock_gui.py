@@ -1873,6 +1873,10 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
         self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(
+            action_bar, text="今天", width=5,
+            command=lambda: self._predict_date_var.set(datetime.now().strftime("%Y%m%d")),
+        ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action_bar, text="回溯天数:").pack(side=tk.LEFT, padx=(10, 2))
         self._predict_lookback_var = tk.StringVar(value="5")
         ttk.Entry(action_bar, textvariable=self._predict_lookback_var, width=4).pack(side=tk.LEFT)
