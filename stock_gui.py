@@ -1373,6 +1373,10 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="今日:").pack(side=tk.LEFT, padx=(12, 2))
         self._zt_today_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._zt_today_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(
+            action_bar, text="今天", width=5,
+            command=lambda: self._zt_today_var.set(datetime.now().strftime("%Y%m%d")),
+        ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action_bar, text="昨日:").pack(side=tk.LEFT, padx=(8, 2))
         self._zt_yesterday_var = tk.StringVar()
         ttk.Entry(action_bar, textvariable=self._zt_yesterday_var, width=10).pack(side=tk.LEFT)
