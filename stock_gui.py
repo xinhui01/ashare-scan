@@ -1662,6 +1662,15 @@ class StockMonitorApp:
             self._zt_compare_result, persist=False, status_message="涨停对比已按筛选条件更新"
         )
 
+    def _refresh_predict_display_if_ready(self):
+        """顶部价格/板块筛选变化时同步刷新涨停预测表（如已有预测结果）。"""
+        if not getattr(self, "_predict_lists", None):
+            return
+        try:
+            self._render_predict_trees()
+        except Exception:
+            pass
+
     def _apply_limit_up_compare(
         self,
         result: Dict[str, Any],
@@ -2550,6 +2559,35 @@ class StockMonitorApp:
         if int(rec.get("score") or 0) < min_score:
             return False
 
+        # 顶部全局价格过滤（与扫描/涨停对比保持一致）
+        try:
+            min_price_raw = (self.min_price_var.get() or "").strip()
+            min_price = float(min_price_raw) if min_price_raw else None
+        except (ValueError, AttributeError, tk.TclError):
+            min_price = None
+        try:
+            max_price_raw = (self.max_price_var.get() or "").strip()
+            max_price = float(max_price_raw) if max_price_raw else None
+        except (ValueError, AttributeError, tk.TclError):
+            max_price = None
+        close = rec.get("close")
+        if isinstance(close, (int, float)):
+            if min_price is not None and close < min_price:
+                return False
+            if max_price is not None and close > max_price:
+                return False
+
+        # 顶部全局板块过滤
+        try:
+            allowed_boards = {str(b).strip() for b in self._selected_boards() if str(b).strip()}
+        except Exception:
+            allowed_boards = set()
+        if allowed_boards:
+            code = str(rec.get("code", "")).strip().zfill(6)
+            board = self._infer_board_from_code(code)
+            if board not in allowed_boards:
+                return False
+
         kw = (self._predict_filter_keyword.get() or "").strip().lower()
         if kw:
             haystack = " ".join(str(rec.get(f, "") or "") for f in
@@ -3354,6 +3392,8 @@ class StockMonitorApp:
             self.status_var.set("已保存显示板块筛选设置")
         # 同步刷新涨停对比
         self._refresh_zt_compare_display()
+        # 同步刷新涨停预测
+        self._refresh_predict_display_if_ready()
 
     def on_price_filter_changed(self, event=None):
         if self.is_scanning:
@@ -3369,6 +3409,8 @@ class StockMonitorApp:
                 return "break" if event is not None else None
         # 同步刷新涨停对比
         self._refresh_zt_compare_display()
+        # 同步刷新涨停预测
+        self._refresh_predict_display_if_ready()
         return "break" if event is not None else None
 
     def clear_price_filter(self):
