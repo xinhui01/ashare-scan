@@ -242,6 +242,36 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             payload_json TEXT NOT NULL,
             saved_at TEXT NOT NULL DEFAULT ''
         );
+
+        CREATE TABLE IF NOT EXISTS limit_up_prediction_accuracy (
+            trade_date TEXT NOT NULL,
+            verify_date TEXT NOT NULL DEFAULT '',
+            code TEXT NOT NULL,
+            category TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
+            predicted_score INTEGER NOT NULL DEFAULT 0,
+            predicted_type TEXT NOT NULL DEFAULT '',
+            t_close REAL,
+            t1_open REAL,
+            t1_high REAL,
+            t1_low REAL,
+            t1_close REAL,
+            t1_pct REAL,
+            t1_limit_up INTEGER NOT NULL DEFAULT 0,
+            t1_one_word INTEGER NOT NULL DEFAULT 0,
+            t1_suspended INTEGER NOT NULL DEFAULT 0,
+            hit_strict INTEGER NOT NULL DEFAULT 0,
+            hit_loose INTEGER NOT NULL DEFAULT 0,
+            hit_buyable INTEGER NOT NULL DEFAULT 1,
+            evaluated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (trade_date, code, category)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lup_accuracy_date
+            ON limit_up_prediction_accuracy(trade_date);
+        CREATE INDEX IF NOT EXISTS idx_lup_accuracy_category
+            ON limit_up_prediction_accuracy(category);
         """
     )
     existing_columns = {
@@ -1155,6 +1185,219 @@ def list_limit_up_compare_dates() -> List[str]:
         logger.exception("列出涨停对比历史日期失败")
         return []
     return [str(row["today_date"]) for row in rows if row and row["today_date"]]
+
+
+# ============== 涨停预测准确率（limit_up_prediction_accuracy） ==============
+
+_PREDICTION_ACCURACY_FIELDS = (
+    "trade_date", "verify_date", "code", "category",
+    "name", "industry", "predicted_score", "predicted_type",
+    "t_close", "t1_open", "t1_high", "t1_low", "t1_close", "t1_pct",
+    "t1_limit_up", "t1_one_word", "t1_suspended",
+    "hit_strict", "hit_loose", "hit_buyable", "evaluated_at",
+)
+
+
+def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
+    """批量 upsert 预测准确率记录，返回写入条数。"""
+    if not records:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows: List[Tuple[Any, ...]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        trade_date = str(rec.get("trade_date") or "").strip()
+        code = str(rec.get("code") or "").strip().zfill(6)
+        category = str(rec.get("category") or "").strip()
+        if not trade_date or not code or not category:
+            continue
+        rows.append((
+            trade_date,
+            str(rec.get("verify_date") or "").strip(),
+            code,
+            category,
+            str(rec.get("name") or ""),
+            str(rec.get("industry") or ""),
+            int(rec.get("predicted_score") or 0),
+            str(rec.get("predicted_type") or ""),
+            _to_float(rec.get("t_close")),
+            _to_float(rec.get("t1_open")),
+            _to_float(rec.get("t1_high")),
+            _to_float(rec.get("t1_low")),
+            _to_float(rec.get("t1_close")),
+            _to_float(rec.get("t1_pct")),
+            int(bool(rec.get("t1_limit_up"))),
+            int(bool(rec.get("t1_one_word"))),
+            int(bool(rec.get("t1_suspended"))),
+            int(bool(rec.get("hit_strict"))),
+            int(bool(rec.get("hit_loose"))),
+            int(bool(rec.get("hit_buyable", True))),
+            str(rec.get("evaluated_at") or now),
+        ))
+
+    if not rows:
+        return 0
+
+    def _write():
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO limit_up_prediction_accuracy(
+                    trade_date, verify_date, code, category,
+                    name, industry, predicted_score, predicted_type,
+                    t_close, t1_open, t1_high, t1_low, t1_close, t1_pct,
+                    t1_limit_up, t1_one_word, t1_suspended,
+                    hit_strict, hit_loose, hit_buyable, evaluated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, code, category) DO UPDATE SET
+                    verify_date=excluded.verify_date,
+                    name=excluded.name,
+                    industry=excluded.industry,
+                    predicted_score=excluded.predicted_score,
+                    predicted_type=excluded.predicted_type,
+                    t_close=excluded.t_close,
+                    t1_open=excluded.t1_open,
+                    t1_high=excluded.t1_high,
+                    t1_low=excluded.t1_low,
+                    t1_close=excluded.t1_close,
+                    t1_pct=excluded.t1_pct,
+                    t1_limit_up=excluded.t1_limit_up,
+                    t1_one_word=excluded.t1_one_word,
+                    t1_suspended=excluded.t1_suspended,
+                    hit_strict=excluded.hit_strict,
+                    hit_loose=excluded.hit_loose,
+                    hit_buyable=excluded.hit_buyable,
+                    evaluated_at=excluded.evaluated_at
+                """,
+                rows,
+            )
+
+    try:
+        with _DB_WRITE_LOCK:
+            _retry_locked(_write)
+    except Exception:
+        logger.exception("保存预测准确率记录失败")
+        return 0
+    return len(rows)
+
+
+def load_prediction_accuracy_by_date(trade_date: str) -> List[Dict[str, Any]]:
+    td = str(trade_date or "").strip()
+    if not td or not _DB_PATH.is_file():
+        return []
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT * FROM limit_up_prediction_accuracy WHERE trade_date = ?",
+                (td,),
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("读取预测准确率记录失败")
+        return []
+    return [dict(r) for r in rows]
+
+
+def list_prediction_accuracy_dates() -> List[str]:
+    if not _DB_PATH.is_file():
+        return []
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT DISTINCT trade_date FROM limit_up_prediction_accuracy "
+                "ORDER BY trade_date DESC"
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("列出预测准确率日期失败")
+        return []
+    return [str(r["trade_date"]) for r in rows if r and r["trade_date"]]
+
+
+def query_prediction_accuracy_stats(
+    category: Optional[str] = None,
+    lookback_dates: Optional[int] = None,
+) -> Dict[str, Any]:
+    """聚合统计命中率。
+
+    返回 {total, buyable, hit_strict, hit_loose, strict_rate, loose_rate, avg_pct, dates}。
+    `lookback_dates`：仅统计最近 N 个 trade_date；None 表示全部。
+    `category`：限定类别（cont/first/fresh/wrap/trend），None 表示全部。
+    """
+    empty = {
+        "total": 0, "buyable": 0,
+        "hit_strict": 0, "hit_loose": 0,
+        "strict_rate": 0.0, "loose_rate": 0.0,
+        "avg_pct": 0.0, "dates": 0,
+    }
+    if not _DB_PATH.is_file():
+        return empty
+
+    def _read():
+        with _connect() as conn:
+            params: List[Any] = []
+            where: List[str] = []
+            if category:
+                where.append("category = ?")
+                params.append(str(category))
+            if lookback_dates and lookback_dates > 0:
+                # 取最近 N 个 trade_date 的并集
+                inner_params: List[Any] = []
+                inner_where = ""
+                if category:
+                    inner_where = "WHERE category = ?"
+                    inner_params.append(str(category))
+                date_rows = conn.execute(
+                    f"SELECT DISTINCT trade_date FROM limit_up_prediction_accuracy "
+                    f"{inner_where} ORDER BY trade_date DESC LIMIT ?",
+                    (*inner_params, int(lookback_dates)),
+                ).fetchall()
+                date_list = [str(r["trade_date"]) for r in date_rows if r and r["trade_date"]]
+                if not date_list:
+                    return None
+                placeholders = ",".join(["?"] * len(date_list))
+                where.append(f"trade_date IN ({placeholders})")
+                params.extend(date_list)
+
+            sql = "SELECT * FROM limit_up_prediction_accuracy"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            return conn.execute(sql, params).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("聚合预测准确率失败")
+        return empty
+    if not rows:
+        return empty
+
+    total = len(rows)
+    dates = {str(r["trade_date"]) for r in rows}
+    buyable_rows = [r for r in rows if int(r["hit_buyable"] or 0)]
+    buyable = len(buyable_rows)
+    hit_strict = sum(1 for r in buyable_rows if int(r["hit_strict"] or 0))
+    hit_loose = sum(1 for r in buyable_rows if int(r["hit_loose"] or 0))
+    pcts = [float(r["t1_pct"]) for r in buyable_rows if r["t1_pct"] is not None]
+    avg_pct = (sum(pcts) / len(pcts)) if pcts else 0.0
+    return {
+        "total": total,
+        "buyable": buyable,
+        "hit_strict": hit_strict,
+        "hit_loose": hit_loose,
+        "strict_rate": (hit_strict / buyable * 100.0) if buyable else 0.0,
+        "loose_rate": (hit_loose / buyable * 100.0) if buyable else 0.0,
+        "avg_pct": avg_pct,
+        "dates": len(dates),
+    }
 
 
 def save_intraday_cache(

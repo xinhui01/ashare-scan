@@ -1149,6 +1149,28 @@ class StockDataFetcher:
             return ""
         return reason
 
+    @staticmethod
+    def _sanitize_limit_up_pool(df: pd.DataFrame) -> pd.DataFrame:
+        """剔除接口返回的脏数据：涨跌幅 ≤ 0 / 最新价 ≤ 0 / 首封时间 全 0。
+
+        akshare `stock_zt_pool_em` 偶尔会塞进异常行（如 涨跌幅=-100、最新价=0、
+        首次封板时间='000000'），这些不是真实涨停股，必须在入库前过滤掉。
+        """
+        if df is None or df.empty:
+            return df
+        keep_mask = pd.Series(True, index=df.index)
+        if "涨跌幅" in df.columns:
+            chg = pd.to_numeric(df["涨跌幅"], errors="coerce")
+            keep_mask &= chg.fillna(-999) > 0
+        if "最新价" in df.columns:
+            price = pd.to_numeric(df["最新价"], errors="coerce")
+            keep_mask &= price.fillna(-1) > 0
+        if "首次封板时间" in df.columns:
+            seal_time = df["首次封板时间"].astype(str).str.strip()
+            # "000000" 或全空都是无效封板时间
+            keep_mask &= ~(seal_time.isin(["", "000000", "0", "0000", "nan", "NaN", "None"]))
+        return df[keep_mask].reset_index(drop=True)
+
     def get_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
         """获取指定日期的涨停板池。
 
@@ -1164,10 +1186,11 @@ class StockDataFetcher:
         if mem_cached is not None:
             return mem_cached
 
-        # 2. SQLite 持久缓存
+        # 2. SQLite 持久缓存（也做一次过滤，防止历史脏数据继续展示）
         from stock_store import load_limit_up_pool, save_limit_up_pool
         db_cached = load_limit_up_pool(date_key)
         if db_cached is not None and not db_cached.empty:
+            db_cached = self._sanitize_limit_up_pool(db_cached)
             self._limit_up_pool_cache[date_key] = db_cached
             if self._log:
                 self._log(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
@@ -1181,10 +1204,14 @@ class StockDataFetcher:
         try:
             df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
             if df is not None and not df.empty:
+                raw_count = len(df)
+                df = self._sanitize_limit_up_pool(df)
+                dropped = raw_count - len(df)
                 self._limit_up_pool_cache[date_key] = df
                 save_limit_up_pool(date_key, df)
                 if self._log:
-                    self._log(f"涨停池 {date_key} 网络获取 {len(df)} 只，已保存到本地")
+                    drop_note = f"，过滤 {dropped} 条脏数据" if dropped > 0 else ""
+                    self._log(f"涨停池 {date_key} 网络获取 {len(df)} 只{drop_note}，已保存到本地")
                 return df
         except Exception as e:
             if self._log:
