@@ -10,3 +10,4 @@ cache/
 data/
 .claude/
 docs/
+_diag_wrap.py

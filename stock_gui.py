@@ -1914,13 +1914,28 @@ class StockMonitorApp:
         # ---- 筛选栏 ----
         filter_bar = ttk.Frame(predict_frame)
         filter_bar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(filter_bar, text="最低分:").pack(side=tk.LEFT)
+        ttk.Label(filter_bar, text="最低分≥").pack(side=tk.LEFT)
         self._predict_filter_min_score = tk.IntVar(value=0)
-        ttk.Spinbox(
-            filter_bar, from_=0, to=100, increment=5, width=4,
+        min_score_spin = ttk.Spinbox(
+            filter_bar, from_=0, to=100, increment=5, width=5,
             textvariable=self._predict_filter_min_score,
             command=self._on_predict_filter_changed,
-        ).pack(side=tk.LEFT, padx=(2, 10))
+        )
+        min_score_spin.pack(side=tk.LEFT, padx=(2, 4))
+        # 让"键盘输入"也触发筛选（Spinbox 默认 command 只响应上下箭头）
+        min_score_spin.bind("<KeyRelease>", lambda _e: self._on_predict_filter_changed())
+        min_score_spin.bind("<FocusOut>", lambda _e: self._on_predict_filter_changed())
+        min_score_spin.bind("<Return>", lambda _e: self._on_predict_filter_changed())
+        # 一键预设按钮
+        for preset in (50, 60, 70):
+            ttk.Button(
+                filter_bar, text=f"≥{preset}", width=4,
+                command=lambda v=preset: (
+                    self._predict_filter_min_score.set(v),
+                    self._on_predict_filter_changed(),
+                ),
+            ).pack(side=tk.LEFT, padx=1)
+        ttk.Frame(filter_bar, width=8).pack(side=tk.LEFT)
 
         ttk.Label(filter_bar, text="关键词:").pack(side=tk.LEFT)
         self._predict_filter_keyword = tk.StringVar(value="")
