@@ -1322,6 +1322,39 @@ def list_prediction_accuracy_dates() -> List[str]:
     return [str(r["trade_date"]) for r in rows if r and r["trade_date"]]
 
 
+# cont 子类别 key，仅在涉及命中率拆分时使用。与 prediction_accuracy_service.CONT_SUB_CATEGORY_KEYS 保持一致。
+_CONT_SUB_CATEGORY_KEYS: Tuple[str, ...] = (
+    "cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus",
+)
+
+
+def list_prediction_accuracy_dates_with_cont_subcat() -> List[str]:
+    """返回已包含 cont 子类别记录的 trade_date。
+
+    供 evaluate_all_pending 判断哪些日期已经按"新逻辑"（含 1进2/2进3 等拆分）评估过。
+    旧版只写了 cont 主类别的日期不在此列表中，下次刷新时会被自动重跑以补全子类别。
+    """
+    if not _DB_PATH.is_file():
+        return []
+
+    placeholders = ",".join(["?"] * len(_CONT_SUB_CATEGORY_KEYS))
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                f"SELECT DISTINCT trade_date FROM limit_up_prediction_accuracy "
+                f"WHERE category IN ({placeholders}) ORDER BY trade_date DESC",
+                _CONT_SUB_CATEGORY_KEYS,
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("列出已含 cont 子类别的预测准确率日期失败")
+        return []
+    return [str(r["trade_date"]) for r in rows if r and r["trade_date"]]
+
+
 def query_prediction_accuracy_stats(
     category: Optional[str] = None,
     lookback_dates: Optional[int] = None,
@@ -1341,6 +1374,8 @@ def query_prediction_accuracy_stats(
     if not _DB_PATH.is_file():
         return empty
 
+    sub_placeholders = ",".join(["?"] * len(_CONT_SUB_CATEGORY_KEYS))
+
     def _read():
         with _connect() as conn:
             params: List[Any] = []
@@ -1348,13 +1383,19 @@ def query_prediction_accuracy_stats(
             if category:
                 where.append("category = ?")
                 params.append(str(category))
+            else:
+                # 全类别聚合时排除 cont 子类别，避免和 cont 主类别重复计数
+                where.append(f"category NOT IN ({sub_placeholders})")
+                params.extend(_CONT_SUB_CATEGORY_KEYS)
             if lookback_dates and lookback_dates > 0:
                 # 取最近 N 个 trade_date 的并集
                 inner_params: List[Any] = []
-                inner_where = ""
                 if category:
                     inner_where = "WHERE category = ?"
                     inner_params.append(str(category))
+                else:
+                    inner_where = f"WHERE category NOT IN ({sub_placeholders})"
+                    inner_params.extend(_CONT_SUB_CATEGORY_KEYS)
                 date_rows = conn.execute(
                     f"SELECT DISTINCT trade_date FROM limit_up_prediction_accuracy "
                     f"{inner_where} ORDER BY trade_date DESC LIMIT ?",

@@ -42,13 +42,43 @@ CATEGORY_KEYS: Dict[str, str] = {
     "trend": "trend_limit_up_candidates",
 }
 
+# 保留涨停按当前连板数细分（仅追加，不替换 cont 总类）
+# - 1板今日涨停 → 预测明日 2 连板 = "1进2"
+# - 2板今日涨停 → 预测明日 3 连板 = "2进3"
+# - 依此类推，5 板及以上合并为 "5进6+"
+CONT_SUB_CATEGORY_KEYS: List[str] = [
+    "cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus",
+]
+
 CATEGORY_LABELS: Dict[str, str] = {
     "cont": "保留涨停",
     "first": "二波接力",
     "fresh": "首板涨停",
     "wrap": "反包/承接",
     "trend": "趋势涨停",
+    "cont_1to2": "1进2",
+    "cont_2to3": "2进3",
+    "cont_3to4": "3进4",
+    "cont_4to5": "4进5",
+    "cont_5plus": "5进6+",
 }
+
+
+def _cont_sub_category(boards: Any) -> str:
+    """按当前连板数派生子类别 key（用于 1进2/2进3 等命中率拆分）。"""
+    try:
+        b = int(boards)
+    except (TypeError, ValueError):
+        b = 1
+    if b <= 1:
+        return "cont_1to2"
+    if b == 2:
+        return "cont_2to3"
+    if b == 3:
+        return "cont_3to4"
+    if b == 4:
+        return "cont_4to5"
+    return "cont_5plus"
 
 
 def _normalize_date_yyyymmdd(value: str) -> str:
@@ -247,7 +277,7 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
             elif not evaluation.get("t1_suspended"):
                 has_any_t1_data = True
 
-            records.append({
+            record = {
                 "trade_date": td,
                 "verify_date": verify_date,
                 "code": code,
@@ -257,7 +287,19 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
                 "predicted_score": int(cand.get("score") or 0),
                 "predicted_type": str(cand.get("predict_type") or ""),
                 **evaluation,
-            })
+            }
+            records.append(record)
+
+            # 保留涨停额外按连板数派生子类别（cont_1to2/cont_2to3/...）
+            # 主类别 cont 仍然写入，子类别用于拆分命中率统计
+            if cat_key == "cont":
+                sub_cat = _cont_sub_category(cand.get("consecutive_boards"))
+                sub_key = (code, sub_cat)
+                if sub_key not in seen:
+                    seen.add(sub_key)
+                    sub_record = dict(record)
+                    sub_record["category"] = sub_cat
+                    records.append(sub_record)
 
     # 没有任何候选拿到 T+1 K 线 → 视为本地缓存还没同步，
     # 不写入坏记录，避免 evaluate_all_pending 把这一天误标为"已评估"后永久卡住
@@ -291,7 +333,12 @@ def evaluate_all_pending(
     pred_dates = stock_store.list_limit_up_prediction_dates()
     if not pred_dates:
         return {"evaluated": [], "skipped": [], "total": 0}
-    evaluated_set = set() if force else set(stock_store.list_prediction_accuracy_dates())
+    if force:
+        evaluated_set: set = set()
+    else:
+        # 已评估口径：accuracy 表里同时存在 cont 子类别记录的日期。
+        # 这样旧版本只写了 cont 主类别的日期，下次刷新时会被自动重跑以补全 1进2/2进3 等子类别。
+        evaluated_set = set(stock_store.list_prediction_accuracy_dates_with_cont_subcat())
 
     pending: List[str] = []
     for d in pred_dates:
@@ -343,12 +390,14 @@ def query_compare(trade_date: str) -> Dict[str, Any]:
         }
     verify_date = next((r["verify_date"] for r in rows if r.get("verify_date")), "")
 
-    # 候选去重时按 (code) 合并多类别
+    # 候选去重时按 (code) 合并多类别；cont 子类别仅用于命中率拆分，不参与对比展示
     by_code: Dict[str, Dict[str, Any]] = {}
     for r in rows:
+        cat = str(r.get("category") or "")
+        if cat in CONT_SUB_CATEGORY_KEYS:
+            continue
         code = r.get("code") or ""
         cur = by_code.get(code)
-        cat = str(r.get("category") or "")
         cat_label = CATEGORY_LABELS.get(cat, cat)
         if cur is None:
             cur = {
@@ -413,11 +462,31 @@ def query_compare(trade_date: str) -> Dict[str, Any]:
 
 
 def query_category_stats(lookback_dates: int = 20) -> Dict[str, Dict[str, Any]]:
-    """返回 5 个类别在最近 N 个交易日的命中率统计。"""
+    """返回主类别 + cont 子类别在最近 N 个交易日的命中率统计。
+
+    返回 key：cont/first/fresh/wrap/trend + cont_1to2/cont_2to3/.../cont_5plus
+    """
     out: Dict[str, Dict[str, Any]] = {}
-    for cat in CATEGORY_KEYS.keys():
+    all_cats: List[str] = list(CATEGORY_KEYS.keys()) + list(CONT_SUB_CATEGORY_KEYS)
+    for cat in all_cats:
         out[cat] = stock_store.query_prediction_accuracy_stats(
             category=cat, lookback_dates=lookback_dates,
+        )
+    return out
+
+
+def query_category_stats_yesterday() -> Dict[str, Dict[str, Any]]:
+    """返回主类别 + cont 子类别在「最近一个已评估交易日」的命中率统计。
+
+    实现：每个 category 调用 query_prediction_accuracy_stats(lookback_dates=1)；
+    其内部按 trade_date DESC LIMIT 1 取该类别下最新一日，所以不同类别的"昨日"
+    可能对应不同 trade_date（少见，但 fresh/wrap 等可能在某天没有任何候选）。
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    all_cats: List[str] = list(CATEGORY_KEYS.keys()) + list(CONT_SUB_CATEGORY_KEYS)
+    for cat in all_cats:
+        out[cat] = stock_store.query_prediction_accuracy_stats(
+            category=cat, lookback_dates=1,
         )
     return out
 
@@ -462,8 +531,14 @@ def _load_recent_rows(
     for td in recent:
         rows = stock_store.load_prediction_accuracy_by_date(td)
         for r in rows:
-            if category and str(r.get("category") or "") != category:
-                continue
+            cat = str(r.get("category") or "")
+            if category:
+                if cat != category:
+                    continue
+            else:
+                # 全类别聚合时跳过 cont 子类别，避免和 cont 主类别重复计数
+                if cat in CONT_SUB_CATEGORY_KEYS:
+                    continue
             out.append(r)
     return out
 

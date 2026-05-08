@@ -2021,6 +2021,15 @@ class StockMonitorApp:
                               anchor=tk.W, padding=(6, 2))
         cont_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["cont"] = cont_stat
+
+        # 1进2 / 2进3 / 3进4 / 4进5 / 5进6+ 子类别命中率（独立统计，不影响主类别）
+        cont_sub_frame = ttk.Frame(cont_tab)
+        cont_sub_frame.pack(side=tk.TOP, fill=tk.X)
+        for sub_key in ("cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus"):
+            sub_lbl = ttk.Label(cont_sub_frame, text="-", foreground="#666",
+                                anchor=tk.W, padding=(12, 1))
+            sub_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._predict_stat_labels[sub_key] = sub_lbl
         cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
                      "seal_time", "breaks", "turnover", "score", "result", "reasons")
         self._predict_cont_tree = ttk.Treeview(
@@ -2924,11 +2933,15 @@ class StockMonitorApp:
                 prediction_accuracy_service.evaluate_all_pending()
             except Exception:
                 pass
-            # 拉取分类统计
+            # 拉取分类统计：近 20 日 + 昨日（最近一个已评估交易日）
             try:
                 stats = prediction_accuracy_service.query_category_stats(lookback_dates=20)
             except Exception:
                 stats = {}
+            try:
+                stats_yesterday = prediction_accuracy_service.query_category_stats_yesterday()
+            except Exception:
+                stats_yesterday = {}
             # 重新加载当前日期的逐行结果
             results_map = {}
             if current_date:
@@ -2936,8 +2949,10 @@ class StockMonitorApp:
                     results_map = prediction_accuracy_service.get_per_code_results(current_date)
                 except Exception:
                     results_map = {}
-            self._post_to_ui(lambda s=stats, m=results_map:
-                             self._apply_predict_accuracy(s, m))
+            self._post_to_ui(
+                lambda s=stats, y=stats_yesterday, m=results_map:
+                self._apply_predict_accuracy(s, m, y)
+            )
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -2945,26 +2960,62 @@ class StockMonitorApp:
         self,
         stats: Dict[str, Dict[str, Any]],
         results_map: Dict,
+        stats_yesterday: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
-        """更新 5 个 tab 顶部的命中率标签 + 刷新 result 列。"""
+        """更新 5 个 tab 顶部的命中率标签 + 刷新 result 列。
+
+        stats: 近 N 日命中率（默认 N=20）
+        stats_yesterday: 最近一个已评估交易日的命中率（"昨日"）
+        """
         labels = getattr(self, "_predict_stat_labels", {}) or {}
+        stats_yesterday = stats_yesterday or {}
         category_names = {
             "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
             "wrap": "反包/承接", "trend": "趋势涨停",
+            "cont_1to2": "1进2", "cont_2to3": "2进3", "cont_3to4": "3进4",
+            "cont_4to5": "4进5", "cont_5plus": "5进6+",
         }
+        sub_keys = {"cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus"}
+
+        def _fmt_pair(d: Dict[str, Any]) -> str:
+            """昨日命中率紧凑串。无样本时返回 '-'。"""
+            d = d or {}
+            b = int(d.get("buyable") or 0)
+            if b <= 0:
+                return "-"
+            h = int(d.get("hit_strict") or 0)
+            r = float(d.get("strict_rate") or 0.0)
+            return f"{r:.1f}% ({h}/{b})"
+
         for cat, lbl in labels.items():
             data = stats.get(cat) or {}
+            y_data = stats_yesterday.get(cat) or {}
             buyable = int(data.get("buyable") or 0)
             hit = int(data.get("hit_strict") or 0)
             rate = float(data.get("strict_rate") or 0.0)
             avg_pct = float(data.get("avg_pct") or 0.0)
             dates = int(data.get("dates") or 0)
-            if buyable <= 0:
-                txt = f"{category_names.get(cat, cat)} · 历史命中率: -（暂无回填数据）"
+            y_str = _fmt_pair(y_data)
+            name = category_names.get(cat, cat)
+            if cat in sub_keys:
+                # 子类别紧凑格式：1进2 · 昨 60.0% (3/5) | 近20d 42.1% (8/19)
+                if buyable <= 0:
+                    txt = f"{name}: 昨{y_str} | 近-"
+                else:
+                    txt = (
+                        f"{name}: 昨{y_str} | "
+                        f"近{dates}d {rate:.1f}% ({hit}/{buyable})"
+                    )
+            elif buyable <= 0:
+                txt = (
+                    f"{name} · 昨日命中率 {y_str} · 历史近{dates}日: "
+                    f"-（暂无回填数据）"
+                )
             else:
                 txt = (
-                    f"{category_names.get(cat, cat)} · 近{dates}日命中率 "
-                    f"{rate:.1f}% ({hit}/{buyable})  平均次日涨幅 {avg_pct:+.2f}%"
+                    f"{name} · 昨日命中率 {y_str} · "
+                    f"近{dates}日 {rate:.1f}% ({hit}/{buyable})  "
+                    f"平均次日涨幅 {avg_pct:+.2f}%"
                 )
             try:
                 lbl.configure(text=txt)
