@@ -211,6 +211,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (trade_date, pool_type)
         );
 
+        CREATE TABLE IF NOT EXISTS limit_up_stock_meta (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
+            last_limit_up_trade_date TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS watchlist (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
@@ -1845,6 +1853,10 @@ def save_limit_up_pool(trade_date: str, df: pd.DataFrame, pool_type: str = "toda
             )
     with _DB_WRITE_LOCK:
         _retry_locked(_do)
+    try:
+        save_limit_up_stock_meta_from_pool(date_key, df)
+    except Exception:
+        logger.exception("保存涨停池股票元信息失败")
 
 
 def load_limit_up_pool(trade_date: str, pool_type: str = "today") -> Optional[pd.DataFrame]:
@@ -1870,3 +1882,94 @@ def load_limit_up_pool(trade_date: str, pool_type: str = "today") -> Optional[pd
     except Exception as e:
         logger.warning("读取涨停池 %s/%s 失败: %s", date_key, pool_type, e)
         return None
+
+
+def save_limit_up_stock_meta_from_pool(trade_date: str, df: pd.DataFrame) -> int:
+    """从涨停池提取每只股票最近一次已知的名称/行业，用于非涨停日详情回退。"""
+    date_key = str(trade_date or "").strip().replace("-", "")
+    if not date_key or df is None or df.empty or "代码" not in df.columns:
+        return 0
+
+    out = df.copy()
+    if "名称" not in out.columns:
+        out["名称"] = ""
+    if "所属行业" not in out.columns:
+        out["所属行业"] = ""
+    out["代码"] = out["代码"].astype(str).str.strip().str.zfill(6)
+    out["名称"] = out["名称"].astype(str).fillna("").str.strip()
+    out["所属行业"] = out["所属行业"].astype(str).fillna("").str.strip()
+    out = out[(out["代码"] != "") & (out["代码"].str.len() == 6)]
+    if out.empty:
+        return 0
+    out = out.drop_duplicates(subset=["代码"], keep="last")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        (str(row["代码"]), str(row["名称"]), str(row["所属行业"]), date_key, now)
+        for _, row in out.iterrows()
+    ]
+    if not rows:
+        return 0
+
+    def _write():
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO limit_up_stock_meta(
+                    code, name, industry, last_limit_up_trade_date, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    name=CASE
+                        WHEN excluded.name <> '' THEN excluded.name
+                        ELSE limit_up_stock_meta.name
+                    END,
+                    industry=CASE
+                        WHEN excluded.industry <> '' THEN excluded.industry
+                        ELSE limit_up_stock_meta.industry
+                    END,
+                    last_limit_up_trade_date=CASE
+                        WHEN excluded.last_limit_up_trade_date >= COALESCE(NULLIF(limit_up_stock_meta.last_limit_up_trade_date, ''), '')
+                            THEN excluded.last_limit_up_trade_date
+                        ELSE limit_up_stock_meta.last_limit_up_trade_date
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+
+    with _DB_WRITE_LOCK:
+        _retry_locked(_write)
+    return len(rows)
+
+
+def load_limit_up_stock_meta(stock_code: str) -> Optional[Dict[str, Any]]:
+    code = str(stock_code or "").strip().zfill(6)
+    if not code or not _DB_PATH.is_file():
+        return None
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                """
+                SELECT code, name, industry, last_limit_up_trade_date, updated_at
+                FROM limit_up_stock_meta
+                WHERE code = ?
+                """,
+                (code,),
+            ).fetchone()
+
+    try:
+        row = _retry_locked(_read)
+    except Exception:
+        logger.exception("读取涨停池股票元信息失败")
+        return None
+    if row is None:
+        return None
+    return {
+        "code": str(row["code"] or "").strip().zfill(6),
+        "name": str(row["name"] or ""),
+        "industry": str(row["industry"] or ""),
+        "last_limit_up_trade_date": str(row["last_limit_up_trade_date"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }

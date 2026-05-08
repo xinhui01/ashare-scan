@@ -15,7 +15,11 @@ from src.services.history_analysis_service import HistoryAnalysisService
 from src.utils.cancel_token import CancelToken, coerce_should_stop
 from stock_data import StockDataFetcher, DaemonThreadPoolExecutor
 from stock_logger import get_logger
-from stock_store import save_last_limit_up_prediction, save_limit_up_prediction_record
+from stock_store import (
+    load_limit_up_stock_meta,
+    save_last_limit_up_prediction,
+    save_limit_up_prediction_record,
+)
 
 logger = get_logger(__name__)
 
@@ -61,19 +65,34 @@ class StockFilter:
 
     def _resolve_stock_identity(self, universe: Optional[pd.DataFrame], stock_code: str) -> Dict[str, str]:
         code = str(stock_code or "").strip().zfill(6)
+        cached_meta = load_limit_up_stock_meta(code) or {}
         if universe is None or universe.empty or not code:
-            return {"name": "", "board": "", "exchange": ""}
+            return {
+                "name": str(cached_meta.get("name", "") or ""),
+                "board": "",
+                "exchange": "",
+                "industry": str(cached_meta.get("industry", "") or ""),
+                "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
+            }
         try:
             match = universe[universe["code"].astype(str).str.zfill(6) == code]
         except Exception:
-            return {"name": "", "board": "", "exchange": ""}
+            match = pd.DataFrame()
         if match.empty:
-            return {"name": "", "board": "", "exchange": ""}
+            return {
+                "name": str(cached_meta.get("name", "") or ""),
+                "board": "",
+                "exchange": "",
+                "industry": str(cached_meta.get("industry", "") or ""),
+                "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
+            }
         row = match.iloc[0]
         return {
-            "name": str(row.get("name", "") or ""),
+            "name": str(row.get("name", "") or "") or str(cached_meta.get("name", "") or ""),
             "board": str(row.get("board", "") or ""),
             "exchange": str(row.get("exchange", "") or ""),
+            "industry": str(cached_meta.get("industry", "") or ""),
+            "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
         }
 
     def _enrich_analysis_with_history_snapshot(
@@ -174,6 +193,8 @@ class StockFilter:
             "name": str(stock_identity.get("name", "") or ""),
             "board": str(stock_identity.get("board", "") or ""),
             "exchange": str(stock_identity.get("exchange", "") or ""),
+            "industry": str(stock_identity.get("industry", "") or ""),
+            "last_limit_up_trade_date": str(stock_identity.get("last_limit_up_trade_date", "") or ""),
             "history": history,
             "analysis": analysis,
         }

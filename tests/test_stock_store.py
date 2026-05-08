@@ -229,6 +229,37 @@ class TestCoverageSummary(StockStoreTestCase):
         self.assertAlmostEqual(summary["coverage_ratio"], 0.5)
 
 
+class TestLimitUpStockMeta(StockStoreTestCase):
+    def test_save_limit_up_pool_persists_stock_meta(self):
+        from stock_store import load_limit_up_stock_meta, save_limit_up_pool
+
+        df = pd.DataFrame([
+            {"代码": "000001", "名称": "平安银行", "所属行业": "银行"},
+            {"代码": "300001", "名称": "特锐德", "所属行业": "电气设备"},
+        ])
+        save_limit_up_pool("2026-04-30", df)
+
+        meta = load_limit_up_stock_meta("000001")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["industry"], "银行")
+        self.assertEqual(meta["last_limit_up_trade_date"], "20260430")
+
+    def test_save_limit_up_pool_keeps_old_industry_when_new_row_missing_it(self):
+        from stock_store import load_limit_up_stock_meta, save_limit_up_pool
+
+        save_limit_up_pool("2026-04-29", pd.DataFrame([
+            {"代码": "000001", "名称": "平安银行", "所属行业": "银行"},
+        ]))
+        save_limit_up_pool("2026-04-30", pd.DataFrame([
+            {"代码": "000001", "名称": "平安银行", "所属行业": ""},
+        ]))
+
+        meta = load_limit_up_stock_meta("000001")
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["industry"], "银行")
+        self.assertEqual(meta["last_limit_up_trade_date"], "20260430")
+
+
 class TestClearTables(StockStoreTestCase):
     def test_clear_universe(self):
         from stock_store import save_universe, load_universe, clear_universe

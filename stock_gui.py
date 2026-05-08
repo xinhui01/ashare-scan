@@ -1221,6 +1221,7 @@ class StockMonitorApp:
         items = [
             ("code", "股票代码"),
             ("name", "股票名称"),
+            ("industry", "行业"),
             ("latest_date", "最新日期"),
             ("quote_time", "刷新时间"),
             ("latest_close", "最新收盘"),
@@ -4837,6 +4838,7 @@ class StockMonitorApp:
                 detail_payload = {
                     "code": code,
                     "name": result.get("name", ""),
+                    "industry": result.get("industry", ""),
                     "board": data.get("board", ""),
                     "exchange": data.get("exchange", ""),
                     "history": data.get("history"),
@@ -4933,6 +4935,7 @@ class StockMonitorApp:
         placeholders = {
             "code": str(stock_code).strip().zfill(6),
             "name": "加载中...",
+            "industry": "加载中...",
             "latest_date": "加载中...",
             "quote_time": "加载中...",
             "latest_close": "加载中...",
@@ -5001,6 +5004,12 @@ class StockMonitorApp:
 
         self.detail_labels["code"].config(text=detail.get("code", "-"))
         self.detail_labels["name"].config(text=detail.get("name", "-"))
+        industry = str(detail.get("industry", "") or "").strip()
+        last_limit_up_trade_date = str(detail.get("last_limit_up_trade_date", "") or "").strip()
+        industry_text = industry or "-"
+        if industry and last_limit_up_trade_date:
+            industry_text = f"{industry} (涨停缓存 {last_limit_up_trade_date})"
+        self.detail_labels["industry"].config(text=industry_text)
         self.detail_labels["latest_date"].config(text=analysis.get("latest_date", "-"))
         self.detail_labels["quote_time"].config(text=analysis.get("quote_time", "-") or "-")
         self.detail_labels["latest_close"].config(
