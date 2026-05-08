@@ -1826,17 +1826,17 @@ class StockFilter:
         lookback_days: int = 5,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> Dict[str, Any]:
-        """基于涨停对比 + 五日承接数据预测明日涨停候选。
+        """基于涨停对比 + 二波接力数据预测明日涨停候选。
 
         步骤：
         1. 回看最近 N 日涨停对比，统计昨日首板晋级率等环境数据
         2. 保留涨停候选：对今日涨停股按封板质量 + 近期晋级环境评分
-        3. 五日承接候选：从今日强势股中挑出"涨停→回落缩量→站稳"的股票
+        3. 二波接力候选：近期涨停过 + 今日已启动 + 收盘强势的接力候选
 
         返回字段沿用旧结构，便于 GUI 直接复用：
             profile: 兼容旧 UI，现固定为空
             continuation_candidates: 保留涨停/连板候选
-            first_board_candidates: 五日承接候选
+            first_board_candidates: 二波接力候选（字段名沿用 first_board_*）
             hot_industries: 今日涨停行业分布
             summary: 文字摘要
         """
@@ -2075,9 +2075,9 @@ class StockFilter:
                                   f"保留涨停分析 {rec['code']} {rec.get('name', '')}")
         continuation_candidates.sort(key=lambda x: -x["score"])
 
-        # 阶段5：五日承接候选（历史数据 + 行情都已缓存）
+        # 阶段5：二波接力候选（历史数据 + 行情都已缓存）
         if self._log:
-            self._log("涨停预测：阶段5 - 识别五日承接候选...")
+            self._log("涨停预测：阶段5 - 识别二波接力候选...")
 
         first_board_candidates = self._scan_followthrough_candidates_cached(
             hot_industries, spot_df, zt_codes, compare_context, progress_callback, lookback_days=lookback_days,
@@ -2110,7 +2110,7 @@ class StockFilter:
             f"环境样本：最近 {compare_context.get('pair_count', 0)} 组首板晋级对比",
             f"今日涨停总数：{len(all_pool_records)} 只",
             f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
-            f"五日承接候选：{len(first_board_candidates)} 只（得分>=50）",
+            f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
             f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=50）",
             f"反包/承接候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉反包 / 不破前涨停价承接，得分>=50）",
             f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=50）",
@@ -2648,21 +2648,15 @@ class StockFilter:
         *,
         lookback_days: int = 5,
     ) -> List[Dict[str, Any]]:
-        """从今日强势股中识别五日承接候选。"""
+        """从今日强势股中识别二波接力候选。
+
+        新规则要求当日涨幅 ≥+4%，所以只取 _filter_strong_stocks（3.0%~9.95%）
+        作为输入，不再合并回踩股票（那些 change_pct < +4 必然被硬过滤掉）。
+        """
         if spot_df is None or spot_df.empty:
             return []
 
-        strong_stocks = self._filter_strong_stocks(spot_df, zt_codes)
-        ma5_pullback_stocks = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
-
-        seen_codes = set()
-        merged: List[Dict[str, Any]] = []
-        for rec in strong_stocks + ma5_pullback_stocks:
-            if rec["code"] in seen_codes:
-                continue
-            seen_codes.add(rec["code"])
-            merged.append(rec)
-
+        merged = self._filter_strong_stocks(spot_df, zt_codes)
         if not merged:
             return []
 
@@ -2678,7 +2672,7 @@ class StockFilter:
             if score_info is not None and score_info["score"] >= 50:
                 candidates.append(score_info)
             if progress_callback:
-                progress_callback(idx + 1, total, f"五日承接 {rec['code']} {rec.get('name', '')}")
+                progress_callback(idx + 1, total, f"二波接力 {rec['code']} {rec.get('name', '')}")
 
         candidates.sort(key=lambda x: -x["score"])
         return candidates[:50]
@@ -2691,14 +2685,24 @@ class StockFilter:
         *,
         lookback_days: int = 5,
     ) -> Optional[Dict[str, Any]]:
-        """对"近期爆量后回落到 MA5 附近"的股票评分。
+        """二波接力候选评分：识别"近期涨停过 + 今日处于接力窗口"形态。
+
+        设计目标：预测**次日涨停**。
+
+        基于 1118 只历史涨停股 T 日特征统计的发现：
+        - 真实涨停前一日，67% 涨幅在 -5%~+4%（潜伏/小阴）
+        - 89% 量比 < 2（缩量或温和放量）
+        - 82% 收盘强势 ≥ 当日高点 × 0.96
+        - 28% 距前涨停 ≤ 5 日（这部分就是"二波接力"的目标）
+
+        所以放宽硬过滤，靠评分识别真正强的：
 
         硬性过滤（缺一不返回）：
-        1. 必须出现近期爆量（量比 ≥ 1.8x）
-        2. 收盘价 > MA5 且距 MA5 ≤ +3%（真正贴近 MA5 上方）
-        3. 当日涨幅 ∈ [-5%, +6%)（避免大跌或抢跑，>6% 让首板/趋势处理）
-        4. 距爆量日 ≤ 7 个交易日（信号还有效）
-        5. 近 60 个交易日（不含今日）内出现过收盘涨停
+        1. 当日涨幅 ∈ [-3%, +9.5%)（覆盖潜伏与启动两类，>9.5% 让保留涨停处理）
+        2. 距前涨停日 ∈ [1, 5]（这是接力窗口的核心定义）
+        3. 距 MA5 ∈ [-5%, +12%]（不能跌破太深也不能位置过高）
+        4. 量比 ≥ 0.7（避免极度缩量阴跌）
+        5. 收盘 ≥ 当日最高 × 0.93（不要尾盘跳水）
         """
         code = rec["code"]
         name = rec.get("name", "")
@@ -2716,33 +2720,35 @@ class StockFilter:
                 request_plan=self._build_local_cache_history_plan(reason="predict-followthrough-cache-only"),
             )
         except Exception as exc:
-            logger.debug("预测五日承接获取历史 %s 失败: %s", code, exc)
+            logger.debug("预测二波接力获取历史 %s 失败: %s", code, exc)
             history = None
 
         latest_close = rec.get("close")
-        ma5_val = None
-        dist_ma5_pct = None
-        recent_burst_ratio = None
-        recent_burst_amount_ratio = None
-        burst_date = ""
-        days_since_burst = None
-        trend_10d = None
+        latest_high = None
         latest_low = None
-        touched_ma5 = False
-        recent_above_ma5 = False
-        trend_ok = False
+        ma5_val = None
+        ma10_val = None
+        ma20_val = None
+        dist_ma5_pct = None
+        volume_ratio_today = None  # 今日量比（基于前 5 日均量）
+        prior_lu_idx = None        # 最近一次收盘涨停的索引
+        days_since_prior_lu = None
+        prior_lu_date = ""
         had_limit_up_60d = False
+        breakout_20d = False       # 是否突破近 20 日新高
+        above_ma10 = False
+        position_60d = None
 
         if history is not None and not history.empty and len(history) >= 10:
             df = history.sort_values("date").reset_index(drop=True)
             close = pd.to_numeric(df["close"], errors="coerce")
+            high = pd.to_numeric(df.get("high"), errors="coerce") if "high" in df.columns else pd.Series(dtype=float)
             low = pd.to_numeric(df.get("low"), errors="coerce") if "low" in df.columns else pd.Series(dtype=float)
             volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
-            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
 
             t = len(df) - 1
             latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else latest_close
-            prev_close = float(close.iloc[t - 1]) if t >= 1 and not pd.isna(close.iloc[t - 1]) else None
+            latest_high = float(high.iloc[t]) if not high.empty and not pd.isna(high.iloc[t]) else None
             latest_low = float(low.iloc[t]) if not low.empty and not pd.isna(low.iloc[t]) else None
 
             ma5 = close.rolling(5, min_periods=5).mean()
@@ -2754,66 +2760,32 @@ class StockFilter:
 
             if latest_close is not None and ma5_val is not None and ma5_val > 0:
                 dist_ma5_pct = round((latest_close / ma5_val - 1) * 100, 2)
-            if latest_low is not None and ma5_val is not None and ma5_val > 0:
-                touched_ma5 = latest_low <= ma5_val * 1.01 and latest_low >= ma5_val * 0.97
+            if latest_close is not None and ma10_val is not None:
+                above_ma10 = latest_close >= ma10_val
 
-            burst_window = max(3, min(int(lookback_days or 5), 7))
-            burst_start = max(5, t - burst_window)
-            best_burst_idx = None
-            best_burst_score = 0.0
-            recent_burst_ratio_20 = None
-            for idx in range(burst_start, t):
-                if pd.isna(volume.iloc[idx]):
-                    continue
-                prev_vol = volume.iloc[idx - 5:idx].dropna()
-                vol_ratio_i = None
-                vol_ratio_i_20 = None
-                amt_ratio_i = None
+            # 今日量比（基于前 5 日均量）
+            if not volume.empty and not pd.isna(volume.iloc[t]) and t >= 5:
+                prev_vol = volume.iloc[t - 5:t].dropna()
                 if not prev_vol.empty and float(prev_vol.mean()) > 0:
-                    vol_ratio_i = float(volume.iloc[idx]) / float(prev_vol.mean())
-                # 20 日基准：剔除"5 日缩量后的小放量"假爆量
-                if idx >= 20:
-                    prev_vol_20 = volume.iloc[idx - 20:idx].dropna()
-                    if not prev_vol_20.empty and float(prev_vol_20.mean()) > 0:
-                        vol_ratio_i_20 = float(volume.iloc[idx]) / float(prev_vol_20.mean())
-                if not amount.empty and idx < len(amount) and not pd.isna(amount.iloc[idx]):
-                    prev_amt = amount.iloc[idx - 5:idx].dropna()
-                    if not prev_amt.empty and float(prev_amt.mean()) > 0:
-                        amt_ratio_i = float(amount.iloc[idx]) / float(prev_amt.mean())
+                    volume_ratio_today = round(float(volume.iloc[t]) / float(prev_vol.mean()), 2)
 
-                score_i = max(
-                    vol_ratio_i if vol_ratio_i is not None else 0.0,
-                    amt_ratio_i if amt_ratio_i is not None else 0.0,
-                )
-                if score_i > best_burst_score:
-                    best_burst_score = score_i
-                    best_burst_idx = idx
-                    recent_burst_ratio = round(vol_ratio_i, 2) if vol_ratio_i is not None else None
-                    recent_burst_ratio_20 = round(vol_ratio_i_20, 2) if vol_ratio_i_20 is not None else None
-                    recent_burst_amount_ratio = round(amt_ratio_i, 2) if amt_ratio_i is not None else None
+            # 突破近 20 日新高（不含今日）
+            if t >= 20 and latest_close is not None and not high.empty:
+                prior_20d_high = float(high.iloc[t - 20:t].max())
+                if not pd.isna(prior_20d_high) and latest_close > prior_20d_high:
+                    breakout_20d = True
 
-            if best_burst_idx is not None:
-                burst_date = str(df.iloc[best_burst_idx].get("date", "") or "")
-                days_since_burst = t - best_burst_idx
+            # 60 日相对位置
+            if t >= 30 and latest_close is not None and not low.empty and not high.empty:
+                lo60 = float(low.iloc[max(0, t - 60):t + 1].min())
+                hi60 = float(high.iloc[max(0, t - 60):t + 1].max())
+                if hi60 > lo60:
+                    position_60d = round((latest_close - lo60) / (hi60 - lo60) * 100, 1)
 
-            if t >= 10 and not pd.isna(close.iloc[t - 10]) and close.iloc[t - 10] > 0 and latest_close is not None:
-                trend_10d = round((latest_close / float(close.iloc[t - 10]) - 1) * 100, 1)
-
-            if ma5_val is not None and ma10_val is not None:
-                trend_ok = ma5_val >= ma10_val or (latest_close is not None and latest_close >= ma10_val)
-
-            if ma5_val is not None:
-                for lb in range(1, min(4, t + 1)):
-                    idx_b = t - lb
-                    if idx_b >= 0 and not pd.isna(close.iloc[idx_b]) and not pd.isna(ma5.iloc[idx_b]):
-                        if float(close.iloc[idx_b]) > float(ma5.iloc[idx_b]) * 1.01:
-                            recent_above_ma5 = True
-                            break
-
-            # 近 60 个交易日（不含今日）内是否有过收盘涨停
+            # 近 7 日内最近一次收盘涨停（用作"前涨停日"，决定接力窗口）
             zt_threshold = self._limit_up_threshold_pct(code)
-            zt_start = max(1, t - 60)
-            for i in range(zt_start, t):
+            scan_start = max(1, t - 7)
+            for i in range(t - 1, scan_start - 1, -1):
                 if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
                     continue
                 prev_c = float(close.iloc[i - 1])
@@ -2821,157 +2793,137 @@ class StockFilter:
                     continue
                 chg_i = (float(close.iloc[i]) / prev_c - 1) * 100
                 if chg_i >= zt_threshold - 0.3:
-                    had_limit_up_60d = True
+                    prior_lu_idx = i
+                    days_since_prior_lu = t - i
+                    prior_lu_date = str(df.iloc[i].get("date", "") or "")
                     break
 
-        # ---- 硬性过滤：不满足"五日承接"形态的票直接淘汰 ----
-        if recent_burst_ratio is None or recent_burst_ratio < 1.8:
-            return None
-        if dist_ma5_pct is None or not (0 < dist_ma5_pct <= 3.0):
-            return None
-        # 收盘低于 MA5 时必须当日有触及 MA5（日内回踩才放行，避免趋势走弱）
-        if dist_ma5_pct < 0 and not touched_ma5:
-            return None
-        if change_pct is None or change_pct < -5.0 or change_pct >= 6.0:
-            return None
-        if days_since_burst is None or days_since_burst > 7:
-            return None
-        if not had_limit_up_60d:
-            return None
+            # 近 60 日内是否有过任意收盘涨停
+            if prior_lu_idx is not None:
+                had_limit_up_60d = True
+            else:
+                zt_start = max(1, t - 60)
+                for i in range(zt_start, t):
+                    if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
+                        continue
+                    prev_c = float(close.iloc[i - 1])
+                    if prev_c <= 0:
+                        continue
+                    chg_i = (float(close.iloc[i]) / prev_c - 1) * 100
+                    if chg_i >= zt_threshold - 0.3:
+                        had_limit_up_60d = True
+                        break
 
-        # 1. 爆量强度（max 22）
-        if recent_burst_ratio >= 5.0:
-            score += 22
-            reasons.append(f"爆量{recent_burst_ratio:.1f}x+22")
-        elif recent_burst_ratio >= 3.5:
+        # ---- 硬性过滤（基于 1118 只历史涨停股 T 日特征统计放宽）----
+        if change_pct is None or change_pct < -3.0 or change_pct >= 9.5:
+            return None
+        if days_since_prior_lu is None or not (1 <= days_since_prior_lu <= 5):
+            return None
+        if dist_ma5_pct is None or not (-5.0 <= dist_ma5_pct <= 12.0):
+            return None
+        if volume_ratio_today is None or volume_ratio_today < 0.7:
+            return None
+        # 不要尾盘跳水（高点回落超过 7% 排除）
+        if latest_high is not None and latest_close is not None:
+            if latest_high > 0 and latest_close < latest_high * 0.93:
+                return None
+
+        # 评分维度
+        is_strong_close = (
+            latest_high is not None and latest_close is not None
+            and latest_high > 0 and latest_close >= latest_high * 0.96
+        )
+
+        # 1. 接力窗口（max 25，最重要的信号）
+        relay_score_map = {1: 25, 2: 20, 3: 15, 4: 8, 5: 3}
+        relay_bonus = relay_score_map.get(days_since_prior_lu, 0)
+        if relay_bonus:
+            score += relay_bonus
+            reasons.append(f"距前涨停{days_since_prior_lu}日+{relay_bonus}")
+
+        # 2. 当日表现（max 25）— 启动型 / 潜伏型并存
+        if 4.0 <= change_pct < 9.5 and is_strong_close:
+            score += 25
+            reasons.append(f"启动+收强{change_pct:+.1f}%+25")
+        elif -1.0 <= change_pct < 4.0 and is_strong_close:
             score += 18
-            reasons.append(f"爆量{recent_burst_ratio:.1f}x+18")
-        elif recent_burst_ratio >= 2.5:
-            score += 12
-            reasons.append(f"放量{recent_burst_ratio:.1f}x+12")
-        else:
-            score += 6
-            reasons.append(f"温和放量{recent_burst_ratio:.1f}x+6")
-
-        if recent_burst_amount_ratio is not None and recent_burst_amount_ratio >= 2.5:
-            score += 4
-            reasons.append(f"额比{recent_burst_amount_ratio:.1f}x+4")
-
-        # 1b. 爆量真伪校验：5d 量比 ≥2.5 但 20d 量比 <1.0 → 调整期假爆量
-        if (
-            recent_burst_ratio is not None and recent_burst_ratio >= 2.5
-            and recent_burst_ratio_20 is not None and recent_burst_ratio_20 < 1.0
-        ):
-            score -= 8
-            reasons.append(
-                f"5d{recent_burst_ratio:.1f}x但20d仅{recent_burst_ratio_20:.1f}x假爆量-8"
-            )
-
-        # 2. 距爆量天数（max 12）
-        if 1 <= days_since_burst <= 2:
-            score += 12
-            reasons.append(f"爆量后{days_since_burst}日回踩+12")
-        elif days_since_burst == 3:
+            reasons.append(f"潜伏+收强{change_pct:+.1f}%+18")
+        elif 4.0 <= change_pct < 9.5:
             score += 8
-            reasons.append(f"爆量后3日回踩+8")
-        elif 4 <= days_since_burst <= 5:
-            score += 4
-            reasons.append(f"爆量后{days_since_burst}日回踩+4")
+            reasons.append(f"启动但收弱{change_pct:+.1f}%+8")
+        elif -3.0 <= change_pct < -1.0 and is_strong_close:
+            score += 10
+            reasons.append(f"小阴+收强{change_pct:+.1f}%+10")
         else:
-            score -= 5
-            reasons.append(f"距爆量{days_since_burst}日偏久-5")
+            score += 3
+            reasons.append(f"涨幅{change_pct:+.1f}%+3")
 
-        # 3. 距 MA5（max 18，区间收紧）
-        if abs(dist_ma5_pct) <= 0.6:
-            score += 18
-            reasons.append(f"紧贴MA5 {dist_ma5_pct:+.1f}%+18")
-        elif abs(dist_ma5_pct) <= 1.5:
-            score += 12
-            reasons.append(f"贴近MA5 {dist_ma5_pct:+.1f}%+12")
-        else:
-            score += 4
-            reasons.append(f"靠近MA5 {dist_ma5_pct:+.1f}%+4")
-
-        if touched_ma5:
-            score += 4
-            reasons.append("日内触及MA5+4")
-
-        # 4. 当日表现（max 12）
-        if -2.0 <= change_pct <= 1.0:
-            score += 12
-            reasons.append(f"当日小幅回踩{change_pct:+.1f}%+12")
-        elif 1.0 < change_pct <= 3.0:
-            score += 6
-            reasons.append(f"当日小阳{change_pct:+.1f}%+6")
-        elif -4.0 <= change_pct < -2.0:
-            score += 4
-            reasons.append(f"当日深回踩{change_pct:+.1f}%+4")
-        elif 3.0 < change_pct < 6.0:
-            score -= 6
-            reasons.append(f"当日已抢跑{change_pct:+.1f}%-6")
-        elif change_pct < -4.0:
-            score -= 8
-            reasons.append(f"当日深跌{change_pct:+.1f}%-8")
-
-        # 5. 趋势配合（max 10）
-        if recent_above_ma5:
-            score += 4
-            reasons.append("前几日曾强于MA5+4")
-        if trend_ok:
-            score += 4
-            reasons.append("趋势未坏+4")
-        elif dist_ma5_pct < 0:
-            score -= 6
-            reasons.append("回落时趋势偏弱-6")
-
-        if trend_10d is not None:
-            if 5 <= trend_10d <= 25:
-                score += 4
-                reasons.append(f"10日仍强{trend_10d:.1f}%+4")
-            elif trend_10d < -5:
-                score -= 6
-                reasons.append(f"10日转弱{trend_10d:.1f}%-6")
-
-        # 6. 距涨停可达性（max 8）— 越接近涨停明日越容易封板
+        # 3. 距涨停可达（max 15）
         lu_threshold = self._limit_up_threshold_pct(code)
         room_to_lu = lu_threshold - change_pct
-        if room_to_lu < 4.0:
-            score += 8
-            reasons.append(f"距涨停剩{room_to_lu:.1f}%可达+8")
-        elif room_to_lu < 6.0:
+        if room_to_lu <= 4.0:
+            score += 15
+            reasons.append(f"距涨停剩{room_to_lu:.1f}%+15")
+        elif room_to_lu <= 6.0:
+            score += 10
+            reasons.append(f"距涨停剩{room_to_lu:.1f}%+10")
+        elif room_to_lu <= 8.0:
             score += 5
             reasons.append(f"距涨停剩{room_to_lu:.1f}%+5")
-        elif room_to_lu < 8.0:
-            score += 2
-            reasons.append(f"距涨停剩{room_to_lu:.1f}%+2")
 
-        # 7. 行业（max 10）
-        if industry and hot_industries.get(industry, 0) >= 3:
-            score += 10
-            reasons.append(f"热门板块({hot_industries[industry]}只)+10")
-        elif industry and hot_industries.get(industry, 0) >= 2:
+        # 4. 量价配合（max 15）
+        if volume_ratio_today >= 3.0:
+            score += 12
+            reasons.append(f"爆量{volume_ratio_today:.1f}x+12")
+        elif volume_ratio_today >= 1.5:
+            score += 6
+            reasons.append(f"温和放量{volume_ratio_today:.1f}x+6")
+        elif 0.7 <= volume_ratio_today < 1.0 and is_strong_close:
             score += 5
-            reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+            reasons.append(f"强势缩量整理{volume_ratio_today:.1f}x+5")
+        # 1.0~1.5 不加分
 
-        # 7b. 题材热度（来自 AI 题材聚类缓存，max 8）
+        # 5. 情绪共振（max 20）
+        if industry and hot_industries.get(industry, 0) >= 3:
+            score += 12
+            reasons.append(f"热门板块({hot_industries[industry]}只)+12")
+        elif industry and hot_industries.get(industry, 0) >= 2:
+            score += 6
+            reasons.append(f"板块联动({hot_industries[industry]}只)+6")
+
         theme_bonus, theme_reason = self._theme_bonus(code, industry, compare_context)
         if theme_bonus > 0:
-            score += theme_bonus
+            score += min(theme_bonus, 8)
             if theme_reason:
                 reasons.append(theme_reason)
 
-        # 7c. 资金面：龙虎榜 + 北向 3 日加仓
         flow_bonus, flow_reasons = self._capital_flow_bonus(code, compare_context)
         if flow_bonus != 0:
             score += flow_bonus
             reasons.extend(flow_reasons)
 
-        # 8. 换手率（max 5）
+        # 6. 形态加分（max 10）
+        if breakout_20d:
+            score += 6
+            reasons.append("突破20日新高+6")
+        if above_ma10:
+            score += 4
+            reasons.append("站稳MA10+4")
+
+        # 7. 减分项
+        if position_60d is not None and position_60d >= 95:
+            score -= 8
+            reasons.append(f"60日位置{position_60d:.0f}%过高-8")
+        if change_pct <= -2.0:
+            score -= 5
+            reasons.append(f"当日跌{change_pct:+.1f}%-5")
+
+        # 换手率
         if turnover is not None:
-            if 3 <= turnover <= 18:
-                score += 5
-                reasons.append(f"换手{turnover:.1f}%适中+5")
-            elif turnover > 30:
+            if 3 <= turnover <= 20:
+                score += 4
+                reasons.append(f"换手{turnover:.1f}%适中+4")
+            elif turnover > 35:
                 score -= 5
                 reasons.append(f"换手{turnover:.1f}%过高-5")
 
@@ -2985,15 +2937,18 @@ class StockFilter:
             "turnover": turnover,
             "ma5": ma5_val,
             "dist_ma5_pct": dist_ma5_pct,
-            "volume_ratio": recent_burst_ratio,
-            "amount_ratio": recent_burst_amount_ratio,
-            "burst_date": burst_date,
-            "days_since_burst": days_since_burst,
-            "trend_10d": trend_10d,
-            "touched_ma5": touched_ma5,
+            "volume_ratio": volume_ratio_today,
+            # 兼容旧字段名（GUI 仍使用 burst_date / days_since_burst）
+            "burst_date": prior_lu_date,
+            "days_since_burst": days_since_prior_lu,
+            "prior_lu_date": prior_lu_date,
+            "days_since_prior_lu": days_since_prior_lu,
+            "is_strong_close": is_strong_close,
+            "breakout_20d": breakout_20d,
+            "position_60d": position_60d,
             "score": final_score,
             "reasons": " / ".join(reasons[:8]),
-            "predict_type": "五日承接",
+            "predict_type": "二波接力",
         }
 
     @staticmethod
@@ -4260,7 +4215,7 @@ class StockFilter:
     def _filter_ma5_pullback_stocks(
         self, spot_df: pd.DataFrame, exclude_codes: set
     ) -> List[Dict[str, Any]]:
-        """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（覆盖五日承接需要的 -5~-3% 区间）。
+        """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（用于反包/承接候选）。
 
         历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
         """

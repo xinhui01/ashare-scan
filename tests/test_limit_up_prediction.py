@@ -29,6 +29,7 @@ class _CompareFetcher:
 
 
 class _HistoryFetcher:
+    """二波接力典型形态：4/13 涨停 → 5 日盘整 → 4/18 放量启动 +5.5% 收盘强势。"""
     def get_history_data(self, code, days=65, force_refresh=False, request_plan=None):
         return pd.DataFrame({
             "date": [
@@ -36,13 +37,13 @@ class _HistoryFetcher:
                 "2026-04-13", "2026-04-14", "2026-04-15", "2026-04-16", "2026-04-17",
                 "2026-04-18",
             ],
-            "open": [8.95, 9.05, 9.15, 9.30, 9.50, 9.80, 10.65, 10.50, 10.40, 10.35, 10.32],
-            "high": [9.05, 9.15, 9.25, 9.45, 9.75, 10.67, 10.70, 10.55, 10.42, 10.38, 10.48],
-            "low":  [8.90, 9.00, 9.10, 9.25, 9.45, 9.78, 10.45, 10.38, 10.30, 10.28, 10.30],
-            "close": [9.00, 9.10, 9.20, 9.40, 9.70, 10.67, 10.50, 10.40, 10.35, 10.30, 10.45],
-            "change_pct": [0.5, 1.1, 1.1, 2.2, 3.2, 10.0, -1.6, -0.95, -0.48, -0.48, 1.46],
-            "volume": [1_000_000, 1_100_000, 1_150_000, 1_200_000, 1_300_000, 6_000_000, 2_300_000, 1_800_000, 1_550_000, 1_420_000, 1_350_000],
-            "amount": [9_000_000, 10_000_000, 10_500_000, 11_300_000, 12_600_000, 64_000_000, 24_000_000, 18_700_000, 16_000_000, 14_600_000, 14_100_000],
+            "open": [8.95, 9.05, 9.15, 9.30, 9.50, 9.80, 10.65, 10.50, 10.40, 10.35, 10.50],
+            "high": [9.05, 9.15, 9.25, 9.45, 9.75, 10.67, 10.70, 10.55, 10.42, 10.38, 10.98],
+            "low":  [8.90, 9.00, 9.10, 9.25, 9.45, 9.78, 10.45, 10.38, 10.30, 10.28, 10.50],
+            "close": [9.00, 9.10, 9.20, 9.40, 9.70, 10.67, 10.50, 10.40, 10.35, 10.30, 10.95],
+            "change_pct": [0.5, 1.1, 1.1, 2.2, 3.2, 10.0, -1.6, -0.95, -0.48, -0.48, 5.5],
+            "volume": [1_000_000, 1_100_000, 1_150_000, 1_200_000, 1_300_000, 6_000_000, 2_300_000, 1_800_000, 1_550_000, 1_420_000, 7_000_000],
+            "amount": [9_000_000, 10_000_000, 10_500_000, 11_300_000, 12_600_000, 64_000_000, 24_000_000, 18_700_000, 16_000_000, 14_600_000, 76_000_000],
         })
 
 
@@ -86,7 +87,8 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
         self.assertIsNotNone(rec)
         self.assertEqual(rec["industry"], "银行")
 
-    def test_score_followthrough_candidate_hits_recent_burst_pullback(self):
+    def test_score_followthrough_candidate_hits_relay_breakout(self):
+        """二波接力：今日放量启动 +5.5% 且收盘强势，距前涨停 5 日。"""
         f = self._build_filter()
         f.fetcher = _HistoryFetcher()
 
@@ -94,9 +96,9 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
             "code": "000001",
             "name": "测试股",
             "industry": "机器人",
-            "close": 10.45,
-            "change_pct": 1.46,
-            "turnover": 8.0,
+            "close": 10.95,
+            "change_pct": 5.5,
+            "turnover": 12.0,
         }
 
         result = f._score_followthrough_candidate(
@@ -105,12 +107,36 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertGreaterEqual(result["score"], 50)
-        self.assertEqual(result["predict_type"], "五日承接")
+        self.assertEqual(result["predict_type"], "二波接力")
+        self.assertEqual(result["prior_lu_date"], "2026-04-13")
+        self.assertEqual(result["days_since_prior_lu"], 5)
+        # 兼容旧字段名（GUI 仍读 burst_date / days_since_burst）
         self.assertEqual(result["burst_date"], "2026-04-13")
         self.assertEqual(result["days_since_burst"], 5)
         self.assertIsNotNone(result["dist_ma5_pct"])
         self.assertGreater(result["dist_ma5_pct"], 0)
-        self.assertIn("爆量", result["reasons"])
+        self.assertTrue(result["is_strong_close"])
+        self.assertIn("启动", result["reasons"])
+
+    def test_score_followthrough_rejects_deep_drop(self):
+        """当日深跌（change_pct < -3）应被硬过滤拒掉。"""
+        f = self._build_filter()
+        f.fetcher = _HistoryFetcher()
+
+        rec = {
+            "code": "000001",
+            "name": "测试股",
+            "industry": "机器人",
+            "close": 10.95,
+            "change_pct": -5.0,  # 越过 [-3, +9.5) 下界
+            "turnover": 8.0,
+        }
+
+        result = f._score_followthrough_candidate(
+            rec, {"机器人": 3}, {}, lookback_days=5,
+        )
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

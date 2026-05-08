@@ -44,7 +44,7 @@ CATEGORY_KEYS: Dict[str, str] = {
 
 CATEGORY_LABELS: Dict[str, str] = {
     "cont": "保留涨停",
-    "first": "五日承接",
+    "first": "二波接力",
     "fresh": "首板涨停",
     "wrap": "反包/承接",
     "trend": "趋势涨停",

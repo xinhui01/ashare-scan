@@ -1891,7 +1891,7 @@ class StockMonitorApp:
         ttk.Label(action_bar, text="回溯天数:").pack(side=tk.LEFT, padx=(10, 2))
         self._predict_lookback_var = tk.StringVar(value="5")
         ttk.Entry(action_bar, textvariable=self._predict_lookback_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(回看N日涨停对比环境 + 识别五日承接)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(action_bar, text="(回看N日涨停对比环境 + 识别二波接力)").pack(side=tk.LEFT, padx=6)
         self._predict_status_label = ttk.Label(action_bar, text="")
         self._predict_status_label.pack(side=tk.RIGHT, padx=8)
 
@@ -1984,9 +1984,9 @@ class StockMonitorApp:
             "  1. 保留涨停: 今日涨停股次日保板概率\n"
             "     - 最近首板晋级率、炸板、封板时间\n"
             "     - 板块热度、连板高度、涨停形态\n\n"
-            "  2. 五日承接: 近期先爆量，随后价格回落\n"
-            "     到 MA5 附近，重点看爆量倍数、距\n"
-            "     MA5 位置、回落是否温和、板块联动\n\n"
+            "  2. 二波接力: 近期涨停过 + 今日已启动，\n"
+            "     重点看放量启动、收盘强势、距前涨停\n"
+            "     ≤5日的接力窗口、距涨停可达性\n\n"
             "说明: 预测仅供参考，请结合盘面综合判断")
         self._predict_summary_text.config(state=tk.DISABLED)
         body.add(summary_frame, weight=2)
@@ -2039,7 +2039,7 @@ class StockMonitorApp:
 
         # 首板候选 Tab
         first_tab = ttk.Frame(self._predict_table_nb)
-        self._predict_table_nb.add(first_tab, text="五日承接候选")
+        self._predict_table_nb.add(first_tab, text="二波接力候选")
         first_stat = ttk.Label(first_tab, text="历史命中率: -", foreground="#444",
                                anchor=tk.W, padding=(6, 2))
         first_stat.pack(side=tk.TOP, fill=tk.X)
@@ -2499,7 +2499,7 @@ class StockMonitorApp:
 
         if first_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  五日承接候选 TOP10\n")
+            txt.insert(tk.END, f"  二波接力候选 TOP10\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for rec in first_list[:10]:
                 chg = rec.get("change_pct")
@@ -2555,8 +2555,8 @@ class StockMonitorApp:
                 txt.insert(tk.END, f"  {k:10s}  {v:2d} 只  {bar}\n")
 
         txt.insert(tk.END, f"\n{'='*36}\n")
-        txt.insert(tk.END, "说明：预测基于最近涨停对比环境，以及“近期爆量\n"
-                           "后回落到 MA5 附近”的五日承接形态，仅供参考。\n"
+        txt.insert(tk.END, "说明：预测基于最近涨停对比环境，以及“今日已启动+\n"
+                           "收盘强势+距前涨停≤5日”的二波接力形态，仅供参考。\n"
                            "请结合次日竞价、盘口、板块情绪\n"
                            "综合判断。\n")
         self._predict_summary_text.config(state=tk.DISABLED)
@@ -2592,7 +2592,7 @@ class StockMonitorApp:
             messagebox.showwarning(
                 "历史数据未就绪",
                 "本地历史 K 线缓存尚未预热，\n"
-                "「五日承接 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
+                "「二波接力 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
                 "首次点击会触发后台缓存预取，\n"
                 "请稍等几秒后再次点击「预测涨停数据」按钮，\n"
                 "即可看到完整候选列表。",
@@ -2863,7 +2863,7 @@ class StockMonitorApp:
         def _label(name: str, shown: int, total: int) -> str:
             return f"{name}({shown}/{total})" if shown != total else f"{name}({total})"
         self._predict_table_nb.tab(0, text=_label("保留涨停候选", len(cont_list), total_cont))
-        self._predict_table_nb.tab(1, text=_label("五日承接候选", len(first_list), total_first))
+        self._predict_table_nb.tab(1, text=_label("二波接力候选", len(first_list), total_first))
         self._predict_table_nb.tab(2, text=_label("首板涨停候选", len(fresh_list), total_fresh))
         self._predict_table_nb.tab(3, text=_label("反包/承接候选", len(wrap_list), total_wrap))
         self._predict_table_nb.tab(4, text=_label("趋势涨停候选", len(trend_list), total_trend))
@@ -2877,7 +2877,7 @@ class StockMonitorApp:
 
         self._predict_status_label.config(text="")
         self.status_var.set(
-            f"涨停预测完成: 保留涨停{total_cont} / 五日承接{total_first} / "
+            f"涨停预测完成: 保留涨停{total_cont} / 二波接力{total_first} / "
             f"首板{total_fresh} / 反包{total_wrap} / 趋势{total_trend}"
         )
 
@@ -2934,7 +2934,7 @@ class StockMonitorApp:
         """更新 5 个 tab 顶部的命中率标签 + 刷新 result 列。"""
         labels = getattr(self, "_predict_stat_labels", {}) or {}
         category_names = {
-            "cont": "保留涨停", "first": "五日承接", "fresh": "首板涨停",
+            "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
             "wrap": "反包/承接", "trend": "趋势涨停",
         }
         for cat, lbl in labels.items():
@@ -3180,7 +3180,7 @@ class StockMonitorApp:
 
         ttk.Label(top, text="类别:").pack(side=tk.LEFT)
         category_var = tk.StringVar(value="全部")
-        cat_options = ["全部", "保留涨停", "五日承接", "首板涨停", "反包/承接", "趋势涨停"]
+        cat_options = ["全部", "保留涨停", "二波接力", "首板涨停", "反包/承接", "趋势涨停"]
         cat_combo = ttk.Combobox(top, textvariable=category_var, values=cat_options,
                                  width=12, state="readonly")
         cat_combo.pack(side=tk.LEFT, padx=(2, 12))
@@ -3238,7 +3238,7 @@ class StockMonitorApp:
 
         # 渲染逻辑
         cat_label_to_key = {
-            "全部": None, "保留涨停": "cont", "五日承接": "first",
+            "全部": None, "保留涨停": "cont", "二波接力": "first",
             "首板涨停": "fresh", "反包/承接": "wrap", "趋势涨停": "trend",
         }
 
