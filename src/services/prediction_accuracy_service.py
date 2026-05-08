@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from collections import Counter
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -110,6 +111,35 @@ def _next_trading_day_yyyymmdd(trade_date: str) -> Optional[str]:
         if _is_trading_day(cand, cal):
             return cand.strftime("%Y%m%d")
     return None
+
+
+def _infer_verify_date_from_history(
+    history_cache: Dict[str, Optional[pd.DataFrame]],
+    trade_date_dash: str,
+) -> Optional[str]:
+    """从本地 history 缓存推断 trade_date 之后的真实下一个交易日。
+
+    主要用于交易日历不可用时的节假日兜底：优先取"最常见的下一个日期"，
+    并在并列时取更早的那个日期。
+    """
+    next_dates: List[str] = []
+    for df in history_cache.values():
+        if df is None or df.empty or "date" not in df.columns:
+            continue
+        try:
+            dates = df["date"].astype(str).str.strip()
+        except Exception:
+            continue
+        later = dates[dates > trade_date_dash]
+        if later.empty:
+            continue
+        next_dates.append(str(later.iloc[0]).strip())
+
+    if not next_dates:
+        return None
+
+    counter = Counter(next_dates)
+    return sorted(counter.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
 def _limit_up_threshold(code: str, name: str = "") -> float:
@@ -234,72 +264,88 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
     trade_date_dash = _to_dash_date(td)
     verify_date_dash = _to_dash_date(verify_date)
 
-    records: List[Dict[str, Any]] = []
-    seen: set = set()  # (code, category) 去重
     history_cache: Dict[str, Optional[pd.DataFrame]] = {}
-    has_any_t1_data = False
 
-    for cat_key, payload_key in CATEGORY_KEYS.items():
-        for cand in payload.get(payload_key, []) or []:
-            if not isinstance(cand, dict):
-                continue
-            code = str(cand.get("code") or "").strip().zfill(6)
-            if not code:
-                continue
-            key = (code, cat_key)
-            if key in seen:
-                continue
-            seen.add(key)
+    def _build_records(target_verify_date: str) -> Tuple[List[Dict[str, Any]], bool]:
+        records: List[Dict[str, Any]] = []
+        seen: set = set()  # (code, category) 去重
+        has_any_t1_data = False
+        target_verify_date_dash = _to_dash_date(target_verify_date)
 
-            if code not in history_cache:
-                try:
-                    history_cache[code] = stock_store.load_history(code)
-                except Exception:
-                    history_cache[code] = None
-            df = history_cache[code]
+        for cat_key, payload_key in CATEGORY_KEYS.items():
+            for cand in payload.get(payload_key, []) or []:
+                if not isinstance(cand, dict):
+                    continue
+                code = str(cand.get("code") or "").strip().zfill(6)
+                if not code:
+                    continue
+                key = (code, cat_key)
+                if key in seen:
+                    continue
+                seen.add(key)
 
-            evaluation = _evaluate_candidate(
-                code=code,
-                name=str(cand.get("name") or ""),
-                history_df=df,
-                trade_date_dash=trade_date_dash,
-                verify_date_dash=verify_date_dash,
-            )
-            if evaluation is None:
-                # 完全无 K 线 → 标记为停牌、命中=0
-                evaluation = {
-                    "t_close": None, "t1_open": None, "t1_high": None,
-                    "t1_low": None, "t1_close": None, "t1_pct": None,
-                    "t1_limit_up": False, "t1_one_word": False,
-                    "t1_suspended": True,
-                    "hit_strict": False, "hit_loose": False, "hit_buyable": False,
+                if code not in history_cache:
+                    try:
+                        history_cache[code] = stock_store.load_history(code)
+                    except Exception:
+                        history_cache[code] = None
+                df = history_cache[code]
+
+                evaluation = _evaluate_candidate(
+                    code=code,
+                    name=str(cand.get("name") or ""),
+                    history_df=df,
+                    trade_date_dash=trade_date_dash,
+                    verify_date_dash=target_verify_date_dash,
+                )
+                if evaluation is None:
+                    # 完全无 K 线 → 标记为停牌、命中=0
+                    evaluation = {
+                        "t_close": None, "t1_open": None, "t1_high": None,
+                        "t1_low": None, "t1_close": None, "t1_pct": None,
+                        "t1_limit_up": False, "t1_one_word": False,
+                        "t1_suspended": True,
+                        "hit_strict": False, "hit_loose": False, "hit_buyable": False,
+                    }
+                elif not evaluation.get("t1_suspended"):
+                    has_any_t1_data = True
+
+                record = {
+                    "trade_date": td,
+                    "verify_date": target_verify_date,
+                    "code": code,
+                    "category": cat_key,
+                    "name": str(cand.get("name") or ""),
+                    "industry": str(cand.get("industry") or ""),
+                    "predicted_score": int(cand.get("score") or 0),
+                    "predicted_type": str(cand.get("predict_type") or ""),
+                    **evaluation,
                 }
-            elif not evaluation.get("t1_suspended"):
+                records.append(record)
+
+                # 保留涨停额外按连板数派生子类别（cont_1to2/cont_2to3/...）
+                # 主类别 cont 仍然写入，子类别用于拆分命中率统计
+                if cat_key == "cont":
+                    sub_cat = _cont_sub_category(cand.get("consecutive_boards"))
+                    sub_key = (code, sub_cat)
+                    if sub_key not in seen:
+                        seen.add(sub_key)
+                        sub_record = dict(record)
+                        sub_record["category"] = sub_cat
+                        records.append(sub_record)
+        return records, has_any_t1_data
+
+    records, has_any_t1_data = _build_records(verify_date)
+
+    if records and not has_any_t1_data:
+        inferred_verify_date_dash = _infer_verify_date_from_history(history_cache, trade_date_dash)
+        inferred_verify_date = _normalize_date_yyyymmdd(inferred_verify_date_dash or "")
+        if inferred_verify_date and inferred_verify_date != verify_date:
+            alt_records, alt_has_any_t1_data = _build_records(inferred_verify_date)
+            if alt_has_any_t1_data:
+                verify_date = inferred_verify_date
+                records = alt_records
                 has_any_t1_data = True
-
-            record = {
-                "trade_date": td,
-                "verify_date": verify_date,
-                "code": code,
-                "category": cat_key,
-                "name": str(cand.get("name") or ""),
-                "industry": str(cand.get("industry") or ""),
-                "predicted_score": int(cand.get("score") or 0),
-                "predicted_type": str(cand.get("predict_type") or ""),
-                **evaluation,
-            }
-            records.append(record)
-
-            # 保留涨停额外按连板数派生子类别（cont_1to2/cont_2to3/...）
-            # 主类别 cont 仍然写入，子类别用于拆分命中率统计
-            if cat_key == "cont":
-                sub_cat = _cont_sub_category(cand.get("consecutive_boards"))
-                sub_key = (code, sub_cat)
-                if sub_key not in seen:
-                    seen.add(sub_key)
-                    sub_record = dict(record)
-                    sub_record["category"] = sub_cat
-                    records.append(sub_record)
 
     # 没有任何候选拿到 T+1 K 线 → 视为本地缓存还没同步，
     # 不写入坏记录，避免 evaluate_all_pending 把这一天误标为"已评估"后永久卡住
