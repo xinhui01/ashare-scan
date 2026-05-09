@@ -266,6 +266,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             t1_low REAL,
             t1_close REAL,
             t1_pct REAL,
+            t1_open_close_pct REAL,
             t1_limit_up INTEGER NOT NULL DEFAULT 0,
             t1_one_word INTEGER NOT NULL DEFAULT 0,
             t1_suspended INTEGER NOT NULL DEFAULT 0,
@@ -297,6 +298,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE history_meta ADD COLUMN needs_repair INTEGER NOT NULL DEFAULT 0")
     if "source_failure_streak" not in meta_columns:
         conn.execute("ALTER TABLE history_meta ADD COLUMN source_failure_streak INTEGER NOT NULL DEFAULT 0")
+
+    accuracy_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(limit_up_prediction_accuracy)").fetchall()
+    }
+    if "t1_open_close_pct" not in accuracy_columns:
+        conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t1_open_close_pct REAL")
 
 
 def db_path() -> Path:
@@ -1201,6 +1208,7 @@ _PREDICTION_ACCURACY_FIELDS = (
     "trade_date", "verify_date", "code", "category",
     "name", "industry", "predicted_score", "predicted_type",
     "t_close", "t1_open", "t1_high", "t1_low", "t1_close", "t1_pct",
+    "t1_open_close_pct",
     "t1_limit_up", "t1_one_word", "t1_suspended",
     "hit_strict", "hit_loose", "hit_buyable", "evaluated_at",
 )
@@ -1235,6 +1243,7 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
             _to_float(rec.get("t1_low")),
             _to_float(rec.get("t1_close")),
             _to_float(rec.get("t1_pct")),
+            _to_float(rec.get("t1_open_close_pct")),
             int(bool(rec.get("t1_limit_up"))),
             int(bool(rec.get("t1_one_word"))),
             int(bool(rec.get("t1_suspended"))),
@@ -1255,10 +1264,11 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     trade_date, verify_date, code, category,
                     name, industry, predicted_score, predicted_type,
                     t_close, t1_open, t1_high, t1_low, t1_close, t1_pct,
+                    t1_open_close_pct,
                     t1_limit_up, t1_one_word, t1_suspended,
                     hit_strict, hit_loose, hit_buyable, evaluated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date, code, category) DO UPDATE SET
                     verify_date=excluded.verify_date,
                     name=excluded.name,
@@ -1271,6 +1281,7 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     t1_low=excluded.t1_low,
                     t1_close=excluded.t1_close,
                     t1_pct=excluded.t1_pct,
+                    t1_open_close_pct=excluded.t1_open_close_pct,
                     t1_limit_up=excluded.t1_limit_up,
                     t1_one_word=excluded.t1_one_word,
                     t1_suspended=excluded.t1_suspended,
@@ -1369,14 +1380,21 @@ def query_prediction_accuracy_stats(
 ) -> Dict[str, Any]:
     """聚合统计命中率。
 
-    返回 {total, buyable, hit_strict, hit_loose, strict_rate, loose_rate, avg_pct, dates}。
+    返回 {total, buyable, hit_strict, hit_loose, strict_rate, loose_rate,
+          hit_primary, primary_rate, avg_pct, dates}。
     `lookback_dates`：仅统计最近 N 个 trade_date；None 表示全部。
     `category`：限定类别（cont/first/fresh/wrap/trend），None 表示全部。
+
+    primary 指"按类别选取的成功口径"：保留涨停（cont 及其子类）使用 hit_strict，
+    其他类别使用 hit_loose（开盘买、收盘 ≥ 5% 或涨停）。avg_pct 使用
+    t1_open_close_pct（开盘买、收盘卖）口径，老数据回退到 t1_pct。
     """
     empty = {
         "total": 0, "buyable": 0,
         "hit_strict": 0, "hit_loose": 0,
+        "hit_primary": 0,
         "strict_rate": 0.0, "loose_rate": 0.0,
+        "primary_rate": 0.0,
         "avg_pct": 0.0, "dates": 0,
     }
     if not _DB_PATH.is_file():
@@ -1435,15 +1453,36 @@ def query_prediction_accuracy_stats(
     buyable = len(buyable_rows)
     hit_strict = sum(1 for r in buyable_rows if int(r["hit_strict"] or 0))
     hit_loose = sum(1 for r in buyable_rows if int(r["hit_loose"] or 0))
-    pcts = [float(r["t1_pct"]) for r in buyable_rows if r["t1_pct"] is not None]
+
+    def _primary_hit(r) -> int:
+        cat = str(r["category"] or "")
+        if cat == "cont" or cat in _CONT_SUB_CATEGORY_KEYS:
+            return int(r["hit_strict"] or 0)
+        return int(r["hit_loose"] or 0)
+
+    hit_primary = sum(_primary_hit(r) for r in buyable_rows)
+
+    # avg_pct 优先使用开盘买、收盘卖口径，老记录回退到 t1_pct
+    pcts: List[float] = []
+    for r in buyable_rows:
+        try:
+            oc = r["t1_open_close_pct"]
+        except (IndexError, KeyError):
+            oc = None
+        if oc is not None:
+            pcts.append(float(oc))
+        elif r["t1_pct"] is not None:
+            pcts.append(float(r["t1_pct"]))
     avg_pct = (sum(pcts) / len(pcts)) if pcts else 0.0
     return {
         "total": total,
         "buyable": buyable,
         "hit_strict": hit_strict,
         "hit_loose": hit_loose,
+        "hit_primary": hit_primary,
         "strict_rate": (hit_strict / buyable * 100.0) if buyable else 0.0,
         "loose_rate": (hit_loose / buyable * 100.0) if buyable else 0.0,
+        "primary_rate": (hit_primary / buyable * 100.0) if buyable else 0.0,
         "avg_pct": avg_pct,
         "dates": len(dates),
     }

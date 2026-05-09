@@ -2451,7 +2451,14 @@ class StockMonitorApp:
             for rec in records:
                 key = (str(rec.get("code") or "").zfill(6), cat)
                 row = self._predict_results_map.get(key)
-                rec["_t1_pct"] = row.get("t1_pct") if row else None
+                if row:
+                    # 用"开盘买、收盘卖"口径作为结果排序值；老记录回退到 t1_pct
+                    pct = row.get("t1_open_close_pct")
+                    if pct is None:
+                        pct = row.get("t1_pct")
+                    rec["_t1_pct"] = pct
+                else:
+                    rec["_t1_pct"] = None
             return records
 
         cont_list = self._sort_predict_records(_enrich(list(result.get("continuation_candidates", [])), "cont"), "cont")
@@ -2744,8 +2751,14 @@ class StockMonitorApp:
         # 取本次预测对应日期的命中结果（若已回填）
         results_map = getattr(self, "_predict_results_map", {}) or {}
 
+        cont_cat_keys = {"cont", "cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus"}
+
         def _result_cell(category: str, code: str):
-            """返回 (cell_text, hit_tag_or_None)。"""
+            """返回 (cell_text, hit_tag_or_None)。
+
+            cont 类（保留涨停）必须涨停才算 hit；其他类别用「开盘买、收盘卖 ≥ 5%」或涨停。
+            数字部分一律展示 t1_open_close_pct（实盘可达盈亏），老记录回退到 t1_pct。
+            """
             row = results_map.get((str(code).zfill(6), category))
             if not row:
                 return ("—", None)
@@ -2753,17 +2766,20 @@ class StockMonitorApp:
                 return ("⏸停牌", None)
             if row.get("t1_one_word"):
                 return ("一字未买", None)
+            pct_oc = row.get("t1_open_close_pct")
+            if pct_oc is None:
+                pct_oc = row.get("t1_pct")  # 老数据回退
             if row.get("hit_strict"):
-                pct = row.get("t1_pct")
-                txt = "✓涨停" if pct is None else f"✓涨停 +{pct:.1f}%"
+                t1pct = row.get("t1_pct")
+                txt = "✓涨停" if t1pct is None else f"✓涨停 +{t1pct:.1f}%"
                 return (txt, "hit")
-            pct = row.get("t1_pct")
-            if pct is None:
+            if pct_oc is None:
                 return ("—", None)
-            if pct >= 5:
-                return (f"↑+{pct:.1f}%", "hit")  # 弱命中
-            sign = "+" if pct >= 0 else ""
-            return (f"{sign}{pct:.1f}%", "miss" if pct < 0 else None)
+            is_cont = category in cont_cat_keys
+            if not is_cont and pct_oc >= 5:
+                return (f"↑+{pct_oc:.1f}%", "hit")  # 弱命中：开盘买、收盘 ≥ 5%
+            sign = "+" if pct_oc >= 0 else ""
+            return (f"{sign}{pct_oc:.1f}%", "miss" if pct_oc < 0 else None)
 
         # ---- 填充连板延续表格 ----
         self._predict_cont_tree.delete(*self._predict_cont_tree.get_children())
@@ -2984,16 +3000,17 @@ class StockMonitorApp:
             b = int(d.get("buyable") or 0)
             if b <= 0:
                 return "-"
-            h = int(d.get("hit_strict") or 0)
-            r = float(d.get("strict_rate") or 0.0)
+            # primary 口径：cont 走 hit_strict（涨停），其他类别走 hit_loose（开→收 ≥ 5% 或涨停）
+            h = int(d.get("hit_primary") or d.get("hit_strict") or 0)
+            r = float(d.get("primary_rate") or d.get("strict_rate") or 0.0)
             return f"{r:.1f}% ({h}/{b})"
 
         for cat, lbl in labels.items():
             data = stats.get(cat) or {}
             y_data = stats_yesterday.get(cat) or {}
             buyable = int(data.get("buyable") or 0)
-            hit = int(data.get("hit_strict") or 0)
-            rate = float(data.get("strict_rate") or 0.0)
+            hit = int(data.get("hit_primary") or data.get("hit_strict") or 0)
+            rate = float(data.get("primary_rate") or data.get("strict_rate") or 0.0)
             avg_pct = float(data.get("avg_pct") or 0.0)
             dates = int(data.get("dates") or 0)
             y_str = _fmt_pair(y_data)
@@ -3110,7 +3127,7 @@ class StockMonitorApp:
             "categories": ("类别", 140, tk.W),
             "score": ("预测分", 60, tk.CENTER),
             "result": ("结果", 90, tk.CENTER),
-            "t1_pct": ("次日涨幅%", 80, tk.CENTER),
+            "t1_pct": ("次日开→收%", 90, tk.CENTER),
         }.items():
             left_tree.heading(col, text=label)
             left_tree.column(col, width=w, anchor=anc)
@@ -3145,23 +3162,29 @@ class StockMonitorApp:
         body.add(right_frame, weight=2)
 
         # 填充左侧
+        cont_label = "保留涨停"  # 与 prediction_accuracy_service.CATEGORY_LABELS["cont"] 保持一致
         for c in data.get("candidates", []):
-            t1_pct = c.get("t1_pct")
+            cats = c.get("categories", []) or []
+            has_non_cont = any(lbl != cont_label for lbl in cats)
+            pct_oc = c.get("t1_open_close_pct")
+            if pct_oc is None:
+                pct_oc = c.get("t1_pct")  # 老记录回退
             if c.get("t1_suspended"):
                 res, tag = "⏸停牌", "info"
             elif c.get("t1_one_word"):
                 res, tag = "一字未买", "info"
             elif c.get("hit_strict"):
                 res, tag = "✓涨停", "hit"
-            elif t1_pct is not None and t1_pct >= 5:
-                res, tag = f"↑+{t1_pct:.1f}%", "hit"
-            elif t1_pct is None:
+            elif has_non_cont and pct_oc is not None and pct_oc >= 5:
+                # 非保留涨停类别走开盘买、收盘卖 ≥ 5% 的弱命中
+                res, tag = f"↑+{pct_oc:.1f}%", "hit"
+            elif pct_oc is None:
                 res, tag = "—", None
             else:
-                res = f"{'+' if t1_pct >= 0 else ''}{t1_pct:.1f}%"
-                tag = "miss" if t1_pct < 0 else None
-            pct_text = f"{t1_pct:+.2f}" if isinstance(t1_pct, (int, float)) else "-"
-            cats_text = " / ".join(c.get("categories", []))
+                res = f"{'+' if pct_oc >= 0 else ''}{pct_oc:.1f}%"
+                tag = "miss" if pct_oc < 0 else None
+            pct_text = f"{pct_oc:+.2f}" if isinstance(pct_oc, (int, float)) else "-"
+            cats_text = " / ".join(cats)
             left_tree.insert("", tk.END, values=(
                 c.get("code", ""), c.get("name", ""), c.get("industry", ""),
                 cats_text, c.get("max_score", 0), res, pct_text,
@@ -3215,14 +3238,16 @@ class StockMonitorApp:
                 w.writerow([
                     "code", "name", "industry", "categories", "score",
                     "hit_strict", "hit_loose", "buyable",
-                    "t1_pct", "t1_close", "one_word", "suspended",
+                    "t1_pct", "t1_open_close_pct", "t1_open", "t1_close",
+                    "one_word", "suspended",
                 ])
                 for c in data.get("candidates", []):
                     w.writerow([
                         c.get("code", ""), c.get("name", ""), c.get("industry", ""),
                         " / ".join(c.get("categories", [])), c.get("max_score", 0),
                         c.get("hit_strict", 0), c.get("hit_loose", 0), c.get("hit_buyable", 0),
-                        c.get("t1_pct"), c.get("t1_close"),
+                        c.get("t1_pct"), c.get("t1_open_close_pct"),
+                        c.get("t1_open"), c.get("t1_close"),
                         c.get("t1_one_word", 0), c.get("t1_suspended", 0),
                     ])
             self.status_var.set(f"已导出对比CSV: {path}")

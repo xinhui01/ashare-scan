@@ -5,9 +5,14 @@
 并提供查询接口（聚合命中率、单日明细、对比展示）。
 
 命中口径：
-- hit_strict：T+1 收盘 = 涨停（按代码前缀推断 10% / 20% / 5%）
-- hit_loose ：T+1 涨幅 ≥ 5%
+- hit_strict：T+1 收盘 = 涨停（按代码前缀推断 10% / 20% / 5%）且非一字板
+- hit_loose ：T+1「按开盘价买入、收盘价卖出」收益 ≥ 5%，或者达到涨停（含 hit_strict）
+              —— 用于"保留涨停"以外的预测类别；比单纯 t1_pct ≥ 5% 更贴合实盘
 - hit_buyable：非一字（open!=high 或 涨幅可买），非停牌；用于剔除"理论命中但买不到"的样本
+
+成功标准（GUI / 统计层面会按类别区分）：
+- 保留涨停（cont 及子类 cont_1to2/.../cont_5plus）：必须 hit_strict（次日继续涨停）
+- 其他类别（first/fresh/wrap/trend）：hit_loose（开盘买、收盘 ≥ 5% 或涨停）
 
 类别名称（与 stock_filter.predict_limit_up_candidates 输出一致）：
     cont   = continuation_candidates
@@ -63,6 +68,21 @@ CATEGORY_LABELS: Dict[str, str] = {
     "cont_4to5": "4进5",
     "cont_5plus": "5进6+",
 }
+
+
+def _is_cont_category(category: Any) -> bool:
+    """保留涨停的主类别 + 1进2/2进3/.../5进6+ 子类别。"""
+    cat = str(category or "")
+    return cat == "cont" or cat in CONT_SUB_CATEGORY_KEYS
+
+
+def _row_is_hit(row: Dict[str, Any]) -> bool:
+    """按类别选取成功口径：cont 走 hit_strict（必须涨停），其它类别走 hit_loose。"""
+    if not int(row.get("hit_buyable") or 0):
+        return False
+    if _is_cont_category(row.get("category")):
+        return bool(int(row.get("hit_strict") or 0))
+    return bool(int(row.get("hit_loose") or 0))
 
 
 def _cont_sub_category(boards: Any) -> str:
@@ -200,7 +220,7 @@ def _evaluate_candidate(
         return {
             "t_close": t_close,
             "t1_open": None, "t1_high": None, "t1_low": None,
-            "t1_close": None, "t1_pct": None,
+            "t1_close": None, "t1_pct": None, "t1_open_close_pct": None,
             "t1_limit_up": False, "t1_one_word": False, "t1_suspended": True,
             "hit_strict": False, "hit_loose": False, "hit_buyable": False,
         }
@@ -215,12 +235,24 @@ def _evaluate_candidate(
     t1_close = _f("close")
     t1_pct = _f("change_pct")
 
+    # 开盘买入、收盘卖出的真实涨幅 —— 实盘可达盈亏的口径
+    if t1_open is not None and t1_close is not None and t1_open > 0:
+        t1_open_close_pct: Optional[float] = (t1_close - t1_open) / t1_open * 100.0
+    else:
+        t1_open_close_pct = None
+
     threshold = _limit_up_threshold(code, name)
     is_lu = (t1_pct is not None and t1_pct >= threshold)
     one_word = is_lu and _is_one_word(t1_open, t1_high, t1_low, t1_close)
     buyable = not one_word  # 一字板买不到
     hit_strict = bool(is_lu and buyable)
-    hit_loose = bool(t1_pct is not None and t1_pct >= 5.0 and buyable)
+    # 新口径：开盘买、收盘 ≥ 5% 或涨停（且可买）；保留涨停类别另在统计层强制走 hit_strict
+    hit_loose = bool(
+        buyable and (
+            hit_strict
+            or (t1_open_close_pct is not None and t1_open_close_pct >= 5.0)
+        )
+    )
 
     return {
         "t_close": t_close,
@@ -229,6 +261,7 @@ def _evaluate_candidate(
         "t1_low": t1_low,
         "t1_close": t1_close,
         "t1_pct": t1_pct,
+        "t1_open_close_pct": t1_open_close_pct,
         "t1_limit_up": is_lu,
         "t1_one_word": one_word,
         "t1_suspended": False,
@@ -303,6 +336,7 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
                     evaluation = {
                         "t_close": None, "t1_open": None, "t1_high": None,
                         "t1_low": None, "t1_close": None, "t1_pct": None,
+                        "t1_open_close_pct": None,
                         "t1_limit_up": False, "t1_one_word": False,
                         "t1_suspended": True,
                         "hit_strict": False, "hit_loose": False, "hit_buyable": False,
@@ -451,9 +485,12 @@ def query_compare(trade_date: str) -> Dict[str, Any]:
                 "name": r.get("name") or "",
                 "industry": r.get("industry") or "",
                 "categories": [cat_label],
+                "category_keys": [cat],
                 "max_score": int(r.get("predicted_score") or 0),
                 "t1_pct": r.get("t1_pct"),
+                "t1_open_close_pct": r.get("t1_open_close_pct"),
                 "t1_close": r.get("t1_close"),
+                "t1_open": r.get("t1_open"),
                 "hit_strict": int(r.get("hit_strict") or 0),
                 "hit_loose": int(r.get("hit_loose") or 0),
                 "hit_buyable": int(r.get("hit_buyable") or 0),
@@ -465,6 +502,8 @@ def query_compare(trade_date: str) -> Dict[str, Any]:
         else:
             if cat_label not in cur["categories"]:
                 cur["categories"].append(cat_label)
+            if cat not in cur["category_keys"]:
+                cur["category_keys"].append(cat)
             cur["max_score"] = max(cur["max_score"], int(r.get("predicted_score") or 0))
 
     candidates = sorted(by_code.values(), key=lambda x: -x["max_score"])
@@ -485,7 +524,18 @@ def query_compare(trade_date: str) -> Dict[str, Any]:
     predicted = len(candidates)
     buyable_cands = [c for c in candidates if c["hit_buyable"]]
     buyable = len(buyable_cands)
-    hit = sum(1 for c in buyable_cands if c["hit_strict"])
+
+    def _candidate_is_hit(c: Dict[str, Any]) -> bool:
+        # 涨停始终算命中（任何类别都满足）
+        if int(c.get("hit_strict") or 0):
+            return True
+        # 非 cont 类别走 hit_loose（开盘买、收盘 ≥ 5%）
+        cat_keys = c.get("category_keys") or []
+        if any(not _is_cont_category(k) for k in cat_keys):
+            return bool(int(c.get("hit_loose") or 0))
+        return False
+
+    hit = sum(1 for c in buyable_cands if _candidate_is_hit(c))
     hit_rate = (hit / buyable * 100.0) if buyable else 0.0
 
     return {
@@ -602,8 +652,14 @@ def query_score_bucket_stats(
     for label, lo, hi in SCORE_BUCKETS:
         bucket = [r for r in rows if lo <= int(r.get("predicted_score") or 0) <= hi]
         buyable = [r for r in bucket if int(r.get("hit_buyable") or 0)]
-        hit = sum(1 for r in buyable if int(r.get("hit_strict") or 0))
-        pcts = [float(r["t1_pct"]) for r in buyable if r.get("t1_pct") is not None]
+        hit = sum(1 for r in buyable if _row_is_hit(r))
+        # avg_pct 用"开盘买、收盘卖"口径，保留涨停类别仍可参考但回退到 t1_pct
+        pcts = [
+            float(r["t1_open_close_pct"]) if r.get("t1_open_close_pct") is not None
+            else float(r["t1_pct"])
+            for r in buyable
+            if (r.get("t1_open_close_pct") is not None or r.get("t1_pct") is not None)
+        ]
         avg_pct = (sum(pcts) / len(pcts)) if pcts else 0.0
         out.append({
             "label": label,
@@ -636,8 +692,13 @@ def query_industry_stats(
         buyable = [r for r in lst if int(r.get("hit_buyable") or 0)]
         if len(buyable) < min_samples:
             continue
-        hit = sum(1 for r in buyable if int(r.get("hit_strict") or 0))
-        pcts = [float(r["t1_pct"]) for r in buyable if r.get("t1_pct") is not None]
+        hit = sum(1 for r in buyable if _row_is_hit(r))
+        pcts = [
+            float(r["t1_open_close_pct"]) if r.get("t1_open_close_pct") is not None
+            else float(r["t1_pct"])
+            for r in buyable
+            if (r.get("t1_open_close_pct") is not None or r.get("t1_pct") is not None)
+        ]
         avg_pct = (sum(pcts) / len(pcts)) if pcts else 0.0
         out.append({
             "industry": ind,
@@ -664,7 +725,7 @@ def classify_failure(row: Dict[str, Any]) -> Optional[str]:
     """
     if not int(row.get("hit_buyable") or 0):
         return None
-    if int(row.get("hit_strict") or 0):
+    if _row_is_hit(row):
         return None
     t_close = row.get("t_close")
     t1_open = row.get("t1_open")
@@ -717,9 +778,14 @@ def query_failure_reasons(
     by_reason_count: Dict[str, List[float]] = {}
     by_reason_ind: Dict[str, Dict[str, int]] = {}
     for reason, r in miss_rows:
-        by_reason_count.setdefault(reason, []).append(
-            float(r["t1_pct"]) if r.get("t1_pct") is not None else 0.0
-        )
+        # 失败 bucket 的 avg_pct 使用"开盘买、收盘卖"口径（实盘可达盈亏）
+        if r.get("t1_open_close_pct") is not None:
+            pct_val = float(r["t1_open_close_pct"])
+        elif r.get("t1_pct") is not None:
+            pct_val = float(r["t1_pct"])
+        else:
+            pct_val = 0.0
+        by_reason_count.setdefault(reason, []).append(pct_val)
         ind = (r.get("industry") or "").strip() or "未分类"
         by_reason_ind.setdefault(reason, {}).setdefault(ind, 0)
         by_reason_ind[reason][ind] += 1
