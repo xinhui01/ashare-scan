@@ -1377,7 +1377,7 @@ class StockMonitorApp:
         ttk.Entry(action_bar, textvariable=self._zt_today_var, width=10).pack(side=tk.LEFT)
         ttk.Button(
             action_bar, text="今天", width=5,
-            command=lambda: self._zt_today_var.set(datetime.now().strftime("%Y%m%d")),
+            command=self._zt_fill_today_and_prev,
         ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action_bar, text="昨日:").pack(side=tk.LEFT, padx=(8, 2))
         self._zt_yesterday_var = tk.StringVar()
@@ -1516,6 +1516,21 @@ class StockMonitorApp:
         "突破平台涨停": "pat_breakout",
         "首板低位涨停": "pat_lowpos",
     }
+
+    def _zt_fill_today_and_prev(self) -> None:
+        """一键填好「今日 = 今天」「昨日 = 上一个交易日」。
+
+        优先使用真实交易日历（节假日感知），日历不可用时退回到周末过滤。
+        """
+        today = datetime.now().date()
+        cal = _get_trade_calendar()
+        try:
+            prev = _previous_trading_day(today, cal)
+            prev_str = prev.strftime("%Y%m%d")
+        except Exception:
+            prev_str = self._estimate_yesterday(today.strftime("%Y%m%d"))
+        self._zt_today_var.set(today.strftime("%Y%m%d"))
+        self._zt_yesterday_var.set(prev_str)
 
     def _estimate_yesterday(self, today_str: str) -> str:
         from datetime import timedelta
