@@ -2780,14 +2780,23 @@ class StockMonitorApp:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {spread_text:9s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
-        # 热门行业
+        # 明日热点板块预测（基于今日涨停股的行业分布；今日热点延续到明日）
         if hot_industries:
+            sorted_inds = sorted(hot_industries.items(), key=lambda x: -x[1])
+            total_zt = sum(hot_industries.values()) or 1
+            top5 = sorted_inds[:5]
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  今日涨停行业分布\n")
+            txt.insert(tk.END, f"  明日热点板块预测（TOP5 · 基于今日涨停股分布）\n")
             txt.insert(tk.END, f"{'='*36}\n")
-            for k, v in sorted(hot_industries.items(), key=lambda x: -x[1])[:10]:
-                bar = "#" * v
-                txt.insert(tk.END, f"  {k:10s}  {v:2d} 只  {bar}\n")
+            for k, v in top5:
+                ratio = v / total_zt * 100.0
+                bar = "█" * min(v, 24)
+                txt.insert(tk.END, f"  {k:12s}  {v:2d} 只 ({ratio:4.1f}%)  {bar}\n")
+            # 11+ 名次的行业以紧凑形式追加
+            if len(sorted_inds) > 5:
+                tail = sorted_inds[5:10]
+                tail_str = "、".join(f"{k}({v})" for k, v in tail)
+                txt.insert(tk.END, f"  其他: {tail_str}\n")
 
         txt.insert(tk.END, f"\n{'='*36}\n")
         txt.insert(tk.END, "说明：预测基于最近涨停对比环境，以及“今日已启动+\n"
@@ -3585,60 +3594,90 @@ class StockMonitorApp:
         self, chart_holder: ttk.Frame, table_holder: ttk.Frame,
         buckets: List[Dict[str, Any]],
     ) -> None:
-        """绘制分数段命中率柱状图 + 下方明细表格。"""
+        """并排展示「分数段命中率」与「成功分布占比」，下方明细表。
+
+        左图：bucket.hit / bucket.buyable —— 衡量该分数段命中"质量"。
+        右图：bucket.hit / 总命中数 —— 衡量成功集中在哪些分数段。
+        两个视角互补：高分段可能命中率高但样本少，中段命中率不高但贡献了更多成功。
+        """
         for w in chart_holder.winfo_children():
             w.destroy()
         for w in table_holder.winfo_children():
             w.destroy()
 
-        # 柱状图
-        fig = Figure(figsize=(8, 4), dpi=100)
-        ax = fig.add_subplot(111)
         labels = [b["label"] for b in buckets]
         rates = [b["rate"] for b in buckets]
         counts = [b["buyable"] for b in buckets]
-        colors = []
+        hits = [int(b.get("hit") or 0) for b in buckets]
+        total_hits = sum(hits)
+        dist_pcts = [
+            (h / total_hits * 100.0) if total_hits > 0 else 0.0
+            for h in hits
+        ]
+
+        fig = Figure(figsize=(10, 4), dpi=100)
+        ax_rate = fig.add_subplot(1, 2, 1)
+        ax_dist = fig.add_subplot(1, 2, 2)
+
+        # 左：命中率
+        rate_colors = []
         for r, c in zip(rates, counts):
             if c == 0:
-                colors.append("#bdbdbd")
+                rate_colors.append("#bdbdbd")
             elif r >= 40:
-                colors.append("#43a047")
+                rate_colors.append("#43a047")
             elif r >= 25:
-                colors.append("#fb8c00")
+                rate_colors.append("#fb8c00")
             else:
-                colors.append("#e53935")
-        bars = ax.bar(labels, rates, color=colors, edgecolor="#333", linewidth=0.6)
-        for bar, rate, cnt in zip(bars, rates, counts):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                    f"{rate:.1f}%\nn={cnt}", ha="center", va="bottom", fontsize=9)
-        ax.set_ylabel("命中率 %")
-        ax.set_xlabel("预测分段")
-        ax.set_title("分数段 → 命中率（绿=高、橙=中、红=低、灰=无可买样本）")
-        max_rate = max(rates + [10])
-        ax.set_ylim(0, max(max_rate * 1.25, 20))
-        ax.grid(axis="y", linestyle="--", alpha=0.4)
+                rate_colors.append("#e53935")
+        bars_l = ax_rate.bar(labels, rates, color=rate_colors,
+                             edgecolor="#333", linewidth=0.6)
+        for bar, rate, cnt in zip(bars_l, rates, counts):
+            ax_rate.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                         f"{rate:.1f}%\nn={cnt}", ha="center", va="bottom", fontsize=8)
+        ax_rate.set_ylabel("命中率 %")
+        ax_rate.set_xlabel("预测分段")
+        ax_rate.set_title("命中率（hit / 可买）")
+        ax_rate.set_ylim(0, max(max(rates + [10]) * 1.25, 20))
+        ax_rate.grid(axis="y", linestyle="--", alpha=0.4)
+
+        # 右：成功分布占比
+        bars_r = ax_dist.bar(labels, dist_pcts, color="#1976d2",
+                             edgecolor="#333", linewidth=0.6)
+        for bar, pct, h in zip(bars_r, dist_pcts, hits):
+            if pct > 0:
+                ax_dist.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                             f"{pct:.1f}%\nhit={h}", ha="center", va="bottom", fontsize=8)
+        ax_dist.set_ylabel("占总命中 %")
+        ax_dist.set_xlabel("预测分段")
+        ax_dist.set_title(f"成功分布（共 {total_hits} 命中）")
+        ax_dist.set_ylim(0, max(max(dist_pcts + [10]) * 1.25, 20))
+        ax_dist.grid(axis="y", linestyle="--", alpha=0.4)
+
         fig.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=chart_holder)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # 下方明细表
-        cols = ("label", "total", "buyable", "hit", "rate", "avg_pct")
+        # 下方明细表（多加一列：占总命中%）
+        cols = ("label", "total", "buyable", "hit", "rate", "dist_pct", "avg_pct")
         tree = ttk.Treeview(table_holder, columns=cols, show="headings", height=6)
         for col, (label, w, anc) in {
-            "label": ("分段", 90, tk.CENTER),
-            "total": ("总样本", 80, tk.CENTER),
-            "buyable": ("可买入", 80, tk.CENTER),
+            "label": ("分段", 80, tk.CENTER),
+            "total": ("总样本", 70, tk.CENTER),
+            "buyable": ("可买入", 70, tk.CENTER),
             "hit": ("命中", 60, tk.CENTER),
-            "rate": ("命中率", 90, tk.CENTER),
+            "rate": ("命中率", 80, tk.CENTER),
+            "dist_pct": ("占总命中%", 90, tk.CENTER),
             "avg_pct": ("平均次日涨幅", 110, tk.CENTER),
         }.items():
             tree.heading(col, text=label)
             tree.column(col, width=w, anchor=anc)
-        for b in buckets:
+        for b, dist in zip(buckets, dist_pcts):
             tree.insert("", tk.END, values=(
                 b["label"], b["total"], b["buyable"], b["hit"],
-                f"{b['rate']:.1f}%", f"{b['avg_pct']:+.2f}%",
+                f"{b['rate']:.1f}%", f"{dist:.1f}%",
+                f"{b['avg_pct']:+.2f}%",
             ))
         tree.pack(fill=tk.X)
 
