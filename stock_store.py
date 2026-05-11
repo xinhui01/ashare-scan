@@ -643,6 +643,122 @@ def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.Da
     return df.reset_index(drop=True)
 
 
+def list_history_trade_dates_in_range(
+    start_yyyymmdd: str, end_yyyymmdd: str,
+) -> List[str]:
+    """返回 history 表中 [start, end] 区间内的不同交易日（YYYYMMDD 格式，升序）。"""
+    if not _DB_PATH.is_file():
+        return []
+    raw_s = str(start_yyyymmdd or "").strip().replace("-", "")
+    raw_e = str(end_yyyymmdd or "").strip().replace("-", "")
+    if len(raw_s) != 8 or len(raw_e) != 8:
+        return []
+    s_dash = f"{raw_s[:4]}-{raw_s[4:6]}-{raw_s[6:]}"
+    e_dash = f"{raw_e[:4]}-{raw_e[4:6]}-{raw_e[6:]}"
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT DISTINCT trade_date FROM history "
+                "WHERE trade_date >= ? AND trade_date <= ? "
+                "ORDER BY trade_date ASC",
+                (s_dash, e_dash),
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("列出 history 交易日范围失败 %s~%s", s_dash, e_dash)
+        return []
+    out: List[str] = []
+    for r in rows:
+        d = str(r["trade_date"] or "").strip()
+        if not d:
+            continue
+        digits = d.replace("-", "")
+        if len(digits) == 8:
+            out.append(digits)
+    return out
+
+
+def list_limit_up_pool_trade_dates() -> List[str]:
+    """返回 limit_up_pool 表已缓存的交易日（YYYYMMDD 格式，去重升序）。"""
+    if not _DB_PATH.is_file():
+        return []
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT DISTINCT trade_date FROM limit_up_pool ORDER BY trade_date ASC"
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("列出 limit_up_pool 交易日失败")
+        return []
+    out: List[str] = []
+    for r in rows:
+        d = str(r["trade_date"] or "").strip()
+        if not d:
+            continue
+        digits = d.replace("-", "")
+        if len(digits) == 8:
+            out.append(digits)
+    return out
+
+
+def load_spot_snapshot_at(trade_date: str) -> Optional[pd.DataFrame]:
+    """从 history JOIN universe 合成指定历史日期的"全市场快照"。
+
+    返回 DataFrame 字段使用中文列名（兼容 stock_filter._parse_spot_record）：
+        代码 / 名称 / 最新价 / 涨跌幅 / 成交额 / 成交量 / 换手率 / 所属行业
+
+    `trade_date` 接受 YYYYMMDD 或 YYYY-MM-DD（history 表里实际存的是带横线格式）。
+
+    注：universe 表无 industry 字段，所属行业一律置空；候选筛选不依赖行业，
+    仅 hot_industries 统计在历史模式下会变成空字典。
+    """
+    if not _DB_PATH.is_file():
+        return None
+    raw = str(trade_date or "").strip()
+    if not raw:
+        return None
+    digits = raw.replace("-", "").replace("/", "")
+    if len(digits) == 8 and digits.isdigit():
+        td_dash = f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    else:
+        td_dash = raw
+
+    sql = """
+        SELECT h.code AS "代码",
+               COALESCE(u.name, '') AS "名称",
+               h.close AS "最新价",
+               h.change_pct AS "涨跌幅",
+               h.amount AS "成交额",
+               h.volume AS "成交量",
+               h.turnover_rate AS "换手率",
+               '' AS "所属行业"
+        FROM history h
+        LEFT JOIN universe u ON h.code = u.code
+        WHERE h.trade_date = ?
+    """
+
+    def _read():
+        with _connect() as conn:
+            return pd.read_sql_query(sql, conn, params=[td_dash])
+
+    try:
+        df = _retry_locked(_read)
+    except Exception:
+        logger.exception("加载历史快照失败 trade_date=%s", td_dash)
+        return None
+    if df is None or df.empty:
+        return None
+    df["代码"] = df["代码"].astype(str).str.strip().str.zfill(6)
+    return df
+
+
 def save_history_meta(
     stock_code: str,
     latest_trade_date: str,

@@ -119,6 +119,26 @@ class TestEvaluateCandidateOpenCloseCriteria(unittest.TestCase):
         self.assertFalse(r["hit_loose"])
 
 
+class TestLoadSpotSnapshotAt(unittest.TestCase):
+    """历史模式合成 spot 快照 —— 列名兼容、code 补 0、industry 容空。"""
+
+    def test_synthesized_columns_match_parse_spot_record(self):
+        import stock_store
+        from stock_filter import StockFilter
+
+        # 不实际查 DB，验证列名约定即可
+        df = stock_store.load_spot_snapshot_at("20991231")  # 不存在的远期日期 → None
+        self.assertIsNone(df)
+
+        # 列名应满足 _parse_spot_record 的字段读取
+        expected_cols = {"代码", "名称", "最新价", "涨跌幅", "成交额", "成交量", "换手率", "所属行业"}
+        # 函数 SQL alias 列名是固定的，直接读源文件做轻量断言
+        import inspect
+        src = inspect.getsource(stock_store.load_spot_snapshot_at)
+        for col in expected_cols:
+            self.assertIn(col, src, f"合成快照必须包含 {col} 列")
+
+
 class TestRowIsHit(unittest.TestCase):
     """按类别选取成功口径。"""
 

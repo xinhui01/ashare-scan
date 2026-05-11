@@ -33,6 +33,7 @@ from src.gui.ui_dispatch import UIDispatcher
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from src.services import prediction_accuracy_service
+import stock_store
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from llm_client import (
@@ -1897,6 +1898,9 @@ class StockMonitorApp:
         ttk.Button(
             action_bar, text="策略分析", command=self._open_predict_strategy_window,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            action_bar, text="批量回测", command=self._open_predict_backtest_dialog,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
         self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
@@ -2434,6 +2438,190 @@ class StockMonitorApp:
         self._predict_summary_text.config(state=tk.DISABLED)
         self._predict_status_label.config(text="")
         self.status_var.set("涨停预测失败")
+
+    # ============== 批量回测 ==============
+    def _open_predict_backtest_dialog(self) -> None:
+        """打开批量回测对话框：输入日期范围，预校验可用数据，确认后后台跑。"""
+        win = tk.Toplevel(self.root)
+        win.title("批量回测")
+        win.geometry("520x340")
+        win.transient(self.root)
+
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="对历史日期回放预测并统计成功率。",
+                  foreground="#555").pack(anchor=tk.W, pady=(0, 6))
+        ttk.Label(body, text="数据依赖：history 表 + limit_up_pool 表均需缓存。",
+                  foreground="#888", font=("", 9)).pack(anchor=tk.W, pady=(0, 8))
+
+        # 日期输入
+        form = ttk.Frame(body)
+        form.pack(fill=tk.X, pady=4)
+        ttk.Label(form, text="起始日期:").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        # 默认起始：最近一个有 pool 缓存的 14 天前
+        try:
+            pool_dates = stock_store.list_limit_up_pool_trade_dates()
+        except Exception:
+            pool_dates = []
+        default_end = pool_dates[-1] if pool_dates else datetime.now().strftime("%Y%m%d")
+        default_start = pool_dates[0] if pool_dates else default_end
+        from_var = tk.StringVar(value=default_start)
+        to_var = tk.StringVar(value=default_end)
+        ttk.Entry(form, textvariable=from_var, width=12).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(form, text="结束日期:").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
+        ttk.Entry(form, textvariable=to_var, width=12).grid(row=0, column=3, padx=(0, 8))
+        ttk.Label(form, text="回溯天数:").grid(row=0, column=4, sticky=tk.W, padx=(0, 4))
+        lookback_var = tk.StringVar(value="5")
+        ttk.Entry(form, textvariable=lookback_var, width=4).grid(row=0, column=5)
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(body, textvariable=status_var, foreground="#1565c0",
+                  wraplength=480, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+
+        log_text = scrolledtext.ScrolledText(body, height=10, wrap=tk.WORD)
+        log_text.pack(fill=tk.BOTH, expand=True, pady=(8, 6))
+        log_text.config(state=tk.DISABLED)
+
+        btn_bar = ttk.Frame(body)
+        btn_bar.pack(fill=tk.X, pady=(2, 0))
+
+        def _append_log(s: str) -> None:
+            log_text.config(state=tk.NORMAL)
+            log_text.insert(tk.END, s + "\n")
+            log_text.see(tk.END)
+            log_text.config(state=tk.DISABLED)
+
+        def _check_feasible_dates() -> List[str]:
+            s = from_var.get().strip()
+            e = to_var.get().strip()
+            if len(s) != 8 or len(e) != 8 or not s.isdigit() or not e.isdigit():
+                messagebox.showwarning("日期格式", "请输入 YYYYMMDD 格式", parent=win)
+                return []
+            if s > e:
+                messagebox.showwarning("日期范围", "起始日期不能晚于结束日期", parent=win)
+                return []
+            try:
+                hist = set(stock_store.list_history_trade_dates_in_range(s, e))
+                pool = set(stock_store.list_limit_up_pool_trade_dates())
+            except Exception as exc:
+                messagebox.showerror("数据检查失败", str(exc), parent=win)
+                return []
+            # 可回测 = 该日有 history & limit_up_pool & T+1 也有 history
+            feasible_set = hist & pool
+            feasible = sorted(feasible_set)
+            # 去掉没有 T+1 history 的日期（无法评估准确率）
+            evaluable = [d for d in feasible if any(h > d for h in hist)]
+            return evaluable
+
+        def _on_check():
+            ds = _check_feasible_dates()
+            log_text.config(state=tk.NORMAL)
+            log_text.delete("1.0", tk.END)
+            log_text.config(state=tk.DISABLED)
+            if not ds:
+                status_var.set("范围内没有可回测的日期（需要 history + limit_up_pool 都有缓存，并有 T+1 数据）")
+                _append_log("可回测日期：0 天")
+                return
+            status_var.set(f"范围内可回测 {len(ds)} 天")
+            _append_log(f"可回测日期（{len(ds)} 天）：")
+            for d in ds:
+                _append_log(f"  {d}")
+
+        def _run_worker(dates: List[str], lookback: int):
+            evaluated_dates: List[str] = []
+            for i, d in enumerate(dates, 1):
+                self._post_to_ui(lambda x=i, n=len(dates), td=d:
+                                 status_var.set(f"[{x}/{n}] 回测 {td} ..."))
+                try:
+                    result = self.stock_filter.predict_limit_up_candidates(
+                        d, lookback_days=lookback, historical_mode=True,
+                    )
+                    self._post_to_ui(lambda td=d, r=result, x=i, n=len(dates):
+                                     _append_log(
+                                         f"[{x}/{n}] {td} → cont={len(r.get('continuation_candidates', []))} "
+                                         f"first={len(r.get('first_board_candidates', []))} "
+                                         f"fresh={len(r.get('fresh_first_board_candidates', []))} "
+                                         f"wrap={len(r.get('broken_board_wrap_candidates', []))} "
+                                         f"trend={len(r.get('trend_limit_up_candidates', []))}"
+                                     ))
+                    evaluated_dates.append(d)
+                except Exception as exc:
+                    err = str(exc)
+                    self._post_to_ui(lambda td=d, e=err:
+                                     _append_log(f"  {td} 失败: {e}"))
+            # 全部跑完 → 强制评估这批日期
+            self._post_to_ui(lambda: status_var.set(f"预测完成，正在评估准确率..."))
+            try:
+                from src.services import prediction_accuracy_service as svc
+                for d in evaluated_dates:
+                    try:
+                        svc.evaluate(d)
+                    except Exception as exc:
+                        self._post_to_ui(lambda td=d, e=str(exc):
+                                         _append_log(f"  评估 {td} 失败: {e}"))
+                # 汇总最近 N 日命中率
+                stats = svc.query_category_stats(lookback_dates=max(1, len(evaluated_dates)))
+            except Exception as exc:
+                self._post_to_ui(lambda e=str(exc):
+                                 status_var.set(f"评估失败: {e}"))
+                return
+
+            def _show_done():
+                status_var.set(f"完成。共 {len(evaluated_dates)} 天预测、评估完成")
+                _append_log("")
+                _append_log("=== 命中率汇总（按类别）===")
+                for cat, lbl in [("cont", "保留涨停"), ("first", "二波接力"),
+                                 ("fresh", "首板涨停"), ("wrap", "反包/承接"),
+                                 ("trend", "趋势涨停")]:
+                    d = stats.get(cat) or {}
+                    b = int(d.get("buyable") or 0)
+                    h = int(d.get("hit_primary") or d.get("hit_strict") or 0)
+                    r = float(d.get("primary_rate") or d.get("strict_rate") or 0.0)
+                    if b > 0:
+                        _append_log(f"  {lbl}: {r:.1f}% ({h}/{b})")
+                    else:
+                        _append_log(f"  {lbl}: 暂无可买样本")
+                # 刷新主页面
+                try:
+                    self._refresh_predict_accuracy_async("")
+                except Exception:
+                    pass
+
+            self._post_to_ui(_show_done)
+
+        def _on_start():
+            try:
+                lookback = max(2, min(int(lookback_var.get().strip() or "5"), 15))
+            except ValueError:
+                lookback = 5
+            lookback_var.set(str(lookback))
+            ds = _check_feasible_dates()
+            if not ds:
+                status_var.set("没有可回测的日期")
+                return
+            if len(ds) < 3:
+                if not messagebox.askyesno(
+                    "样本过少",
+                    f"范围内只有 {len(ds)} 天可回测，样本量较少。是否继续？",
+                    parent=win,
+                ):
+                    return
+            start_btn.config(state=tk.DISABLED)
+            check_btn.config(state=tk.DISABLED)
+            log_text.config(state=tk.NORMAL)
+            log_text.delete("1.0", tk.END)
+            log_text.config(state=tk.DISABLED)
+            _append_log(f"开始回测 {len(ds)} 天 (lookback={lookback})...")
+            threading.Thread(
+                target=_run_worker, args=(ds, lookback), daemon=True,
+            ).start()
+
+        check_btn = ttk.Button(btn_bar, text="检查可用数据", command=_on_check)
+        check_btn.pack(side=tk.LEFT)
+        start_btn = ttk.Button(btn_bar, text="开始回测", command=_on_start)
+        start_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btn_bar, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
 
     _PROFILE_LABELS = {
         "change_pct_t1": "T-1涨跌幅%",

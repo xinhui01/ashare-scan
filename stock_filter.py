@@ -1846,6 +1846,7 @@ class StockFilter:
         trade_date: str,
         lookback_days: int = 5,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        historical_mode: bool = False,
     ) -> Dict[str, Any]:
         """基于涨停对比 + 二波接力数据预测明日涨停候选。
 
@@ -1860,6 +1861,11 @@ class StockFilter:
             first_board_candidates: 二波接力候选（字段名沿用 first_board_*）
             hot_industries: 今日涨停行业分布
             summary: 文字摘要
+
+        `historical_mode=True`：回测模式。spot_df 从 history 表合成（"as of 收盘"）
+        而非实时快照；龙虎榜 / 北向 / 板块强度等实时指标全部置空。涨停池仍用
+        get_limit_up_pool（其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放
+        预测"的批量回测场景下使用。
         """
         # 阶段1：回看最近 N 日涨停对比环境
         if self._log:
@@ -1886,42 +1892,61 @@ class StockFilter:
             nonlocal today_pool_df
             today_pool_df = self.fetcher.get_limit_up_pool(trade_date)
 
-        def _fetch_spot():
-            nonlocal spot_df
-            spot_df = self._fetch_spot_snapshot()
-
-        # 使用线程池并行获取两个数据源。这里不能用 `with`，否则退出上下文时会 wait=True，
-        # 即使 result(timeout=...) 超时了，仍然会继续等待后台任务跑完。
-        executor = DaemonThreadPoolExecutor(max_workers=2, thread_name_prefix="stage2")
-        try:
-            future_pool = executor.submit(_fetch_pool)
-            future_spot = executor.submit(_fetch_spot)
-
+        if historical_mode:
+            # 历史模式：spot_df 从 history 表合成（"as of 收盘"），不走实时网络
+            import stock_store as _stock_store
             try:
-                # 涨停池最多 15 秒（底层 _ashare_request_with_retry 有 20s deadline 兜底）
-                future_pool.result(timeout=15.0)
-            except FutureTimeoutError as e:
+                spot_df = _stock_store.load_spot_snapshot_at(trade_date)
                 if self._log:
-                    self._log(f"涨停预测：获取涨停池超时 (get_limit_up_pool): {e}")
+                    cnt = 0 if spot_df is None else len(spot_df)
+                    self._log(f"涨停预测[历史模式]：从 history 合成 spot 快照 {cnt} 行")
             except Exception as e:
                 if self._log:
-                    self._log(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
-
+                    self._log(f"涨停预测[历史模式]：合成 spot 失败: {e}")
+                spot_df = None
+            # 涨停池仍然走 get_limit_up_pool —— 本地 SQLite 命中即可，未命中才联网
             try:
-                # 全市场行情：东财约5秒，新浪约30秒
-                from stock_data import _eastmoney_circuit_breaker_open
-                _spot_timeout = 45.0 if _eastmoney_circuit_breaker_open() else 20.0
-                future_spot.result(timeout=_spot_timeout)
-            except FutureTimeoutError as e:
-                if self._log:
-                    self._log(f"涨停预测：获取全市场行情超时 (5000+只股票): {e}")
-                    self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
+                _fetch_pool()
             except Exception as e:
                 if self._log:
-                    self._log(f"涨停预测：获取全市场行情失败: {e}")
-                    self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+                    self._log(f"涨停预测[历史模式]：获取涨停池失败: {e}")
+        else:
+            def _fetch_spot():
+                nonlocal spot_df
+                spot_df = self._fetch_spot_snapshot()
+
+            # 使用线程池并行获取两个数据源。这里不能用 `with`，否则退出上下文时会 wait=True，
+            # 即使 result(timeout=...) 超时了，仍然会继续等待后台任务跑完。
+            executor = DaemonThreadPoolExecutor(max_workers=2, thread_name_prefix="stage2")
+            try:
+                future_pool = executor.submit(_fetch_pool)
+                future_spot = executor.submit(_fetch_spot)
+
+                try:
+                    # 涨停池最多 15 秒（底层 _ashare_request_with_retry 有 20s deadline 兜底）
+                    future_pool.result(timeout=15.0)
+                except FutureTimeoutError as e:
+                    if self._log:
+                        self._log(f"涨停预测：获取涨停池超时 (get_limit_up_pool): {e}")
+                except Exception as e:
+                    if self._log:
+                        self._log(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
+
+                try:
+                    # 全市场行情：东财约5秒，新浪约30秒
+                    from stock_data import _eastmoney_circuit_breaker_open
+                    _spot_timeout = 45.0 if _eastmoney_circuit_breaker_open() else 20.0
+                    future_spot.result(timeout=_spot_timeout)
+                except FutureTimeoutError as e:
+                    if self._log:
+                        self._log(f"涨停预测：获取全市场行情超时 (5000+只股票): {e}")
+                        self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
+                except Exception as e:
+                    if self._log:
+                        self._log(f"涨停预测：获取全市场行情失败: {e}")
+                        self._log("涨停预测：将跳过首板候选筛选，继续执行连板延续分析")
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         if today_pool_df is None or today_pool_df.empty:
             non_trading = False
@@ -2018,24 +2043,32 @@ class StockFilter:
             self._log("涨停预测：未找到题材聚类缓存（如需题材加分，请先在涨停对比 tab 跑一次 AI 题材聚类）")
 
         # 阶段2.6：加载龙虎榜 + 北向资金（失败不影响预测）
-        if self._log:
-            self._log("涨停预测：正在加载龙虎榜 / 北向资金...")
-        try:
-            lhb_map = self._load_lhb_for_date(trade_date)
-        except Exception as exc:
-            logger.debug("龙虎榜加载异常: %s", exc)
+        # 历史模式：这些都是"当前时刻"的指标，对历史日期没意义，全部置空
+        if historical_mode:
+            if self._log:
+                self._log("涨停预测[历史模式]：跳过龙虎榜 / 北向 / 板块强度（实时指标）")
             lhb_map = {}
-        try:
-            northbound_map = self._load_northbound_accumulation()
-        except Exception as exc:
-            logger.debug("北向资金加载异常: %s", exc)
             northbound_map = {}
-
-        try:
-            board_strength = self._load_industry_board_strength()
-        except Exception as exc:
-            logger.debug("板块涨跌幅加载异常: %s", exc)
             board_strength = {}
+        else:
+            if self._log:
+                self._log("涨停预测：正在加载龙虎榜 / 北向资金...")
+            try:
+                lhb_map = self._load_lhb_for_date(trade_date)
+            except Exception as exc:
+                logger.debug("龙虎榜加载异常: %s", exc)
+                lhb_map = {}
+            try:
+                northbound_map = self._load_northbound_accumulation()
+            except Exception as exc:
+                logger.debug("北向资金加载异常: %s", exc)
+                northbound_map = {}
+
+            try:
+                board_strength = self._load_industry_board_strength()
+            except Exception as exc:
+                logger.debug("板块涨跌幅加载异常: %s", exc)
+                board_strength = {}
 
         compare_context["lhb_map"] = lhb_map
         compare_context["northbound_map"] = northbound_map
