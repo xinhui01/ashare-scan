@@ -474,6 +474,44 @@ _estimate_last_trade_date = _cache_fresh.estimate_last_trade_date
 _is_history_cache_fresh = _cache_fresh.is_history_cache_fresh
 
 
+# 分时进程内 TTL 缓存：盘中 60s 内重复访问同股秒开
+# key=(code, target_trade_date, day_offset) → (saved_at_epoch, payload_dict)
+# payload_dict 与 get_intraday_data(include_meta=True) 返回结构一致
+_INTRADAY_MEM_CACHE: Dict[Tuple[str, str, int], Tuple[float, Dict[str, Any]]] = {}
+_INTRADAY_MEM_TTL_SECONDS = 60.0
+
+
+def _intraday_market_closed_now() -> bool:
+    """本地时间 ≥ 15:30 视为收盘——东财集合竞价 + 收盘清算到 15:30 后基本固化。"""
+    now = datetime.now()
+    return (now.hour, now.minute) >= (15, 30)
+
+
+def _intraday_mem_get(key: Tuple[str, str, int]) -> Optional[Dict[str, Any]]:
+    entry = _INTRADAY_MEM_CACHE.get(key)
+    if entry is None:
+        return None
+    saved_at, payload = entry
+    if (time.time() - saved_at) > _INTRADAY_MEM_TTL_SECONDS:
+        _INTRADAY_MEM_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _intraday_mem_put(key: Tuple[str, str, int], payload: Dict[str, Any]) -> None:
+    _INTRADAY_MEM_CACHE[key] = (time.time(), payload)
+    # 简单 LRU：超过 256 条就清掉最老的一半，避免无限增长
+    if len(_INTRADAY_MEM_CACHE) > 256:
+        oldest = sorted(_INTRADAY_MEM_CACHE.items(), key=lambda kv: kv[1][0])[:128]
+        for k, _ in oldest:
+            _INTRADAY_MEM_CACHE.pop(k, None)
+
+
+def _clear_intraday_mem_cache() -> None:
+    """供测试或运行时清缓存用。"""
+    _INTRADAY_MEM_CACHE.clear()
+
+
 _build_a_share_universe = _src_universe.build_a_share_universe
 
 
@@ -1970,10 +2008,23 @@ class StockDataFetcher:
             return None if not include_meta else _empty_intraday_meta_payload()
 
         today_str = _today_ymd()
-
-        # ---- 本地缓存命中：过去交易日的分时数据不会再变 ----
         requested_date = str(target_trade_date or "").strip()
-        if requested_date and requested_date < today_str:
+        mem_key = (code, requested_date, int(day_offset or 0))
+
+        def _return(payload: Dict[str, Any]) -> Any:
+            return payload if include_meta else payload.get("intraday")
+
+        # ---- L1: 进程内 TTL 缓存（60s）盘中反复进入秒开 ----
+        mem_hit = _intraday_mem_get(mem_key)
+        if mem_hit is not None:
+            if self._log:
+                self._log(f"分时 {code} 内存缓存命中")
+            return _return(mem_hit)
+
+        # ---- L2: SQLite 缓存——过去日期永久；今日数据收盘后（15:30+）也复用 ----
+        sqlite_cacheable_today = (requested_date == today_str
+                                  and _intraday_market_closed_now())
+        if requested_date and (requested_date < today_str or sqlite_cacheable_today):
             cached = load_intraday_cache(code, requested_date)
             if cached and cached.get("data_json"):
                 try:
@@ -1995,15 +2046,15 @@ class StockDataFetcher:
                                 auction_snapshot = None
                         if self._log:
                             self._log(f"分时 {code} {requested_date} 从本地缓存读取 ({len(intraday_df)} 行)")
-                        if include_meta:
-                            return {
-                                "intraday": intraday_df,
-                                "selected_trade_date": requested_date,
-                                "available_trade_dates": [requested_date],
-                                "applied_day_offset": 0,
-                                "auction": auction_snapshot,
-                            }
-                        return intraday_df
+                        payload = {
+                            "intraday": intraday_df,
+                            "selected_trade_date": requested_date,
+                            "available_trade_dates": [requested_date],
+                            "applied_day_offset": 0,
+                            "auction": auction_snapshot,
+                        }
+                        _intraday_mem_put(mem_key, payload)
+                        return _return(payload)
                 except Exception:
                     pass  # 缓存损坏，回退网络
 
@@ -2077,8 +2128,14 @@ class StockDataFetcher:
 
         intraday_df = df[["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]].copy()
 
-        # ---- 缓存过去交易日的分时数据到本地 ----
-        if selected_trade_date and selected_trade_date < today_str and not intraday_df.empty:
+        # ---- 缓存写入 ----
+        # 过去交易日永久缓存；当日数据要等到 15:30+（收盘清算完）才落 SQLite，
+        # 避免盘中"半成品"被永久化
+        write_sqlite_today = (selected_trade_date == today_str
+                              and _intraday_market_closed_now())
+        if selected_trade_date and not intraday_df.empty and (
+            selected_trade_date < today_str or write_sqlite_today
+        ):
             try:
                 save_df = intraday_df.copy()
                 save_df["time"] = save_df["time"].astype(str)
@@ -2093,13 +2150,14 @@ class StockDataFetcher:
             except Exception:
                 pass  # 缓存写入失败不影响正常流程
 
-        if include_meta:
-            payload = _empty_intraday_meta_payload(
-                selected_trade_date=selected_trade_date,
-                available_trade_dates=trade_dates,
-                applied_day_offset=applied_offset,
-                auction_snapshot=auction_snapshot,
-            )
-            payload["intraday"] = intraday_df
-            return payload
-        return intraday_df
+        # 构造返回 payload + 写进程内 TTL 缓存（盘中也缓存，下次访问 60s 内秒开）
+        payload = _empty_intraday_meta_payload(
+            selected_trade_date=selected_trade_date,
+            available_trade_dates=trade_dates,
+            applied_day_offset=applied_offset,
+            auction_snapshot=auction_snapshot,
+        )
+        payload["intraday"] = intraday_df
+        if not intraday_df.empty:
+            _intraday_mem_put(mem_key, payload)
+        return _return(payload)
