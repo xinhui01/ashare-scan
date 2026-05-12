@@ -2161,3 +2161,184 @@ class StockDataFetcher:
         if not intraday_df.empty:
             _intraday_mem_put(mem_key, payload)
         return _return(payload)
+
+    def prewarm_intraday_for_codes(
+        self,
+        codes: List[str],
+        *,
+        ndays: int = 5,
+        max_workers: int = 4,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, int]:
+        """对多只股票预热分时缓存——每只一次网络拉 ndays 天，按日切片写缓存。
+
+        与重复 N 次 get_intraday_data 相比：单次东财调用即获 5 日全部数据，
+        切片后批量入 mem cache + SQLite（过去日期 / 收盘后今日），效率高出 5x。
+
+        - codes: 候选代码列表（自动去重 / zfill 6 位）
+        - ndays: 拉取最近 N 个交易日，eastmoney trends2 API 支持 1~5
+        - cancel_check: 取消令牌检查，返回 True 即终止后续股票
+        - progress_cb: 进度回调 (done, total, current_code)
+        """
+        import json as _json
+        from stock_store import save_intraday_cache
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        seen: List[str] = []
+        seen_set: set = set()
+        for c in codes or []:
+            c = str(c or "").strip().zfill(6)
+            if c and c not in seen_set:
+                seen.append(c)
+                seen_set.add(c)
+        if not seen:
+            return {"total": 0, "done": 0, "failed": 0}
+
+        today_str = _today_ymd()
+        can_persist_today = _intraday_market_closed_now()
+
+        def _process_one(code: str) -> bool:
+            if cancel_check and cancel_check():
+                return False
+            try:
+                raw = _retry_ak_call(
+                    _fetch_eastmoney_intraday_1min, code,
+                    ndays=ndays, logger=None,
+                )
+            except Exception:
+                return False
+            if raw is None or getattr(raw, "empty", True):
+                return False
+            df = _normalize_intraday_source_frame(raw, code, logger=None)
+            if df.empty:
+                return False
+            trade_dates = _resolve_intraday_trade_dates(df)
+            if not trade_dates:
+                return False
+
+            # 当日有效的 auction snapshot
+            auction_snapshot = None
+            if today_str in trade_dates:
+                try:
+                    auction_snapshot = _retry_ak_call(
+                        _fetch_eastmoney_auction_snapshot, code, logger=None,
+                    )
+                except Exception:
+                    auction_snapshot = None
+                if auction_snapshot is not None and str(auction_snapshot.get("trade_date") or "") != today_str:
+                    auction_snapshot = None
+
+            latest_td = trade_dates[-1]
+            for td in trade_dates:
+                day_df = _slice_intraday_frame_by_trade_date(df, td)
+                if day_df.empty:
+                    continue
+                cols = ["time", "open", "close", "high", "low", "volume", "amount", "avg_price"]
+                cols = [c for c in cols if c in day_df.columns]
+                slim = day_df[cols].copy()
+                payload = {
+                    "intraday": slim,
+                    "selected_trade_date": td,
+                    "available_trade_dates": list(trade_dates),
+                    "applied_day_offset": 0,
+                    "auction": auction_snapshot if td == today_str else None,
+                }
+                # 显式日期入口
+                _intraday_mem_put((code, td, 0), payload)
+                # GUI 默认入口 target_trade_date="" → 用最新一天覆盖
+                if td == latest_td:
+                    _intraday_mem_put((code, "", 0), payload)
+
+                # SQLite 持久化：过去日期 / 收盘后今日
+                can_save = (td < today_str) or (td == today_str and can_persist_today)
+                if can_save:
+                    try:
+                        save_df = slim.copy()
+                        save_df["time"] = save_df["time"].astype(str)
+                        data_json = save_df.to_json(orient="records", force_ascii=False)
+                        auction_json = ""
+                        if td == today_str and auction_snapshot:
+                            save_auction = dict(auction_snapshot)
+                            if "time" in save_auction:
+                                save_auction["time"] = str(save_auction["time"])
+                            auction_json = _json.dumps(save_auction, ensure_ascii=False, default=str)
+                        save_intraday_cache(code, td, data_json, auction_json, len(slim))
+                    except Exception:
+                        pass
+            return True
+
+        done = 0
+        failed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = {pool.submit(_process_one, c): c for c in seen}
+            for fut in as_completed(futs):
+                if cancel_check and cancel_check():
+                    break
+                code = futs[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                done += 1
+                if not ok:
+                    failed += 1
+                if progress_cb:
+                    try:
+                        progress_cb(done, len(seen), code)
+                    except Exception:
+                        pass
+        return {"total": len(seen), "done": done, "failed": failed}
+
+    def prewarm_fund_flow_for_codes(
+        self,
+        codes: List[str],
+        *,
+        days: int = 30,
+        max_workers: int = 4,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    ) -> Dict[str, int]:
+        """对多只股票预热资金流缓存——走 get_fund_flow_data 让 SQLite 入库。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        seen: List[str] = []
+        seen_set: set = set()
+        for c in codes or []:
+            c = str(c or "").strip().zfill(6)
+            if c and c not in seen_set:
+                seen.append(c)
+                seen_set.add(c)
+        if not seen:
+            return {"total": 0, "done": 0, "failed": 0}
+
+        def _process_one(code: str) -> bool:
+            if cancel_check and cancel_check():
+                return False
+            try:
+                df = self.get_fund_flow_data(code, days=days, force_refresh=False)
+                return df is not None and not df.empty
+            except Exception:
+                return False
+
+        done = 0
+        failed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futs = {pool.submit(_process_one, c): c for c in seen}
+            for fut in as_completed(futs):
+                if cancel_check and cancel_check():
+                    break
+                code = futs[fut]
+                try:
+                    ok = fut.result()
+                except Exception:
+                    ok = False
+                done += 1
+                if not ok:
+                    failed += 1
+                if progress_cb:
+                    try:
+                        progress_cb(done, len(seen), code)
+                    except Exception:
+                        pass
+        return {"total": len(seen), "done": done, "failed": failed}

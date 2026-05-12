@@ -2257,6 +2257,8 @@ class StockMonitorApp:
         self._predict_thread: Optional[threading.Thread] = None
         self._predict_result: Optional[Dict[str, Any]] = None
         self._predict_results_map: Dict = {}
+        self._predict_prewarm_thread: Optional[threading.Thread] = None
+        self._predict_prewarm_token: Optional[CancelToken] = None
 
         # 启动时即刻把 5 个 tab 的"历史命中率"标签填上
         self._refresh_predict_accuracy_async("")
@@ -2899,6 +2901,9 @@ class StockMonitorApp:
         # 异步刷新命中率统计 + 触发未回填日期的回填
         self._refresh_predict_accuracy_async(current_date)
 
+        # 启动后台预热：把所有候选股的分时 + 资金流缓存起来，方便用户后续秒开
+        self._start_predict_prewarm(result)
+
         # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
         # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
         if (
@@ -2917,6 +2922,102 @@ class StockMonitorApp:
                 "即可看到完整候选列表。",
                 parent=self.root,
             )
+
+    # ============== 后台预热：分时 + 资金流缓存 ==============
+    def _start_predict_prewarm(self, result: Dict[str, Any]) -> None:
+        """预测完成后，对所有候选股票预热分时 + 资金流缓存，让后续点击秒开。
+
+        - 自动去重 5 类候选的所有 code
+        - 串行执行：先分时（用户最先点的多），再资金流
+        - 每个任务内部并发 4 worker，可被新预测/取消令牌打断
+        """
+        if not isinstance(result, dict):
+            return
+        # 旧的预热在跑就先取消（新预测意味着新的候选集）
+        old = getattr(self, "_predict_prewarm_thread", None)
+        old_token = getattr(self, "_predict_prewarm_token", None)
+        if old is not None and old.is_alive() and old_token is not None:
+            try:
+                old_token.cancel()
+            except Exception:
+                pass
+
+        codes: set = set()
+        for key in (
+            "continuation_candidates", "first_board_candidates",
+            "fresh_first_board_candidates", "broken_board_wrap_candidates",
+            "trend_limit_up_candidates",
+        ):
+            for cand in result.get(key, []) or []:
+                if not isinstance(cand, dict):
+                    continue
+                c = str(cand.get("code") or "").strip().zfill(6)
+                if c:
+                    codes.add(c)
+        if not codes:
+            return
+        try:
+            lookback = max(1, min(int(self._predict_lookback_var.get().strip() or "5"), 5))
+        except (ValueError, AttributeError, tk.TclError):
+            lookback = 5
+        codes_list = sorted(codes)
+        thread, token = self._start_background_job(
+            self._run_predict_prewarm,
+            name="predict-prewarm",
+            args=(codes_list, lookback),
+        )
+        self._predict_prewarm_thread = thread
+        self._predict_prewarm_token = token
+
+    def _run_predict_prewarm(
+        self, codes: List[str], lookback: int, cancel_token: CancelToken,
+    ) -> None:
+        """预热 worker：分时优先 → 资金流，状态栏滚动显示进度。"""
+        total = len(codes)
+        if total == 0:
+            return
+        fetcher = self.stock_filter.fetcher
+
+        def _report_intraday(done: int, n: int, _code: str) -> None:
+            msg = f"预热分时 {done}/{n} · 资金流待跑"
+            self._post_to_ui(lambda m=msg: self.status_var.set(m))
+
+        def _report_flow(done: int, n: int, _code: str) -> None:
+            msg = f"预热资金流 {done}/{n}（分时完成）"
+            self._post_to_ui(lambda m=msg: self.status_var.set(m))
+
+        try:
+            self._post_to_ui(
+                lambda: self.status_var.set(f"预热缓存启动：分时 0/{total}")
+            )
+            intraday_stat = fetcher.prewarm_intraday_for_codes(
+                codes,
+                ndays=max(1, min(int(lookback), 5)),
+                max_workers=4,
+                cancel_check=lambda: cancel_token.is_cancelled(),
+                progress_cb=_report_intraday,
+            )
+            if cancel_token.is_cancelled():
+                self._post_to_ui(lambda: self.status_var.set("预热已取消"))
+                return
+            flow_stat = fetcher.prewarm_fund_flow_for_codes(
+                codes,
+                days=30,
+                max_workers=4,
+                cancel_check=lambda: cancel_token.is_cancelled(),
+                progress_cb=_report_flow,
+            )
+            if cancel_token.is_cancelled():
+                self._post_to_ui(lambda: self.status_var.set("预热已取消"))
+                return
+            summary = (
+                f"预热完成 · 分时 {intraday_stat['done']-intraday_stat['failed']}/{intraday_stat['total']}"
+                f"，资金流 {flow_stat['done']-flow_stat['failed']}/{flow_stat['total']}"
+            )
+            self._post_to_ui(lambda s=summary: self.status_var.set(s))
+        except Exception as exc:
+            err = str(exc)
+            self._post_to_ui(lambda e=err: self.status_var.set(f"预热失败: {e}"))
 
     # ============== 候选筛选与表格渲染 ==============
     def _refresh_predict_industry_options(self) -> None:
