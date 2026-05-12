@@ -673,6 +673,43 @@ def query_score_bucket_stats(
     return out
 
 
+def get_score_bucket_rates(
+    category: Optional[str] = None,
+    lookback_dates: int = 20,
+    min_samples: int = 5,
+) -> Dict[Tuple[int, int], Dict[str, Any]]:
+    """获取各分数段历史命中率，供"按命中桶"排序使用。
+
+    返回 {(lo, hi): {rate, buyable, hit, eligible}}。
+    eligible=False 表示桶内可买入样本不足（< min_samples），调用方应在
+    排序时把这些桶回退到默认的分数序，避免小样本噪声主导排序。
+    """
+    buckets = query_score_bucket_stats(category=category, lookback_dates=lookback_dates)
+    out: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for b in buckets:
+        out[(int(b["lo"]), int(b["hi"]))] = {
+            "rate": float(b["rate"]),
+            "buyable": int(b["buyable"]),
+            "hit": int(b["hit"]),
+            "eligible": int(b["buyable"]) >= int(min_samples),
+        }
+    return out
+
+
+def score_to_bucket(score: Any) -> Tuple[int, int]:
+    """把单个预测分映射到所属分数段 (lo, hi)。超出 [0,100] 时夹到端桶。"""
+    try:
+        s = int(score)
+    except (TypeError, ValueError):
+        s = 0
+    for _label, lo, hi in SCORE_BUCKETS:
+        if lo <= s <= hi:
+            return (lo, hi)
+    if s < SCORE_BUCKETS[0][1]:
+        return (SCORE_BUCKETS[0][1], SCORE_BUCKETS[0][2])
+    return (SCORE_BUCKETS[-1][1], SCORE_BUCKETS[-1][2])
+
+
 def query_industry_stats(
     lookback_dates: int = 20,
     min_samples: int = 3,

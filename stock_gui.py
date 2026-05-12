@@ -5,7 +5,7 @@ import json
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -132,6 +132,9 @@ class StockMonitorApp:
         self._predict_wrap_sort_reverse = True
         self._predict_trend_sort_column = "score"
         self._predict_trend_sort_reverse = True
+        # 按历史命中段排序时，缓存每个类别的 {(lo, hi): {rate, eligible, ...}}
+        # 在 _apply_predict_result / _refresh_predict_accuracy_async 后清空，懒加载
+        self._predict_bucket_rates_cache: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -1992,6 +1995,15 @@ class StockMonitorApp:
             command=self._on_predict_filter_changed,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
+        # 按历史命中段排序：以策略分析的"分数段命中率"做主排序键，
+        # 把历史高命中的分数段顶到表头（每个 tab 用各自类别的命中率）
+        self._predict_sort_by_hit_bucket = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_bar, text="按历史命中段排序",
+            variable=self._predict_sort_by_hit_bucket,
+            command=self._on_predict_sort_mode_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Button(
             filter_bar, text="重置筛选",
             command=self._reset_predict_filters,
@@ -2324,6 +2336,23 @@ class StockMonitorApp:
             secondary = ["score", "burst_ratio", "dist_ma5", "change_pct"]
         if column in secondary:
             secondary = [c for c in secondary if c != column]
+
+        # "按历史命中段排序"模式：把当前类别下"历史命中率最高的分数段"顶到最上
+        # 桶内按 score 降序（再叠加原 secondary 列），保证细排仍然可控
+        bucket_priority = self._predict_bucket_priority_for(table_kind)
+        if bucket_priority is not None:
+            return sorted(
+                records,
+                key=lambda rec: tuple(
+                    [bucket_priority(rec)]
+                    + [self._predict_sort_value(rec, "score")]
+                    + [self._predict_sort_value(rec, c) for c in secondary
+                       if c != "score"]
+                    + [str(rec.get("code", ""))]
+                ),
+                reverse=True,
+            )
+
         return sorted(
             records,
             key=lambda rec: tuple(
@@ -2333,6 +2362,52 @@ class StockMonitorApp:
             ),
             reverse=reverse,
         )
+
+    def _predict_bucket_priority_for(self, table_kind: str):
+        """返回桶排序的 key 函数；若关闭模式或拿不到数据则返回 None。
+
+        样本不足（< 5）的桶 priority 退化为 -1，让它们沉到分数排序之后；
+        其它桶用其历史命中率（0-100），越大越靠前。
+        """
+        try:
+            if not self._predict_sort_by_hit_bucket.get():
+                return None
+        except (AttributeError, tk.TclError):
+            return None
+        cat_key = {
+            "cont": "cont", "first": "first", "fresh": "fresh",
+            "wrap": "wrap", "trend": "trend",
+        }.get(table_kind)
+        if cat_key is None:
+            return None
+        rates = self._get_predict_bucket_rates(cat_key)
+        if not rates:
+            return None
+        from src.services import prediction_accuracy_service as svc
+
+        def _priority(rec: Dict[str, Any]) -> float:
+            bucket = svc.score_to_bucket(rec.get("score"))
+            info = rates.get(bucket)
+            if not info or not info.get("eligible"):
+                return -1.0
+            return float(info.get("rate") or 0.0)
+
+        return _priority
+
+    def _get_predict_bucket_rates(self, category: str) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        """读取类别的历史分数段命中率（带缓存，lookback=20）。"""
+        cache = self._predict_bucket_rates_cache
+        if category in cache:
+            return cache[category]
+        try:
+            from src.services import prediction_accuracy_service as svc
+            rates = svc.get_score_bucket_rates(
+                category=category, lookback_dates=20, min_samples=5,
+            )
+        except Exception:
+            rates = {}
+        cache[category] = rates
+        return rates
 
     def _on_predict_heading_click(self, table_kind: str, column: str) -> None:
         if table_kind == "cont":
@@ -2873,6 +2948,13 @@ class StockMonitorApp:
         """筛选条件变化时重渲染表格（不重跑预测）。"""
         self._render_predict_trees()
 
+    def _on_predict_sort_mode_changed(self) -> None:
+        """切换"按历史命中段排序"开关：清空缓存并重排 5 类列表。"""
+        # 切换模式时强制重新读取（lookback 内最新累计的命中数据可能已变化）
+        self._predict_bucket_rates_cache = {}
+        if self._predict_result:
+            self._apply_predict_result(self._predict_result)
+
     def _matches_predict_filters(self, rec: Dict[str, Any]) -> bool:
         """记录是否通过当前筛选条件。"""
         try:
@@ -3196,6 +3278,8 @@ class StockMonitorApp:
         stats: 近 N 日命中率（默认 N=20）
         stats_yesterday: 最近一个已评估交易日的命中率（"昨日"）
         """
+        # 累计回填可能改写了"分数段命中率"，下次"按历史命中段排序"时强制重读
+        self._predict_bucket_rates_cache = {}
         labels = getattr(self, "_predict_stat_labels", {}) or {}
         stats_yesterday = stats_yesterday or {}
         category_names = {
