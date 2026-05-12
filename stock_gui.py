@@ -29,6 +29,7 @@ from src.gui.result_columns import (
     desc_by_default_ids,
 )
 from src.gui import result_filters
+from src.gui.tree_enhancer import attach_enhancers_recursively as _attach_tree_enhancers
 from src.gui.ui_dispatch import UIDispatcher
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
@@ -495,6 +496,12 @@ class StockMonitorApp:
         self.setup_predict_tab()
         self.setup_watchlist_tab()
         self.setup_log_tab()
+
+        # 给所有 Treeview 挂上"截断单元格悬停 tooltip + 表头双击自适应列宽"增强
+        try:
+            _attach_tree_enhancers(self.root)
+        except Exception:
+            pass
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
@@ -3599,6 +3606,11 @@ class StockMonitorApp:
                 "✓ 已预测" if in_pred else "✗ 漏报",
             ), tags=(tag,))
 
+        try:
+            _attach_tree_enhancers(win)
+        except Exception:
+            pass
+
     def _reopen_compare_window(self, trade_date: str, old_win: tk.Toplevel) -> None:
         try:
             old_win.destroy()
@@ -3771,6 +3783,12 @@ class StockMonitorApp:
                 f"近 {lookback} 个交易日 · 类别: {category_var.get()} · "
                 f"未命中样本 {fr.get('total_miss', 0)} 只"
             ))
+
+            # 每次 _reload 都会重建桶明细表，幂等挂载新的 Treeview
+            try:
+                _attach_tree_enhancers(win)
+            except Exception:
+                pass
 
         cat_combo.bind("<<ComboboxSelected>>", lambda _e: _reload())
         _reload()
