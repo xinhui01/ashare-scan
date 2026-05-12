@@ -273,6 +273,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             hit_strict INTEGER NOT NULL DEFAULT 0,
             hit_loose INTEGER NOT NULL DEFAULT 0,
             hit_buyable INTEGER NOT NULL DEFAULT 1,
+            reasons TEXT NOT NULL DEFAULT '',
             evaluated_at TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (trade_date, code, category)
         );
@@ -304,6 +305,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     }
     if "t1_open_close_pct" not in accuracy_columns:
         conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t1_open_close_pct REAL")
+    if "reasons" not in accuracy_columns:
+        conn.execute(
+            "ALTER TABLE limit_up_prediction_accuracy ADD COLUMN reasons TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def db_path() -> Path:
@@ -1326,7 +1331,7 @@ _PREDICTION_ACCURACY_FIELDS = (
     "t_close", "t1_open", "t1_high", "t1_low", "t1_close", "t1_pct",
     "t1_open_close_pct",
     "t1_limit_up", "t1_one_word", "t1_suspended",
-    "hit_strict", "hit_loose", "hit_buyable", "evaluated_at",
+    "hit_strict", "hit_loose", "hit_buyable", "reasons", "evaluated_at",
 )
 
 
@@ -1366,6 +1371,7 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
             int(bool(rec.get("hit_strict"))),
             int(bool(rec.get("hit_loose"))),
             int(bool(rec.get("hit_buyable", True))),
+            str(rec.get("reasons") or ""),
             str(rec.get("evaluated_at") or now),
         ))
 
@@ -1382,13 +1388,16 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     t_close, t1_open, t1_high, t1_low, t1_close, t1_pct,
                     t1_open_close_pct,
                     t1_limit_up, t1_one_word, t1_suspended,
-                    hit_strict, hit_loose, hit_buyable, evaluated_at
+                    hit_strict, hit_loose, hit_buyable, reasons, evaluated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date, code, category) DO UPDATE SET
                     verify_date=excluded.verify_date,
                     name=excluded.name,
-                    industry=excluded.industry,
+                    industry=CASE
+                        WHEN excluded.industry <> '' THEN excluded.industry
+                        ELSE limit_up_prediction_accuracy.industry
+                    END,
                     predicted_score=excluded.predicted_score,
                     predicted_type=excluded.predicted_type,
                     t_close=excluded.t_close,
@@ -1404,6 +1413,7 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     hit_strict=excluded.hit_strict,
                     hit_loose=excluded.hit_loose,
                     hit_buyable=excluded.hit_buyable,
+                    reasons=excluded.reasons,
                     evaluated_at=excluded.evaluated_at
                 """,
                 rows,
@@ -2128,3 +2138,76 @@ def load_limit_up_stock_meta(stock_code: str) -> Optional[Dict[str, Any]]:
         "last_limit_up_trade_date": str(row["last_limit_up_trade_date"] or ""),
         "updated_at": str(row["updated_at"] or ""),
     }
+
+
+def load_industry_map(codes: List[str]) -> Dict[str, str]:
+    """根据 codes 批量从 limit_up_stock_meta 查 industry，返回 {code: industry}。
+
+    给"评估准确率"等场景做 industry 回填用：trend / first / wrap 等候选在 spot
+    数据里拿不到行业，但只要历史曾涨停过就会在 limit_up_stock_meta 留下记录。
+    无 industry 或代码非法的不会出现在结果里。
+    """
+    cleaned = sorted({str(c or "").strip().zfill(6) for c in codes if str(c or "").strip()})
+    if not cleaned or not _DB_PATH.is_file():
+        return {}
+
+    out: Dict[str, str] = {}
+
+    def _read():
+        with _connect() as conn:
+            placeholders = ",".join("?" for _ in cleaned)
+            return conn.execute(
+                f"""
+                SELECT code, industry FROM limit_up_stock_meta
+                WHERE code IN ({placeholders}) AND industry != ''
+                """,
+                cleaned,
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("批量读取股票行业失败")
+        return {}
+    for row in rows or []:
+        c = str(row["code"] or "").strip().zfill(6)
+        ind = str(row["industry"] or "").strip()
+        if c and ind:
+            out[c] = ind
+    return out
+
+
+def backfill_prediction_accuracy_industry() -> int:
+    """一次性回填：从 limit_up_stock_meta 把 industry 补到 accuracy 表里。
+
+    只更新 industry='' 的行；返回更新行数。
+    """
+    if not _DB_PATH.is_file():
+        return 0
+
+    def _run() -> int:
+        with _connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE limit_up_prediction_accuracy
+                SET industry = (
+                    SELECT industry FROM limit_up_stock_meta m
+                    WHERE m.code = limit_up_prediction_accuracy.code
+                      AND m.industry != ''
+                )
+                WHERE industry = ''
+                  AND EXISTS (
+                    SELECT 1 FROM limit_up_stock_meta m
+                    WHERE m.code = limit_up_prediction_accuracy.code
+                      AND m.industry != ''
+                  )
+                """
+            )
+            return cur.rowcount or 0
+
+    try:
+        with _DB_WRITE_LOCK:
+            return _retry_locked(_run)
+    except Exception:
+        logger.exception("回填 accuracy 表 industry 失败")
+        return 0

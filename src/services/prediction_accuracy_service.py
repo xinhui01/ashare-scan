@@ -299,6 +299,23 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
 
     history_cache: Dict[str, Optional[pd.DataFrame]] = {}
 
+    # 预先收集所有缺 industry 的代码，一次性从 limit_up_stock_meta 批量回填
+    # 现状：cont 候选自带 industry，但 first/wrap/trend/fresh 来自 spot 数据没有
+    missing_industry_codes: List[str] = []
+    for _payload_key in CATEGORY_KEYS.values():
+        for _cand in payload.get(_payload_key, []) or []:
+            if not isinstance(_cand, dict):
+                continue
+            _ind = str(_cand.get("industry") or "").strip()
+            if not _ind:
+                _c = str(_cand.get("code") or "").strip().zfill(6)
+                if _c:
+                    missing_industry_codes.append(_c)
+    industry_fallback: Dict[str, str] = (
+        stock_store.load_industry_map(missing_industry_codes)
+        if missing_industry_codes else {}
+    )
+
     def _build_records(target_verify_date: str) -> Tuple[List[Dict[str, Any]], bool]:
         records: List[Dict[str, Any]] = []
         seen: set = set()  # (code, category) 去重
@@ -344,15 +361,19 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
                 elif not evaluation.get("t1_suspended"):
                     has_any_t1_data = True
 
+                industry_val = str(cand.get("industry") or "").strip()
+                if not industry_val:
+                    industry_val = industry_fallback.get(code, "")
                 record = {
                     "trade_date": td,
                     "verify_date": target_verify_date,
                     "code": code,
                     "category": cat_key,
                     "name": str(cand.get("name") or ""),
-                    "industry": str(cand.get("industry") or ""),
+                    "industry": industry_val,
                     "predicted_score": int(cand.get("score") or 0),
                     "predicted_type": str(cand.get("predict_type") or ""),
+                    "reasons": str(cand.get("reasons") or ""),
                     **evaluation,
                 }
                 records.append(record)
@@ -446,6 +467,13 @@ def evaluate_all_pending(
             evaluated.append(res)
         else:
             skipped.append(res)
+    # 每次回填都顺手把 accuracy 表里历史空缺的 industry 补上一遍——limit_up_stock_meta
+    # 会随着新涨停股逐日新增，所以越久 industry 命中率越高
+    try:
+        stock_store.backfill_prediction_accuracy_industry()
+    except Exception:
+        logger.exception("回填 accuracy industry 失败")
+
     return {"evaluated": evaluated, "skipped": skipped, "total": total}
 
 

@@ -2165,9 +2165,9 @@ class StockFilter:
             f"今日涨停总数：{len(all_pool_records)} 只",
             f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
             f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
-            f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=50）",
+            f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=45）",
             f"反包/承接候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉反包 / 不破前涨停价承接，得分>=50）",
-            f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=50）",
+            f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=65）",
         ]
         latest_cont_rate = compare_context.get("latest_continuation_rate")
         avg_cont_rate = compare_context.get("avg_continuation_rate")
@@ -2895,19 +2895,20 @@ class StockFilter:
             score += relay_bonus
             reasons.append(f"距前涨停{days_since_prior_lu}日+{relay_bonus}")
 
-        # 2. 当日表现（max 25）— 启动型 / 潜伏型并存
+        # 2. 当日表现（max 22）— 数据反馈：高涨幅+收强 70+分段在 22 个样本里 0 命中，
+        #    而 56-57 分段的"潜伏+收强"反而 30%+ 命中（动能透支 vs 蓄势启动）
         if 4.0 <= change_pct < 9.5 and is_strong_close:
-            score += 25
-            reasons.append(f"启动+收强{change_pct:+.1f}%+25")
+            score += 12
+            reasons.append(f"启动+收强{change_pct:+.1f}%+12")
         elif -1.0 <= change_pct < 4.0 and is_strong_close:
-            score += 18
-            reasons.append(f"潜伏+收强{change_pct:+.1f}%+18")
+            score += 22
+            reasons.append(f"潜伏+收强{change_pct:+.1f}%+22")
         elif 4.0 <= change_pct < 9.5:
-            score += 8
-            reasons.append(f"启动但收弱{change_pct:+.1f}%+8")
+            score += 3
+            reasons.append(f"启动但收弱{change_pct:+.1f}%+3")
         elif -3.0 <= change_pct < -1.0 and is_strong_close:
-            score += 10
-            reasons.append(f"小阴+收强{change_pct:+.1f}%+10")
+            score += 13
+            reasons.append(f"小阴+收强{change_pct:+.1f}%+13")
         else:
             score += 3
             reasons.append(f"涨幅{change_pct:+.1f}%+3")
@@ -2925,10 +2926,14 @@ class StockFilter:
             score += 5
             reasons.append(f"距涨停剩{room_to_lu:.1f}%+5")
 
-        # 4. 量价配合（max 15）
+        # 4. 量价配合（max 12）— 爆量与"高涨幅"叠加时打折，防止"加速顶"被堆出高分
         if volume_ratio_today >= 3.0:
-            score += 12
-            reasons.append(f"爆量{volume_ratio_today:.1f}x+12")
+            if change_pct >= 4.0:
+                score += 4
+                reasons.append(f"爆量{volume_ratio_today:.1f}x+涨{change_pct:+.1f}%(透支)+4")
+            else:
+                score += 12
+                reasons.append(f"爆量{volume_ratio_today:.1f}x+12")
         elif volume_ratio_today >= 1.5:
             score += 6
             reasons.append(f"温和放量{volume_ratio_today:.1f}x+6")
@@ -2971,6 +2976,12 @@ class StockFilter:
         if change_pct <= -2.0:
             score -= 5
             reasons.append(f"当日跌{change_pct:+.1f}%-5")
+        # 动能堆叠：高涨幅 + 突破20日 + 爆量 同时出现，多为"加速顶"信号
+        # 数据反馈：满足全部三项的样本在 70+ 分段中 0 命中
+        if (change_pct >= 4.0 and breakout_20d
+                and volume_ratio_today is not None and volume_ratio_today >= 3.0):
+            score -= 8
+            reasons.append("启动+突破+爆量三连(加速顶)-8")
 
         # 换手率
         if turnover is not None:
@@ -3057,7 +3068,9 @@ class StockFilter:
             score_info = self._score_fresh_first_board(
                 rec, hot_industries, compare_context, cooldown_days=cooldown_days,
             )
-            if score_info is not None and score_info["score"] >= 50:
+            # 门槛从 50 降到 45：30 天只攒到 13 条样本统计意义不足，
+            # 先放宽吸量积累数据，待样本到位再回收门槛
+            if score_info is not None and score_info["score"] >= 45:
                 candidates.append(score_info)
             if progress_callback:
                 progress_callback(idx + 1, total, f"首板筛选 {rec['code']} {rec.get('name', '')}")
@@ -3654,7 +3667,9 @@ class StockFilter:
             score_info = self._score_trend_limit_up(
                 rec, hot_industries, compare_context,
             )
-            if score_info is not None and score_info["score"] >= 50:
+            # 门槛从 50 提到 65：30 天数据显示 50-60 分段命中率仅 5.9%（n=222）几乎没有
+            # 区分度；65+ 才能把"次日实质上行"的标的过滤出来
+            if score_info is not None and score_info["score"] >= 65:
                 candidates.append(score_info)
             if progress_callback:
                 progress_callback(idx + 1, total, f"趋势筛选 {rec['code']} {rec.get('name', '')}")
