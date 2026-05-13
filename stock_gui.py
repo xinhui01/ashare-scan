@@ -489,13 +489,16 @@ class StockMonitorApp:
         self.notebook = ttk.Notebook(parent)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        self.setup_result_tab()
+        self.setup_predict_tab()
         self.setup_detail_tab()
         self.setup_intraday_tab()
+        self.setup_result_tab()
         self.setup_limit_up_compare_tab()
-        self.setup_predict_tab()
         self.setup_watchlist_tab()
         self.setup_log_tab()
+
+        # 构建 tab 注册表 + 应用用户配置的可见性（默认只显示预测/详情/分时）
+        self._init_tab_visibility()
 
         # 给所有 Treeview 挂上"截断单元格悬停 tooltip + 表头双击自适应列宽"增强
         try:
@@ -521,9 +524,117 @@ class StockMonitorApp:
         else:
             self._clear_top_header()
 
+    # ============== Tab 可见性管理 ==============
+    _TAB_VISIBILITY_CONFIG_KEY = "visible_tabs"
+    _DEFAULT_VISIBLE_TABS = ("predict", "detail", "intraday")
+
+    def _init_tab_visibility(self) -> None:
+        """构建 tab 注册表并按用户配置隐藏不需要的 tab。
+
+        默认只显示 涨停预测 / 股票详情 / 分时；其他通过"视图"菜单随时切换。
+        预测/详情/分时是核心工作流，作为 always-on 不让用户隐藏掉
+        （否则预测候选双击会跳到不存在的 tab）。
+        """
+        # (key, widget, text, can_hide) —— 顺序与 setup_notebook 中 setup_*_tab 调用顺序一致
+        self._tab_registry: List[Tuple[str, Any, str, bool]] = [
+            ("predict", self.predict_tab, "涨停预测", False),
+            ("detail", self.detail_tab_frame, "股票详情", False),
+            ("intraday", self.intraday_tab, "分时", False),
+            ("result", self.result_tab, "扫描结果", True),
+            ("compare", self.compare_tab, "涨停对比", True),
+            ("watchlist", self.watchlist_tab, "自选池", True),
+            ("log", self.log_tab, "运行日志", True),
+        ]
+
+        # 加载用户偏好（首次运行用默认）
+        try:
+            saved = stock_store.load_app_config(
+                self._TAB_VISIBILITY_CONFIG_KEY, default=None,
+            )
+        except Exception:
+            saved = None
+        if isinstance(saved, list):
+            visible_set = set(str(x) for x in saved)
+        else:
+            visible_set = set(self._DEFAULT_VISIBLE_TABS)
+            # 把默认值写入，让后续 load 拿到一致结果
+            try:
+                stock_store.save_app_config(
+                    self._TAB_VISIBILITY_CONFIG_KEY, sorted(visible_set),
+                )
+            except Exception:
+                pass
+
+        # always-on tab 强制可见
+        for key, _w, _t, can_hide in self._tab_registry:
+            if not can_hide:
+                visible_set.add(key)
+
+        self._visible_tab_set = visible_set
+
+        # 隐藏初始不在可见集合里的 tab
+        for key, widget, _text, _can_hide in self._tab_registry:
+            if key not in visible_set:
+                try:
+                    self.notebook.hide(widget)
+                except Exception:
+                    pass
+
+        # 视图菜单
+        self._build_view_menu()
+
+    def _build_view_menu(self) -> None:
+        """在已有 menubar 上追加"视图"菜单，每个可隐藏 tab 一个 checkbox。"""
+        menubar = self.root.nametowidget(self.root["menu"]) if self.root["menu"] else None
+        if menubar is None:
+            return
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="视图", menu=view_menu)
+        self._tab_visible_vars: Dict[str, tk.BooleanVar] = {}
+        for key, _widget, text, can_hide in self._tab_registry:
+            if not can_hide:
+                continue  # always-on 不进菜单
+            var = tk.BooleanVar(value=(key in self._visible_tab_set))
+            self._tab_visible_vars[key] = var
+            view_menu.add_checkbutton(
+                label=f"显示「{text}」",
+                variable=var,
+                command=lambda k=key: self._toggle_tab_visibility(k),
+            )
+
+    def _toggle_tab_visibility(self, key: str) -> None:
+        entry = next(
+            ((w, t, ch) for k, w, t, ch in self._tab_registry if k == key),
+            None,
+        )
+        if not entry:
+            return
+        widget, _text, can_hide = entry
+        if not can_hide:
+            return
+        want_show = bool(self._tab_visible_vars[key].get())
+        try:
+            if want_show:
+                # 用 state='normal' 取消隐藏，tab 位置自动保留在注册表原序
+                # （hide 不移除 tab 节点，只把 state 设成 hidden；用 insert 反而不能取消隐藏）
+                self.notebook.tab(widget, state="normal")
+                self._visible_tab_set.add(key)
+            else:
+                self.notebook.hide(widget)
+                self._visible_tab_set.discard(key)
+        except Exception:
+            return
+        try:
+            stock_store.save_app_config(
+                self._TAB_VISIBILITY_CONFIG_KEY, sorted(self._visible_tab_set),
+            )
+        except Exception:
+            pass
+
     def setup_result_tab(self):
         result_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(result_frame, text="扫描结果")
+        self.result_tab = result_frame
 
         action_frame = ttk.Frame(result_frame)
         action_frame.pack(fill=tk.X, pady=(0, 6))
@@ -1370,6 +1481,7 @@ class StockMonitorApp:
     def setup_limit_up_compare_tab(self):
         compare_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(compare_frame, text="涨停对比")
+        self.compare_tab = compare_frame
 
         style = ttk.Style()
         style.configure("ZT.Treeview", rowheight=24)
@@ -1889,6 +2001,7 @@ class StockMonitorApp:
     def setup_predict_tab(self):
         predict_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(predict_frame, text="涨停预测")
+        self.predict_tab = predict_frame
 
         style = ttk.Style()
         style.configure("Predict.Treeview", rowheight=24)
@@ -3984,6 +4097,7 @@ class StockMonitorApp:
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(log_frame, text="运行日志")
+        self.log_tab = log_frame
 
         self.log_text = scrolledtext.ScrolledText(log_frame, height=30, width=100)
         self.log_text.pack(fill=tk.BOTH, expand=True)
