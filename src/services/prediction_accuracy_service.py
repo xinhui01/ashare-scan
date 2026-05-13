@@ -271,11 +271,60 @@ def _evaluate_candidate(
     }
 
 
-def evaluate(trade_date: str) -> Dict[str, Any]:
+_FETCHER_SINGLETON: Optional[Any] = None
+
+
+def _get_history_fetcher() -> Optional[Any]:
+    """懒加载一个 StockDataFetcher 单例，用来在 evaluate 时刷新过期 K 线。
+
+    避免在模块加载时硬依赖 stock_data（它依赖 akshare，启动开销大），
+    且任何导入异常都安全返回 None 让上层退化为"只读本地缓存"行为。
+    """
+    global _FETCHER_SINGLETON
+    if _FETCHER_SINGLETON is not None:
+        return _FETCHER_SINGLETON
+    try:
+        import stock_data  # type: ignore
+        _FETCHER_SINGLETON = stock_data.StockDataFetcher()
+    except Exception:
+        logger.exception("初始化 StockDataFetcher 失败，evaluate 将跳过 K 线刷新")
+        _FETCHER_SINGLETON = None
+    return _FETCHER_SINGLETON
+
+
+def _refresh_history_for_codes(
+    codes: List[str],
+    history_cache: Dict[str, Optional[pd.DataFrame]],
+) -> int:
+    """对给定 codes 调 fetcher 刷新 K 线，并回写到 history_cache。返回刷新成功数。
+
+    用于 evaluate 发现"T+1 行缺失但 verify_date 已到"时，触发一次按需拉新。
+    force_refresh=True：cache 的 freshness 启发可能错判"昨日K线已够新"，
+    accuracy 评估必须拿到当日最新一行才能算 T+1，所以走强制路径。
+    """
+    fetcher = _get_history_fetcher()
+    if fetcher is None or not codes:
+        return 0
+    success = 0
+    for code in codes:
+        try:
+            df = fetcher.get_history_data(code, days=10, force_refresh=True)
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            history_cache[code] = df
+            success += 1
+    return success
+
+
+def evaluate(trade_date: str, *, refresh_stale: bool = False) -> Dict[str, Any]:
     """评估某一日的预测结果，回填到 limit_up_prediction_accuracy。
 
     返回 {trade_date, verify_date, written, skipped, reason}。
     若 verify_date 尚未到达或无 K 线数据，返回 reason='not_ready'。
+
+    refresh_stale: True 时若发现"verify_date <= 今天但 T+1 K 线缺失"，会触发
+    一次按需 fetcher 刷新；GUI 调用应传 True 以保证当日早上能拿到"昨日命中率"。
     """
     td = _normalize_date_yyyymmdd(trade_date)
     if not td:
@@ -392,6 +441,19 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
 
     records, has_any_t1_data = _build_records(verify_date)
 
+    # 按需刷新过期 K 线：发现 t1_suspended 的候选且 verify_date <= 今天 →
+    # 本地 K 线大概率没拉到最新一行，调 fetcher 拉新后重评估这批
+    if refresh_stale and records and verify_date <= today_str:
+        suspended_codes = [
+            r["code"] for r in records
+            if r.get("t1_suspended") and r["category"] not in CONT_SUB_CATEGORY_KEYS
+        ]
+        suspended_codes = sorted(set(suspended_codes))
+        if suspended_codes:
+            refreshed = _refresh_history_for_codes(suspended_codes, history_cache)
+            if refreshed > 0:
+                records, has_any_t1_data = _build_records(verify_date)
+
     if records and not has_any_t1_data:
         inferred_verify_date_dash = _infer_verify_date_from_history(history_cache, trade_date_dash)
         inferred_verify_date = _normalize_date_yyyymmdd(inferred_verify_date_dash or "")
@@ -426,10 +488,14 @@ def evaluate(trade_date: str) -> Dict[str, Any]:
 def evaluate_all_pending(
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     force: bool = False,
+    *,
+    refresh_stale: bool = False,
 ) -> Dict[str, Any]:
     """扫描所有 limit_up_predictions，对 T+1 已就绪且未写入或被强制刷新的日期回填。
 
     `force=True` 时强制重新评估所有日期（覆盖旧记录）。
+    `refresh_stale=True` 时遇到 t1_suspended 的候选会按需 fetch 最新 K 线再重评估；
+    并且 verify_date == 今天 的日期会被无条件重评（处理"早上 K 线没到位"的场景）。
     """
     pred_dates = stock_store.list_limit_up_prediction_dates()
     if not pred_dates:
@@ -441,11 +507,22 @@ def evaluate_all_pending(
         # 这样旧版本只写了 cont 主类别的日期，下次刷新时会被自动重跑以补全 1进2/2进3 等子类别。
         evaluated_set = set(stock_store.list_prediction_accuracy_dates_with_cont_subcat())
 
+    today_str = datetime.now().strftime("%Y%m%d")
     pending: List[str] = []
     for d in pred_dates:
         td = _normalize_date_yyyymmdd(d)
         if force or td not in evaluated_set:
             pending.append(td)
+            continue
+        # verify_date == 今天 的预测，早上跑评估时 K 线可能没全 → 始终重评
+        # 配合 refresh_stale=True 能把"昨日命中率"的全 suspended 状态恢复
+        if refresh_stale:
+            try:
+                v = _next_trading_day_yyyymmdd(td)
+            except Exception:
+                v = None
+            if v and v == today_str:
+                pending.append(td)
 
     pending.sort()  # 早 → 晚
     total = len(pending)
@@ -458,7 +535,7 @@ def evaluate_all_pending(
             except Exception:
                 pass
         try:
-            res = evaluate(td)
+            res = evaluate(td, refresh_stale=refresh_stale)
         except Exception as exc:
             logger.exception("回填准确率失败 trade_date=%s", td)
             skipped.append({"trade_date": td, "reason": f"error: {exc}"})

@@ -3349,7 +3349,9 @@ class StockMonitorApp:
         def _worker():
             try:
                 # 仅评估尚未评估且 T+1 已就绪的日期，幂等
-                prediction_accuracy_service.evaluate_all_pending()
+                # refresh_stale=True：早上 K 线没到位时会按需 fetch 最新数据，
+                # 避免"昨日命中率"因本地缓存陈旧而显示一片 suspended
+                prediction_accuracy_service.evaluate_all_pending(refresh_stale=True)
             except Exception:
                 pass
             # 拉取分类统计：近 20 日 + 昨日（最近一个已评估交易日）
@@ -3465,7 +3467,7 @@ class StockMonitorApp:
 
         # 先尝试同步评估（若 T+1 已就绪），再查询
         try:
-            prediction_accuracy_service.evaluate(trade_date)
+            prediction_accuracy_service.evaluate(trade_date, refresh_stale=True)
         except Exception:
             pass
         try:
@@ -3618,7 +3620,7 @@ class StockMonitorApp:
             pass
         # 强制重新评估
         try:
-            prediction_accuracy_service.evaluate(trade_date)
+            prediction_accuracy_service.evaluate(trade_date, refresh_stale=True)
         except Exception:
             pass
         try:
