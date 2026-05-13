@@ -2122,7 +2122,9 @@ class StockFilter:
         continuation_candidates = []
         for idx, rec in enumerate(all_pool_records):
             score_info = self._score_continuation_by_compare(rec, hot_industries, compare_context)
-            if score_info["score"] >= 40:
+            # 门槛 40→50：30 天数据显示 0-49 段命中仅 15.2%（n=277），50+ 段才有
+            # 22.5% 区分度，进一步过滤减少 false positive
+            if score_info["score"] >= 50:
                 continuation_candidates.append(score_info)
             if progress_callback:
                 progress_callback(idx + 1, len(all_pool_records),
@@ -2502,18 +2504,20 @@ class StockFilter:
         turnover = rec.get("turnover")
 
         # 1. 连板数基础分
+        # 数据反馈：cont 主类 17.7% 命中，首板 (cont_1to2) 仅 14.5%；
+        # 多连板（boards>=2）命中率显著更高（ratio 2.10 正指），加大区分度
         if boards >= 5:
+            score += 35
+            reasons.append(f"{boards}连板+35")
+        elif boards >= 3:
             score += 30
             reasons.append(f"{boards}连板+30")
-        elif boards >= 3:
-            score += 25
-            reasons.append(f"{boards}连板+25")
         elif boards == 2:
-            score += 20
-            reasons.append("2连板+20")
+            score += 25
+            reasons.append("2连板+25")
         else:
-            score += 10
-            reasons.append("首板+10")
+            score += 5
+            reasons.append("首板+5")
 
         # 2. 封板强度（炸板次数少、封板时间早）
         if break_count == 0:
@@ -2547,13 +2551,13 @@ class StockFilter:
             except (ValueError, IndexError):
                 pass
 
-        # 3. 板块热度加分
+        # 3. 板块热度加分（数据反馈：板块热是 cont 类正指，hit ratio 1.29）
         if industry and hot_industries.get(industry, 0) >= 3:
-            score += 10
-            reasons.append(f"板块热({hot_industries[industry]}只)+10")
+            score += 13
+            reasons.append(f"板块热({hot_industries[industry]}只)+13")
         elif industry and hot_industries.get(industry, 0) >= 2:
-            score += 5
-            reasons.append(f"板块有{hot_industries[industry]}只+5")
+            score += 7
+            reasons.append(f"板块有{hot_industries[industry]}只+7")
 
         # 4. 换手率
         if turnover is not None:
@@ -2592,13 +2596,12 @@ class StockFilter:
                 reasons.append("多头排列+10")
 
             # 量能（5 日 + 20 日双校验）
+            # 数据反馈：1.0~3.0 量比适中 +5 无区分度（hit 27% / miss 74% 都满足），
+            # 取消加分，只保留过大/假放量的负向信号
             t_idx = len(close) - 1
             vol_ratio, vol_ratio_20 = self._vol_ratio_with_baseline(volume, t_idx)
             if vol_ratio is not None:
-                if 1.0 <= vol_ratio <= 3.0:
-                    score += 5
-                    reasons.append(f"量比{vol_ratio:.1f}适中+5")
-                elif vol_ratio > 5.0:
+                if vol_ratio > 5.0:
                     score -= 5
                     reasons.append(f"量比{vol_ratio:.1f}过大-5")
                 if vol_ratio >= 1.5 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
@@ -2647,8 +2650,9 @@ class StockFilter:
                     score += 8
                     reasons.append(f"首板晋级环境尚可({ref_rate:.1f}%)+8")
                 elif ref_rate < 15:
-                    score -= 10
-                    reasons.append(f"首板晋级环境弱({ref_rate:.1f}%)-10")
+                    # 数据反馈：弱市首板继续涨停极少，加大惩罚
+                    score -= 15
+                    reasons.append(f"首板晋级环境弱({ref_rate:.1f}%)-15")
             else:
                 if ref_rate >= 30:
                     score += 8
@@ -2662,7 +2666,12 @@ class StockFilter:
                 rec["code"],
                 stock_name=rec.get("name", ""),
             ).get("pattern", "")
-            if pattern in {"回踩MA5涨停", "趋势加速涨停", "突破平台涨停"}:
+            # 数据反馈：cont 类样本中"趋势加速涨停"是最强反指（hit 9% vs miss 61%，
+            # ratio 0.15, n=34）。高位趋势股的涨停往往是"诱多顶"，次日大概率冲高回落
+            if pattern == "趋势加速涨停":
+                score -= 10
+                reasons.append("趋势加速首板诱多顶-10")
+            elif pattern in {"回踩MA5涨停", "突破平台涨停"}:
                 score += 8
                 reasons.append(f"{pattern}+8")
             elif pattern == "暴量涨停":
