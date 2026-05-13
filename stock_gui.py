@@ -2266,6 +2266,8 @@ class StockMonitorApp:
         self._predict_results_map: Dict = {}
         self._predict_prewarm_thread: Optional[threading.Thread] = None
         self._predict_prewarm_token: Optional[CancelToken] = None
+        self._concept_index_thread: Optional[threading.Thread] = None
+        self._concept_index_token: Optional[CancelToken] = None
 
         # 启动时即刻把 5 个 tab 的"历史命中率"标签填上
         self._refresh_predict_accuracy_async("")
@@ -6747,13 +6749,19 @@ class StockMonitorApp:
         ).grid(row=13, column=1, pady=8)
 
         ttk.Label(frame, text="涨停原因源:").grid(row=14, column=0, sticky=tk.E, pady=8)
+        reason_box = ttk.Frame(frame)
+        reason_box.grid(row=14, column=1, pady=8, sticky=tk.W)
         ttk.Combobox(
-            frame,
+            reason_box,
             textvariable=self.limit_up_reason_source_var,
-            width=15,
+            width=12,
             state="readonly",
             values=DATA_SOURCE_OPTIONS["limit_up_reason"],
-        ).grid(row=14, column=1, pady=8)
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            reason_box, text="刷新概念库",
+            command=self._refresh_concept_index_dialog,
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         # ==== 承接强势形态 ====
         ttk.Separator(frame, orient="horizontal").grid(
@@ -6815,6 +6823,71 @@ class StockMonitorApp:
     def on_clear_history_data(self):
         clear_history_data()
         self._log("已清空历史数据。")
+
+    # ============== 概念库刷新 ==============
+    def _refresh_concept_index_dialog(self) -> None:
+        """点击"刷新概念库"按钮：弹确认 → 后台拉取东财+同花顺概念板块，
+        写入 stock_concept_tags 反查表。耗时 10-15 分钟，可取消。
+        """
+        from src.sources import concept_index
+        stats = stock_store.concept_tags_stats()
+        msg_lines = [
+            "拉取东财 + 同花顺所有概念板块的成份股，",
+            "建立股票→概念反查表，让涨停原因显示更细的题材标签。",
+            "",
+            f"当前已有：{stats.get('pairs_total', 0)} 对 (覆盖 {stats.get('codes_total', 0)} 只),",
+            f"东财 {stats.get('em_pairs', 0)}，同花顺 {stats.get('ths_pairs', 0)}",
+        ]
+        last = stats.get("latest_updated_at") or ""
+        if last:
+            msg_lines.append(f"最近更新：{last}")
+        msg_lines += [
+            "",
+            "本次刷新预计 10-15 分钟，后台执行，期间可正常使用。",
+            "是否继续？",
+        ]
+        ok = messagebox.askyesno("刷新概念库", "\n".join(msg_lines), parent=self.root)
+        if not ok:
+            return
+
+        # 后台执行
+        thread, token = self._start_background_job(
+            self._run_concept_index_refresh,
+            name="concept-index-refresh",
+            args=(),
+        )
+        self._concept_index_thread = thread
+        self._concept_index_token = token
+
+    def _run_concept_index_refresh(self, cancel_token: "CancelToken") -> None:
+        from src.sources import concept_index
+
+        def _progress(done: int, total: int, label: str) -> None:
+            msg = f"刷新概念库 {done}/{total} · {label[:30]}"
+            self._post_to_ui(lambda m=msg: self.status_var.set(m))
+
+        try:
+            self._post_to_ui(lambda: self.status_var.set("刷新概念库启动..."))
+            result = concept_index.build_concept_reverse_index(
+                sources=("em", "ths"),
+                cancel_check=lambda: cancel_token.is_cancelled(),
+                progress_cb=_progress,
+            )
+            if result.get("cancelled"):
+                self._post_to_ui(lambda: self.status_var.set("概念库刷新已取消"))
+                return
+            summary = (
+                f"概念库刷新完成 · 东财 {result.get('em_pairs', 0)} 对/"
+                f"同花顺 {result.get('ths_pairs', 0)} 对，"
+                f"覆盖 {result.get('total_codes', 0)} 只，"
+                f"耗时 {result.get('duration_seconds', 0):.0f}s"
+            )
+            self._post_to_ui(lambda s=summary: self.status_var.set(s))
+            self._post_to_ui(lambda s=summary: self._log(s))
+        except Exception as exc:
+            err = str(exc)
+            self._post_to_ui(lambda e=err: self.status_var.set(f"概念库刷新失败: {e}"))
+            self._post_to_ui(lambda e=err: self._log(f"概念库刷新失败: {e}"))
 
     # ================= 网络异常醒目提示 =================
 

@@ -219,6 +219,18 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS stock_concept_tags (
+            code TEXT NOT NULL,
+            concept_name TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (code, concept_name, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sct_code
+            ON stock_concept_tags(code);
+        CREATE INDEX IF NOT EXISTS idx_sct_source
+            ON stock_concept_tags(source);
+
         CREATE TABLE IF NOT EXISTS watchlist (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL DEFAULT '',
@@ -2210,4 +2222,177 @@ def backfill_prediction_accuracy_industry() -> int:
             return _retry_locked(_run)
     except Exception:
         logger.exception("回填 accuracy 表 industry 失败")
+        return 0
+
+
+# ============== 股票概念反查 (stock_concept_tags) ==============
+
+def save_concept_tags_bulk(rows: List[Dict[str, Any]]) -> int:
+    """批量 upsert 概念标签：每行 {code, concept_name, source, updated_at}。"""
+    if not rows:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    payload: List[Tuple[str, str, str, str]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("code") or "").strip().zfill(6)
+        name = str(r.get("concept_name") or "").strip()
+        src = str(r.get("source") or "").strip()
+        if not code or not name or not src:
+            continue
+        ts = str(r.get("updated_at") or "").strip() or now
+        payload.append((code, name, src, ts))
+    if not payload:
+        return 0
+
+    def _write():
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO stock_concept_tags(code, concept_name, source, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(code, concept_name, source) DO UPDATE SET
+                    updated_at=excluded.updated_at
+                """,
+                payload,
+            )
+
+    try:
+        with _DB_WRITE_LOCK:
+            _retry_locked(_write)
+    except Exception:
+        logger.exception("保存概念标签失败")
+        return 0
+    return len(payload)
+
+
+def lookup_concepts_by_code(
+    code: str, *, limit: int = 0, sources: Optional[List[str]] = None,
+) -> List[str]:
+    """查股票的所有概念名（去重，按 source 字母序 + 概念名）。
+
+    `limit=0` 不限；`sources=None` 不限来源。
+    """
+    c = str(code or "").strip().zfill(6)
+    if not c or not _DB_PATH.is_file():
+        return []
+
+    sql = "SELECT DISTINCT concept_name FROM stock_concept_tags WHERE code = ?"
+    args: List[Any] = [c]
+    if sources:
+        placeholders = ",".join("?" for _ in sources)
+        sql += f" AND source IN ({placeholders})"
+        args.extend(sources)
+    sql += " ORDER BY concept_name"
+    if limit > 0:
+        sql += f" LIMIT {int(limit)}"
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(sql, args).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        return []
+    return [str(r["concept_name"] or "").strip() for r in rows if r["concept_name"]]
+
+
+def lookup_concepts_batch(
+    codes: List[str], *, per_code_limit: int = 8,
+    sources: Optional[List[str]] = None,
+) -> Dict[str, List[str]]:
+    """批量查多个代码的概念，返回 {code: [concept1, concept2, ...]}。"""
+    cleaned = sorted({str(c or "").strip().zfill(6) for c in codes if str(c or "").strip()})
+    if not cleaned or not _DB_PATH.is_file():
+        return {}
+
+    placeholders = ",".join("?" for _ in cleaned)
+    sql = (
+        f"SELECT code, concept_name FROM stock_concept_tags "
+        f"WHERE code IN ({placeholders})"
+    )
+    args: List[Any] = list(cleaned)
+    if sources:
+        sp = ",".join("?" for _ in sources)
+        sql += f" AND source IN ({sp})"
+        args.extend(sources)
+    sql += " ORDER BY code, concept_name"
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(sql, args).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        return {}
+    out: Dict[str, List[str]] = {}
+    for r in rows or []:
+        c = str(r["code"] or "").strip().zfill(6)
+        n = str(r["concept_name"] or "").strip()
+        if not c or not n:
+            continue
+        lst = out.setdefault(c, [])
+        if n in lst:
+            continue
+        if per_code_limit > 0 and len(lst) >= per_code_limit:
+            continue
+        lst.append(n)
+    return out
+
+
+def concept_tags_stats() -> Dict[str, Any]:
+    """返回 {pairs_total, codes_total, em_pairs, ths_pairs, latest_updated_at}。"""
+    if not _DB_PATH.is_file():
+        return {"pairs_total": 0, "codes_total": 0, "em_pairs": 0,
+                "ths_pairs": 0, "latest_updated_at": ""}
+
+    def _read():
+        with _connect() as conn:
+            return {
+                "pairs_total": conn.execute(
+                    "SELECT COUNT(*) FROM stock_concept_tags"
+                ).fetchone()[0],
+                "codes_total": conn.execute(
+                    "SELECT COUNT(DISTINCT code) FROM stock_concept_tags"
+                ).fetchone()[0],
+                "em_pairs": conn.execute(
+                    "SELECT COUNT(*) FROM stock_concept_tags WHERE source='em'"
+                ).fetchone()[0],
+                "ths_pairs": conn.execute(
+                    "SELECT COUNT(*) FROM stock_concept_tags WHERE source='ths'"
+                ).fetchone()[0],
+                "latest_updated_at": (
+                    conn.execute(
+                        "SELECT MAX(updated_at) FROM stock_concept_tags"
+                    ).fetchone()[0] or ""
+                ),
+            }
+
+    try:
+        return _retry_locked(_read)
+    except Exception:
+        return {"pairs_total": 0, "codes_total": 0, "em_pairs": 0,
+                "ths_pairs": 0, "latest_updated_at": ""}
+
+
+def prune_stale_concept_tags(source: str, before_timestamp: str) -> int:
+    """删除某 source 下 updated_at 早于给定时间的标签（移除已下架概念）。"""
+    if not source or not before_timestamp or not _DB_PATH.is_file():
+        return 0
+
+    def _run() -> int:
+        with _connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM stock_concept_tags WHERE source = ? AND updated_at < ?",
+                (source, before_timestamp),
+            )
+            return cur.rowcount or 0
+
+    try:
+        with _DB_WRITE_LOCK:
+            return _retry_locked(_run)
+    except Exception:
         return 0

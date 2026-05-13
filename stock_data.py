@@ -1171,21 +1171,45 @@ class StockDataFetcher:
         return df
 
     def get_limit_up_reason(self, stock_code: str, trade_date: str, source: Optional[str] = None) -> str:
+        """返回 "东财入选理由 [概念1 / 概念2 / 概念3]" 的拼接文本。
+
+        - 东财入选理由：当日强势股池里的 "入选理由" 列（短文本触发条件）
+        - 概念标签：从本地 stock_concept_tags 反查表读，最多 8 个，按字母序
+        - 任一为空则只输出另一项；两者都空返回 ""
+        """
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return ""
-        pool = self._load_strong_pool(trade_date, source=source)
-        if pool is None or pool.empty:
-            return ""
-        if "代码" not in pool.columns or "入选理由" not in pool.columns:
-            return ""
-        match = pool[pool["代码"].astype(str).str.strip().str.zfill(6) == code]
-        if match.empty:
-            return ""
-        reason = str(match.iloc[0].get("入选理由", "") or "").strip()
-        if not reason or reason.lower() == "nan":
-            return ""
-        return reason
+
+        # 1) 东财入选理由
+        reason_text = ""
+        try:
+            pool = self._load_strong_pool(trade_date, source=source)
+            if (pool is not None and not pool.empty
+                    and "代码" in pool.columns and "入选理由" in pool.columns):
+                match = pool[pool["代码"].astype(str).str.strip().str.zfill(6) == code]
+                if not match.empty:
+                    raw = str(match.iloc[0].get("入选理由", "") or "").strip()
+                    if raw and raw.lower() != "nan":
+                        reason_text = raw
+        except Exception:
+            reason_text = ""
+
+        # 2) 概念标签反查
+        concepts: List[str] = []
+        try:
+            import stock_store as _ss
+            concepts = _ss.lookup_concepts_by_code(code, limit=8) or []
+        except Exception:
+            concepts = []
+
+        if reason_text and concepts:
+            return f"{reason_text} [{' / '.join(concepts)}]"
+        if reason_text:
+            return reason_text
+        if concepts:
+            return f"[{' / '.join(concepts)}]"
+        return ""
 
     @staticmethod
     def _sanitize_limit_up_pool(df: pd.DataFrame) -> pd.DataFrame:
