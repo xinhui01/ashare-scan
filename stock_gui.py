@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import threading
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -140,6 +142,15 @@ class StockMonitorApp:
         # 在 _apply_predict_accuracy 里刷新；用于 tab header 提示 + 行高亮
         self._predict_best_buckets: Dict[str, Optional[Tuple[int, int]]] = {}
         self._predict_best_bucket_labels: Dict[str, Any] = {}
+        # 详情/分时 payload 的 GUI 层 LRU 缓存：用户反复点击同一只股票时秒开
+        # 详情 TTL 120s（兼顾盘中实时性）；分时仅"实时请求"用 30s TTL，
+        # 指定历史日（day_offset<0 或 target_trade_date 非空）则数据不变长缓存
+        self._detail_payload_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
+        self._intraday_payload_cache: "OrderedDict[Tuple[str, int, str], Tuple[float, Dict[str, Any], bool]]" = OrderedDict()
+        self._DETAIL_CACHE_MAX = 20
+        self._INTRADAY_CACHE_MAX = 30
+        self._DETAIL_CACHE_TTL_SEC = 120.0
+        self._INTRADAY_LIVE_TTL_SEC = 30.0
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -5545,6 +5556,22 @@ class StockMonitorApp:
                 break
         self._set_top_header_for_code(code, prefilled_name)
 
+        # ---- GUI 层 LRU 缓存命中：反复点击同一只股票秒开 ----
+        if not force_refresh:
+            cached = self._detail_payload_cache.get(code)
+            if cached is not None:
+                ts, payload = cached
+                if (time.time() - ts) < self._DETAIL_CACHE_TTL_SEC:
+                    self._detail_payload_cache.move_to_end(code)
+                    try:
+                        self._update_detail_ui(payload)
+                        age = int(time.time() - ts)
+                        self.status_var.set(f"{code} 详情（内存缓存 {age}s）")
+                        self._detail_loading_code = ""
+                        return
+                    except Exception as e:
+                        self._log(f"渲染内存缓存详情失败，回退到完整加载: {e}")
+
         detail_payload = None
         for result in self.filtered_stocks:
             if str(result.get("code", "")).strip().zfill(6) == code:
@@ -5624,13 +5651,23 @@ class StockMonitorApp:
             self._log(f"更新缓存详情失败: {e}")
 
     def _apply_detail_if_current(self, stock_code: str, detail: Dict[str, Any]) -> None:
-        if str(stock_code).strip().zfill(6) != self._detail_request_code:
+        code = str(stock_code).strip().zfill(6)
+        if code != self._detail_request_code:
             return
         try:
             self._update_detail_ui(detail)
         except Exception as e:
             self._log(f"更新详情面板失败: {e}")
             self._show_detail_error(stock_code, f"详情渲染失败: {e}")
+            return
+        # 写入 LRU 缓存：下次点击该股票走秒开路径
+        try:
+            self._detail_payload_cache[code] = (time.time(), detail)
+            self._detail_payload_cache.move_to_end(code)
+            while len(self._detail_payload_cache) > self._DETAIL_CACHE_MAX:
+                self._detail_payload_cache.popitem(last=False)
+        except Exception:
+            pass
     def _finish_detail_status(self, stock_code: str) -> None:
         code = str(stock_code).strip().zfill(6)
         if code == self._detail_loading_code:
@@ -6340,6 +6377,24 @@ class StockMonitorApp:
 
         normalized_target_date = str(target_trade_date or "").strip()
         self._intraday_request_target_date = normalized_target_date
+
+        # ---- GUI 层 LRU 缓存命中：历史日期永久有效，实时请求 30s TTL ----
+        cache_key = (code, requested_offset, normalized_target_date)
+        cached = self._intraday_payload_cache.get(cache_key)
+        if cached is not None:
+            ts, payload, is_live = cached
+            age = time.time() - ts
+            fresh = (not is_live) or (age < self._INTRADAY_LIVE_TTL_SEC)
+            if fresh:
+                self._intraday_payload_cache.move_to_end(cache_key)
+                try:
+                    self._apply_intraday_if_current(
+                        code, requested_offset, normalized_target_date, payload,
+                    )
+                    return
+                except Exception as e:
+                    self._log(f"渲染内存缓存分时失败，回退到完整加载: {e}")
+
         if (
             self._intraday_loading_code == code
             and self._intraday_loading_offset == requested_offset
@@ -6366,7 +6421,24 @@ class StockMonitorApp:
             )
             if cancel_token.is_cancelled():
                 return
-            self._post_to_ui(lambda: self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload))
+            code = str(stock_code).strip().zfill(6)
+            normalized_target = str(target_trade_date or "").strip()
+            # 历史日（非"最新"）数据不变，可永久缓存；day_offset=0 且无指定日才算 live
+            is_live = (int(day_offset) == 0 and not normalized_target)
+            cache_key = (code, int(day_offset), normalized_target)
+
+            def _apply():
+                # UI 线程写缓存 + 渲染（避免 OrderedDict 跨线程争用）
+                try:
+                    self._intraday_payload_cache[cache_key] = (time.time(), payload, is_live)
+                    self._intraday_payload_cache.move_to_end(cache_key)
+                    while len(self._intraday_payload_cache) > self._INTRADAY_CACHE_MAX:
+                        self._intraday_payload_cache.popitem(last=False)
+                except Exception:
+                    pass
+                self._apply_intraday_if_current(stock_code, day_offset, target_trade_date, payload)
+
+            self._post_to_ui(_apply)
         except Exception as e:
             self._post_to_ui(lambda: self._draw_intraday_error(stock_code, f"分时加载失败: {e}"))
             self._post_to_ui(lambda: self._log(f"分时加载失败 {stock_code}: {e}"))
