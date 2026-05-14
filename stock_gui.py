@@ -3125,6 +3125,8 @@ class StockMonitorApp:
                 pass
 
         codes: set = set()
+        # 同时按分数排序，挑 top-N 做上层 payload 预热（写入 GUI LRU 缓存，秒开）
+        code_best_score: Dict[str, int] = {}
         for key in (
             "continuation_candidates", "first_board_candidates",
             "fresh_first_board_candidates", "broken_board_wrap_candidates",
@@ -3134,8 +3136,15 @@ class StockMonitorApp:
                 if not isinstance(cand, dict):
                     continue
                 c = str(cand.get("code") or "").strip().zfill(6)
-                if c:
-                    codes.add(c)
+                if not c:
+                    continue
+                codes.add(c)
+                try:
+                    sc = int(cand.get("score") or 0)
+                except (TypeError, ValueError):
+                    sc = 0
+                if sc > code_best_score.get(c, -1):
+                    code_best_score[c] = sc
         if not codes:
             return
         try:
@@ -3143,18 +3152,26 @@ class StockMonitorApp:
         except (ValueError, AttributeError, tk.TclError):
             lookback = 5
         codes_list = sorted(codes)
+        # 按分数降序取 top-N 做上层 payload 预热，N 与 LRU 上限对齐避免互相挤掉
+        top_codes_for_payload = [
+            c for c, _ in sorted(
+                code_best_score.items(), key=lambda kv: (-kv[1], kv[0]),
+            )
+        ][: self._DETAIL_CACHE_MAX]
         thread, token = self._start_background_job(
             self._run_predict_prewarm,
             name="predict-prewarm",
-            args=(codes_list, lookback),
+            args=(codes_list, lookback, top_codes_for_payload),
         )
         self._predict_prewarm_thread = thread
         self._predict_prewarm_token = token
 
     def _run_predict_prewarm(
-        self, codes: List[str], lookback: int, cancel_token: CancelToken,
+        self, codes: List[str], lookback: int,
+        top_codes_for_payload: List[str],
+        cancel_token: CancelToken,
     ) -> None:
-        """预热 worker：分时优先 → 资金流，状态栏滚动显示进度。"""
+        """预热 worker：分时 → 资金流 → 上层 payload (top-N，写 GUI LRU)。"""
         total = len(codes)
         if total == 0:
             return
@@ -3192,14 +3209,97 @@ class StockMonitorApp:
             if cancel_token.is_cancelled():
                 self._post_to_ui(lambda: self.status_var.set("预热已取消"))
                 return
+            # 底层缓存就绪后，对 top-N 跑完整 get_stock_detail + get_stock_intraday，
+            # 写到 GUI LRU 缓存 —— 用户点击 top-N 候选直接秒开
+            payload_stat = self._prewarm_upper_payloads(
+                top_codes_for_payload, cancel_token,
+            )
             summary = (
                 f"预热完成 · 分时 {intraday_stat['done']-intraday_stat['failed']}/{intraday_stat['total']}"
                 f"，资金流 {flow_stat['done']-flow_stat['failed']}/{flow_stat['total']}"
+                f"，详情payload {payload_stat['done']-payload_stat['failed']}/{payload_stat['total']}"
             )
             self._post_to_ui(lambda s=summary: self.status_var.set(s))
         except Exception as exc:
             err = str(exc)
             self._post_to_ui(lambda e=err: self.status_var.set(f"预热失败: {e}"))
+
+    def _prewarm_upper_payloads(
+        self, codes: List[str], cancel_token: CancelToken,
+    ) -> Dict[str, int]:
+        """对 top-N 候选直接调上层 get_stock_detail/get_stock_intraday，结果写 GUI LRU。
+
+        底层数据已被 prewarm_intraday/prewarm_fund_flow 缓存，这里主要在补齐：
+        - analyze_history + 技术指标 (MACD/KDJ/RSI/BOLL) 的计算
+        - _resolve_intraday_prev_close 的计算
+        - GUI LRU 缓存的填充
+
+        用户点击 top-N 候选时 → LRU 命中 → 秒开。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        total = len(codes or [])
+        stat = {"total": total, "done": 0, "failed": 0}
+        if total == 0:
+            return stat
+        self._post_to_ui(
+            lambda n=total: self.status_var.set(f"预热详情 payload 0/{n}")
+        )
+
+        def _one(code: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+            if cancel_token.is_cancelled():
+                return code, None, None
+            detail = None
+            intraday = None
+            try:
+                detail = self.stock_filter.get_stock_detail(code)
+            except Exception:
+                detail = None
+            if cancel_token.is_cancelled():
+                return code, detail, None
+            try:
+                intraday = self.stock_filter.get_stock_intraday(code, day_offset=0)
+            except Exception:
+                intraday = None
+            return code, detail, intraday
+
+        def _write_to_lru(code: str, detail, intraday) -> None:
+            now = time.time()
+            if isinstance(detail, dict):
+                self._detail_payload_cache[code] = (now, detail)
+                self._detail_payload_cache.move_to_end(code)
+                while len(self._detail_payload_cache) > self._DETAIL_CACHE_MAX:
+                    self._detail_payload_cache.popitem(last=False)
+            if isinstance(intraday, dict):
+                key = (code, 0, "")
+                self._intraday_payload_cache[key] = (now, intraday, True)
+                self._intraday_payload_cache.move_to_end(key)
+                while len(self._intraday_payload_cache) > self._INTRADAY_CACHE_MAX:
+                    self._intraday_payload_cache.popitem(last=False)
+
+        # 3 worker 并行：底层缓存已就绪，主要瓶颈是上层分析 + 锁竞争
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="payload-prewarm") as pool:
+            futs = {pool.submit(_one, c): c for c in codes}
+            for fut in as_completed(futs):
+                if cancel_token.is_cancelled():
+                    break
+                try:
+                    code, detail, intraday = fut.result()
+                except Exception:
+                    stat["failed"] += 1
+                    stat["done"] += 1
+                    continue
+                if detail is None and intraday is None:
+                    stat["failed"] += 1
+                else:
+                    self._post_to_ui(
+                        lambda c=code, d=detail, i=intraday: _write_to_lru(c, d, i),
+                    )
+                stat["done"] += 1
+                self._post_to_ui(
+                    lambda done=stat["done"], n=total:
+                    self.status_var.set(f"预热详情 payload {done}/{n}")
+                )
+        return stat
 
     # ============== 候选筛选与表格渲染 ==============
     def _refresh_predict_industry_options(self) -> None:
