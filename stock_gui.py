@@ -136,6 +136,10 @@ class StockMonitorApp:
         # 按历史命中段排序时，缓存每个类别的 {(lo, hi): {rate, eligible, ...}}
         # 在 _apply_predict_result / _refresh_predict_accuracy_async 后清空，懒加载
         self._predict_bucket_rates_cache: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
+        # 每个主类别的"历史最优分数段" (lo, hi) —— eligible 桶里命中率最高的
+        # 在 _apply_predict_accuracy 里刷新；用于 tab header 提示 + 行高亮
+        self._predict_best_buckets: Dict[str, Optional[Tuple[int, int]]] = {}
+        self._predict_best_bucket_labels: Dict[str, Any] = {}
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -526,14 +530,14 @@ class StockMonitorApp:
 
     # ============== Tab 可见性管理 ==============
     _TAB_VISIBILITY_CONFIG_KEY = "visible_tabs"
-    _DEFAULT_VISIBLE_TABS = ("predict", "detail", "intraday")
+    _DEFAULT_VISIBLE_TABS = ("predict", "detail", "intraday", "log")
 
     def _init_tab_visibility(self) -> None:
         """构建 tab 注册表并按用户配置隐藏不需要的 tab。
 
-        默认只显示 涨停预测 / 股票详情 / 分时；其他通过"视图"菜单随时切换。
-        预测/详情/分时是核心工作流，作为 always-on 不让用户隐藏掉
-        （否则预测候选双击会跳到不存在的 tab）。
+        默认只显示 涨停预测 / 股票详情 / 分时 / 运行日志；其他通过"视图"菜单随时切换。
+        预测/详情/分时/运行日志是核心工作流，作为 always-on 不让用户隐藏掉
+        （否则预测候选双击会跳到不存在的 tab；日志关键报错也看不到）。
         """
         # (key, widget, text, can_hide) —— 顺序与 setup_notebook 中 setup_*_tab 调用顺序一致
         self._tab_registry: List[Tuple[str, Any, str, bool]] = [
@@ -543,7 +547,7 @@ class StockMonitorApp:
             ("result", self.result_tab, "扫描结果", True),
             ("compare", self.compare_tab, "涨停对比", True),
             ("watchlist", self.watchlist_tab, "自选池", True),
-            ("log", self.log_tab, "运行日志", True),
+            ("log", self.log_tab, "运行日志", False),
         ]
 
         # 加载用户偏好（首次运行用默认）
@@ -2173,6 +2177,10 @@ class StockMonitorApp:
                               anchor=tk.W, padding=(6, 2))
         cont_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["cont"] = cont_stat
+        cont_best = ttk.Label(cont_tab, text="历史最优段: -",
+                              foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+        cont_best.pack(side=tk.TOP, fill=tk.X)
+        self._predict_best_bucket_labels["cont"] = cont_best
 
         # 1进2 / 2进3 / 3进4 / 4进5 / 5进6+ 子类别命中率（独立统计，不影响主类别）
         cont_sub_frame = ttk.Frame(cont_tab)
@@ -2212,6 +2220,7 @@ class StockMonitorApp:
         self._predict_cont_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
         self._predict_cont_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self._predict_cont_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        self._predict_cont_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
         # 首板候选 Tab
         first_tab = ttk.Frame(self._predict_table_nb)
@@ -2220,6 +2229,10 @@ class StockMonitorApp:
                                anchor=tk.W, padding=(6, 2))
         first_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["first"] = first_stat
+        first_best = ttk.Label(first_tab, text="历史最优段: -",
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+        first_best.pack(side=tk.TOP, fill=tk.X)
+        self._predict_best_bucket_labels["first"] = first_best
         first_cols = ("code", "name", "industry", "change_pct", "close",
                       "burst_date", "burst_ratio", "dist_ma5", "days_since_burst",
                       "score", "result", "reasons")
@@ -2250,6 +2263,7 @@ class StockMonitorApp:
         self._predict_first_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
         self._predict_first_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self._predict_first_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        self._predict_first_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
         # 首板涨停候选 Tab（最近 N 日未涨停、今日量价启动）
         fresh_tab = ttk.Frame(self._predict_table_nb)
@@ -2258,6 +2272,10 @@ class StockMonitorApp:
                                anchor=tk.W, padding=(6, 2))
         fresh_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["fresh"] = fresh_stat
+        fresh_best = ttk.Label(fresh_tab, text="历史最优段: -",
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+        fresh_best.pack(side=tk.TOP, fill=tk.X)
+        self._predict_best_bucket_labels["fresh"] = fresh_best
         fresh_cols = ("code", "name", "industry", "change_pct", "close",
                       "volume_ratio", "dist_ma5", "trend_5d", "position_60d",
                       "turnover", "score", "result", "reasons")
@@ -2289,6 +2307,7 @@ class StockMonitorApp:
         self._predict_fresh_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
         self._predict_fresh_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self._predict_fresh_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        self._predict_fresh_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
         # 断板反包候选 Tab（近期涨停被打掉，今日逼近反包）
         wrap_tab = ttk.Frame(self._predict_table_nb)
@@ -2297,6 +2316,10 @@ class StockMonitorApp:
                               anchor=tk.W, padding=(6, 2))
         wrap_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["wrap"] = wrap_stat
+        wrap_best = ttk.Label(wrap_tab, text="历史最优段: -",
+                              foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+        wrap_best.pack(side=tk.TOP, fill=tk.X)
+        self._predict_best_bucket_labels["wrap"] = wrap_best
         wrap_cols = ("code", "name", "industry", "pattern_kind", "change_pct", "close",
                      "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
                      "worst_drop", "volume_ratio", "score", "result", "reasons")
@@ -2329,6 +2352,7 @@ class StockMonitorApp:
         self._predict_wrap_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
         self._predict_wrap_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self._predict_wrap_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        self._predict_wrap_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
         # 趋势涨停候选 Tab（多头排列稳健上行）
         trend_tab = ttk.Frame(self._predict_table_nb)
@@ -2337,6 +2361,10 @@ class StockMonitorApp:
                                anchor=tk.W, padding=(6, 2))
         trend_stat.pack(side=tk.TOP, fill=tk.X)
         self._predict_stat_labels["trend"] = trend_stat
+        trend_best = ttk.Label(trend_tab, text="历史最优段: -",
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+        trend_best.pack(side=tk.TOP, fill=tk.X)
+        self._predict_best_bucket_labels["trend"] = trend_best
         trend_cols = ("code", "name", "industry", "change_pct", "close",
                       "ma_spread", "dist_ma5", "ma20_slope",
                       "trend_5d", "trend_10d", "position_60d",
@@ -2371,6 +2399,7 @@ class StockMonitorApp:
         self._predict_trend_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
         self._predict_trend_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self._predict_trend_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        self._predict_trend_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
         body.add(table_frame, weight=4)
 
@@ -2391,6 +2420,26 @@ class StockMonitorApp:
         elif score >= 50:
             return "score_mid"
         return "score_low"
+
+    def _predict_row_tag(self, category: str, hit_tag: Optional[str], score: Any) -> str:
+        """决定预测候选行的背景色 tag。
+
+        优先级：hit/miss（已回填的次日结果）> best_bucket（历史最优分数段）> 分数段色。
+        """
+        if hit_tag:
+            return hit_tag
+        best = (getattr(self, "_predict_best_buckets", None) or {}).get(category)
+        if best is not None:
+            try:
+                s = int(score)
+                if best[0] <= s <= best[1]:
+                    return "best_bucket"
+            except (TypeError, ValueError):
+                pass
+        try:
+            return self._score_tag(int(score) if score is not None else 0)
+        except (TypeError, ValueError):
+            return self._score_tag(0)
 
     @staticmethod
     def _predict_sort_value(record: Dict[str, Any], column: str):
@@ -3302,7 +3351,7 @@ class StockMonitorApp:
         self._predict_cont_tree.delete(*self._predict_cont_tree.get_children())
         for rec in cont_list:
             res_text, hit_tag = _result_cell("cont", rec.get("code", ""))
-            tag = hit_tag or self._score_tag(rec.get("score", 0))
+            tag = self._predict_row_tag("cont", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3323,7 +3372,7 @@ class StockMonitorApp:
         self._predict_first_tree.delete(*self._predict_first_tree.get_children())
         for rec in first_list:
             res_text, hit_tag = _result_cell("first", rec.get("code", ""))
-            tag = hit_tag or self._score_tag(rec.get("score", 0))
+            tag = self._predict_row_tag("first", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3344,7 +3393,7 @@ class StockMonitorApp:
         self._predict_fresh_tree.delete(*self._predict_fresh_tree.get_children())
         for rec in fresh_list:
             res_text, hit_tag = _result_cell("fresh", rec.get("code", ""))
-            tag = hit_tag or self._score_tag(rec.get("score", 0))
+            tag = self._predict_row_tag("fresh", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3367,7 +3416,7 @@ class StockMonitorApp:
         _PATTERN_LABELS = {"wrap": "断板反包", "hold_strong": "强势承接"}
         for rec in wrap_list:
             res_text, hit_tag = _result_cell("wrap", rec.get("code", ""))
-            tag = hit_tag or self._score_tag(rec.get("score", 0))
+            tag = self._predict_row_tag("wrap", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3391,7 +3440,7 @@ class StockMonitorApp:
         self._predict_trend_tree.delete(*self._predict_trend_tree.get_children())
         for rec in trend_list:
             res_text, hit_tag = _result_cell("trend", rec.get("code", ""))
-            tag = hit_tag or self._score_tag(rec.get("score", 0))
+            tag = self._predict_row_tag("trend", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3485,9 +3534,19 @@ class StockMonitorApp:
                     results_map = prediction_accuracy_service.get_per_code_results(current_date)
                 except Exception:
                     results_map = {}
+            # 提前拉取每类的分数段命中率（在 worker 线程做 DB 查询，避免 UI 卡顿）
+            # 用于 _apply_predict_accuracy 后续计算"历史最优段"
+            bucket_rates_by_cat: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
+            for cat in ("cont", "first", "fresh", "wrap", "trend"):
+                try:
+                    bucket_rates_by_cat[cat] = prediction_accuracy_service.get_score_bucket_rates(
+                        category=cat, lookback_dates=20, min_samples=5,
+                    )
+                except Exception:
+                    bucket_rates_by_cat[cat] = {}
             self._post_to_ui(
-                lambda s=stats, y=stats_yesterday, m=results_map:
-                self._apply_predict_accuracy(s, m, y)
+                lambda s=stats, y=stats_yesterday, m=results_map, br=bucket_rates_by_cat:
+                self._apply_predict_accuracy(s, m, y, br)
             )
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -3497,14 +3556,21 @@ class StockMonitorApp:
         stats: Dict[str, Dict[str, Any]],
         results_map: Dict,
         stats_yesterday: Optional[Dict[str, Dict[str, Any]]] = None,
+        bucket_rates_by_cat: Optional[
+            Dict[str, Dict[Tuple[int, int], Dict[str, Any]]]
+        ] = None,
     ) -> None:
         """更新 5 个 tab 顶部的命中率标签 + 刷新 result 列。
 
         stats: 近 N 日命中率（默认 N=20）
         stats_yesterday: 最近一个已评估交易日的命中率（"昨日"）
+        bucket_rates_by_cat: worker 线程预取的分数段命中率，避免 UI 卡顿
         """
-        # 累计回填可能改写了"分数段命中率"，下次"按历史命中段排序"时强制重读
-        self._predict_bucket_rates_cache = {}
+        # 用 worker 预取结果重置缓存；若调用方没传则按旧行为清空，懒加载兜底
+        if bucket_rates_by_cat is not None:
+            self._predict_bucket_rates_cache = dict(bucket_rates_by_cat)
+        else:
+            self._predict_bucket_rates_cache = {}
         labels = getattr(self, "_predict_stat_labels", {}) or {}
         stats_yesterday = stats_yesterday or {}
         category_names = {
@@ -3561,6 +3627,9 @@ class StockMonitorApp:
             except Exception:
                 pass
 
+        # 计算每个主类别的"历史最优分数段"并刷新黄色提示标签
+        self._refresh_predict_best_bucket_labels()
+
         # 当前日期的逐行结果（用于 result 列着色）
         if results_map:
             self._predict_results_map = results_map
@@ -3568,6 +3637,63 @@ class StockMonitorApp:
                 self._render_predict_trees()
             except Exception:
                 pass
+        else:
+            # 即使没有逐行结果，best_bucket 也可能因数据更新而变化 —— 刷新一次行高亮
+            try:
+                if getattr(self, "_predict_lists", None):
+                    self._render_predict_trees()
+            except Exception:
+                pass
+
+    def _refresh_predict_best_bucket_labels(self) -> None:
+        """读取近 20 日的分数段命中率，找出每类历史命中率最高的桶并更新标签。
+
+        eligible=True 的桶里挑 rate 最大者；同 rate 时挑分数段更高的（高分往往更稳）。
+        样本不足或无回填时显示 "-"。结果同步写入 self._predict_best_buckets，
+        供 _render_predict_trees 给落在该段的行打 best_bucket tag。
+        """
+        category_display = {
+            "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
+            "wrap": "反包/承接", "trend": "趋势涨停",
+        }
+        best_map: Dict[str, Optional[Tuple[int, int]]] = {}
+        for cat in ("cont", "first", "fresh", "wrap", "trend"):
+            rates = self._get_predict_bucket_rates(cat)
+            best_bucket: Optional[Tuple[int, int]] = None
+            best_info: Optional[Dict[str, Any]] = None
+            for bucket, info in rates.items():
+                if not info or not info.get("eligible"):
+                    continue
+                if best_info is None:
+                    best_bucket, best_info = bucket, info
+                    continue
+                if (
+                    float(info.get("rate") or 0) > float(best_info.get("rate") or 0)
+                    or (
+                        float(info.get("rate") or 0) == float(best_info.get("rate") or 0)
+                        and bucket[0] > (best_bucket or (0, 0))[0]
+                    )
+                ):
+                    best_bucket, best_info = bucket, info
+            best_map[cat] = best_bucket
+            lbl = self._predict_best_bucket_labels.get(cat)
+            if lbl is None:
+                continue
+            if best_bucket is None or best_info is None:
+                txt = f"历史最优段: -（{category_display.get(cat, cat)} 样本不足）"
+            else:
+                lo, hi = best_bucket
+                txt = (
+                    f"历史最优段: {lo}-{hi} 命中率 "
+                    f"{float(best_info.get('rate') or 0):.1f}% "
+                    f"(样本 {int(best_info.get('buyable') or 0)}) "
+                    f"— 表中此段行已金色高亮"
+                )
+            try:
+                lbl.configure(text=txt)
+            except Exception:
+                pass
+        self._predict_best_buckets = best_map
 
     def _open_predict_compare_window(self) -> None:
         """弹窗：今日实际涨停 与 上次预测候选 的命中对比。"""
