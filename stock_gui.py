@@ -3431,12 +3431,25 @@ class StockMonitorApp:
             regen_btn.config(state=tk.DISABLED)
 
             def _worker():
+                # 先拉今日新闻（按日缓存，二次秒回）
+                news_payload = None
+                try:
+                    from src.services import news_feed_service
+                    news_payload = news_feed_service.fetch_today_news(
+                        td, use_cache=use_cache,
+                        log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._post_to_ui(
+                        lambda m=str(exc): self._log(f"今日新闻拉取失败（继续无新闻短报）: {m}")
+                    )
                 try:
                     result = svc.generate_daily_brief(
                         td,
                         predict_result=self._predict_result,
                         hype_result=getattr(self, "_concept_hype_result", None),
                         sentiment_result=getattr(self, "_sentiment_result", None),
+                        news_result=news_payload,
                         use_cache=use_cache,
                         log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
                     )

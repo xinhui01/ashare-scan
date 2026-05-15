@@ -73,6 +73,21 @@ def _trim_predict_candidates(
     return out
 
 
+def _trim_news(
+    news_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """从 news_feed 结果摘 早餐 + top 电报。"""
+    if not news_result:
+        return {}
+    return {
+        "morning_briefing": news_result.get("morning_briefing") or {},
+        "telegrams": [
+            {"title": t.get("title", ""), "time": t.get("time", "")}
+            for t in (news_result.get("telegrams") or [])[:10]
+        ],
+    }
+
+
 def _trim_sentiment(
     sentiment_result: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -161,16 +176,33 @@ def _build_prompt(
     candidates: Dict[str, List[Dict[str, Any]]],
     hype: Dict[str, Any],
     sentiment: Optional[Dict[str, Any]] = None,
+    news: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     sys_msg = (
-        "你是 A 股短线操盘手助手。任务：基于今日规则系统产出的"
-        "市场情绪 + 涨停候选 + 概念炒作主线，给一份明日博弈短报。"
-        "要求：客观、克制、不空喊口号；优先标注多维度重叠的高确信票；"
+        "你是 A 股短线操盘手助手。任务：基于当日新闻 + 市场情绪 + 涨停候选 + "
+        "概念炒作主线，给一份明日博弈短报。"
+        "要求：客观、克制、不空喊口号；如果当日新闻里有政策/事件能解释主线题材"
+        "或预示明日方向，请明确指出关联；优先标注多维度重叠的高确信票；"
         "明确给出风险点。仓位建议必须严格参考'市场情绪'板块给出的仓位标签，"
         "不可随意上调。不要复读输入数据，要做语言化综合判断。"
     )
 
     blocks: List[str] = [f"# 基准交易日：{trade_date}", ""]
+
+    # 当日新闻（让 LLM 有"时事感"）
+    if news:
+        morning = news.get("morning_briefing") or {}
+        telegrams = news.get("telegrams") or []
+        if morning or telegrams:
+            blocks.append("## 当日新闻 / 政策")
+            if morning:
+                blocks.append(f"早餐摘要 ({morning.get('time', '')})：")
+                blocks.append(f"  {morning.get('summary', '')}")
+            if telegrams:
+                blocks.append("重点电报：")
+                for t in telegrams[:10]:
+                    blocks.append(f"  - [{t.get('time', '')}] {t.get('title', '')}")
+            blocks.append("")
 
     # 市场情绪（首要上下文，决定仓位基调）
     if sentiment:
@@ -267,6 +299,7 @@ def generate_daily_brief(
     predict_result: Optional[Dict[str, Any]] = None,
     hype_result: Optional[Dict[str, Any]] = None,
     sentiment_result: Optional[Dict[str, Any]] = None,
+    news_result: Optional[Dict[str, Any]] = None,
     model: str = DEFAULT_MODEL,
     api_key: Optional[str] = None,
     use_cache: bool = True,
@@ -297,7 +330,11 @@ def generate_daily_brief(
     candidates = _trim_predict_candidates(predict_result)
     hype = _trim_concept_hype(hype_result)
     sentiment_slim = _trim_sentiment(sentiment_result)
-    payload = {"candidates": candidates, "hype": hype, "sentiment": sentiment_slim}
+    news_slim = _trim_news(news_result)
+    payload = {
+        "candidates": candidates, "hype": hype,
+        "sentiment": sentiment_slim, "news": news_slim,
+    }
     h = _payload_hash(payload)
 
     if use_cache:
@@ -311,7 +348,7 @@ def generate_daily_brief(
             "未配置 NVIDIA_API_KEY。请设置环境变量 NVIDIA_API_KEY 或在应用设置中保存。"
         )
 
-    messages = _build_prompt(td, candidates, hype, sentiment_slim)
+    messages = _build_prompt(td, candidates, hype, sentiment_slim, news_slim)
     _l(f"AI 博弈短报：调用 NIM model={model}")
     client = NvidiaNimClient(api_key=api_key)
     raw = client.chat(
