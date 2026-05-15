@@ -2081,6 +2081,25 @@ class StockFilter:
                 f"板块强弱榜 TOP5 {board_summary}"
             )
 
+        # 市场情绪评分（供二波接力等评分调节，冰点情绪下降权）
+        try:
+            from src.services.market_sentiment_service import analyze_market_sentiment
+            sent = analyze_market_sentiment(
+                trade_date, fetch_external=True, log=self._log,
+            )
+            compare_context["sentiment_score"] = int(sent.get("score", 50))
+            compare_context["sentiment_label"] = (
+                (sent.get("position_suggest") or {}).get("label", "")
+            )
+            if self._log:
+                self._log(
+                    f"涨停预测：市场情绪 {compare_context['sentiment_score']}/100"
+                    f" → {compare_context['sentiment_label']}"
+                )
+        except Exception as exc:
+            logger.debug("接入市场情绪评分失败: %s", exc)
+            compare_context["sentiment_score"] = 50
+
         # 阶段3：统一预取所有需要的历史数据（一次搞定）
         if self._log:
             self._log("涨停预测：阶段3 - 统一预取历史数据...")
@@ -2890,6 +2909,79 @@ class StockFilter:
                         had_limit_up_60d = True
                         break
 
+            # ============== 二波接力增强信号 ==============
+            # A. 前一波"高度"：从 prior_lu_idx 往前数连续涨停的板数（顶 3 板见顶概率高）
+            if prior_lu_idx is not None and prior_lu_idx >= 1:
+                prior_wave_boards = 1
+                for j in range(prior_lu_idx - 1, max(-1, prior_lu_idx - 8), -1):
+                    if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]):
+                        break
+                    prev_c = float(close.iloc[j - 1])
+                    if prev_c <= 0:
+                        break
+                    chg = (float(close.iloc[j]) / prev_c - 1) * 100
+                    if chg >= zt_threshold - 0.3:
+                        prior_wave_boards += 1
+                    else:
+                        break
+            else:
+                prior_wave_boards = 0
+
+            # B/C. 前涨停日的高/低，用于回调深度 + 是否破前低
+            prior_lu_high = None
+            prior_lu_low = None
+            prior_lu_open = None
+            if prior_lu_idx is not None:
+                if not high.empty and not pd.isna(high.iloc[prior_lu_idx]):
+                    prior_lu_high = float(high.iloc[prior_lu_idx])
+                if not low.empty and not pd.isna(low.iloc[prior_lu_idx]):
+                    prior_lu_low = float(low.iloc[prior_lu_idx])
+                if "open" in df.columns:
+                    o_val = pd.to_numeric(df["open"], errors="coerce").iloc[prior_lu_idx]
+                    if not pd.isna(o_val):
+                        prior_lu_open = float(o_val)
+
+            pullback_pct = None
+            if prior_lu_high and prior_lu_high > 0 and latest_close is not None:
+                pullback_pct = round((latest_close / prior_lu_high - 1) * 100, 2)
+            broken_prior_lu_low = (
+                latest_low is not None and prior_lu_low is not None
+                and prior_lu_low > 0 and latest_low < prior_lu_low
+            )
+
+            # E. 窗口期内涨停次数（[t-5, t-1] 不含今日）
+            window_lu_count = 0
+            for j in range(max(1, t - 5), t):
+                if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]):
+                    continue
+                prev_c = float(close.iloc[j - 1])
+                if prev_c <= 0:
+                    continue
+                chg = (float(close.iloc[j]) / prev_c - 1) * 100
+                if chg >= zt_threshold - 0.3:
+                    window_lu_count += 1
+
+            # F. 前涨停日形态（一字 / T 字 / 普通）—— 烂板需分时数据，暂跳过
+            prior_lu_pattern = "normal"
+            if (prior_lu_idx is not None and prior_lu_open is not None
+                    and prior_lu_high is not None and prior_lu_low is not None
+                    and prior_lu_high > 0):
+                p_close = float(close.iloc[prior_lu_idx])
+                close_at_high = abs(p_close - prior_lu_high) / prior_lu_high < 0.005
+                open_at_high = abs(prior_lu_open - prior_lu_high) / prior_lu_high < 0.005
+                low_far_from_high = (prior_lu_high - prior_lu_low) / prior_lu_high > 0.05
+                if close_at_high and open_at_high and not low_far_from_high:
+                    prior_lu_pattern = "一字"
+                elif close_at_high and open_at_high and low_far_from_high:
+                    prior_lu_pattern = "T字"
+        else:
+            # 历史数据不足时给保守默认（不阻塞硬过滤；scoring 块会跳过这些维度）
+            prior_wave_boards = 0
+            pullback_pct = None
+            broken_prior_lu_low = False
+            window_lu_count = 0
+            prior_lu_pattern = "normal"
+
         # ---- 硬性过滤（基于 1118 只历史涨停股 T 日特征统计放宽）----
         if change_pct is None or change_pct < -3.0 or change_pct >= 9.5:
             return None
@@ -3014,6 +3106,57 @@ class StockFilter:
                 score -= 5
                 reasons.append(f"换手{turnover:.1f}%过高-5")
 
+        # ============== 二波接力增强信号评分 ==============
+        # A. 前一波"高度"：1 板 +5 / 2 板 0 / ≥3 板 -5
+        if prior_wave_boards == 1:
+            score += 5
+            reasons.append("前波首板+5")
+        elif prior_wave_boards >= 3:
+            score -= 5
+            reasons.append(f"前波{prior_wave_boards}板高位-5")
+
+        # B. 回调深度：-8~-3% 良性洗盘 +6 / -15~-8% 深回调 +3 / <-15% 形态破坏 -5
+        if pullback_pct is not None:
+            if -8.0 <= pullback_pct <= -3.0:
+                score += 6
+                reasons.append(f"良性回调{pullback_pct:+.1f}%+6")
+            elif -15.0 <= pullback_pct < -8.0:
+                score += 3
+                reasons.append(f"深回调{pullback_pct:+.1f}%+3")
+            elif pullback_pct < -15.0:
+                score -= 5
+                reasons.append(f"回调过深{pullback_pct:+.1f}%-5")
+
+        # C. 破前涨停日最低价：短线趋势走坏
+        if broken_prior_lu_low:
+            score -= 8
+            reasons.append("破前涨停日低点-8")
+
+        # E. 窗口期涨停次数 ≥2：已是连板股，不该走二波逻辑
+        if window_lu_count >= 2:
+            score -= 8
+            reasons.append(f"5日内涨停{window_lu_count}次(连板股)-8")
+
+        # F. 前涨停日形态：一字板抢筹激烈 -5 / T 字板 -2
+        if prior_lu_pattern == "一字":
+            score -= 5
+            reasons.append("前波一字板抢筹激烈-5")
+        elif prior_lu_pattern == "T字":
+            score -= 2
+            reasons.append("前波T字板-2")
+
+        # D. 情绪定盘联动：冰点情绪下二波接力胜率显著下降
+        sent_score = int(compare_context.get("sentiment_score") or 50)
+        if sent_score < 35:
+            score -= 15
+            reasons.append(f"情绪冰点{sent_score}-15")
+        elif sent_score < 50:
+            score -= 7
+            reasons.append(f"情绪偏冷{sent_score}-7")
+        elif sent_score >= 70:
+            score += 5
+            reasons.append(f"情绪火爆{sent_score}+5")
+
         final_score = max(0, min(100, int(round(score))))
         return {
             "code": code,
@@ -3033,8 +3176,13 @@ class StockFilter:
             "is_strong_close": is_strong_close,
             "breakout_20d": breakout_20d,
             "position_60d": position_60d,
+            "prior_wave_boards": prior_wave_boards,
+            "pullback_pct": pullback_pct,
+            "broken_prior_lu_low": broken_prior_lu_low,
+            "window_lu_count": window_lu_count,
+            "prior_lu_pattern": prior_lu_pattern,
             "score": final_score,
-            "reasons": " / ".join(reasons[:8]),
+            "reasons": " / ".join(reasons[:10]),
             "predict_type": "二波接力",
         }
 
