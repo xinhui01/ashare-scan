@@ -2348,6 +2348,7 @@ class StockFilter:
         compare_context: Dict[str, Any],
         *,
         industry: str = "",
+        boards: int = 0,
     ) -> Tuple[float, List[str]]:
         """龙虎榜 + 北向资金 + 板块涨跌幅加分（含 LHB 解读字段细分）。
 
@@ -2361,6 +2362,7 @@ class StockFilter:
         - 机构卖出 → -4
         - 历史成功率 ≥45% → +2；<25% → -2
         - 普通席位单独上榜 → -1（散户接力，弱信号）
+          · boards>=3 时升级为 -5（高位连板没有机构/游资接力 = 见顶特征）
 
         北向 3 日加仓：
         - ≥5000 万 → +5；≥1000 万 → +3；≥200 万 → +1
@@ -2419,8 +2421,13 @@ class StockFilter:
                         bonus -= 2
                         reasons.append(f"历史成功率仅{rate:.0f}%-2")
                 if is_buy and ordinary and inst_buy == 0 and not main_t and not region:
-                    bonus -= 1
-                    reasons.append("普通席位接力-1")
+                    # 高位连板还只有散户接力 = 机构/游资不愿进场，是典型见顶特征
+                    if boards >= 3:
+                        bonus -= 5
+                        reasons.append(f"{boards}连板仅普通席位接力-5")
+                    else:
+                        bonus -= 1
+                        reasons.append("普通席位接力-1")
 
         nb_change = (compare_context.get("northbound_map") or {}).get(code)
         if isinstance(nb_change, (int, float)):
@@ -2657,9 +2664,14 @@ class StockFilter:
                 if ref_rate >= 30:
                     score += 8
                     reasons.append(f"连板接力环境偏强({ref_rate:.1f}%)+8")
-                elif ref_rate < 12:
-                    score -= 5
-                    reasons.append(f"接力环境偏冷({ref_rate:.1f}%)-5")
+                elif ref_rate < 15:
+                    # 大盘连板延续率 <15% 是典型见顶信号，权重要压过单股技术面。
+                    # 高位（boards>=3）逆环境继续涨停的概率更低，再叠一刀。
+                    score -= 10
+                    reasons.append(f"接力环境偏冷({ref_rate:.1f}%)-10")
+                    if boards >= 3:
+                        score -= 5
+                        reasons.append(f"{boards}连板逆冷环境-5")
 
         if boards == 1:
             pattern = self.classify_limit_up_pattern(
@@ -2687,9 +2699,10 @@ class StockFilter:
             if theme_reason:
                 reasons.append(theme_reason)
 
-        # 资金面：龙虎榜 + 北向 3 日加仓
+        # 资金面：龙虎榜 + 北向 3 日加仓（cont 类需要 boards 用于高位散户接力的额外惩罚）
         flow_bonus, flow_reasons = self._capital_flow_bonus(
-            rec.get("code", ""), compare_context, industry=rec.get("industry", ""),
+            rec.get("code", ""), compare_context,
+            industry=rec.get("industry", ""), boards=boards,
         )
         if flow_bonus != 0:
             score += flow_bonus
