@@ -504,7 +504,8 @@ class StockMonitorApp:
         self._build_control_actions_row(control_frame)
         self._build_control_board_filter_row(control_frame)
         self._build_control_price_filter_row(control_frame)
-        self._build_control_quick_filter_row(control_frame)
+        # 快速过滤栏（搜索/评分≥/5日涨幅≥/放量≥/连板≥/只显示...）只对扫描结果有意义，
+        # 移到 setup_result_tab 内部，避免在涨停预测/详情等 tab 顶部干扰视线
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -667,6 +668,10 @@ class StockMonitorApp:
             action_frame,
             text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
         ).pack(side=tk.RIGHT)
+
+        # 客户端快速过滤栏（搜索/评分/5日涨幅/放量/连板 + 只显示自选/涨停/...）
+        # 仅对扫描结果表生效，因此放在本 tab 内部
+        self._build_control_quick_filter_row(result_frame)
 
         # 列定义全部来自 src/gui/result_columns.py 的注册表
         self._result_columns_map = columns_by_id()
@@ -2048,6 +2053,9 @@ class StockMonitorApp:
         ttk.Button(
             action_bar, text="AI 博弈短报", command=self._open_daily_brief_window,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            action_bar, text="NIM Key", command=self._open_nim_key_dialog,
+        ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
         self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
