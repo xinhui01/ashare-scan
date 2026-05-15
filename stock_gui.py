@@ -36,6 +36,7 @@ from src.gui.ui_dispatch import UIDispatcher
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from src.services import prediction_accuracy_service
+from src.services import concept_hype_service
 import stock_store
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
@@ -2039,6 +2040,9 @@ class StockMonitorApp:
         ttk.Button(
             action_bar, text="批量回测", command=self._open_predict_backtest_dialog,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            action_bar, text="AI 博弈短报", command=self._open_daily_brief_window,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Label(action_bar, text="基准日期:").pack(side=tk.LEFT, padx=(12, 2))
         self._predict_date_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
         ttk.Entry(action_bar, textvariable=self._predict_date_var, width=10).pack(side=tk.LEFT)
@@ -2412,6 +2416,9 @@ class StockMonitorApp:
         self._predict_trend_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
         self._predict_trend_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
+        # 概念炒作 Tab（按"题材"维度看：哪些概念在被炒、持续多久、主线/龙头/潜伏）
+        self._setup_concept_hype_subtab(self._predict_table_nb)
+
         body.add(table_frame, weight=4)
 
         self._predict_thread: Optional[threading.Thread] = None
@@ -2697,6 +2704,596 @@ class StockMonitorApp:
         self._predict_summary_text.config(state=tk.DISABLED)
         self._predict_status_label.config(text="")
         self.status_var.set("涨停预测失败")
+
+    # ============== 概念炒作 sub-tab ==============
+    def _setup_concept_hype_subtab(self, parent_nb: ttk.Notebook) -> None:
+        """在涨停预测的内层 notebook 里加一个'概念炒作'子 tab。
+
+        左侧为摘要面板（主线 + 萌芽题材），右侧上下分栏：
+        - 上：题材排行表（按 今日涨停 / 累计 / 持续 排序）
+        - 下：选中题材的涨停成员表（双击跳详情）
+        """
+        hype_tab = ttk.Frame(parent_nb)
+        parent_nb.add(hype_tab, text="概念炒作")
+        self._concept_hype_tab = hype_tab
+
+        # ---- 操作栏 ----
+        action = ttk.Frame(hype_tab)
+        action.pack(fill=tk.X, pady=(2, 4))
+        ttk.Button(
+            action, text="开始分析", command=self._start_concept_hype_analysis,
+        ).pack(side=tk.LEFT)
+        ttk.Label(action, text="基准日期:").pack(side=tk.LEFT, padx=(10, 2))
+        self._concept_hype_end_date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y%m%d"),
+        )
+        ttk.Entry(
+            action, textvariable=self._concept_hype_end_date_var, width=10,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            action, text="今日", width=5,
+            command=lambda: self._concept_hype_end_date_var.set(
+                datetime.now().strftime("%Y%m%d"),
+            ),
+        ).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Button(
+            action, text="同步上方", width=8,
+            command=lambda: self._concept_hype_end_date_var.set(
+                (self._predict_date_var.get() or "").strip().replace("-", ""),
+            ),
+        ).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(action, text="回看交易日:").pack(side=tk.LEFT, padx=(10, 2))
+        self._concept_hype_lookback_var = tk.StringVar(value="10")
+        ttk.Spinbox(
+            action, from_=3, to=30, width=4,
+            textvariable=self._concept_hype_lookback_var,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            action, text="(按 limit_up_pool 已缓存日切片，不在缓存内的日期会自动取最近可用日)",
+            foreground="#888",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        self._concept_hype_status = ttk.Label(action, text="尚未分析", foreground="#666")
+        self._concept_hype_status.pack(side=tk.RIGHT, padx=8)
+
+        # ---- 筛选栏 ----
+        filt = ttk.Frame(hype_tab)
+        filt.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(filt, text="来源:").pack(side=tk.LEFT)
+        self._concept_hype_source_var = tk.StringVar(value="全部")
+        src_combo = ttk.Combobox(
+            filt, textvariable=self._concept_hype_source_var,
+            values=("全部", "行业", "概念", "LLM题材"),
+            width=10, state="readonly",
+        )
+        src_combo.pack(side=tk.LEFT, padx=(2, 10))
+        src_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_concept_hype_list())
+        ttk.Label(filt, text="阶段:").pack(side=tk.LEFT)
+        self._concept_hype_phase_var = tk.StringVar(value="全部")
+        phase_combo = ttk.Combobox(
+            filt, textvariable=self._concept_hype_phase_var,
+            values=("全部", "萌芽", "主升", "末期", "退潮"),
+            width=8, state="readonly",
+        )
+        phase_combo.pack(side=tk.LEFT, padx=(2, 10))
+        phase_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_concept_hype_list())
+        self._concept_hype_active_only = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            filt, text="仅今日仍有涨停", variable=self._concept_hype_active_only,
+            command=self._refresh_concept_hype_list,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(filt, text="关键词:").pack(side=tk.LEFT)
+        self._concept_hype_keyword_var = tk.StringVar(value="")
+        kw = ttk.Entry(filt, textvariable=self._concept_hype_keyword_var, width=12)
+        kw.pack(side=tk.LEFT, padx=(2, 4))
+        kw.bind("<KeyRelease>", lambda _e: self._refresh_concept_hype_list())
+        self._concept_hype_count_label = ttk.Label(filt, text="", foreground="#666")
+        self._concept_hype_count_label.pack(side=tk.RIGHT, padx=8)
+
+        # ---- 主区域 ----
+        body = ttk.PanedWindow(hype_tab, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 左：摘要面板
+        summary_frame = ttk.LabelFrame(body, text="主线 / 萌芽", padding=6)
+        self._concept_hype_summary = scrolledtext.ScrolledText(
+            summary_frame, width=38, height=24, wrap=tk.WORD,
+        )
+        self._concept_hype_summary.pack(fill=tk.BOTH, expand=True)
+        self._concept_hype_summary.insert(
+            tk.END,
+            "点击「开始分析」识别近 N 个交易日正在被炒作的概念/行业。\n\n"
+            "数据维度：\n"
+            "  · 行业（涨停池自带，必有）\n"
+            "  · 概念（依赖“刷新概念库”，未刷则跳过）\n"
+            "  · LLM 题材（依赖涨停对比 tab AI 聚类缓存）\n\n"
+            "判定口径：\n"
+            "  · 起爆日：单日涨停数 ≥ 3 且 ≥ 前 3 日均值的 2 倍\n"
+            "  · 持续天数：起爆日 → 基准日\n"
+            "  · 阶段：萌芽(≤2d) / 主升(3-7d) / 末期 / 退潮\n\n"
+            "  · 双击表格行 → 展开题材成份股\n"
+            "  · 双击成份股 → 跳转股票详情",
+        )
+        self._concept_hype_summary.config(state=tk.DISABLED)
+        body.add(summary_frame, weight=2)
+
+        # 右：上下分栏
+        right = ttk.PanedWindow(body, orient=tk.VERTICAL)
+
+        # 右上：题材排行表
+        rank_frame = ttk.LabelFrame(right, text="题材排行", padding=2)
+        rank_cols = (
+            "score", "name", "source", "today", "total", "active", "ignite",
+            "duration", "phase", "trend", "leaders",
+        )
+        self._concept_hype_rank_tree = ttk.Treeview(
+            rank_frame, columns=rank_cols, show="headings",
+            height=12, style="Predict.Treeview",
+        )
+        rank_headings = {
+            "score": ("机会分", 60),
+            "name": ("题材", 130), "source": ("来源", 70),
+            "today": ("今涨停", 60), "total": ("累计", 55),
+            "active": ("活跃日", 60), "ignite": ("起爆日", 80),
+            "duration": ("持续", 50), "phase": ("阶段", 55),
+            "trend": ("趋势", 55), "leaders": ("龙头(连板)", 280),
+        }
+        for col, (heading, w) in rank_headings.items():
+            self._concept_hype_rank_tree.heading(
+                col, text=heading,
+                command=lambda c=col: self._on_concept_hype_sort(c),
+            )
+            self._concept_hype_rank_tree.column(
+                col, width=w,
+                anchor=tk.CENTER if col not in ("name", "leaders") else tk.W,
+            )
+        sb_rank = ttk.Scrollbar(
+            rank_frame, orient=tk.VERTICAL,
+            command=self._concept_hype_rank_tree.yview,
+        )
+        self._concept_hype_rank_tree.configure(yscrollcommand=sb_rank.set)
+        sb_rank.pack(side=tk.RIGHT, fill=tk.Y)
+        self._concept_hype_rank_tree.pack(fill=tk.BOTH, expand=True)
+        self._concept_hype_rank_tree.bind(
+            "<<TreeviewSelect>>", self._on_concept_hype_select,
+        )
+        # 阶段配色
+        self._concept_hype_rank_tree.tag_configure(
+            "phase_萌芽", background="#bbdefb", foreground="#0d47a1",
+        )
+        self._concept_hype_rank_tree.tag_configure(
+            "phase_主升", background="#c8e6c9", foreground="#1b5e20",
+        )
+        self._concept_hype_rank_tree.tag_configure(
+            "phase_末期", background="#ffe0b2", foreground="#bf360c",
+        )
+        self._concept_hype_rank_tree.tag_configure(
+            "phase_退潮", background="#eceff1", foreground="#616161",
+        )
+        right.add(rank_frame, weight=3)
+
+        # 右下：选中题材的成份股
+        members_frame = ttk.LabelFrame(right, text="题材成份股（点击上方某行查看）", padding=2)
+        self._concept_hype_members_label = members_frame
+        member_cols = (
+            "code", "name", "industry", "boards", "change_pct",
+            "close", "turnover", "lu_count", "lu_dates",
+        )
+        self._concept_hype_members_tree = ttk.Treeview(
+            members_frame, columns=member_cols, show="headings",
+            height=10, style="Predict.Treeview",
+        )
+        member_headings = {
+            "code": ("代码", 70), "name": ("名称", 90),
+            "industry": ("所属行业", 90), "boards": ("最高板", 60),
+            "change_pct": ("涨幅%", 65), "close": ("收盘", 70),
+            "turnover": ("换手%", 60),
+            "lu_count": ("窗口涨停", 70),
+            "lu_dates": ("涨停日历", 320),
+        }
+        for col, (heading, w) in member_headings.items():
+            self._concept_hype_members_tree.heading(col, text=heading)
+            self._concept_hype_members_tree.column(
+                col, width=w,
+                anchor=tk.CENTER if col not in ("name", "industry", "lu_dates") else tk.W,
+            )
+        sb_mem = ttk.Scrollbar(
+            members_frame, orient=tk.VERTICAL,
+            command=self._concept_hype_members_tree.yview,
+        )
+        self._concept_hype_members_tree.configure(yscrollcommand=sb_mem.set)
+        sb_mem.pack(side=tk.RIGHT, fill=tk.Y)
+        self._concept_hype_members_tree.pack(fill=tk.BOTH, expand=True)
+        self._concept_hype_members_tree.bind(
+            "<Double-1>", self._on_concept_hype_member_double_click,
+        )
+        right.add(members_frame, weight=2)
+
+        body.add(right, weight=5)
+
+        # 状态
+        self._concept_hype_result: Optional[Dict[str, Any]] = None
+        self._concept_hype_thread: Optional[threading.Thread] = None
+        self._concept_hype_sort_col: str = "score"
+        self._concept_hype_sort_reverse: bool = True
+
+    def _start_concept_hype_analysis(self) -> None:
+        """点击"开始分析"：后台跑 concept_hype_service.analyze_concept_hype。"""
+        if self._concept_hype_thread is not None and self._concept_hype_thread.is_alive():
+            self._log("概念炒作分析已在运行中，请稍候")
+            return
+        try:
+            lookback = max(3, min(30, int(self._concept_hype_lookback_var.get() or "10")))
+        except ValueError:
+            lookback = 10
+        end_date = (self._concept_hype_end_date_var.get() or "").strip().replace("-", "")
+        self._concept_hype_status.config(text="分析中...", foreground="#1565c0")
+
+        def _worker():
+            try:
+                result = concept_hype_service.analyze_concept_hype(
+                    end_date=end_date or None,
+                    lookback=lookback,
+                    log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                logger_msg = f"概念炒作分析失败: {err}"
+                self._post_to_ui(lambda m=logger_msg: self._log(m))
+                self._post_to_ui(
+                    lambda: self._concept_hype_status.config(
+                        text="分析失败", foreground="#c62828",
+                    ),
+                )
+                return
+            self._post_to_ui(lambda r=result: self._apply_concept_hype_result(r))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._concept_hype_thread = t
+        t.start()
+
+    def _apply_concept_hype_result(self, result: Dict[str, Any]) -> None:
+        """主线程回调：保存结果 + 刷新摘要 + 刷新列表。"""
+        self._concept_hype_result = result or {}
+        ml = (result or {}).get("main_line") or {}
+        stats = (result or {}).get("stats") or {}
+        dates = (result or {}).get("trade_dates") or []
+        # 摘要
+        self._concept_hype_summary.config(state=tk.NORMAL)
+        self._concept_hype_summary.delete("1.0", tk.END)
+        lines: List[str] = []
+        if dates:
+            lines.append(
+                f"窗口：{dates[0]} ~ {dates[-1]}（{len(dates)} 个交易日）"
+            )
+        lines.append(
+            f"题材数 {stats.get('total_concepts', 0)}（今日活跃 "
+            f"{stats.get('active_concepts', 0)}） | 累计涨停 "
+            f"{stats.get('total_limit_ups', 0)} 次"
+        )
+        lines.append("")
+        if ml.get("name"):
+            lines.append("【主线】")
+            lines.append(ml.get("summary", ""))
+        else:
+            lines.append(ml.get("summary", "无主线"))
+        lines.append("")
+        fresh = stats.get("fresh_concepts") or []
+        if fresh:
+            lines.append(f"【萌芽题材 ({len(fresh)})】")
+            for f in fresh:
+                lines.append(
+                    f"  • {f['name']} ({f['source']}) "
+                    f"起爆 {f['ignite_date']} 今 {f['today_count']} 只"
+                )
+        else:
+            lines.append("【萌芽题材】无")
+        self._concept_hype_summary.insert(tk.END, "\n".join(lines))
+        self._concept_hype_summary.config(state=tk.DISABLED)
+        # 状态
+        self._concept_hype_status.config(
+            text=f"已分析 · {result.get('generated_at', '')}",
+            foreground="#2e7d32",
+        )
+        # 列表
+        self._refresh_concept_hype_list()
+        # 清空成员表
+        for it in self._concept_hype_members_tree.get_children():
+            self._concept_hype_members_tree.delete(it)
+
+    def _filtered_concepts(self) -> List[Dict[str, Any]]:
+        result = self._concept_hype_result or {}
+        concepts = list(result.get("concepts") or [])
+        if not concepts:
+            return []
+        src = self._concept_hype_source_var.get()
+        phase = self._concept_hype_phase_var.get()
+        kw = (self._concept_hype_keyword_var.get() or "").strip().lower()
+        active_only = bool(self._concept_hype_active_only.get())
+        out: List[Dict[str, Any]] = []
+        for c in concepts:
+            if src != "全部" and c.get("source") != src:
+                continue
+            if phase != "全部" and c.get("phase") != phase:
+                continue
+            if active_only and int(c.get("today_count", 0)) <= 0:
+                continue
+            if kw:
+                hay = (
+                    f"{c.get('name', '')} {c.get('source', '')} "
+                    + " ".join(m.get("name", "") for m in (c.get("leaders") or []))
+                ).lower()
+                if kw not in hay:
+                    continue
+            out.append(c)
+        # 排序
+        col = self._concept_hype_sort_col
+        rev = self._concept_hype_sort_reverse
+        key_map = {
+            "score": lambda c: int(c.get("opportunity_score", 0)),
+            "name": lambda c: str(c.get("name", "")),
+            "source": lambda c: str(c.get("source", "")),
+            "today": lambda c: int(c.get("today_count", 0)),
+            "total": lambda c: int(c.get("total_limit_ups", 0)),
+            "active": lambda c: int(c.get("active_days", 0)),
+            "ignite": lambda c: str(c.get("ignite_date", "")),
+            "duration": lambda c: int(c.get("duration", 0)),
+            "phase": lambda c: str(c.get("phase", "")),
+            "trend": lambda c: str(c.get("trend", "")),
+            "leaders": lambda c: -len(c.get("leaders") or []),
+        }
+        out.sort(key=key_map.get(col, key_map["score"]), reverse=rev)
+        return out
+
+    def _refresh_concept_hype_list(self) -> None:
+        for it in self._concept_hype_rank_tree.get_children():
+            self._concept_hype_rank_tree.delete(it)
+        rows = self._filtered_concepts()
+        for c in rows:
+            leaders_str = " / ".join(
+                f"{m.get('name', '')}({m.get('boards', 1)}板)"
+                for m in (c.get("leaders") or [])[:4]
+            )
+            self._concept_hype_rank_tree.insert(
+                "", tk.END,
+                values=(
+                    c.get("opportunity_score", 0),
+                    c.get("name", ""),
+                    c.get("source", ""),
+                    c.get("today_count", 0),
+                    c.get("total_limit_ups", 0),
+                    c.get("active_days", 0),
+                    c.get("ignite_date", ""),
+                    f"{c.get('duration', 0)}d",
+                    c.get("phase", ""),
+                    c.get("trend", ""),
+                    leaders_str,
+                ),
+                tags=(f"phase_{c.get('phase', '')}",),
+            )
+        total = len((self._concept_hype_result or {}).get("concepts") or [])
+        self._concept_hype_count_label.config(
+            text=f"显示 {len(rows)} / 共 {total}",
+        )
+
+    def _on_concept_hype_sort(self, col: str) -> None:
+        if self._concept_hype_sort_col == col:
+            self._concept_hype_sort_reverse = not self._concept_hype_sort_reverse
+        else:
+            self._concept_hype_sort_col = col
+            # 数字类列默认降序，文本类列默认升序
+            self._concept_hype_sort_reverse = col not in (
+                "name", "source", "phase", "trend",
+            )
+        self._refresh_concept_hype_list()
+
+    def _on_concept_hype_select(self, _event=None) -> None:
+        """点击题材行 → 在下方表格展开成员明细。"""
+        sel = self._concept_hype_rank_tree.selection()
+        if not sel:
+            return
+        values = self._concept_hype_rank_tree.item(sel[0]).get("values") or []
+        if not values:
+            return
+        name = str(values[0])
+        source = str(values[1])
+        concept = next(
+            (
+                c for c in (self._concept_hype_result or {}).get("concepts") or []
+                if c.get("name") == name and c.get("source") == source
+            ),
+            None,
+        )
+        # 清表
+        for it in self._concept_hype_members_tree.get_children():
+            self._concept_hype_members_tree.delete(it)
+        if not concept:
+            return
+        members = concept.get("members") or []
+        for m in members:
+            lu_dates = m.get("limit_up_dates") or []
+            self._concept_hype_members_tree.insert(
+                "", tk.END,
+                values=(
+                    m.get("code", ""),
+                    m.get("name", ""),
+                    m.get("industry", ""),
+                    m.get("boards", 1),
+                    f"{float(m.get('change_pct', 0)):.2f}",
+                    f"{float(m.get('close', 0)):.2f}",
+                    f"{float(m.get('turnover', 0)):.2f}",
+                    len(lu_dates),
+                    " ".join(lu_dates),
+                ),
+            )
+        try:
+            self._concept_hype_members_label.configure(
+                text=f"题材成份股【{name} · {source}】 共 {len(members)} 只 · 双击跳详情",
+            )
+        except Exception:
+            pass
+
+    def _on_concept_hype_member_double_click(self, _event=None) -> None:
+        sel = self._concept_hype_members_tree.selection()
+        if not sel:
+            return
+        values = self._concept_hype_members_tree.item(sel[0]).get("values") or []
+        if not values:
+            return
+        code = str(values[0]).strip().zfill(6)
+        if not code:
+            return
+        try:
+            self._cancel_scheduled_detail()
+        except Exception:
+            pass
+        try:
+            self.show_stock_detail(code, force_refresh=True)
+            self.notebook.select(self.detail_tab_frame)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"打开股票详情失败 {code}: {exc}")
+
+    # ============== AI 博弈短报 ==============
+    def _open_daily_brief_window(self) -> None:
+        """打开 AI 博弈短报窗口，展示融合后的语言化建议。
+
+        基于内存中的 self._predict_result + self._concept_hype_result，
+        优雅降级 — 任意一个有就能跑，全无则给出明确提示。
+        """
+        if (
+            (not self._predict_result or not isinstance(self._predict_result, dict))
+            and not getattr(self, "_concept_hype_result", None)
+        ):
+            messagebox.showinfo(
+                "AI 博弈短报",
+                "需要先运行至少一项分析：\n"
+                "  · 涨停预测：点击「开始预测」\n"
+                "  · 概念炒作：在「概念炒作」tab 点击「开始分析」\n\n"
+                "短报会基于这些结果给出综合建议。",
+                parent=self.root,
+            )
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("AI 博弈短报")
+        win.geometry("680x520")
+        win.transient(self.root)
+
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 头部信息栏
+        header = ttk.Frame(body)
+        header.pack(fill=tk.X, pady=(0, 6))
+        td = (self._predict_date_var.get() or "").strip().replace("-", "")
+        if not td:
+            td = datetime.now().strftime("%Y%m%d")
+        ttk.Label(header, text=f"基准日: {td}", font=("", 10, "bold")).pack(side=tk.LEFT)
+        meta_var = tk.StringVar(value="模型: -  生成于: -")
+        ttk.Label(header, textvariable=meta_var, foreground="#666").pack(side=tk.LEFT, padx=10)
+
+        status_var = tk.StringVar(value="正在调用 NIM 生成中...")
+        ttk.Label(body, textvariable=status_var, foreground="#1565c0").pack(anchor=tk.W)
+
+        text_widget = scrolledtext.ScrolledText(
+            body, wrap=tk.WORD, font=("Microsoft YaHei", 10),
+        )
+        text_widget.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
+        text_widget.config(state=tk.DISABLED)
+
+        # 底部按钮
+        btn_bar = ttk.Frame(body)
+        btn_bar.pack(fill=tk.X)
+        regen_btn = ttk.Button(btn_bar, text="重新生成（强制忽略缓存）")
+        regen_btn.pack(side=tk.LEFT)
+
+        def _copy_brief():
+            text = text_widget.get("1.0", tk.END).strip()
+            if not text:
+                return
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                status_var.set("已复制到剪贴板")
+            except Exception as exc:  # noqa: BLE001
+                status_var.set(f"复制失败: {exc}")
+
+        ttk.Button(btn_bar, text="复制", command=_copy_brief).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_bar, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+
+        def _set_text(content: str, color: str = "#1f1f1f") -> None:
+            text_widget.config(state=tk.NORMAL)
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert(tk.END, content)
+            text_widget.tag_configure("body", foreground=color)
+            text_widget.tag_add("body", "1.0", tk.END)
+            text_widget.config(state=tk.DISABLED)
+
+        def _run(use_cache: bool) -> None:
+            from src.services import daily_brief_service as svc
+            try:
+                from llm_client import LlmConfigError, LlmRequestError
+            except ImportError:
+                LlmConfigError = LlmRequestError = Exception  # type: ignore
+
+            status_var.set("正在调用 NIM 生成中..." if use_cache else "强制重新生成中...")
+            regen_btn.config(state=tk.DISABLED)
+
+            def _worker():
+                try:
+                    result = svc.generate_daily_brief(
+                        td,
+                        predict_result=self._predict_result,
+                        hype_result=getattr(self, "_concept_hype_result", None),
+                        use_cache=use_cache,
+                        log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
+                    )
+                except LlmConfigError as exc:
+                    msg = str(exc)
+                    self._post_to_ui(lambda: status_var.set("失败：未配置 API Key"))
+                    self._post_to_ui(lambda m=msg: _set_text(
+                        f"未能生成短报：\n\n{m}\n\n"
+                        "请到设置 → 保存 NIM API Key，或设置环境变量 NVIDIA_API_KEY。",
+                        color="#c62828",
+                    ))
+                    self._post_to_ui(lambda: regen_btn.config(state=tk.NORMAL))
+                    return
+                except LlmRequestError as exc:
+                    msg = str(exc)
+                    self._post_to_ui(lambda: status_var.set("失败：NIM 调用错误"))
+                    self._post_to_ui(lambda m=msg: _set_text(
+                        f"NIM 调用失败：\n\n{m}",
+                        color="#c62828",
+                    ))
+                    self._post_to_ui(lambda: regen_btn.config(state=tk.NORMAL))
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    self._post_to_ui(lambda: status_var.set("失败"))
+                    self._post_to_ui(lambda m=msg: _set_text(
+                        f"未知错误：\n\n{m}", color="#c62828",
+                    ))
+                    self._post_to_ui(lambda: regen_btn.config(state=tk.NORMAL))
+                    return
+
+                def _apply():
+                    _set_text(result.get("brief") or "(空)")
+                    cache_tag = " · 来自缓存" if result.get("from_cache") else ""
+                    meta_var.set(
+                        f"模型: {result.get('model', '-')}  "
+                        f"生成于: {result.get('generated_at', '-')}{cache_tag}  "
+                        f"候选数: {result.get('candidates_count', 0)}  "
+                        f"题材数: {result.get('hype_concepts_count', 0)}"
+                    )
+                    status_var.set("完成" + cache_tag)
+                    regen_btn.config(state=tk.NORMAL)
+
+                self._post_to_ui(_apply)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        regen_btn.config(command=lambda: _run(use_cache=False))
+        # 首次打开：尝试缓存优先
+        _run(use_cache=True)
 
     # ============== 批量回测 ==============
     def _open_predict_backtest_dialog(self) -> None:
