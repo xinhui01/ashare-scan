@@ -2100,6 +2100,58 @@ class StockFilter:
             logger.debug("接入市场情绪评分失败: %s", exc)
             compare_context["sentiment_score"] = 50
 
+        # 龙头身份预算：同板块今日最高板数 + 持有该板数的代码集合
+        # 让 cont 评分识别"板块独苗高板龙头"vs"高位跟风票"
+        industry_max_boards: Dict[str, int] = {}
+        industry_top_codes: Dict[str, set] = {}
+        for r in all_pool_records:
+            ind = str(r.get("industry") or "").strip()
+            if not ind:
+                continue
+            try:
+                b = int(r.get("consecutive_boards") or 1)
+            except (TypeError, ValueError):
+                b = 1
+            cur_max = industry_max_boards.get(ind, 0)
+            code = str(r.get("code") or "").strip()
+            if b > cur_max:
+                industry_max_boards[ind] = b
+                industry_top_codes[ind] = {code}
+            elif b == cur_max:
+                industry_top_codes.setdefault(ind, set()).add(code)
+        compare_context["industry_max_boards"] = industry_max_boards
+        compare_context["industry_top_codes"] = industry_top_codes
+
+        # 题材阶段映射（来自 concept_hype 服务）：code → 该票所在题材的最佳阶段
+        # 萌芽 > 主升 > 末期 > 退潮 优先级，让连板股能识别自己处在主线还是末班车
+        try:
+            from src.services.concept_hype_service import analyze_concept_hype
+            hype = analyze_concept_hype(trade_date, lookback=10, log=self._log)
+            phase_priority = {"萌芽": 4, "主升": 3, "末期": 2, "退潮": 1}
+            code_to_phase: Dict[str, str] = {}
+            for c in hype.get("concepts") or []:
+                phase = str(c.get("phase") or "")
+                for m in c.get("members") or []:
+                    code = str(m.get("code") or "").strip()
+                    if not code:
+                        continue
+                    existing = code_to_phase.get(code)
+                    if (not existing or
+                            phase_priority.get(phase, 0) > phase_priority.get(existing, 0)):
+                        code_to_phase[code] = phase
+            compare_context["code_to_concept_phase"] = code_to_phase
+            if self._log:
+                self._log(
+                    f"涨停预测：题材阶段映射 {len(code_to_phase)} 只票，"
+                    f"萌芽 {sum(1 for v in code_to_phase.values() if v == '萌芽')} / "
+                    f"主升 {sum(1 for v in code_to_phase.values() if v == '主升')} / "
+                    f"末期 {sum(1 for v in code_to_phase.values() if v == '末期')} / "
+                    f"退潮 {sum(1 for v in code_to_phase.values() if v == '退潮')}"
+                )
+        except Exception as exc:
+            logger.debug("接入题材阶段映射失败: %s", exc)
+            compare_context["code_to_concept_phase"] = {}
+
         # 阶段3：统一预取所有需要的历史数据（一次搞定）
         if self._log:
             self._log("涨停预测：阶段3 - 统一预取历史数据...")
@@ -2727,9 +2779,50 @@ class StockFilter:
             score += flow_bonus
             reasons.extend(flow_reasons)
 
+        # ============== 游资视角增强信号 ==============
+        # 1. 龙头身份：板块独苗最高板 +10；并列最高 +5
+        ind = str(rec.get("industry") or "").strip()
+        ind_max = compare_context.get("industry_max_boards", {}).get(ind, 0)
+        code = str(rec.get("code") or "").strip()
+        if ind and ind_max > 0 and boards == ind_max and boards >= 2:
+            top_codes = compare_context.get("industry_top_codes", {}).get(ind) or set()
+            if len(top_codes) == 1 and code in top_codes:
+                score += 10
+                reasons.append(f"板块独苗{boards}板龙头+10")
+            elif len(top_codes) >= 2 and code in top_codes:
+                score += 5
+                reasons.append(f"板块并列{boards}板龙头({len(top_codes)}只)+5")
+
+        # 2. 题材阶段：萌芽/主升 加分；末期/退潮 重扣
+        phase = (compare_context.get("code_to_concept_phase") or {}).get(code, "")
+        if phase == "萌芽":
+            score += 5
+            reasons.append("题材萌芽阶段+5")
+        elif phase == "主升":
+            score += 3
+            reasons.append("题材主升阶段+3")
+        elif phase == "末期":
+            score -= 8
+            reasons.append("题材末期阶段-8")
+        elif phase == "退潮":
+            score -= 15
+            reasons.append("题材退潮阶段-15")
+
+        # 3. 情绪定盘：冰点情绪下高位连板的"死亡之吻"
+        sent_score = int(compare_context.get("sentiment_score") or 50)
+        if sent_score < 35:
+            score -= 15
+            reasons.append(f"情绪冰点{sent_score}-15")
+        elif sent_score < 50:
+            score -= 7
+            reasons.append(f"情绪偏冷{sent_score}-7")
+        elif sent_score >= 70:
+            score += 5
+            reasons.append(f"情绪火爆{sent_score}+5")
+
         final_score = max(0, min(100, int(round(score))))
         base["score"] = final_score
-        base["reasons"] = " / ".join(reasons[:10])
+        base["reasons"] = " / ".join(reasons[:12])
         base["predict_type"] = "保留涨停"
         return base
 
