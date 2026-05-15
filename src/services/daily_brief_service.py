@@ -73,6 +73,28 @@ def _trim_predict_candidates(
     return out
 
 
+def _trim_sentiment(
+    sentiment_result: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """从 sentiment 结果摘 score / 仓位 / 7 个 signal。"""
+    if not sentiment_result:
+        return {}
+    return {
+        "score": sentiment_result.get("score", 50),
+        "position_suggest": sentiment_result.get("position_suggest") or {},
+        "summary": sentiment_result.get("summary", ""),
+        "signals": [
+            {
+                "name": s.get("name", ""),
+                "value": s.get("value", ""),
+                "delta": int(s.get("delta", 0)),
+                "note": s.get("note", ""),
+            }
+            for s in (sentiment_result.get("signals") or [])
+        ],
+    }
+
+
 def _trim_concept_hype(
     hype_result: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -138,15 +160,35 @@ def _build_prompt(
     trade_date: str,
     candidates: Dict[str, List[Dict[str, Any]]],
     hype: Dict[str, Any],
+    sentiment: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     sys_msg = (
         "你是 A 股短线操盘手助手。任务：基于今日规则系统产出的"
-        "涨停候选 + 概念炒作主线，给一份明日博弈短报。"
+        "市场情绪 + 涨停候选 + 概念炒作主线，给一份明日博弈短报。"
         "要求：客观、克制、不空喊口号；优先标注多维度重叠的高确信票；"
-        "明确给出风险点。不要复读输入数据，要做语言化综合判断。"
+        "明确给出风险点。仓位建议必须严格参考'市场情绪'板块给出的仓位标签，"
+        "不可随意上调。不要复读输入数据，要做语言化综合判断。"
     )
 
     blocks: List[str] = [f"# 基准交易日：{trade_date}", ""]
+
+    # 市场情绪（首要上下文，决定仓位基调）
+    if sentiment:
+        adv = sentiment.get("position_suggest") or {}
+        blocks.append("## 市场情绪 / 仓位建议（核心上下文）")
+        blocks.append(
+            f"综合评分 {sentiment.get('score', 50)}/100 → 建议 {adv.get('label', '-')}"
+        )
+        blocks.append(f"摘要：{sentiment.get('summary', '')}")
+        blocks.append("各维度信号：")
+        for s in sentiment.get("signals") or []:
+            d = int(s.get("delta", 0))
+            sign = "+" if d > 0 else ""
+            blocks.append(
+                f"  - {s.get('name', '')}: {s.get('value', '')} "
+                f"({sign}{d}) — {s.get('note', '')}"
+            )
+        blocks.append("")
 
     # 概念炒作板块
     if hype:
@@ -202,11 +244,12 @@ def _build_prompt(
 
     blocks.append("## 输出要求")
     blocks.append(
-        "请用 250 字以内的精炼短报回答，结构如下：\n"
-        "1. **盘面综合**（一段话）：今日涨停整体特征 + 主线/萌芽分布 + 强弱判断\n"
-        "2. **明日重点**（3-5 个候选）：每个一行，格式 `代码 名称(行业) — 一句逻辑`，"
+        "请用 280 字以内的精炼短报回答，结构如下：\n"
+        "1. **盘面综合**（一段话）：今日情绪定调（参考仓位建议）+ 涨停整体特征 + 主线分布\n"
+        "2. **仓位建议**（一行）：明确写出『明日建议 X 仓』，必须严格采用『市场情绪』板块给出的仓位标签\n"
+        "3. **明日重点**（3-5 个候选）：每个一行，格式 `代码 名称(行业) — 一句逻辑`，"
         "优先选多维度重叠 + 主线/萌芽题材内的票\n"
-        "3. **风险点**（一句话）：哪些信号要警惕（如末期题材集中、龙头炸板等）\n\n"
+        "4. **风险点**（一句话）：哪些信号要警惕（如末期题材集中、龙头炸板、跌停数飙升等）\n\n"
         "不要写 JSON、不要 markdown 代码块、直接输出叙述文本。"
     )
 
@@ -223,6 +266,7 @@ def generate_daily_brief(
     *,
     predict_result: Optional[Dict[str, Any]] = None,
     hype_result: Optional[Dict[str, Any]] = None,
+    sentiment_result: Optional[Dict[str, Any]] = None,
     model: str = DEFAULT_MODEL,
     api_key: Optional[str] = None,
     use_cache: bool = True,
@@ -252,7 +296,8 @@ def generate_daily_brief(
 
     candidates = _trim_predict_candidates(predict_result)
     hype = _trim_concept_hype(hype_result)
-    payload = {"candidates": candidates, "hype": hype}
+    sentiment_slim = _trim_sentiment(sentiment_result)
+    payload = {"candidates": candidates, "hype": hype, "sentiment": sentiment_slim}
     h = _payload_hash(payload)
 
     if use_cache:
@@ -266,7 +311,7 @@ def generate_daily_brief(
             "未配置 NVIDIA_API_KEY。请设置环境变量 NVIDIA_API_KEY 或在应用设置中保存。"
         )
 
-    messages = _build_prompt(td, candidates, hype)
+    messages = _build_prompt(td, candidates, hype, sentiment_slim)
     _l(f"AI 博弈短报：调用 NIM model={model}")
     client = NvidiaNimClient(api_key=api_key)
     raw = client.chat(

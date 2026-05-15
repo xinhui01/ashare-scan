@@ -37,6 +37,7 @@ from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from src.services import prediction_accuracy_service
 from src.services import concept_hype_service
+from src.services import market_sentiment_service
 import stock_store
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
@@ -152,6 +153,10 @@ class StockMonitorApp:
         self._INTRADAY_CACHE_MAX = 30
         self._DETAIL_CACHE_TTL_SEC = 120.0
         self._INTRADAY_LIVE_TTL_SEC = 30.0
+        # stale-while-revalidate：缓存命中后总在后台再拉一次最新数据（盘后/盘中都修），
+        # 同一只票 N 秒内只会触发一次，避免高频点击雪崩。
+        self._DETAIL_REVALIDATE_THROTTLE_SEC = 5.0
+        self._detail_last_revalidate_ts: Dict[str, float] = {}
         self._top_header_name_by_code: Dict[str, str] = {}
         self.is_scanning = False
         self.is_updating_cache = False
@@ -2073,6 +2078,39 @@ class StockMonitorApp:
             "<<ComboboxSelected>>", self._on_predict_history_selected,
         )
 
+        # ---- 市场情绪条 ----
+        sent_bar = ttk.Frame(predict_frame, padding=(4, 3))
+        sent_bar.pack(fill=tk.X, pady=(0, 4))
+        try:
+            sent_bar.configure(relief=tk.GROOVE, borderwidth=1)
+        except tk.TclError:
+            pass
+        self._sentiment_score_label = ttk.Label(
+            sent_bar, text="情绪: -/100", font=("", 11, "bold"),
+        )
+        self._sentiment_score_label.pack(side=tk.LEFT, padx=(0, 6))
+        self._sentiment_advice_label = ttk.Label(sent_bar, text="→ -")
+        self._sentiment_advice_label.pack(side=tk.LEFT, padx=(0, 12))
+        self._sentiment_summary_label = ttk.Label(
+            sent_bar, text="点击右侧「刷新」分析市场情绪", foreground="#666",
+        )
+        self._sentiment_summary_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            sent_bar, text="详情", width=6,
+            command=self._show_sentiment_detail,
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            sent_bar, text="刷新", width=6,
+            command=self._refresh_sentiment_async,
+        ).pack(side=tk.RIGHT, padx=(0, 4))
+        self._sentiment_result: Optional[Dict[str, Any]] = None
+        self._sentiment_thread: Optional[threading.Thread] = None
+        # 启动后 1.5s 自动算一次（有 app_config 缓存时秒回）
+        try:
+            self.root.after(1500, self._refresh_sentiment_async)
+        except Exception:
+            pass
+
         # ---- 筛选栏 ----
         filter_bar = ttk.Frame(predict_frame)
         filter_bar.pack(fill=tk.X, pady=(0, 6))
@@ -3152,6 +3190,152 @@ class StockMonitorApp:
         except Exception as exc:  # noqa: BLE001
             self._log(f"打开股票详情失败 {code}: {exc}")
 
+    # ============== 市场情绪 + 仓位建议 ==============
+    def _refresh_sentiment_async(self) -> None:
+        """后台刷新市场情绪条；同一只票同日已缓存则秒回。"""
+        if (
+            getattr(self, "_sentiment_thread", None) is not None
+            and self._sentiment_thread.is_alive()
+        ):
+            return
+        target = (self._predict_date_var.get() or "").strip().replace("-", "") or None
+        try:
+            self._sentiment_score_label.config(
+                text="情绪: 分析中...", foreground="#1565c0",
+            )
+            self._sentiment_advice_label.config(text="", foreground="#1565c0")
+            self._sentiment_summary_label.config(text="", foreground="#666")
+        except Exception:
+            return
+
+        def _worker():
+            try:
+                r = market_sentiment_service.analyze_market_sentiment(
+                    target,
+                    fetch_external=True,
+                    log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self._post_to_ui(lambda m=err: self._log(f"市场情绪分析失败: {m}"))
+                self._post_to_ui(lambda: self._sentiment_score_label.config(
+                    text="情绪: 失败", foreground="#c62828",
+                ))
+                return
+            self._post_to_ui(lambda res=r: self._apply_sentiment_result(res))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        self._sentiment_thread = t
+        t.start()
+
+    def _apply_sentiment_result(self, r: Dict[str, Any]) -> None:
+        self._sentiment_result = r or {}
+        score = int(r.get("score", 50))
+        advice = r.get("position_suggest") or {}
+        color = advice.get("color", "#1f1f1f")
+        try:
+            self._sentiment_score_label.config(
+                text=f"情绪 {r.get('trade_date', '-')} : {score}/100",
+                foreground=color,
+            )
+            self._sentiment_advice_label.config(
+                text=f"→ {advice.get('label', '-')}", foreground=color,
+            )
+            # 显示 5 个最重要指标的缩略
+            sigs = r.get("signals") or []
+            key_names = ("涨停数", "晋级率", "最高连板", "大盘", "跌停数")
+            parts: List[str] = []
+            for s in sigs:
+                if s.get("name") in key_names:
+                    delta = int(s.get("delta", 0))
+                    sign = "+" if delta > 0 else ""
+                    parts.append(f"{s.get('name', '')} {s.get('value', '')}({sign}{delta})")
+            self._sentiment_summary_label.config(
+                text=" · ".join(parts), foreground="#444",
+            )
+        except Exception:
+            pass
+
+    def _show_sentiment_detail(self) -> None:
+        r = getattr(self, "_sentiment_result", None) or {}
+        if not r:
+            messagebox.showinfo(
+                "市场情绪", "请先点击「刷新」分析市场情绪。", parent=self.root,
+            )
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"市场情绪明细 · {r.get('trade_date', '-')}")
+        win.geometry("560x460")
+        win.transient(self.root)
+
+        body = ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        score = int(r.get("score", 50))
+        advice = r.get("position_suggest") or {}
+        color = advice.get("color", "#1f1f1f")
+
+        header = ttk.Frame(body)
+        header.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            header, text=f"综合 {score}/100", font=("", 18, "bold"),
+            foreground=color,
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            header, text=f"→ 建议 {advice.get('label', '-')}",
+            font=("", 13), foreground=color,
+        ).pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(
+            body, text=r.get("summary", ""), wraplength=520,
+            foreground="#333",
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        # 信号明细表
+        cols = ("name", "value", "delta", "note")
+        tree = ttk.Treeview(body, columns=cols, show="headings", height=10)
+        for col, (h, w, anc) in {
+            "name": ("信号", 90, tk.W),
+            "value": ("数值", 110, tk.W),
+            "delta": ("加减分", 60, tk.CENTER),
+            "note": ("解读", 270, tk.W),
+        }.items():
+            tree.heading(col, text=h)
+            tree.column(col, width=w, anchor=anc)
+        for s in r.get("signals") or []:
+            d = int(s.get("delta", 0))
+            tree.insert("", tk.END, values=(
+                s.get("name", ""), s.get("value", ""),
+                f"+{d}" if d > 0 else (str(d) if d < 0 else "0"),
+                s.get("note", ""),
+            ))
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            body, text=f"生成于: {r.get('generated_at', '-')}",
+            foreground="#888",
+        ).pack(anchor=tk.W, pady=(8, 0))
+
+        bottom = ttk.Frame(body)
+        bottom.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            bottom, text="刷新（强制重拉外部数据）",
+            command=lambda: (win.destroy(), self._force_refresh_sentiment()),
+        ).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+
+    def _force_refresh_sentiment(self) -> None:
+        """清掉外部数据缓存后重算（解决盘中跌停/指数尚未更新到最新的情况）。"""
+        td = (self._predict_date_var.get() or "").strip().replace("-", "")
+        if td:
+            try:
+                stock_store.save_app_config(
+                    f"{market_sentiment_service.CACHE_KEY_PREFIX}{td}", None,
+                )
+            except Exception:
+                pass
+        self._refresh_sentiment_async()
+
     # ============== AI 博弈短报 ==============
     def _open_daily_brief_window(self) -> None:
         """打开 AI 博弈短报窗口，展示融合后的语言化建议。
@@ -3244,6 +3428,7 @@ class StockMonitorApp:
                         td,
                         predict_result=self._predict_result,
                         hype_result=getattr(self, "_concept_hype_result", None),
+                        sentiment_result=getattr(self, "_sentiment_result", None),
                         use_cache=use_cache,
                         log=lambda s: self._post_to_ui(lambda m=s: self._log(m)),
                     )
@@ -6240,6 +6425,26 @@ class StockMonitorApp:
         except tk.TclError:
             self._detail_after_id = None
 
+    def _trigger_detail_revalidate(self, code: str) -> None:
+        """缓存命中后悄悄拉一次最新详情，5s 节流避免重复。
+
+        新数据回来会通过 _apply_detail_if_current 静默更新面板（用户无感）。
+        如果用户已切到别的票，过滤掉过期请求。
+        """
+        c = str(code or "").strip().zfill(6)
+        if not c:
+            return
+        last = self._detail_last_revalidate_ts.get(c, 0.0)
+        if (time.time() - last) < self._DETAIL_REVALIDATE_THROTTLE_SEC:
+            return
+        self._detail_last_revalidate_ts[c] = time.time()
+        try:
+            self._start_background_job(
+                self._load_detail, name=f"detail-revalidate-{c}", args=(c,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"详情后台刷新启动失败 {c}: {exc}")
+
     def show_stock_detail(self, stock_code: str, force_refresh: bool = False):
         code = str(stock_code).strip().zfill(6)
         self._cancel_scheduled_detail()
@@ -6263,8 +6468,10 @@ class StockMonitorApp:
                     try:
                         self._update_detail_ui(payload)
                         age = int(time.time() - ts)
-                        self.status_var.set(f"{code} 详情（内存缓存 {age}s）")
+                        self.status_var.set(f"{code} 详情（内存缓存 {age}s，正在后台刷新）")
                         self._detail_loading_code = ""
+                        # stale-while-revalidate：后台再拉一次，新数据回来静默替换
+                        self._trigger_detail_revalidate(code)
                         return
                     except Exception as e:
                         self._log(f"渲染内存缓存详情失败，回退到完整加载: {e}")
@@ -6292,10 +6499,12 @@ class StockMonitorApp:
                 self._log(f"渲染缓存详情失败: {e}")
                 self._show_detail_error(code, f"渲染详情失败: {e}")
             if not force_refresh:
-                # 扫描结果中已有完整数据，直接展示不再发起后台刷新。
-                # get_history_data 内部的缓存新鲜度机制会确保数据时效性。
-                self.status_var.set(f"{code} 详情（缓存）")
+                # 扫描快照可能是几分钟到几小时前拉的，先秒开再后台 revalidate，
+                # 让用户既快又新（盘后场景下尤其重要 —— 14:50 扫描的快照在
+                # 15:00 收盘后应当被替换为收盘价）
+                self.status_var.set(f"{code} 详情（扫描快照，正在后台刷新）")
                 self._detail_loading_code = ""
+                self._trigger_detail_revalidate(code)
                 return
             self.status_var.set(f"正在刷新 {code} 最新详情...")
             self._detail_loading_code = code
