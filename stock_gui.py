@@ -943,10 +943,14 @@ class StockMonitorApp:
                 code = str(rec.get("code") or "").strip().zfill(6)
                 if not code:
                     continue
-                try:
-                    reason = fetcher.get_limit_up_reason(code, today_date)
-                except Exception:
-                    reason = ""
+                reason = str(rec.get("limit_up_reason") or "").strip()
+                if not reason:
+                    try:
+                        reason = fetcher.get_limit_up_reason(code, today_date, stock_name=rec.get("name", ""))
+                    except Exception:
+                        reason = ""
+                if not reason:
+                    reason = str(rec.get("strong_tag") or "").strip()
                 stocks.append({
                     "code": code,
                     "name": rec.get("name", ""),
@@ -1491,9 +1495,9 @@ class StockMonitorApp:
         gs = self.intraday_fig.add_gridspec(
             2,
             2,
-            width_ratios=[4.0, 1.4],
+            width_ratios=[4.5, 1.2],
             height_ratios=[3.0, 1.2],
-            wspace=0.32,
+            wspace=0.36,
             hspace=0.14,
         )
         self.intraday_price_ax = self.intraday_fig.add_subplot(gs[0, 0])
@@ -1590,7 +1594,7 @@ class StockMonitorApp:
         # 今日涨停形态分类 Tab（核心表格）
         pattern_tab = ttk.Frame(self._zt_table_nb)
         self._zt_table_nb.add(pattern_tab, text="今日涨停形态分类")
-        zt_pattern_cols = ("code", "name", "industry", "pattern", "change_pct", "close",
+        zt_pattern_cols = ("code", "name", "industry", "limit_up_reason", "strong_tag", "pattern", "change_pct", "close",
                            "burst", "dist_ma5", "trend_10d", "pos_60d", "detail")
         self._zt_pattern_tree = ttk.Treeview(
             pattern_tab,
@@ -1601,13 +1605,15 @@ class StockMonitorApp:
         )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "limit_up_reason": ("涨停原因", 130), "strong_tag": ("强势标签", 150),
             "pattern": ("技术形态", 110), "change_pct": ("涨跌幅%", 70), "close": ("最新价", 70),
             "burst": ("放量倍数", 80),
             "dist_ma5": ("距MA5%", 70), "trend_10d": ("10日涨幅%", 80),
             "pos_60d": ("60日分位%", 80), "detail": ("形态说明", 220),
         }.items():
             self._zt_pattern_tree.heading(col, text=heading)
-            self._zt_pattern_tree.column(col, width=w, anchor=tk.CENTER if col != "detail" else tk.W)
+            left_cols = {"limit_up_reason", "strong_tag", "detail"}
+            self._zt_pattern_tree.column(col, width=w, anchor=tk.W if col in left_cols else tk.CENTER)
         sb_p = ttk.Scrollbar(pattern_tab, orient=tk.VERTICAL, command=self._zt_pattern_tree.yview)
         self._zt_pattern_tree.configure(yscrollcommand=sb_p.set)
         sb_p.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1628,7 +1634,7 @@ class StockMonitorApp:
         yest_tab = ttk.Frame(self._zt_table_nb)
         self._zt_yest_tab = yest_tab
         self._zt_table_nb.add(yest_tab, text="昨日首板今日表现")
-        zt_cols_yest = ("code", "name", "industry", "pattern", "today_chg", "close", "still_zt", "status")
+        zt_cols_yest = ("code", "name", "industry", "limit_up_reason", "strong_tag", "pattern", "today_chg", "close", "still_zt", "status")
         self._zt_yest_tree = ttk.Treeview(
             yest_tab,
             columns=zt_cols_yest,
@@ -1638,11 +1644,13 @@ class StockMonitorApp:
         )
         for col, (heading, w) in {
             "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "limit_up_reason": ("涨停原因", 130), "strong_tag": ("强势标签", 150),
             "pattern": ("昨日形态", 110), "today_chg": ("今日涨跌%", 80), "close": ("最新价", 70),
             "still_zt": ("继续涨停", 70), "status": ("状态", 70),
         }.items():
             self._zt_yest_tree.heading(col, text=heading)
-            self._zt_yest_tree.column(col, width=w, anchor=tk.CENTER)
+            left_cols = {"limit_up_reason", "strong_tag"}
+            self._zt_yest_tree.column(col, width=w, anchor=tk.W if col in left_cols else tk.CENTER)
         sb2 = ttk.Scrollbar(yest_tab, orient=tk.VERTICAL, command=self._zt_yest_tree.yview)
         self._zt_yest_tree.configure(yscrollcommand=sb2.set)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1972,6 +1980,8 @@ class StockMonitorApp:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                rec.get("limit_up_reason", ""),
+                rec.get("strong_tag", ""),
                 rec.get("pattern", ""),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
@@ -2007,6 +2017,8 @@ class StockMonitorApp:
                 code,
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                rec.get("limit_up_reason", ""),
+                rec.get("strong_tag", ""),
                 rec.get("pattern", ""),
                 f"{chg:.2f}" if chg is not None else "-",
                 f"{close_val:.2f}" if close_val is not None else "-",
@@ -7576,8 +7588,20 @@ class StockMonitorApp:
         secax.set_ylabel("价\n格\n(元)", rotation=0, labelpad=12, va="center")
         secax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.2f}"))
 
-        self.intraday_price_ax.set_title("分时走势（含竞价标记）" if auction_context["has_auction"] else "分时走势")
-        self.intraday_price_ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
+        self.intraday_price_ax.set_title(
+            "分时走势（含竞价标记）" if auction_context["has_auction"] else "分时走势",
+            pad=10,
+        )
+        self.intraday_price_ax.legend(
+            loc="lower left",
+            bbox_to_anchor=(0.0, 1.01),
+            ncol=4,
+            fontsize=8,
+            framealpha=0.9,
+            borderaxespad=0.0,
+            columnspacing=1.0,
+            handlelength=1.8,
+        )
 
         if auction_context["has_auction"] and auction_context["x"] is not None and auction_context["price"] is not None:
             q_pct = (auction_context["price"] / base_price - 1.0) * 100.0
@@ -7612,7 +7636,7 @@ class StockMonitorApp:
             auction_info_text = "竞价: " + " / ".join(parts)
         self.intraday_price_ax.text(
             0.995,
-            0.98,
+            0.92,
             auction_info_text,
             transform=self.intraday_price_ax.transAxes,
             ha="right",
@@ -7764,7 +7788,7 @@ class StockMonitorApp:
             auction_context,
         )
         self._draw_intraday_distribution_panel(close_series, volume_series)
-        self.intraday_fig.tight_layout(rect=[0.02, 0.06, 0.98, 0.98], h_pad=1.2, w_pad=0.8)
+        self.intraday_fig.tight_layout(rect=[0.02, 0.06, 0.985, 0.965], h_pad=1.2, w_pad=0.9)
         self.intraday_canvas.draw()
     def export_results(self):
         if not self.filtered_stocks:
@@ -8072,7 +8096,7 @@ class StockMonitorApp:
         stats = stock_store.concept_tags_stats()
         msg_lines = [
             "拉取东财 + 同花顺所有概念板块的成份股，",
-            "建立股票→概念反查表，让涨停原因显示更细的题材标签。",
+            "建立股票→概念反查表，让强势标签显示更细的题材标签。",
             "",
             f"当前已有：{stats.get('pairs_total', 0)} 对 (覆盖 {stats.get('codes_total', 0)} 只),",
             f"东财 {stats.get('em_pairs', 0)}，同花顺 {stats.get('ths_pairs', 0)}",

@@ -1425,7 +1425,8 @@ class StockFilter:
             classification["name"] = name
             classification["industry"] = industry
             for key in ("amount", "market_cap", "turnover", "first_board_time",
-                         "last_board_time", "break_count", "board_amount"):
+                         "last_board_time", "break_count", "board_amount",
+                         "limit_up_reason", "limit_up_reason_detail", "strong_tag"):
                 if key in rec:
                     classification[key] = rec[key]
             results.append(classification)

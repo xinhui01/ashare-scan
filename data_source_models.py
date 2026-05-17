@@ -7,7 +7,7 @@ DATA_SOURCE_OPTIONS: Dict[str, Tuple[str, ...]] = {
     "history": ("auto", "eastmoney", "tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn"),
     "intraday": ("auto", "eastmoney", "sina"),
     "fund_flow": ("auto", "eastmoney", "ths"),
-    "limit_up_reason": ("auto", "eastmoney"),
+    "limit_up_reason": ("auto", "fupanwang"),
 }
 
 

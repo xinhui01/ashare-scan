@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import html
 import os
 import time
 import re
@@ -12,6 +13,7 @@ from typing import Optional, List, Dict, Any, Callable, TypeVar, Tuple
 from datetime import datetime, timedelta
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ProxyError as RequestsProxyError
 from requests.exceptions import Timeout as RequestsTimeout
 
 def _project_root() -> Path:
@@ -381,6 +383,7 @@ _fetch_sohu_hist_frame = _src_sohu.fetch_hist_frame
 # 实现已迁移到 src/sources/ths.py；下面是公共函数别名。
 from src.sources import ths as _src_ths
 _fetch_ths_hist_frame = _src_ths.fetch_hist_frame
+_fetch_ths_fund_flow_frame = _src_ths.fetch_fund_flow_frame
 
 
 # ---- 华尔街见闻 (WallstreetCN) 历史日线 ----
@@ -524,6 +527,7 @@ class StockDataFetcher:
         self._strong_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
+        self._limit_up_reason_cache: Dict[str, Dict[str, Dict[str, str]]] = _LRUCache(maxsize=30)
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
         self._history_mirror_cache: List[str] = []
@@ -835,9 +839,9 @@ class StockDataFetcher:
 
     def build_limit_up_reason_plan(self, source: str = "auto") -> DataProviderPlan:
         normalized = self.normalize_limit_up_reason_source(source)
-        if normalized == "eastmoney":
-            return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="limit-up-provider=eastmoney")
-        return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="limit-up-provider=auto")
+        if normalized == "fupanwang":
+            return DataProviderPlan(mode="network", provider_sequence=("fupanwang",), reason="limit-up-provider=fupanwang")
+        return DataProviderPlan(mode="network", provider_sequence=("fupanwang",), reason="limit-up-provider=auto")
 
     def build_history_request_plan(self, source: str = "auto", force_refresh: bool = False) -> HistoryRequestPlan:
         normalized = self.normalize_history_source(source)
@@ -1143,45 +1147,174 @@ class StockDataFetcher:
         date_key = self._normalize_trade_date(trade_date)
         if not date_key:
             return pd.DataFrame()
-        provider = self.normalize_limit_up_reason_source(source or self._default_limit_up_reason_source)
-        cache_key = f"{provider}:{date_key}"
+        cache_key = f"eastmoney:{date_key}"
         cached = self._strong_pool_cache.get(cache_key)
         if cached is not None:
             return cached
-        plan = self.build_limit_up_reason_plan(provider)
         df = pd.DataFrame()
         last_error: Optional[Exception] = None
-        for provider_name in plan.provider_sequence:
-            if provider_name == "eastmoney":
-                if _eastmoney_circuit_breaker_open():
-                    logger.debug("强势股池 %s：东财熔断中，跳过", date_key)
-                    continue
-                try:
-                    df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
-                    break
-                except Exception as e:
-                    last_error = e
-                    if self._log:
-                        self._log(f"强势股池 {date_key} 获取失败: {e}")
+        if _eastmoney_circuit_breaker_open():
+            logger.debug("强势股池 %s：东财熔断中，跳过", date_key)
+        else:
+            try:
+                df = _retry_ak_call(ak.stock_zt_pool_strong_em, date=date_key)
+            except Exception as e:
+                last_error = e
+                if self._log:
+                    self._log(f"强势股池 {date_key} 获取失败: {e}")
         if df is None or getattr(df, "empty", True):
             df = pd.DataFrame()
             if last_error is not None and self._log:
-                self._log(f"涨停原因数据源全部失败 {date_key}: {last_error}")
+                self._log(f"强势股池数据源全部失败 {date_key}: {last_error}")
         self._strong_pool_cache[cache_key] = df
         return df
 
-    def get_limit_up_reason(self, stock_code: str, trade_date: str, source: Optional[str] = None) -> str:
-        """返回 "东财入选理由 [概念1 / 概念2 / 概念3]" 的拼接文本。
+    @staticmethod
+    def _normalize_stock_name(value: str) -> str:
+        name = str(value or "").strip()
+        if not name:
+            return ""
+        return re.sub(r"\s+", "", name).upper()
 
-        - 东财入选理由：当日强势股池里的 "入选理由" 列（短文本触发条件）
-        - 概念标签：从本地 stock_concept_tags 反查表读，最多 8 个，按字母序
-        - 任一为空则只输出另一项；两者都空返回 ""
-        """
+    @staticmethod
+    def _normalize_trade_date_display(trade_date: str) -> str:
+        date_key = re.sub(r"\D", "", str(trade_date or ""))[:8]
+        if len(date_key) != 8:
+            return ""
+        return f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+
+    def _fetch_text_with_optional_proxy_bypass(self, url: str, params: Optional[Dict[str, Any]] = None) -> str:
+        import requests
+
+        session_args: Dict[str, Any] = {
+            "url": url,
+            "params": params or {},
+            "timeout": (5, 12),
+            "headers": {
+                "User-Agent": _random.choice(_USER_AGENT_POOL),
+                "Referer": "https://www.fupanwang.com/",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+        }
+        if _use_insecure_ssl():
+            session_args["verify"] = False
+
+        def _get(*, bypass_proxy: bool) -> str:
+            with requests.Session() as session:
+                if bypass_proxy:
+                    session.trust_env = False
+                    session.proxies = {"http": None, "https": None}
+                response = session.get(**session_args)
+                response.raise_for_status()
+                response.encoding = response.encoding or response.apparent_encoding or "utf-8"
+                return response.text or ""
+
+        try:
+            return _get(bypass_proxy=_use_bypass_proxy())
+        except RequestsProxyError:
+            return _get(bypass_proxy=True)
+
+    @staticmethod
+    def _parse_limit_up_reason_page(html_text: str) -> Dict[str, Dict[str, str]]:
+        """从复盘页 HTML 中提取 {名称: {reason, detail}}。"""
+        if not html_text:
+            return {}
+
+        text = re.sub(r"(?is)<script[^>]*>.*?</script>", "\n", html_text)
+        text = re.sub(r"(?is)<style[^>]*>.*?</style>", "\n", text)
+        text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+        text = re.sub(r"(?i)</(tr|td|th|li|p|div|section|article|header|footer|main|h\d|a)>", "\n", text)
+        text = re.sub(r"(?s)<[^>]+>", "", text)
+        text = html.unescape(text)
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        lines = [line for line in lines if line]
+        if not lines:
+            return {}
+
+        start = 0
+        for idx, line in enumerate(lines):
+            if all(token in line for token in ("时间", "股票名称", "异动标记", "板块题材", "盘面信息")):
+                start = idx + 1
+                break
+            if lines[idx:idx + 5] == ["时间", "股票名称", "异动标记", "板块题材", "盘面信息"]:
+                start = idx + 5
+                break
+
+        reason_by_name: Dict[str, Dict[str, str]] = {}
+        time_re = re.compile(r"^\d{2}:\d{2}$")
+        stop_prefixes = ("ID ", "连板梯队", "板块题材", "市场风向标", "跌停池", "炸板池")
+        i = start
+        while i < len(lines):
+            line = lines[i]
+            if any(line.startswith(prefix) for prefix in stop_prefixes):
+                break
+            if not time_re.match(line):
+                i += 1
+                continue
+            if i + 3 >= len(lines):
+                break
+            name = lines[i + 1]
+            reason = lines[i + 3]
+            detail = lines[i + 4] if i + 4 < len(lines) else ""
+            normalized_name = StockDataFetcher._normalize_stock_name(name)
+            if normalized_name and reason:
+                reason_by_name[normalized_name] = {
+                    "reason": reason,
+                    "detail": detail,
+                }
+            i += 5
+        return reason_by_name
+
+    def _load_limit_up_reason_map(self, trade_date: str, source: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+        date_key = self._normalize_trade_date(trade_date)
+        if not date_key:
+            return {}
+        provider = self.normalize_limit_up_reason_source(source or self._default_limit_up_reason_source)
+        cache_key = f"{provider}:{date_key}"
+        cached = self._limit_up_reason_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        display_date = self._normalize_trade_date_display(date_key)
+        if not display_date:
+            self._limit_up_reason_cache[cache_key] = {}
+            return {}
+
+        url_candidates = [
+            ("https://www.fupanwang.com/fupanla/", {"date": display_date}),
+            ("https://www.fupanwang.com/fupanla/", {"date": date_key}),
+            ("https://www.fupanwang.com/fupanla/", {"day": display_date}),
+            ("https://www.fupanwang.com/fupanla/", {"day": date_key}),
+            ("https://www.fupanwang.com/fupanla/", {}),
+        ]
+
+        last_error: Optional[Exception] = None
+        result: Dict[str, Dict[str, str]] = {}
+        for url, params in url_candidates:
+            try:
+                html_text = self._fetch_text_with_optional_proxy_bypass(url, params=params)
+                parsed = self._parse_limit_up_reason_page(html_text)
+                if not parsed:
+                    continue
+                if params and display_date not in html_text and date_key not in html_text:
+                    continue
+                result = parsed
+                break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if not result and last_error is not None and self._log:
+            self._log(f"涨停原因页 {date_key} 获取失败: {last_error}")
+        self._limit_up_reason_cache[cache_key] = result
+        return result
+
+    def get_limit_up_strong_tag(self, stock_code: str, trade_date: str, source: Optional[str] = None) -> str:
+        """返回东方财富强势股池的入选理由，作为强势标签而非涨停归因。"""
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return ""
 
-        # 1) 东财入选理由
         reason_text = ""
         try:
             pool = self._load_strong_pool(trade_date, source=source)
@@ -1195,7 +1328,6 @@ class StockDataFetcher:
         except Exception:
             reason_text = ""
 
-        # 2) 概念标签反查
         concepts: List[str] = []
         try:
             import stock_store as _ss
@@ -1210,6 +1342,47 @@ class StockDataFetcher:
         if concepts:
             return f"[{' / '.join(concepts)}]"
         return ""
+
+    def get_limit_up_reason(
+        self,
+        stock_code: str,
+        trade_date: str,
+        source: Optional[str] = None,
+        stock_name: str = "",
+    ) -> str:
+        """返回更接近题材/事件归因的涨停原因。"""
+        code = str(stock_code or "").strip().zfill(6)
+        normalized_name = self._normalize_stock_name(stock_name)
+        if not code and not normalized_name:
+            return ""
+        reason_map = self._load_limit_up_reason_map(trade_date, source=source)
+        if normalized_name:
+            payload = reason_map.get(normalized_name)
+            if payload and payload.get("reason"):
+                return str(payload.get("reason") or "").strip()
+        return ""
+
+    def enrich_limit_up_reason_fields(
+        self,
+        records: List[Dict[str, Any]],
+        trade_date: str,
+        source: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        if not records:
+            return records
+        reason_map = self._load_limit_up_reason_map(trade_date, source=source)
+        for rec in records:
+            code = str(rec.get("code") or "").strip().zfill(6)
+            name = str(rec.get("name") or "")
+            normalized_name = self._normalize_stock_name(name)
+            payload = reason_map.get(normalized_name, {})
+            if "limit_up_reason" not in rec:
+                rec["limit_up_reason"] = str(payload.get("reason") or "").strip()
+            if "limit_up_reason_detail" not in rec:
+                rec["limit_up_reason_detail"] = str(payload.get("detail") or "").strip()
+            if "strong_tag" not in rec:
+                rec["strong_tag"] = self.get_limit_up_strong_tag(code, trade_date)
+        return records
 
     @staticmethod
     def _sanitize_limit_up_pool(df: pd.DataFrame) -> pd.DataFrame:
@@ -1382,12 +1555,14 @@ class StockDataFetcher:
         if not today_pool.empty and "连板数" in today_pool.columns:
             today_first_df = today_pool[today_pool["连板数"] == 1].copy()
             result["today_first"] = self._pool_to_records(today_first_df, "today")
+            self.enrich_limit_up_reason_fields(result["today_first"], today_date)
 
         # ---- 昨日首板：从昨日涨停池中取连板数=1 的 ----
         yesterday_first_df = pd.DataFrame()
         if not yesterday_pool.empty and "连板数" in yesterday_pool.columns:
             yesterday_first_df = yesterday_pool[yesterday_pool["连板数"] == 1].copy()
             result["yesterday_first"] = self._pool_to_records(yesterday_first_df, "yesterday")
+            self.enrich_limit_up_reason_fields(result["yesterday_first"], yesterday_date)
 
         # ---- 对比：新增 / 延续 / 流失 ----
         today_codes = set()

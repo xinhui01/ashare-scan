@@ -1,4 +1,4 @@
-"""同花顺 (THS / 10jqka) CDN 历史 K 线源。
+"""同花顺 (THS / 10jqka) 数据源。
 
 接口：``https://d.10jqka.com.cn/v6/line/{ths_code}/01/{year}.js``
 JSONP 格式，按年请求后合并筛选。
@@ -10,6 +10,7 @@ import random
 import threading
 import time
 
+import akshare as ak
 import pandas as pd
 
 from src.network.headers import USER_AGENT_POOL
@@ -43,6 +44,44 @@ def stock_code(code: str) -> str:
     """同花顺用 hs_000001 格式。"""
     c = str(code).strip().zfill(6)
     return f"hs_{c}"
+
+
+def fetch_fund_flow_frame(stock_code_in: str) -> "pd.DataFrame":
+    """同花顺个股资金流补位。
+
+    当前优先复用 akshare 的同花顺资金流榜单接口，从“即时”榜单中过滤目标股票。
+    该源通常只提供最新一笔聚合数据，因此作为东方财富失败时的兜底返回单行结果。
+    """
+    code = str(stock_code_in or "").strip().zfill(6)
+    if not code:
+        return pd.DataFrame()
+
+    df = ak.stock_fund_flow_individual(symbol="即时")
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if "股票代码" not in out.columns:
+        return pd.DataFrame()
+
+    out["股票代码"] = out["股票代码"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
+    out = out[out["股票代码"] == code].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    today_text = pd.Timestamp.now().strftime("%Y-%m-%d")
+    out["日期"] = today_text
+
+    # 同花顺即时榜单只给出汇总净额，没有东财那样的主力/大单/超大单拆分；
+    # 这里保留可用列，并把“净额”映射到统一层最常用的大单净额字段以便界面有值可展示。
+    if "净额" in out.columns and "大单净额" not in out.columns:
+        out["大单净额"] = out["净额"]
+    if "净额" in out.columns and "主力净额" not in out.columns:
+        out["主力净额"] = out["净额"]
+    if "最新价" in out.columns and "收盘价" not in out.columns:
+        out["收盘价"] = out["最新价"]
+
+    return out.reset_index(drop=True)
 
 
 def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.DataFrame":
