@@ -3096,7 +3096,7 @@ class StockMonitorApp:
             "ignite": lambda c: str(c.get("ignite_date", "")),
             "duration": lambda c: int(c.get("duration", 0)),
             "phase": lambda c: str(c.get("phase", "")),
-            "trend": lambda c: str(c.get("trend", "")),
+            "trend": lambda c: concept_hype_service.trend_label(c.get("trend", "")),
             "leaders": lambda c: -len(c.get("leaders") or []),
         }
         out.sort(key=key_map.get(col, key_map["score"]), reverse=rev)
@@ -3111,6 +3111,7 @@ class StockMonitorApp:
                 f"{m.get('name', '')}({m.get('boards', 1)}板)"
                 for m in (c.get("leaders") or [])[:4]
             )
+            trend_text = concept_hype_service.trend_label(c.get("trend", ""))
             self._concept_hype_rank_tree.insert(
                 "", tk.END,
                 values=(
@@ -3123,7 +3124,7 @@ class StockMonitorApp:
                     c.get("ignite_date", ""),
                     f"{c.get('duration', 0)}d",
                     c.get("phase", ""),
-                    c.get("trend", ""),
+                    trend_text,
                     leaders_str,
                 ),
                 tags=(f"phase_{c.get('phase', '')}",),
@@ -3152,8 +3153,10 @@ class StockMonitorApp:
         values = self._concept_hype_rank_tree.item(sel[0]).get("values") or []
         if not values:
             return
-        name = str(values[0])
-        source = str(values[1])
+        # rank_cols = ("score", "name", "source", ...)
+        # 这里要按列位取题材名/来源，不能误把机会分当成题材名。
+        name = str(values[1])
+        source = str(values[2])
         concept = next(
             (
                 c for c in (self._concept_hype_result or {}).get("concepts") or []

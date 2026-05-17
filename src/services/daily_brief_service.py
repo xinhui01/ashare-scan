@@ -22,6 +22,7 @@ from llm_client import (
     NvidiaNimClient,
     has_api_key,
 )
+from src.services.concept_hype_service import trend_label
 from stock_logger import get_logger
 from stock_store import load_app_config, save_app_config
 
@@ -131,7 +132,7 @@ def _trim_concept_hype(
             "name": c.get("name", ""),
             "source": c.get("source", ""),
             "phase": c.get("phase", ""),
-            "trend": c.get("trend", ""),
+            "trend": trend_label(c.get("trend", "")),
             "today_count": int(c.get("today_count") or 0),
             "duration": int(c.get("duration") or 0),
             "score": int(c.get("opportunity_score") or 0),

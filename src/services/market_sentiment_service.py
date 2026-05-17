@@ -19,10 +19,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import stock_data  # 触发 SSL/proxy 网络补丁
 import stock_store
 from stock_logger import get_logger
+from src.utils.trade_calendar import _get_trade_calendar, _previous_trading_day
 
 logger = get_logger(__name__)
 
 CACHE_KEY_PREFIX = "market_sentiment_external_"
+_POOL_FETCHER: Optional["stock_data.StockDataFetcher"] = None
 
 
 # ============== 工具 ==============
@@ -44,6 +46,20 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_date_key(date_key: str):
+    try:
+        return datetime.strptime(date_key, "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _get_pool_fetcher() -> "stock_data.StockDataFetcher":
+    global _POOL_FETCHER
+    if _POOL_FETCHER is None:
+        _POOL_FETCHER = stock_data.StockDataFetcher()
+    return _POOL_FETCHER
 
 
 # ============== 信号计算 ==============
@@ -176,9 +192,12 @@ def _load_pool_aggregates(date_key: str) -> Optional[Dict[str, Any]]:
 
 
 def _avg_lu_count_5d(end_date: str) -> Tuple[float, List[str]]:
-    """end_date 之前 5 个有缓存的交易日平均涨停数。"""
-    all_dates = stock_store.list_limit_up_pool_trade_dates() or []
-    prior = [d for d in all_dates if d < end_date][-5:]
+    """end_date 之前最近 5 个真实交易日的平均涨停数。"""
+    prior = _previous_trade_dates(end_date, 5)
+    if not prior:
+        # 交易日历不可用时，退回旧逻辑：按已缓存日期近似。
+        all_dates = stock_store.list_limit_up_pool_trade_dates() or []
+        prior = [d for d in all_dates if d < end_date][-5:]
     if not prior:
         return 0.0, []
     counts: List[int] = []
@@ -204,9 +223,82 @@ def _continuation_today_from_yesterday(
 
 
 def _previous_pool_date(end_date: str) -> str:
+    prior = _previous_trade_dates(end_date, 1)
+    if prior:
+        return prior[0]
     all_dates = stock_store.list_limit_up_pool_trade_dates() or []
-    prior = [d for d in all_dates if d < end_date]
-    return prior[-1] if prior else ""
+    cached_prior = [d for d in all_dates if d < end_date]
+    return cached_prior[-1] if cached_prior else ""
+
+
+def _previous_trade_dates(end_date: str, count: int) -> List[str]:
+    """返回 end_date 之前最近 count 个真实交易日（不含 end_date）。"""
+    target = _parse_date_key(end_date)
+    if target is None or count <= 0:
+        return []
+    cal = _get_trade_calendar()
+    out: List[str] = []
+    cursor = target
+    seen = set()
+    for _ in range(max(count * 8, 20)):
+        prev = _previous_trading_day(cursor, cal)
+        key = prev.strftime("%Y%m%d")
+        if key in seen:
+            break
+        out.append(key)
+        seen.add(key)
+        cursor = prev
+        if len(out) >= count:
+            break
+    return out
+
+
+def _required_pool_dates(end_date: str) -> List[str]:
+    """市场情绪计算依赖的涨停池日期：当日 + 前 5 个交易日。"""
+    dates = [end_date]
+    dates.extend(_previous_trade_dates(end_date, 5))
+    deduped: List[str] = []
+    seen = set()
+    for d in dates:
+        if d and d not in seen:
+            deduped.append(d)
+            seen.add(d)
+    return deduped
+
+
+def _ensure_pool_dates_ready(
+    date_keys: List[str],
+    *,
+    log: Callable[[str], None],
+) -> List[str]:
+    """缺哪个交易日就补哪个；返回仍然缺失的日期。"""
+    missing = [d for d in date_keys if d and _load_pool_aggregates(d) is None]
+    if not missing:
+        return []
+
+    fetcher = _get_pool_fetcher()
+    try:
+        fetcher.set_log_callback(log)
+    except Exception:
+        pass
+
+    unresolved: List[str] = []
+    for d in missing:
+        try:
+            log(f"市场情绪依赖缺失，正在补齐涨停池 {d} ...")
+            df = fetcher.get_limit_up_pool(d)
+            if df is None or df.empty:
+                unresolved.append(d)
+                log(f"  涨停池 {d} 补齐失败或为空")
+                continue
+            agg = _load_pool_aggregates(d)
+            if agg is None:
+                unresolved.append(d)
+                log(f"  涨停池 {d} 补齐后仍不可用")
+        except Exception as exc:
+            unresolved.append(d)
+            log(f"  涨停池 {d} 补齐失败: {exc}")
+    return unresolved
 
 
 def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, Any]:
@@ -320,6 +412,26 @@ def analyze_market_sentiment(
     if not end or end not in all_dates:
         end = all_dates[-1]
 
+    required_dates = _required_pool_dates(end)
+    missing_dates = _ensure_pool_dates_ready(required_dates, log=_l)
+    if missing_dates:
+        return {
+            "trade_date": end,
+            "score": 50,
+            "position_suggest": _position_advice(50),
+            "signals": [],
+            "summary": (
+                f"{end} 情绪依赖数据不完整，缺少涨停池: "
+                + "、".join(missing_dates)
+                + "。已尝试自动补齐，但仍未成功，请稍后重试。"
+            ),
+            "raw": {
+                "required_pool_dates": required_dates,
+                "missing_pool_dates": missing_dates,
+            },
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
     today_agg = _load_pool_aggregates(end)
     if not today_agg:
         return {
@@ -423,6 +535,7 @@ def analyze_market_sentiment(
             "today_continued": today_continued,
             "avg5": avg5,
             "prior_dates": prior_dates,
+            "required_pool_dates": required_dates,
             "external": external,
         },
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

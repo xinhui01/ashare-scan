@@ -42,6 +42,11 @@ MIN_TOTAL_FOR_LIST = 4
 MIN_ACTIVE_DAYS_FOR_LIST = 2
 # 主线候选数（呈现 top N）
 TOP_LEADERS_PER_CONCEPT = 5
+TREND_LABELS = {
+    "rising": "上升",
+    "flat": "走平",
+    "declining": "下降",
+}
 
 
 def compute_opportunity_score(record: Dict[str, Any]) -> int:
@@ -89,6 +94,12 @@ def compute_opportunity_score(record: Dict[str, Any]) -> int:
 
 
 # ============== 工具函数 ==============
+
+def trend_label(trend: Any) -> str:
+    """把内部趋势枚举转成界面友好的中文。"""
+    value = str(trend or "").strip()
+    return TREND_LABELS.get(value, value)
+
 
 def _normalize_date(s: Any) -> str:
     if s is None:
