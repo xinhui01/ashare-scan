@@ -301,6 +301,73 @@ def _ensure_pool_dates_ready(
     return unresolved
 
 
+def _compute_pct_from_index_df(df, date_key: str) -> Optional[float]:
+    """通用：在指数日 K DataFrame 里找 date_key 那行，算 (close/prev_close - 1)*100。
+
+    适配三种 akshare 指数源：东财(stock_zh_index_daily_em)、新浪(stock_zh_index_daily)、
+    腾讯(stock_zh_index_daily_tx)，它们都有 date + close 字段。
+    """
+    if df is None or df.empty:
+        return None
+    work = df.copy()
+    work["date_key"] = work["date"].astype(str).str.replace("-", "")
+    target = work[work["date_key"] == date_key]
+    if target.empty or len(work) < 2:
+        return None
+    idx = work.index[work["date_key"] == date_key][0]
+    pos = work.index.get_loc(idx)
+    if pos <= 0:
+        return None
+    today_close = _safe_float(work.iloc[pos]["close"])
+    prev_close = _safe_float(work.iloc[pos - 1]["close"])
+    if prev_close <= 0:
+        return None
+    return (today_close / prev_close - 1.0) * 100
+
+
+def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optional[float]:
+    """三源级联拉上证当日涨跌幅：东财 → 新浪 → 腾讯。任一成功即返回。"""
+    import akshare as ak
+    from datetime import datetime as _dt, timedelta
+
+    # 1. 东财：支持 start/end，最快；间歇性熔断
+    try:
+        end_dt = _dt.strptime(date_key, "%Y%m%d")
+        start_dt = end_dt - timedelta(days=10)
+        df = ak.stock_zh_index_daily_em(
+            symbol="sh000001",
+            start_date=start_dt.strftime("%Y%m%d"),
+            end_date=date_key,
+        )
+        pct = _compute_pct_from_index_df(df, date_key)
+        if pct is not None:
+            return pct
+    except Exception as exc:
+        log(f"  上证指数(东财)拉取失败: {exc}")
+
+    # 2. 新浪：拉全量历史，毫秒级解析
+    try:
+        df = ak.stock_zh_index_daily(symbol="sh000001")
+        pct = _compute_pct_from_index_df(df, date_key)
+        if pct is not None:
+            log(f"  上证指数(东财失败，新浪兜底成功)")
+            return pct
+    except Exception as exc:
+        log(f"  上证指数(新浪)拉取失败: {exc}")
+
+    # 3. 腾讯：拉全量历史，逐分块下载较慢但稳
+    try:
+        df = ak.stock_zh_index_daily_tx(symbol="sh000001")
+        pct = _compute_pct_from_index_df(df, date_key)
+        if pct is not None:
+            log(f"  上证指数(东财/新浪失败，腾讯兜底成功)")
+            return pct
+    except Exception as exc:
+        log(f"  上证指数(腾讯)拉取失败: {exc}")
+
+    return None
+
+
 def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, Any]:
     """拉跌停数 + 上证指数涨跌幅，缓存按日。"""
     cache_key = f"{CACHE_KEY_PREFIX}{date_key}"
@@ -325,32 +392,7 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
     except Exception as exc:
         log(f"  跌停池拉取失败: {exc}")
 
-    try:
-        import akshare as ak
-        # 拉前后各几天的 K，找到 date_key 对应那一行
-        from datetime import datetime as _dt, timedelta
-        end_dt = _dt.strptime(date_key, "%Y%m%d")
-        start_dt = end_dt - timedelta(days=10)
-        df = ak.stock_zh_index_daily_em(
-            symbol="sh000001",
-            start_date=start_dt.strftime("%Y%m%d"),
-            end_date=date_key,
-        )
-        if df is not None and not df.empty:
-            df = df.copy()
-            df["date_key"] = df["date"].astype(str).str.replace("-", "")
-            target = df[df["date_key"] == date_key]
-            if not target.empty and len(df) >= 2:
-                today_close = _safe_float(target.iloc[0]["close"])
-                # 找前一行的 close
-                idx = df.index[df["date_key"] == date_key][0]
-                pos = df.index.get_loc(idx)
-                if pos > 0:
-                    prev_close = _safe_float(df.iloc[pos - 1]["close"])
-                    if prev_close > 0:
-                        out["sh_index_pct"] = (today_close / prev_close - 1.0) * 100
-    except Exception as exc:
-        log(f"  上证指数拉取失败: {exc}")
+    out["sh_index_pct"] = _fetch_sh_index_pct(date_key, log=log)
 
     out["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # 只在两个外部字段都拿到时才缓存为"完整成功"。
