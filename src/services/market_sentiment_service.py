@@ -306,7 +306,12 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
     cache_key = f"{CACHE_KEY_PREFIX}{date_key}"
     cached = stock_store.load_app_config(cache_key, default=None)
     if isinstance(cached, dict) and cached.get("ok"):
-        return cached
+        # 二次校验：旧版可能写过 ok=True 但字段是 None 的"半成功"缓存。
+        # 检测到这种情况就忽略缓存，强制重拉一次。
+        if (cached.get("down_limit_count") is not None
+                and cached.get("sh_index_pct") is not None):
+            return cached
+        log(f"  外部数据缓存字段缺失（旧版半成功记录），忽略缓存重拉")
 
     out: Dict[str, Any] = {"date_key": date_key, "down_limit_count": None, "sh_index_pct": None}
 
@@ -347,12 +352,25 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
     except Exception as exc:
         log(f"  上证指数拉取失败: {exc}")
 
-    out["ok"] = True
     out["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        stock_store.save_app_config(cache_key, out)
-    except Exception:
-        logger.exception("保存 sentiment external 缓存失败")
+    # 只在两个外部字段都拿到时才缓存为"完整成功"。
+    # 半失败状态不写缓存，让下次调用继续重试，避免 SSL/网络瞬时抖动导致
+    # 大盘/跌停数据永久 None。
+    all_fetched = (
+        out.get("down_limit_count") is not None
+        and out.get("sh_index_pct") is not None
+    )
+    out["ok"] = all_fetched
+    if all_fetched:
+        try:
+            stock_store.save_app_config(cache_key, out)
+        except Exception:
+            logger.exception("保存 sentiment external 缓存失败")
+    else:
+        log(
+            f"  外部数据未完整拿到（跌停={out.get('down_limit_count')}, "
+            f"上证pct={out.get('sh_index_pct')}），本次不缓存，下次重试"
+        )
     return out
 
 
