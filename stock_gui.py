@@ -289,6 +289,11 @@ class StockMonitorApp:
         help_menu.add_command(label="关于", command=self.show_about)
 
     def _build_control_scan_params_row(self, control_frame) -> None:
+        """顶部参数行：只放 更新历史缓存 必需的参数（扫描数量/并发线程/重新拉取股票池）。
+
+        扫描专属参数（连续天数/MA周期/近N日涨停/放量观察天数/启用放量倍数/放量倍数阈值）
+        通过 _build_scan_only_params_row 渲染到扫描结果 tab 内。
+        """
         row1 = ttk.Frame(control_frame)
         row1.pack(fill=tk.X, pady=5)
         ttk.Label(row1, text="扫描数量(0=全量):").pack(side=tk.LEFT, padx=5)
@@ -299,46 +304,6 @@ class StockMonitorApp:
         self.scan_workers_var = tk.StringVar(value="3")
         ttk.Entry(row1, textvariable=self.scan_workers_var, width=6).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(row1, text="连续天数:").pack(side=tk.LEFT, padx=5)
-        self.trend_days_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.trend_days_var, width=6).pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row1, text="MA周期:").pack(side=tk.LEFT, padx=5)
-        self.ma_period_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.ma_period_var, width=6).pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row1, text="近N日涨停:").pack(side=tk.LEFT, padx=5)
-        self.limit_up_lookback_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.limit_up_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
-
-        ttk.Label(row1, text="放量观察天数:").pack(side=tk.LEFT, padx=5)
-        self.volume_lookback_var = tk.StringVar(value="5")
-        ttk.Entry(row1, textvariable=self.volume_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
-
-        self.volume_expand_enabled_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            row1,
-            text="启用放量倍数",
-            variable=self.volume_expand_enabled_var,
-        ).pack(side=tk.LEFT, padx=8)
-
-        ttk.Label(row1, text="放量倍数阈值:").pack(side=tk.LEFT, padx=5)
-        self.volume_expand_factor_var = tk.StringVar(value="2.0")
-        ttk.Entry(row1, textvariable=self.volume_expand_factor_var, width=6).pack(side=tk.LEFT, padx=5)
-
-        # 承接强势形态相关的变量在这里先声明，实体控件放在"扫描参数"弹窗里（show_settings）。
-        self.strong_ft_enabled_var = tk.BooleanVar(value=False)
-        self.strong_ft_max_pullback_pct_var = tk.StringVar(value="3.0")
-        self.strong_ft_max_volume_ratio_var = tk.StringVar(value="0.7")
-        self.strong_ft_min_hold_days_var = tk.StringVar(value="1")
-
-        row1_note = ttk.Frame(control_frame)
-        row1_note.pack(fill=tk.X, pady=2)
-        ttk.Label(
-            row1_note,
-            text="备注：放量倍数=最近N天成交量最大值/最小值，勾选“启用放量倍数”后才参与筛选。",
-        ).pack(side=tk.LEFT, padx=5)
-
         self.refresh_universe_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             row1,
@@ -346,11 +311,60 @@ class StockMonitorApp:
             variable=self.refresh_universe_var,
         ).pack(side=tk.LEFT, padx=15)
 
+        # 扫描专属变量先在这里声明（保证任何路径都能读到），实体控件移到扫描结果 tab。
+        self.trend_days_var = tk.StringVar(value="5")
+        self.ma_period_var = tk.StringVar(value="5")
+        self.limit_up_lookback_var = tk.StringVar(value="5")
+        self.volume_lookback_var = tk.StringVar(value="5")
+        self.volume_expand_enabled_var = tk.BooleanVar(value=True)
+        self.volume_expand_factor_var = tk.StringVar(value="2.0")
+
+        # 承接强势形态相关的变量在这里先声明，实体控件放在"扫描参数"弹窗里（show_settings）。
+        self.strong_ft_enabled_var = tk.BooleanVar(value=False)
+        self.strong_ft_max_pullback_pct_var = tk.StringVar(value="3.0")
+        self.strong_ft_max_volume_ratio_var = tk.StringVar(value="0.7")
+        self.strong_ft_min_hold_days_var = tk.StringVar(value="1")
+
+    def _build_scan_only_params_row(self, parent) -> None:
+        """扫描专属参数：仅 setup_result_tab 调用，渲染到扫描结果 tab 内部。"""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=4)
+
+        ttk.Label(row, text="连续天数:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row, textvariable=self.trend_days_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row, text="MA周期:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row, textvariable=self.ma_period_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row, text="近N日涨停:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row, textvariable=self.limit_up_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row, text="放量观察天数:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row, textvariable=self.volume_lookback_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        ttk.Checkbutton(
+            row, text="启用放量倍数", variable=self.volume_expand_enabled_var,
+        ).pack(side=tk.LEFT, padx=8)
+
+        ttk.Label(row, text="放量倍数阈值:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row, textvariable=self.volume_expand_factor_var, width=6).pack(side=tk.LEFT, padx=5)
+
+        note = ttk.Frame(parent)
+        note.pack(fill=tk.X, pady=2)
+        ttk.Label(
+            note,
+            text="备注：放量倍数=最近N天成交量最大值/最小值，勾选“启用放量倍数”后才参与筛选。",
+            foreground="#666",
+        ).pack(side=tk.LEFT, padx=5)
+
     def _build_control_actions_row(self, control_frame) -> None:
+        """顶部动作行：保留涨停预测前置需要的更新缓存 + 停止 + 单股查询 + 历史源。
+
+        '开始扫描' 按钮移到扫描结果 tab 内部（与扫描参数同处一处），
+        通过 _build_scan_only_actions_row 渲染。
+        """
         row2 = ttk.Frame(control_frame)
         row2.pack(fill=tk.X, pady=5)
-        self.scan_btn = ttk.Button(row2, text="开始扫描", command=self.start_scan)
-        self.scan_btn.pack(side=tk.LEFT, padx=5)
 
         self.update_cache_btn = ttk.Button(row2, text="更新历史缓存", command=self.start_history_cache_update)
         self.update_cache_btn.pack(side=tk.LEFT, padx=5)
@@ -379,6 +393,13 @@ class StockMonitorApp:
         self.fund_flow_source_var = tk.StringVar(value="auto")
         self.limit_up_reason_source_var = tk.StringVar(value="auto")
 
+    def _build_scan_only_actions_row(self, parent) -> None:
+        """扫描专属动作：'开始扫描' 按钮，渲染到扫描结果 tab 内部。"""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=4)
+        self.scan_btn = ttk.Button(row, text="开始扫描", command=self.start_scan)
+        self.scan_btn.pack(side=tk.LEFT, padx=5)
+
     def _build_control_board_filter_row(self, control_frame) -> None:
         row3 = ttk.Frame(control_frame)
         row3.pack(fill=tk.X, pady=5)
@@ -397,17 +418,20 @@ class StockMonitorApp:
                 command=self.on_board_filter_changed,
             ).pack(side=tk.LEFT, padx=8)
 
+        # 扫描专属过滤变量先声明（实体控件移到扫描结果 tab）
         self.require_limit_up_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            row3,
-            text="仅显示近N日内有涨停",
-            variable=self.require_limit_up_var,
-        ).pack(side=tk.LEFT, padx=18)
-
         self.ignore_result_snapshot_var = tk.BooleanVar(value=False)
+
+    def _build_scan_only_flow_row(self, parent) -> None:
+        """扫描专属流程开关，仅 setup_result_tab 调用。"""
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(
-            row3,
-            text="忽略本地结果快照",
+            row, text="仅显示近N日内有涨停",
+            variable=self.require_limit_up_var,
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(
+            row, text="忽略本地结果快照",
             variable=self.ignore_result_snapshot_var,
         ).pack(side=tk.LEFT, padx=18)
 
@@ -503,9 +527,8 @@ class StockMonitorApp:
         self._build_control_scan_params_row(control_frame)
         self._build_control_actions_row(control_frame)
         self._build_control_board_filter_row(control_frame)
-        self._build_control_price_filter_row(control_frame)
-        # 快速过滤栏（搜索/评分≥/5日涨幅≥/放量≥/连板≥/只显示...）只对扫描结果有意义，
-        # 移到 setup_result_tab 内部，避免在涨停预测/详情等 tab 顶部干扰视线
+        # 扫描专属面板（开始扫描/扫描参数/扫描过滤/价格过滤/快速过滤）全部移到
+        # setup_result_tab 内部，顶部只保留通用的（更新缓存/查询股票/板块/历史源）
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -657,6 +680,16 @@ class StockMonitorApp:
         result_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(result_frame, text="扫描结果")
         self.result_tab = result_frame
+
+        # ---- 扫描专属面板（从顶部控制面板迁过来）----
+        # 扫描动作（开始扫描按钮）
+        self._build_scan_only_actions_row(result_frame)
+        # 扫描参数（连续天数/MA周期/近N日涨停/放量观察天数/启用放量倍数/放量倍数阈值 + 备注）
+        self._build_scan_only_params_row(result_frame)
+        # 扫描流程开关（仅显示近N日有涨停 / 忽略本地结果快照）
+        self._build_scan_only_flow_row(result_frame)
+        # 价格过滤（仅对扫描结果有意义）
+        self._build_control_price_filter_row(result_frame)
 
         action_frame = ttk.Frame(result_frame)
         action_frame.pack(fill=tk.X, pady=(0, 6))
