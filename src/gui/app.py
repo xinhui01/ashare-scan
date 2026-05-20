@@ -1098,8 +1098,6 @@ class StockMonitorApp:
             ("limit_up", "涨停"),
             ("volume_expand", "放量"),
             ("volume_expand_ratio", "放量倍数"),
-            ("big_order_amount", "大单净额"),
-            ("main_force_amount", "主力净额"),
             ("macd", "MACD"),
             ("kdj", "KDJ"),
             ("rsi", "RSI"),
@@ -3149,7 +3147,7 @@ class StockMonitorApp:
         # 异步刷新命中率统计 + 触发未回填日期的回填
         self._refresh_predict_accuracy_async(current_date)
 
-        # 启动后台预热：把所有候选股的分时 + 资金流缓存起来，方便用户后续秒开
+        # 启动后台预热：把候选股分时和详情 payload 缓起来，方便用户后续秒开
         self._start_predict_prewarm(result)
 
         # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
@@ -3171,12 +3169,12 @@ class StockMonitorApp:
                 parent=self.root,
             )
 
-    # ============== 后台预热：分时 + 资金流缓存 ==============
+    # ============== 后台预热：分时 + 详情 payload 缓存 ==============
     def _start_predict_prewarm(self, result: Dict[str, Any]) -> None:
-        """预测完成后，对所有候选股票预热分时 + 资金流缓存，让后续点击秒开。
+        """预测完成后，对所有候选股票预热分时 + 详情 payload，让后续点击秒开。
 
         - 自动去重 5 类候选的所有 code
-        - 串行执行：先分时（用户最先点的多），再资金流
+        - 串行执行：先分时，再详情 payload
         - 每个任务内部并发 4 worker，可被新预测/取消令牌打断
         """
         if not isinstance(result, dict):
@@ -3237,18 +3235,14 @@ class StockMonitorApp:
         top_codes_for_payload: List[str],
         cancel_token: CancelToken,
     ) -> None:
-        """预热 worker：分时 → 资金流 → 上层 payload (top-N，写 GUI LRU)。"""
+        """预热 worker：分时 → 上层 payload (top-N，写 GUI LRU)。"""
         total = len(codes)
         if total == 0:
             return
         fetcher = self.stock_filter.fetcher
 
         def _report_intraday(done: int, n: int, _code: str) -> None:
-            msg = f"预热分时 {done}/{n} · 资金流待跑"
-            self._post_to_ui(lambda m=msg: self.status_var.set(m))
-
-        def _report_flow(done: int, n: int, _code: str) -> None:
-            msg = f"预热资金流 {done}/{n}（分时完成）"
+            msg = f"预热分时 {done}/{n} · 详情待跑"
             self._post_to_ui(lambda m=msg: self.status_var.set(m))
 
         try:
@@ -3265,16 +3259,6 @@ class StockMonitorApp:
             if cancel_token.is_cancelled():
                 self._post_to_ui(lambda: self.status_var.set("预热已取消"))
                 return
-            flow_stat = fetcher.prewarm_fund_flow_for_codes(
-                codes,
-                days=30,
-                max_workers=4,
-                cancel_check=lambda: cancel_token.is_cancelled(),
-                progress_cb=_report_flow,
-            )
-            if cancel_token.is_cancelled():
-                self._post_to_ui(lambda: self.status_var.set("预热已取消"))
-                return
             # 底层缓存就绪后，对 top-N 跑完整 get_stock_detail + get_stock_intraday，
             # 写到 GUI LRU 缓存 —— 用户点击 top-N 候选直接秒开
             payload_stat = self._prewarm_upper_payloads(
@@ -3282,7 +3266,6 @@ class StockMonitorApp:
             )
             summary = (
                 f"预热完成 · 分时 {intraday_stat['done']-intraday_stat['failed']}/{intraday_stat['total']}"
-                f"，资金流 {flow_stat['done']-flow_stat['failed']}/{flow_stat['total']}"
                 f"，详情payload {payload_stat['done']-payload_stat['failed']}/{payload_stat['total']}"
             )
             self._post_to_ui(lambda s=summary: self.status_var.set(s))
@@ -5676,8 +5659,6 @@ class StockMonitorApp:
             "latest_amount": "加载中...",
             "five_day_return": "加载中...",
             "limit_up": "加载中...",
-            "big_order_amount": "加载中...",
-            "main_force_amount": "加载中...",
             "summary": "正在加载详情数据...",
         }
         for key, value in placeholders.items():
@@ -5760,9 +5741,6 @@ class StockMonitorApp:
             text="-" if analysis.get("five_day_return") is None else f"{analysis['five_day_return']:.2f}%"
         )
         self.detail_labels["limit_up"].config(text="是" if analysis.get("limit_up") else "否")
-        self.detail_labels["big_order_amount"].config(text=self._format_amount(analysis.get("big_order_amount")))
-        self.detail_labels["main_force_amount"].config(text=self._format_amount(analysis.get("main_force_amount")))
-
         # 技术指标
         dif = analysis.get("macd_dif")
         dea = analysis.get("macd_dea")
@@ -5935,7 +5913,8 @@ class StockMonitorApp:
         self.volume_ax.grid(True, alpha=0.2)
 
     def _draw_detail_flow_panel(self, chart_data: Dict[str, Any], analysis: Dict[str, Any]) -> None:
-        if not self._detail_flow_expanded:
+        flow_history = (analysis or {}).get("fund_flow_history") or []
+        if not self._detail_flow_expanded or not flow_history:
             self.flow_ax.set_visible(False)
             self.flow_ax.set_axis_off()
             return

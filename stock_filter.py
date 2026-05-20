@@ -1170,14 +1170,14 @@ class StockFilter:
         code = str(stock_code).strip().zfill(6)
         history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
 
-        # ---- 并行获取：历史 / 股票池 / 资金流同时发起 ----
+        # ---- 并行获取：历史 / 股票池同时发起 ----
         from concurrent.futures import ThreadPoolExecutor, as_completed
         history = preloaded_history
         universe = None
         fund_flow_df = None
 
         tasks = {}
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="detail") as pool:
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="detail") as pool:
             if history is None:
                 tasks["history"] = pool.submit(
                     self._call_with_timeout,
@@ -1189,11 +1189,6 @@ class StockFilter:
                 lambda: self.fetcher.get_all_stocks(),
                 8.0, None, f"详情股票池 {code}",
             )
-            tasks["fund_flow"] = pool.submit(
-                self._call_with_timeout,
-                lambda: self.fetcher.get_fund_flow_data(code, days=30, force_refresh=False),
-                10.0, None, f"详情资金流 {code}",
-            )
             for key, fut in tasks.items():
                 try:
                     result = fut.result()
@@ -1201,8 +1196,6 @@ class StockFilter:
                         history = result
                     elif key == "universe":
                         universe = result
-                    elif key == "fund_flow":
-                        fund_flow_df = result
                 except Exception as exc:
                     logger.debug("预取数据 %s 异常: %s", key, exc)
 
