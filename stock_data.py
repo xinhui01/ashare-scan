@@ -1406,6 +1406,127 @@ class StockDataFetcher:
             keep_mask &= ~(seal_time.isin(["", "000000", "0", "0000", "nan", "NaN", "None"]))
         return df[keep_mask].reset_index(drop=True)
 
+    def _fetch_spot_with_fallback(self) -> Optional[pd.DataFrame]:
+        """全市场实时行情快照，东财→新浪自动兜底。
+
+        东财熔断或失败时，回落到 ak.stock_zh_a_spot（新浪），并把代码列
+        归一化为不带 sh/sz/bj 前缀的 6 位形式。
+        """
+        if not _eastmoney_circuit_breaker_open():
+            try:
+                if self._log:
+                    self._log("全市场 spot 快照：东财...")
+                return _retry_ak_call(ak.stock_zh_a_spot_em)
+            except Exception as exc:
+                if self._log:
+                    self._log(f"全市场 spot 东财失败: {exc}，尝试新浪兜底")
+        try:
+            if self._log:
+                self._log("全市场 spot 快照：新浪兜底（约 30s）...")
+            df = _retry_ak_call(ak.stock_zh_a_spot)
+            if df is not None and not df.empty:
+                if "代码" in df.columns:
+                    df = df.copy()
+                    df["代码"] = (
+                        df["代码"].astype(str)
+                        .str.replace(r"^(sh|sz|bj)", "", regex=True)
+                        .str.strip().str.zfill(6)
+                    )
+                return df
+        except Exception as exc:
+            if self._log:
+                self._log(f"全市场 spot 新浪兜底也失败: {exc}")
+        return None
+
+    def _derive_limit_up_pool_from_spot(
+        self,
+        trade_date: str,
+        prev_pool_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """从全市场 spot 派生今日涨停池（东财涨停池失败时的兜底）。
+
+        步骤：
+        1. _fetch_spot_with_fallback 拿全市场快照
+        2. 按代码前缀算涨停阈值（主板 10 / 创业·科创 20 / 北交所 30）
+        3. 过滤涨幅 >= threshold - 0.3 的股票
+        4. 用 prev_pool_df 递推连板数：昨日涨停连板=N → 今日连板=N+1；
+           昨日未涨停 → 连板=1
+        5. 合成兼容 ak.stock_zt_pool_em 列名的 DataFrame
+        """
+        spot = self._fetch_spot_with_fallback()
+        if spot is None or spot.empty:
+            return pd.DataFrame()
+
+        def _threshold_for(code: str) -> float:
+            c = str(code).strip().zfill(6)
+            if c.startswith(("300", "301", "688")):
+                return 20.0
+            if c.startswith(("8", "9")):
+                # 北交所 8xx / 9xx
+                return 30.0
+            return 10.0
+
+        # 标准化代码列
+        spot = spot.copy()
+        if "代码" in spot.columns:
+            spot["代码"] = spot["代码"].astype(str).str.strip().str.zfill(6)
+        if "涨跌幅" not in spot.columns:
+            return pd.DataFrame()
+
+        rows: List[Any] = []
+        for _, row in spot.iterrows():
+            code = str(row.get("代码", "")).strip()
+            if not code:
+                continue
+            try:
+                chg = float(row.get("涨跌幅") or 0)
+            except (TypeError, ValueError):
+                continue
+            thresh = _threshold_for(code)
+            if chg < thresh - 0.3:
+                continue
+            rows.append(row)
+        if not rows:
+            return pd.DataFrame()
+
+        # 递推连板数
+        prev_lookup: Dict[str, int] = {}
+        if prev_pool_df is not None and not prev_pool_df.empty and "代码" in prev_pool_df.columns:
+            prev_pool_df = prev_pool_df.copy()
+            prev_pool_df["代码"] = prev_pool_df["代码"].astype(str).str.strip().str.zfill(6)
+            if "连板数" in prev_pool_df.columns:
+                for _, r in prev_pool_df.iterrows():
+                    c = str(r.get("代码") or "").strip()
+                    try:
+                        n = int(r.get("连板数") or 0)
+                    except (TypeError, ValueError):
+                        n = 0
+                    if c and n > 0:
+                        prev_lookup[c] = n
+
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            code = str(row.get("代码", "")).strip()
+            prev_n = prev_lookup.get(code, 0)
+            boards = prev_n + 1 if prev_n > 0 else 1
+            out.append({
+                "代码": code,
+                "名称": str(row.get("名称", "") or ""),
+                "最新价": row.get("最新价"),
+                "涨跌幅": row.get("涨跌幅"),
+                "换手率": row.get("换手率"),
+                "流通市值": row.get("流通市值"),
+                "总市值": row.get("总市值"),
+                "连板数": boards,
+                "首次封板时间": "",
+                "最后封板时间": "",
+                "炸板次数": 0,
+                "所属行业": str(row.get("所属行业", "") or ""),
+                "涨停统计": "",
+                "涨停原因": "",
+            })
+        return pd.DataFrame(out)
+
     def get_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
         """获取指定日期的涨停板池。
 
