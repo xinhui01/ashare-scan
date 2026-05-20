@@ -2832,6 +2832,28 @@ class StockFilter:
                     score -= 4
                     reasons.append(f"5d量比{vol_ratio:.1f}x但20d{vol_ratio_20:.1f}x假放量-4")
 
+        # === 历史同类形态加分：近 90 日内的连板成功次数 ===
+        occ_count, last_hit_days = _count_historical_continuation(
+            history, code, lookback_days=90,
+            threshold_fn=self._limit_up_threshold_pct,
+        )
+        if occ_count >= 3:
+            bonus = 8
+        elif occ_count >= 2:
+            bonus = 5
+        elif occ_count >= 1:
+            bonus = 2
+        else:
+            bonus = 0
+
+        if bonus > 0:
+            if last_hit_days is not None and last_hit_days <= 30:
+                bonus = min(bonus + 2, 10)
+                reasons.append(f"近90日{occ_count}次连板成功(最近{last_hit_days}日内)+{bonus}")
+            else:
+                reasons.append(f"近90日{occ_count}次连板成功+{bonus}")
+            score += bonus
+
         final_score = max(0, min(100, int(round(score))))
         return {
             "code": code,
@@ -3395,6 +3417,28 @@ class StockFilter:
         elif sent_score >= 70:
             score += 5
             reasons.append(f"情绪火爆{sent_score}+5")
+
+        # === 历史同类形态加分：近 90 日内的二波接力成功次数 ===
+        occ_count, last_hit_days = _count_historical_followthrough(
+            history, code, lookback_days=90, window=5,
+            threshold_fn=self._limit_up_threshold_pct,
+        )
+        if occ_count >= 3:
+            bonus = 8
+        elif occ_count >= 2:
+            bonus = 5
+        elif occ_count >= 1:
+            bonus = 2
+        else:
+            bonus = 0
+
+        if bonus > 0:
+            if last_hit_days is not None and last_hit_days <= 30:
+                bonus = min(bonus + 2, 10)
+                reasons.append(f"近90日{occ_count}次二波接力成功(最近{last_hit_days}日内)+{bonus}")
+            else:
+                reasons.append(f"近90日{occ_count}次二波接力成功+{bonus}")
+            score += bonus
 
         final_score = max(0, min(100, int(round(score))))
         return {
@@ -4006,6 +4050,29 @@ class StockFilter:
             elif latest_cont_rate < 25:
                 score -= 4
                 reasons.append(f"晋级率{latest_cont_rate:.0f}%-4")
+
+        # === 历史同类形态加分：近 90 日内的反包/承接成功次数 ===
+        occ_count, last_hit_days = _count_historical_wrap(
+            history, code, lookback_days=90, window=5, drop_threshold=-3.0,
+            threshold_fn=self._limit_up_threshold_pct,
+        )
+        if occ_count >= 3:
+            bonus = 8
+        elif occ_count >= 2:
+            bonus = 5
+        elif occ_count >= 1:
+            bonus = 2
+        else:
+            bonus = 0
+
+        if bonus > 0:
+            _label = "反包" if pattern_kind == "wrap" else "承接"
+            if last_hit_days is not None and last_hit_days <= 30:
+                bonus = min(bonus + 2, 10)
+                reasons.append(f"近90日{occ_count}次{_label}成功(最近{last_hit_days}日内)+{bonus}")
+            else:
+                reasons.append(f"近90日{occ_count}次{_label}成功+{bonus}")
+            score += bonus
 
         final_score = max(0, min(100, int(round(score))))
 
