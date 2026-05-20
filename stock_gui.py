@@ -1460,13 +1460,56 @@ class StockMonitorApp:
         self._predict_best_bucket_labels["cont"] = cont_best
 
         # 1进2 / 2进3 / 3进4 / 4进5 / 5进6+ 子类别命中率（独立统计，不影响主类别）
+        # 5 行 × 4 列 grid：子类别名 / 昨日 / 近20d / 最优分数段
         cont_sub_frame = ttk.Frame(cont_tab)
-        cont_sub_frame.pack(side=tk.TOP, fill=tk.X)
-        for sub_key in ("cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus"):
-            sub_lbl = ttk.Label(cont_sub_frame, text="-", foreground="#666",
-                                anchor=tk.W, padding=(12, 1))
-            sub_lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self._predict_stat_labels[sub_key] = sub_lbl
+        cont_sub_frame.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(2, 4))
+        # 4 列均匀拉伸
+        for col_idx in range(4):
+            cont_sub_frame.columnconfigure(col_idx, weight=1, uniform="cont_sub")
+
+        # 表头
+        header_font = ("", 9)  # 比默认小一点
+        ttk.Label(cont_sub_frame, text="", font=header_font).grid(
+            row=0, column=0, sticky="w", padx=(8, 0))
+        ttk.Label(cont_sub_frame, text="昨日", foreground="#888",
+                  font=header_font, anchor=tk.W).grid(row=0, column=1, sticky="w")
+        ttk.Label(cont_sub_frame, text="近20d", foreground="#888",
+                  font=header_font, anchor=tk.W).grid(row=0, column=2, sticky="w")
+        ttk.Label(cont_sub_frame, text="最优分数段", foreground="#888",
+                  font=header_font, anchor=tk.W).grid(row=0, column=3, sticky="w")
+
+        # 子类别名 → 显示文案
+        _SUB_DISPLAY = {
+            "cont_1to2": "1进2", "cont_2to3": "2进3", "cont_3to4": "3进4",
+            "cont_4to5": "4进5", "cont_5plus": "5进6+",
+        }
+        # 用于刷新最优段 Label 的字典；Label 创建后 configure(text=..., foreground=...)
+        self._predict_subcategory_best_labels: Dict[str, ttk.Label] = {}
+        # 拆开"昨日"和"近20d"两列，原来的 self._predict_stat_labels[sub_key] 只放一个
+        # Label 不够，现在改放 (yest_label, recent_label) 元组
+        self._predict_subcategory_stat_labels: Dict[str, Tuple[ttk.Label, ttk.Label]] = {}
+
+        for row_idx, sub_key in enumerate(
+            ("cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus"), start=1,
+        ):
+            name = _SUB_DISPLAY[sub_key]
+            ttk.Label(cont_sub_frame, text=name, foreground="#444",
+                      anchor=tk.W, padding=(8, 1)).grid(
+                row=row_idx, column=0, sticky="w")
+            yest_lbl = ttk.Label(cont_sub_frame, text="-", foreground="#444",
+                                 anchor=tk.W, padding=(0, 1))
+            yest_lbl.grid(row=row_idx, column=1, sticky="w")
+            recent_lbl = ttk.Label(cont_sub_frame, text="-", foreground="#444",
+                                   anchor=tk.W, padding=(0, 1))
+            recent_lbl.grid(row=row_idx, column=2, sticky="w")
+            best_lbl = ttk.Label(cont_sub_frame, text="-", foreground="#888",
+                                 anchor=tk.W, padding=(0, 1))
+            best_lbl.grid(row=row_idx, column=3, sticky="w")
+            self._predict_subcategory_stat_labels[sub_key] = (yest_lbl, recent_lbl)
+            self._predict_subcategory_best_labels[sub_key] = best_lbl
+            # 兼容旧 _predict_stat_labels：让 sub_key 指向 recent_lbl（"近20d"列），
+            # 这样 _apply_predict_accuracy 现有 sub_key 分支的 fallback 仍能工作
+            self._predict_stat_labels[sub_key] = recent_lbl
         cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
                      "seal_time", "breaks", "turnover", "score", "result", "reasons")
         self._predict_cont_tree = ttk.Treeview(
@@ -3670,7 +3713,10 @@ class StockMonitorApp:
             # 提前拉取每类的分数段命中率（在 worker 线程做 DB 查询，避免 UI 卡顿）
             # 用于 _apply_predict_accuracy 后续计算"历史最优段"
             bucket_rates_by_cat: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
-            for cat in ("cont", "first", "fresh", "wrap", "trend"):
+            for cat in (
+                "cont", "first", "fresh", "wrap", "trend",
+                "cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus",
+            ):
                 try:
                     bucket_rates_by_cat[cat] = prediction_accuracy_service.get_score_bucket_rates(
                         category=cat, lookback_dates=20, min_samples=5,
@@ -3736,14 +3782,25 @@ class StockMonitorApp:
             y_str = _fmt_pair(y_data)
             name = category_names.get(cat, cat)
             if cat in sub_keys:
-                # 子类别紧凑格式：1进2 · 昨 60.0% (3/5) | 近20d 42.1% (8/19)
-                if buyable <= 0:
-                    txt = f"{name}: 昨{y_str} | 近-"
-                else:
-                    txt = (
-                        f"{name}: 昨{y_str} | "
-                        f"近{dates}d {rate:.1f}% ({hit}/{buyable})"
-                    )
+                # 子类别走 grid 表格，由独立 (yest_lbl, recent_lbl) 渲染
+                yest_lbl, recent_lbl = self._predict_subcategory_stat_labels.get(
+                    cat, (None, None)
+                )
+                if yest_lbl is not None:
+                    try:
+                        yest_lbl.configure(text=y_str)
+                    except Exception:
+                        pass
+                if recent_lbl is not None:
+                    try:
+                        if buyable <= 0:
+                            recent_lbl.configure(text="-")
+                        else:
+                            recent_lbl.configure(text=f"{rate:.1f}% ({hit}/{buyable})")
+                    except Exception:
+                        pass
+                # 继续循环；不要走到 lbl.configure 的旧路径
+                continue
             elif buyable <= 0:
                 txt = (
                     f"{name} · 昨日命中率 {y_str} · 历史近{dates}日: "
@@ -3762,6 +3819,9 @@ class StockMonitorApp:
 
         # 计算每个主类别的"历史最优分数段"并刷新黄色提示标签
         self._refresh_predict_best_bucket_labels()
+
+        # 计算 5 个 cont 子类别各自的"最优分数段"并刷新（含颜色编码）
+        self._refresh_predict_subcategory_best_buckets()
 
         # 当前日期的逐行结果（用于 result 列着色）
         if results_map:
@@ -3827,6 +3887,59 @@ class StockMonitorApp:
             except Exception:
                 pass
         self._predict_best_buckets = best_map
+
+    def _find_best_bucket_for_category(
+        self, cat: str,
+    ) -> Optional[Tuple[Tuple[int, int], Dict[str, Any]]]:
+        """从 self._predict_bucket_rates_cache 取 cat 的所有 bucket rates，
+        返回 eligible=True 中 rate 最大的桶，None 表示无 eligible 桶。
+        同 rate 时取分数段更高的（高分往往更稳）。
+        """
+        rates = self._predict_bucket_rates_cache.get(cat) or {}
+        best: Optional[Tuple[Tuple[int, int], Dict[str, Any]]] = None
+        for (lo, hi), info in rates.items():
+            if not info.get("eligible"):
+                continue
+            if best is None:
+                best = ((lo, hi), info)
+                continue
+            b_rate = best[1].get("rate", 0)
+            cur_rate = info.get("rate", 0)
+            if cur_rate > b_rate or (cur_rate == b_rate and lo > best[0][0]):
+                best = ((lo, hi), info)
+        return best
+
+    def _refresh_predict_subcategory_best_buckets(self) -> None:
+        """刷新 5 个 cont 子类别（cont_1to2/.../cont_5plus）顶部的"最优分数段"Label。
+        使用 self._predict_bucket_rates_cache 里 worker 预取的 rates。
+        按 rate 着色：≥40 绿，25-40 黄，<25 红，无数据/不足灰。
+        """
+        labels = getattr(self, "_predict_subcategory_best_labels", {}) or {}
+        if not labels:
+            return
+        for cat, lbl in labels.items():
+            best = self._find_best_bucket_for_category(cat)
+            if best is None:
+                try:
+                    lbl.configure(text="-（样本不足）", foreground="#888")
+                except Exception:
+                    pass
+                continue
+            (lo, hi), info = best
+            rate = float(info.get("rate") or 0.0)
+            hit = int(info.get("hit") or 0)
+            buyable = int(info.get("buyable") or 0)
+            if rate >= 40.0:
+                fg = "#1b5e20"  # 绿
+            elif rate >= 25.0:
+                fg = "#9c7a00"  # 黄
+            else:
+                fg = "#c62828"  # 红
+            txt = f"{lo}-{hi}: {rate:.0f}% ({hit}/{buyable})"
+            try:
+                lbl.configure(text=txt, foreground=fg)
+            except Exception:
+                pass
 
     def _open_predict_compare_window(self) -> None:
         """弹窗：今日实际涨停 与 上次预测候选 的命中对比。"""
