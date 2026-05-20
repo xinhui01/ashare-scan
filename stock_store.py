@@ -1117,55 +1117,12 @@ def list_limit_up_prediction_dates() -> List[str]:
     return [str(row["trade_date"]) for row in rows if row and row["trade_date"]]
 
 
-def save_limit_up_compare_record(payload: Dict[str, Any]) -> None:
-    """按 today_date 持久化每次涨停对比结果到 `limit_up_compares` 表。
-
-    `payload` 应包含 `today_date`、`yesterday_date`、`compare_days` 等字段。
-    同一日期重复对比会覆盖之前的记录（PK 为 today_date）。
-    """
-    if not isinstance(payload, dict):
-        return
-    today_date = str(payload.get("today_date") or "").strip()
-    if not today_date:
-        return
-    yesterday_date = str(payload.get("yesterday_date") or "").strip()
-    try:
-        compare_days = int(payload.get("compare_days", 2) or 2)
-    except (TypeError, ValueError):
-        compare_days = 2
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        payload_json = json.dumps(payload, ensure_ascii=False, default=str)
-    except Exception:
-        logger.exception("序列化涨停对比结果失败")
-        return
-
-    def _write():
-        with _connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO limit_up_compares(
-                    today_date, yesterday_date, compare_days, payload_json, saved_at
-                )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(today_date) DO UPDATE SET
-                    yesterday_date=excluded.yesterday_date,
-                    compare_days=excluded.compare_days,
-                    payload_json=excluded.payload_json,
-                    saved_at=excluded.saved_at
-                """,
-                (today_date, yesterday_date, int(compare_days), payload_json, now),
-            )
-
-    try:
-        with _DB_WRITE_LOCK:
-            _retry_locked(_write)
-    except Exception:
-        logger.exception("保存涨停对比历史记录失败")
-
-
 def load_limit_up_compare_by_date(today_date: str) -> Optional[Dict[str, Any]]:
-    """按今日日期读取已保存的涨停对比结果，未找到返回 None。"""
+    """按今日日期读取已保存的涨停对比结果，未找到返回 None。
+
+    注：涨停对比 tab 已下线，但 `limit_up_compares` 表中的历史数据仍被
+    涨停预测 tab 的"命中对比"功能使用（取 T+1 实际涨停名单），所以保留读函数。
+    """
     td = str(today_date or "").strip()
     if not td or not _DB_PATH.is_file():
         return None
@@ -1189,25 +1146,6 @@ def load_limit_up_compare_by_date(today_date: str) -> Optional[Dict[str, Any]]:
     except Exception:
         logger.exception("解析涨停对比历史记录失败")
         return None
-
-
-def list_limit_up_compare_dates() -> List[str]:
-    """列出所有已保存涨停对比的今日日期，按日期降序返回。"""
-    if not _DB_PATH.is_file():
-        return []
-
-    def _read():
-        with _connect() as conn:
-            return conn.execute(
-                "SELECT today_date FROM limit_up_compares ORDER BY today_date DESC"
-            ).fetchall()
-
-    try:
-        rows = _retry_locked(_read)
-    except Exception:
-        logger.exception("列出涨停对比历史日期失败")
-        return []
-    return [str(row["today_date"]) for row in rows if row and row["today_date"]]
 
 
 # ============== 涨停预测准确率（limit_up_prediction_accuracy） ==============

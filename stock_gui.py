@@ -42,33 +42,23 @@ import stock_store
 from stock_filter import StockFilter
 from stock_data import clear_history_data, clear_universe_data
 from llm_client import (
-    DEFAULT_MODEL as LLM_DEFAULT_MODEL,
     LlmConfigError,
-    LlmRequestError,
-    has_api_key as llm_has_api_key,
     save_api_key as llm_save_api_key,
-)
-from llm_theme_clustering import (
-    cluster_themes as llm_cluster_themes,
-    load_cached_themes as llm_load_cached_themes,
 )
 from stock_store import (
     backup_database,
     cleanup_all,
     ensure_store_ready,
     list_backups,
-    list_limit_up_compare_dates,
     list_limit_up_prediction_dates,
     load_app_config,
     load_last_limit_up_prediction,
     load_latest_scan_snapshot,
-    load_limit_up_compare_by_date,
     load_limit_up_prediction_by_date,
     load_scan_snapshot,
     reset_all_connections,
     restore_database,
     save_app_config,
-    save_limit_up_compare_record,
     save_scan_snapshot,
 )
 
@@ -170,7 +160,7 @@ class StockMonitorApp:
         self.result_column_vars: Dict[str, tk.BooleanVar] = {}
         self.result_column_order: List[str] = []
         self.default_result_display_columns: tuple[str, ...] = ()
-        # GUI 设置统一存储在 SQLite app_config 表中（key: result_column_layout / board_filter_layout / app_settings / limit_up_compare_snapshot）
+        # GUI 设置统一存储在 SQLite app_config 表中（key: result_column_layout / board_filter_layout / app_settings）
         self._main_thread_id = threading.get_ident()
         self._ui = UIDispatcher(self.root)
         self._log_drainer = LogDrainer(
@@ -187,7 +177,6 @@ class StockMonitorApp:
         self._load_board_filter_layout()
         self.apply_result_display_columns(save=False)
         self._load_last_results()
-        self._load_last_limit_up_compare()
         self._load_last_limit_up_prediction()
         self._log_drainer.start()
 
@@ -521,7 +510,6 @@ class StockMonitorApp:
         self.setup_detail_tab()
         self.setup_intraday_tab()
         self.setup_result_tab()
-        self.setup_limit_up_compare_tab()
         self.setup_log_tab()
 
         # 构建 tab 注册表 + 应用用户配置的可见性（默认只显示预测/详情/分时）
@@ -568,7 +556,6 @@ class StockMonitorApp:
             ("detail", self.detail_tab_frame, "股票详情", False),
             ("intraday", self.intraday_tab, "分时", False),
             ("result", self.result_tab, "扫描结果", True),
-            ("compare", self.compare_tab, "涨停对比", True),
             ("log", self.log_tab, "运行日志", False),
         ]
 
@@ -797,82 +784,7 @@ class StockMonitorApp:
         self.stock_filter.set_fund_flow_source_preference(self.fund_flow_source_var.get())
         self.stock_filter.set_limit_up_reason_source_preference(self.limit_up_reason_source_var.get())
 
-    def _save_limit_up_compare_snapshot(self, result: Dict[str, Any]) -> None:
-        payload = {
-            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "result": result,
-        }
-        save_app_config("limit_up_compare_snapshot", payload)
-        try:
-            save_limit_up_compare_record(result)
-        except Exception:
-            pass
-
-    def _load_last_limit_up_compare(self) -> None:
-        payload = load_app_config("limit_up_compare_snapshot")
-        self._refresh_compare_history_dates()
-        if not isinstance(payload, dict):
-            return
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            return
-        today_date = str(result.get("today_date") or "").strip()
-        yesterday_date = str(result.get("yesterday_date") or "").strip()
-        compare_days = int(result.get("compare_days", 2) or 2)
-        if today_date:
-            self._zt_today_var.set(today_date)
-            if hasattr(self, "_zt_history_var"):
-                self._zt_history_var.set(today_date)
-        if yesterday_date:
-            self._zt_yesterday_var.set(yesterday_date)
-        self._zt_compare_days_var.set(str(max(2, compare_days)))
-        self._apply_limit_up_compare(result, persist=False, status_message="已从本地恢复涨停对比")
-
-    def _refresh_compare_history_dates(self, select: Optional[str] = None) -> None:
-        """刷新涨停对比的历史日期下拉框；可选地选中指定日期。"""
-        if not hasattr(self, "_zt_history_combo"):
-            return
-        try:
-            dates = list_limit_up_compare_dates()
-        except Exception:
-            dates = []
-        self._zt_history_combo["values"] = dates
-        if select and select in dates:
-            self._zt_history_var.set(select)
-        elif not self._zt_history_var.get() and dates:
-            self._zt_history_var.set(dates[0])
-
-    def _on_compare_history_selected(self, _event=None) -> None:
-        today_date = (self._zt_history_var.get() or "").strip()
-        if not today_date:
-            return
-        result = load_limit_up_compare_by_date(today_date)
-        if not isinstance(result, dict):
-            self._zt_status_label.config(text=f"无 {today_date} 的历史对比")
-            return
-        yesterday_date = str(result.get("yesterday_date") or "").strip()
-        compare_days = int(result.get("compare_days", 2) or 2)
-        self._zt_today_var.set(today_date)
-        if yesterday_date:
-            self._zt_yesterday_var.set(yesterday_date)
-        self._zt_compare_days_var.set(str(max(2, compare_days)))
-        self._apply_limit_up_compare(
-            result, persist=False, status_message=f"已加载 {today_date} 的涨停对比历史",
-        )
-
-    def _refresh_selected_compare_date(self) -> None:
-        """重新拉取下拉中选中的历史日期对比数据，覆盖原记录。"""
-        today_date = (self._zt_history_var.get() or "").strip()
-        if not today_date:
-            today_date = (self._zt_today_var.get() or "").strip()
-        if not today_date:
-            self._zt_status_label.config(text="请先选择要刷新的日期")
-            return
-        self._zt_today_var.set(today_date)
-        # 让 _start_limit_up_compare 自行根据 compare_days 决定是否使用 yesterday
-        self._start_limit_up_compare()
-
-    # ============== AI 题材聚类（NVIDIA NIM）==============
+    # ============== NVIDIA NIM API Key 配置 ==============
     def _open_nim_key_dialog(self) -> None:
         """简易对话框：输入并保存 NVIDIA NIM API Key。"""
         from llm_client import _resolve_api_key
@@ -897,157 +809,6 @@ class StockMonitorApp:
             messagebox.showinfo("已保存", "NIM API Key 已保存到本地配置。", parent=self.root)
         except Exception as e:
             messagebox.showerror("保存失败", f"无法保存 API Key: {e}", parent=self.root)
-
-    def _start_ai_theme_clustering(self) -> None:
-        """从当前涨停对比结果里提取今日涨停股，调用 LLM 聚类题材。"""
-        if not llm_has_api_key():
-            messagebox.showwarning(
-                "未配置 API Key",
-                "请先点击「设置 NIM Key」配置 NVIDIA NIM API Key。",
-                parent=self.root,
-            )
-            return
-        if self._zt_compare_result is None:
-            messagebox.showinfo(
-                "无数据",
-                "请先点击「获取涨停对比」加载今日涨停股，再做 AI 题材聚类。",
-                parent=self.root,
-            )
-            return
-        today_date = str(self._zt_compare_result.get("today_date") or "").strip()
-        records = self._zt_compare_result.get("today_classified") or []
-        if not today_date or not records:
-            messagebox.showinfo("无数据", "今日涨停股清单为空。", parent=self.root)
-            return
-
-        self._zt_status_label.config(text=f"AI 题材聚类中（{today_date}，{len(records)} 只）...")
-        self.status_var.set("AI 题材聚类中...")
-
-        self._start_background_job(
-            self._load_ai_theme_clustering,
-            name="ai-theme-cluster",
-            args=(today_date, list(records)),
-        )
-
-    def _load_ai_theme_clustering(
-        self,
-        today_date: str,
-        records: List[Dict[str, Any]],
-        cancel_token: CancelToken,
-    ) -> None:
-        try:
-            # 先看缓存
-            cached = llm_load_cached_themes(today_date)
-            if cached is not None:
-                if cancel_token.is_cancelled():
-                    return
-                self._post_to_ui(
-                    lambda r=cached: self._apply_ai_theme_clustering(r, from_cache=True)
-                )
-                return
-
-            # 拉每只票的入选理由
-            stocks: List[Dict[str, Any]] = []
-            fetcher = self.stock_filter.fetcher
-            for rec in records:
-                if cancel_token.is_cancelled():
-                    return
-                code = str(rec.get("code") or "").strip().zfill(6)
-                if not code:
-                    continue
-                reason = str(rec.get("limit_up_reason") or "").strip()
-                if not reason:
-                    try:
-                        reason = fetcher.get_limit_up_reason(code, today_date, stock_name=rec.get("name", ""))
-                    except Exception:
-                        reason = ""
-                if not reason:
-                    reason = str(rec.get("strong_tag") or "").strip()
-                stocks.append({
-                    "code": code,
-                    "name": rec.get("name", ""),
-                    "industry": rec.get("industry", ""),
-                    "reason": reason,
-                    "consecutive_boards": rec.get("consecutive_boards") or 1,
-                })
-            if cancel_token.is_cancelled():
-                return
-
-            result = llm_cluster_themes(
-                stocks,
-                trade_date=today_date,
-                use_cache=False,
-            )
-            if cancel_token.is_cancelled():
-                return
-            self._post_to_ui(lambda r=result: self._apply_ai_theme_clustering(r))
-        except LlmConfigError as e:
-            err = str(e)
-            self._post_to_ui(
-                lambda: self._zt_status_label.config(text=f"AI 聚类失败：{err}")
-            )
-        except LlmRequestError as e:
-            err = str(e)
-            self._post_to_ui(
-                lambda: self._zt_status_label.config(text=f"AI 聚类失败：{err[:80]}")
-            )
-        except Exception as e:
-            err = str(e)
-            self._post_to_ui(
-                lambda: self._zt_status_label.config(text=f"AI 聚类异常：{err[:80]}")
-            )
-
-    def _apply_ai_theme_clustering(
-        self,
-        result: Dict[str, Any],
-        *,
-        from_cache: bool = False,
-    ) -> None:
-        themes = result.get("themes") or []
-        market_summary = str(result.get("market_summary") or "").strip()
-        model = str(result.get("model") or LLM_DEFAULT_MODEL)
-        td = str(result.get("trade_date") or "").strip()
-        suffix = "（缓存）" if from_cache else ""
-
-        # 构造代码 → 名称映射，便于在题材里展示名字
-        code_to_name: Dict[str, str] = {}
-        if self._zt_compare_result is not None:
-            for rec in (self._zt_compare_result.get("today_classified") or []):
-                code = str(rec.get("code") or "").strip().zfill(6)
-                if code:
-                    code_to_name[code] = str(rec.get("name") or "")
-
-        self._zt_summary_text.config(state=tk.NORMAL)
-        self._zt_summary_text.insert(tk.END, "\n" + "=" * 36 + "\n")
-        self._zt_summary_text.insert(tk.END, f"  🤖 AI 题材聚类 {td}{suffix}\n")
-        self._zt_summary_text.insert(tk.END, f"  模型：{model}\n")
-        self._zt_summary_text.insert(tk.END, "=" * 36 + "\n")
-        if market_summary:
-            self._zt_summary_text.insert(tk.END, f"\n概览：{market_summary}\n")
-        if not themes:
-            self._zt_summary_text.insert(tk.END, "\n（未识别出有效题材）\n")
-        for t in themes:
-            name = str(t.get("name") or "?")
-            codes = list(t.get("codes") or [])
-            core = str(t.get("core_concept") or "").strip()
-            leaders = list(t.get("leaders") or [])
-            self._zt_summary_text.insert(tk.END, f"\n· {name}（{len(codes)}只）")
-            if core:
-                self._zt_summary_text.insert(tk.END, f" — {core}")
-            self._zt_summary_text.insert(tk.END, "\n")
-            for c in codes[:12]:
-                tag = " 🔥" if c in leaders else ""
-                self._zt_summary_text.insert(
-                    tk.END, f"   {c} {code_to_name.get(c, '')}{tag}\n"
-                )
-            if len(codes) > 12:
-                self._zt_summary_text.insert(tk.END, f"   …还有 {len(codes) - 12} 只\n")
-        self._zt_summary_text.config(state=tk.DISABLED)
-        self._zt_summary_text.see(tk.END)
-        self._zt_status_label.config(
-            text=f"AI 题材聚类完成（{len(themes)} 个题材）"
-        )
-        self.status_var.set(f"AI 题材聚类完成: {len(themes)} 题材")
 
     def _load_last_limit_up_prediction(self) -> None:
         payload = load_last_limit_up_prediction()
@@ -1456,293 +1217,17 @@ class StockMonitorApp:
         self.intraday_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._draw_intraday_loading("点击详情页 K 线打开分时")
 
-    # ================= 涨停对比 Tab =================
-    def setup_limit_up_compare_tab(self):
-        compare_frame = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(compare_frame, text="涨停对比")
-        self.compare_tab = compare_frame
-
-        style = ttk.Style()
-        style.configure("ZT.Treeview", rowheight=24)
-        style.map(
-            "ZT.Treeview",
-            background=[("selected", "#2f6fd6")],
-            foreground=[("selected", "#ffffff")],
-        )
-
-        # ---- 操作栏 ----
-        action_bar = ttk.Frame(compare_frame)
-        action_bar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(action_bar, text="获取涨停对比", command=self._start_limit_up_compare).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="今日:").pack(side=tk.LEFT, padx=(12, 2))
-        self._zt_today_var = tk.StringVar(value=datetime.now().strftime("%Y%m%d"))
-        ttk.Entry(action_bar, textvariable=self._zt_today_var, width=10).pack(side=tk.LEFT)
-        ttk.Button(
-            action_bar, text="今天", width=5,
-            command=self._zt_fill_today_and_prev,
-        ).pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Label(action_bar, text="昨日:").pack(side=tk.LEFT, padx=(8, 2))
-        self._zt_yesterday_var = tk.StringVar()
-        ttk.Entry(action_bar, textvariable=self._zt_yesterday_var, width=10).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="对比天数:").pack(side=tk.LEFT, padx=(10, 2))
-        self._zt_compare_days_var = tk.StringVar(value="2")
-        ttk.Entry(action_bar, textvariable=self._zt_compare_days_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(>2 时自动回看最近N个交易日)").pack(side=tk.LEFT, padx=4)
-        ttk.Button(
-            action_bar, text="AI 聚类题材",
-            command=self._start_ai_theme_clustering,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            action_bar, text="设置 NIM Key",
-            command=self._open_nim_key_dialog,
-        ).pack(side=tk.LEFT, padx=(4, 0))
-        self._zt_status_label = ttk.Label(action_bar, text="")
-        self._zt_status_label.pack(side=tk.RIGHT, padx=8)
-
-        # 历史记录选择 + 刷新此日期
-        ttk.Button(
-            action_bar, text="刷新此日期",
-            command=self._refresh_selected_compare_date,
-        ).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Label(action_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
-        self._zt_history_var = tk.StringVar(value="")
-        self._zt_history_combo = ttk.Combobox(
-            action_bar, textvariable=self._zt_history_var,
-            width=12, state="readonly", values=(),
-        )
-        self._zt_history_combo.pack(side=tk.RIGHT)
-        self._zt_history_combo.bind(
-            "<<ComboboxSelected>>", self._on_compare_history_selected,
-        )
-
-        # ---- 主区域：左侧摘要 + 右侧表格 ----
-        body = ttk.PanedWindow(compare_frame, orient=tk.HORIZONTAL)
-        body.pack(fill=tk.BOTH, expand=True)
-
-        # 左侧：摘要面板
-        summary_frame = ttk.LabelFrame(body, text="对比摘要 + 形态分布", padding="6")
-        self._zt_summary_text = scrolledtext.ScrolledText(summary_frame, width=42, height=30, wrap=tk.WORD)
-        self._zt_summary_text.pack(fill=tk.BOTH, expand=True)
-        self._zt_summary_text.insert(tk.END, "点击「获取涨停对比」开始分析\n\n"
-            "分析每只涨停股的技术形态:\n"
-            "  - 回踩MA5涨停: 前日触及五日线后反弹\n"
-            "  - 超跌反弹涨停: 下跌趋势中突然涨停\n"
-            "  - 趋势加速涨停: 均线多头中涨停加速\n"
-            "  - 高位连板: 连续涨停\n"
-            "  - 断板反包: 近期涨停被打掉后今日反包阴线\n"
-            "  - 突破平台涨停: 横盘整理后突破\n"
-            "  - 首板低位涨停: 低位首次涨停\n")
-        self._zt_summary_text.config(state=tk.DISABLED)
-        body.add(summary_frame, weight=2)
-
-        # 右侧：表格区
-        table_frame = ttk.Frame(body)
-        self._zt_table_nb = ttk.Notebook(table_frame)
-        self._zt_table_nb.pack(fill=tk.BOTH, expand=True)
-
-        # 今日涨停形态分类 Tab（核心表格）
-        pattern_tab = ttk.Frame(self._zt_table_nb)
-        self._zt_table_nb.add(pattern_tab, text="今日涨停形态分类")
-        zt_pattern_cols = ("code", "name", "industry", "limit_up_reason", "strong_tag", "pattern", "change_pct", "close",
-                           "burst", "dist_ma5", "trend_10d", "pos_60d", "detail")
-        self._zt_pattern_tree = ttk.Treeview(
-            pattern_tab,
-            columns=zt_pattern_cols,
-            show="headings",
-            height=22,
-            style="ZT.Treeview",
-        )
-        for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "limit_up_reason": ("涨停原因", 130), "strong_tag": ("强势标签", 150),
-            "pattern": ("技术形态", 110), "change_pct": ("涨跌幅%", 70), "close": ("最新价", 70),
-            "burst": ("放量倍数", 80),
-            "dist_ma5": ("距MA5%", 70), "trend_10d": ("10日涨幅%", 80),
-            "pos_60d": ("60日分位%", 80), "detail": ("形态说明", 220),
-        }.items():
-            self._zt_pattern_tree.heading(col, text=heading)
-            left_cols = {"limit_up_reason", "strong_tag", "detail"}
-            self._zt_pattern_tree.column(col, width=w, anchor=tk.W if col in left_cols else tk.CENTER)
-        sb_p = ttk.Scrollbar(pattern_tab, orient=tk.VERTICAL, command=self._zt_pattern_tree.yview)
-        self._zt_pattern_tree.configure(yscrollcommand=sb_p.set)
-        sb_p.pack(side=tk.RIGHT, fill=tk.Y)
-        self._zt_pattern_tree.pack(fill=tk.BOTH, expand=True)
-        self._zt_pattern_tree.bind("<<TreeviewSelect>>", self.on_zt_stock_select)
-        self._zt_pattern_tree.bind("<Double-1>", self.on_zt_stock_double_click)
-        # 行标签色
-        self._zt_pattern_tree.tag_configure("pat_ma5", background="#e8f5e9", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_oversold", background="#fff3e0", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_trend", background="#e3f2fd", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_streak", background="#fce4ec", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_breakout", background="#f3e5f5", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_lowpos", background="#e0f7fa", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_burst", background="#ffe9d6", foreground="#1f1f1f")
-        self._zt_pattern_tree.tag_configure("pat_wrap", background="#ffcdd2", foreground="#1f1f1f")
-
-        # 昨日首板今日表现 Tab
-        yest_tab = ttk.Frame(self._zt_table_nb)
-        self._zt_yest_tab = yest_tab
-        self._zt_table_nb.add(yest_tab, text="昨日首板今日表现")
-        zt_cols_yest = ("code", "name", "industry", "limit_up_reason", "strong_tag", "pattern", "today_chg", "close", "still_zt", "status")
-        self._zt_yest_tree = ttk.Treeview(
-            yest_tab,
-            columns=zt_cols_yest,
-            show="headings",
-            height=22,
-            style="ZT.Treeview",
-        )
-        for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "limit_up_reason": ("涨停原因", 130), "strong_tag": ("强势标签", 150),
-            "pattern": ("昨日形态", 110), "today_chg": ("今日涨跌%", 80), "close": ("最新价", 70),
-            "still_zt": ("继续涨停", 70), "status": ("状态", 70),
-        }.items():
-            self._zt_yest_tree.heading(col, text=heading)
-            left_cols = {"limit_up_reason", "strong_tag"}
-            self._zt_yest_tree.column(col, width=w, anchor=tk.W if col in left_cols else tk.CENTER)
-        sb2 = ttk.Scrollbar(yest_tab, orient=tk.VERTICAL, command=self._zt_yest_tree.yview)
-        self._zt_yest_tree.configure(yscrollcommand=sb2.set)
-        sb2.pack(side=tk.RIGHT, fill=tk.Y)
-        self._zt_yest_tree.pack(fill=tk.BOTH, expand=True)
-        self._zt_yest_tree.bind("<<TreeviewSelect>>", self.on_zt_stock_select)
-        self._zt_yest_tree.bind("<Double-1>", self.on_zt_stock_double_click)
-
-        body.add(table_frame, weight=4)
-
-        self._zt_compare_thread = None
-        self._zt_compare_result: Optional[Dict[str, Any]] = None
-
-    _ZT_PATTERN_TAG_MAP = {
-        "暴量涨停": "pat_burst",
-        "回踩MA5涨停": "pat_ma5",
-        "超跌反弹涨停": "pat_oversold",
-        "趋势加速涨停": "pat_trend",
-        "高位连板": "pat_streak",
-        "断板反包": "pat_wrap",
-        "突破平台涨停": "pat_breakout",
-        "首板低位涨停": "pat_lowpos",
-    }
-
-    def _zt_fill_today_and_prev(self) -> None:
-        """一键填好「今日 = 今天」「昨日 = 上一个交易日」。
-
-        优先使用真实交易日历（节假日感知），日历不可用时退回到周末过滤。
-        """
-        today = datetime.now().date()
-        cal = _get_trade_calendar()
-        try:
-            prev = _previous_trading_day(today, cal)
-            prev_str = prev.strftime("%Y%m%d")
-        except Exception:
-            prev_str = self._estimate_yesterday(today.strftime("%Y%m%d"))
-        self._zt_today_var.set(today.strftime("%Y%m%d"))
-        self._zt_yesterday_var.set(prev_str)
-
-    def _estimate_yesterday(self, today_str: str) -> str:
-        from datetime import timedelta
-        try:
-            d = datetime.strptime(today_str.strip(), "%Y%m%d").date()
-        except (ValueError, TypeError):
-            d = datetime.now().date()
-        d -= timedelta(days=1)
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-        return d.strftime("%Y%m%d")
-
-    def _start_limit_up_compare(self):
-        if self._zt_compare_thread is not None and self._zt_compare_thread.is_alive():
+    def _refresh_predict_display_if_ready(self):
+        """顶部价格/板块筛选变化时同步刷新涨停预测表（如已有预测结果）。"""
+        if not getattr(self, "_predict_lists", None):
             return
-        today = self._zt_today_var.get().strip()
-        if not today:
-            today = datetime.now().strftime("%Y%m%d")
-            self._zt_today_var.set(today)
         try:
-            compare_days = max(2, min(int(self._zt_compare_days_var.get().strip() or "2"), 15))
-        except ValueError:
-            compare_days = 2
-        self._zt_compare_days_var.set(str(compare_days))
-        yesterday = self._zt_yesterday_var.get().strip()
-        if compare_days <= 2 and not yesterday:
-            yesterday = self._estimate_yesterday(today)
-            self._zt_yesterday_var.set(yesterday)
-
-        self._zt_summary_text.config(state=tk.NORMAL)
-        self._zt_summary_text.delete("1.0", tk.END)
-        if compare_days > 2:
-            self._zt_summary_text.insert(tk.END, f"正在获取截至 {today} 的最近 {compare_days} 个交易日涨停对比...\n")
-        else:
-            self._zt_summary_text.insert(tk.END, f"正在获取 {today} vs {yesterday} 涨停数据...\n")
-        self._zt_summary_text.config(state=tk.DISABLED)
-        self._zt_status_label.config(text="获取涨停池...")
-        self.status_var.set("正在获取涨停对比...")
-
-        self._zt_compare_thread, _ = self._start_background_job(
-            self._load_limit_up_compare,
-            name="limit-up-compare",
-            args=(today, yesterday, compare_days),
-        )
-
-    def _load_limit_up_compare(self, today: str, yesterday: str, compare_days: int, cancel_token: CancelToken):
-        try:
-            if cancel_token.is_cancelled():
-                return
-            # 阶段1：获取涨停池对比数据
-            if compare_days > 2:
-                result = self.stock_filter.fetcher.compare_limit_up_pools_window(today, compare_days)
-            else:
-                result = self.stock_filter.fetcher.compare_limit_up_pools(today, yesterday)
-                result["compare_days"] = 2
-                result["trade_dates"] = [result.get("yesterday_date", ""), result.get("today_date", "")]
-                result["daily_stats"] = []
-            if cancel_token.is_cancelled():
-                return
-            self._post_to_ui(lambda: self._zt_status_label.config(
-                text=f"涨停池获取完成，正在分析今日 {len(result.get('today_first', []))} 只首板形态..."
-            ))
-
-            # 阶段2：对今日首板做技术形态分类
-            today_first = result.get("today_first", [])
-            def _progress(cur, tot, info):
-                if cancel_token.is_cancelled():
-                    raise StopIteration
-                self._post_to_ui(lambda c=cur, t=tot, i=info:
-                    self._zt_status_label.config(text=f"分类今日首板 {c}/{t}: {i}"))
-            today_classified = self.stock_filter.classify_limit_up_pool(today_first, progress_callback=_progress)
-            result["today_classified"] = today_classified
-            if cancel_token.is_cancelled():
-                return
-
-            # 阶段3：对昨日首板做技术形态分类
-            yesterday_first = result.get("yesterday_first", [])
-            if yesterday_first:
-                self._post_to_ui(lambda: self._zt_status_label.config(
-                    text=f"正在分析上一交易日 {len(yesterday_first)} 只首板形态..."))
-                def _progress2(cur, tot, info):
-                    if cancel_token.is_cancelled():
-                        raise StopIteration
-                    self._post_to_ui(lambda c=cur, t=tot, i=info:
-                        self._zt_status_label.config(text=f"分类上一交易日首板 {c}/{t}: {i}"))
-                yesterday_classified = self.stock_filter.classify_limit_up_pool(yesterday_first, progress_callback=_progress2)
-                result["yesterday_classified"] = yesterday_classified
-
-            if cancel_token.is_cancelled():
-                return
-            self._post_to_ui(lambda r=result: self._apply_limit_up_compare(r))
-        except StopIteration:
-            self._post_to_ui(lambda: self._zt_status_label.config(text="已取消"))
-        except Exception as e:
-            err = str(e)
-            self._post_to_ui(lambda: self._zt_show_error(f"涨停对比失败: {err}"))
-
-    def _zt_show_error(self, msg: str):
-        self._zt_summary_text.config(state=tk.NORMAL)
-        self._zt_summary_text.delete("1.0", tk.END)
-        self._zt_summary_text.insert(tk.END, msg)
-        self._zt_summary_text.config(state=tk.DISABLED)
-        self._zt_status_label.config(text="")
-        self.status_var.set("涨停对比失败")
+            self._render_predict_trees()
+        except Exception:
+            pass
 
     def _infer_board_from_code(self, code: str) -> str:
+        """根据股票代码前缀推断板块归属。被涨停预测的板块筛选共用。"""
         c = str(code).strip().zfill(6)
         if c.startswith(("300", "301")):
             return "创业板"
@@ -1753,236 +1238,6 @@ class StockMonitorApp:
         if c.startswith(("5", "6", "9")):
             return "上交所主板"
         return ""
-
-    def _zt_filter_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """按当前控制面板的板块和价格筛选涨停分类记录。"""
-        allowed_boards = {str(b).strip() for b in self._selected_boards() if str(b).strip()}
-        try:
-            min_price = float(self.min_price_var.get().strip()) if self.min_price_var.get().strip() else None
-        except ValueError:
-            min_price = None
-        try:
-            max_price = float(self.max_price_var.get().strip()) if self.max_price_var.get().strip() else None
-        except ValueError:
-            max_price = None
-
-        filtered: List[Dict[str, Any]] = []
-        for rec in records:
-            code = str(rec.get("code", "")).strip().zfill(6)
-            board = self._infer_board_from_code(code)
-            if allowed_boards and board not in allowed_boards:
-                continue
-            close = rec.get("close")
-            if close is not None:
-                if min_price is not None and close < min_price:
-                    continue
-                if max_price is not None and close > max_price:
-                    continue
-            filtered.append(rec)
-        return filtered
-
-    def _refresh_zt_compare_display(self):
-        """用当前筛选条件重新渲染涨停对比（不重新拉数据）。"""
-        if self._zt_compare_result is None:
-            return
-        self._apply_limit_up_compare(
-            self._zt_compare_result, persist=False, status_message="涨停对比已按筛选条件更新"
-        )
-
-    def _refresh_predict_display_if_ready(self):
-        """顶部价格/板块筛选变化时同步刷新涨停预测表（如已有预测结果）。"""
-        if not getattr(self, "_predict_lists", None):
-            return
-        try:
-            self._render_predict_trees()
-        except Exception:
-            pass
-
-    def _apply_limit_up_compare(
-        self,
-        result: Dict[str, Any],
-        *,
-        persist: bool = True,
-        status_message: str = "涨停对比完成",
-    ):
-        self._zt_compare_result = result
-        # 应用板块 + 价格过滤
-        today_classified = self._zt_filter_records(result.get("today_classified", []))
-        yesterday_classified = self._zt_filter_records(result.get("yesterday_classified", []))
-        compare_days = int(result.get("compare_days", 2) or 2)
-        trade_dates = [d for d in result.get("trade_dates", []) if d]
-        daily_stats = result.get("daily_stats", []) or []
-        ref_label = "昨日" if compare_days <= 2 else "上一交易日"
-
-        # 筛选状态提示
-        total_today = len(result.get("today_classified", []))
-        total_yest = len(result.get("yesterday_classified", []))
-        filter_active = len(today_classified) < total_today or len(yesterday_classified) < total_yest
-        filter_hint = ""
-        if filter_active:
-            boards_text = "/".join(self._selected_boards())
-            parts = [f"板块={boards_text}"]
-            min_p = self.min_price_var.get().strip()
-            max_p = self.max_price_var.get().strip()
-            if min_p or max_p:
-                parts.append(f"价格={min_p or '*'}~{max_p or '*'}")
-            filter_hint = (
-                f"[筛选中: {', '.join(parts)}] "
-                f"今日 {len(today_classified)}/{total_today}，{ref_label} {len(yesterday_classified)}/{total_yest}"
-            )
-
-        # ---- 统计形态分布 ----
-        pattern_counts_today: Dict[str, int] = {}
-        for rec in today_classified:
-            p = rec.get("pattern", "其他涨停")
-            pattern_counts_today[p] = pattern_counts_today.get(p, 0) + 1
-
-        pattern_counts_yest: Dict[str, int] = {}
-        for rec in yesterday_classified:
-            p = rec.get("pattern", "其他涨停")
-            pattern_counts_yest[p] = pattern_counts_yest.get(p, 0) + 1
-        today_burst_count = sum(1 for rec in today_classified if rec.get("is_volume_burst"))
-        yest_burst_count = sum(1 for rec in yesterday_classified if rec.get("is_volume_burst"))
-
-        # ---- 填充摘要 ----
-        self._zt_summary_text.config(state=tk.NORMAL)
-        self._zt_summary_text.delete("1.0", tk.END)
-        txt = self._zt_summary_text
-
-        txt.insert(tk.END, result.get("summary", "") + "\n")
-        if filter_hint:
-            txt.insert(tk.END, f"\n{filter_hint}\n")
-        if today_burst_count or yest_burst_count:
-            txt.insert(tk.END, f"今日暴量涨停: {today_burst_count} 只；{ref_label}暴量涨停: {yest_burst_count} 只\n")
-
-        if compare_days > 2 and daily_stats:
-            txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  最近 {compare_days} 个交易日逐日统计\n")
-            txt.insert(tk.END, f"{'='*36}\n")
-            for item in daily_stats:
-                industries_text = "、".join(f"{name}({count})" for name, count in item.get("top_industries", [])) or "-"
-                txt.insert(
-                    tk.END,
-                    f"  {item.get('trade_date', '-')}: 涨停 {item.get('pool_count', 0):3d} 只 | "
-                    f"首板 {item.get('first_count', 0):3d} 只 | TOP行业 {industries_text}\n",
-                )
-
-        txt.insert(tk.END, f"\n{'='*36}\n")
-        txt.insert(tk.END, f"  今日首板形态分布 ({len(today_classified)} 只)\n")
-        txt.insert(tk.END, f"{'='*36}\n")
-        for p, c in sorted(pattern_counts_today.items(), key=lambda x: -x[1]):
-            pct = c / max(len(today_classified), 1) * 100
-            bar = "#" * int(pct / 3)
-            txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
-
-        if pattern_counts_yest:
-            all_patterns = sorted(
-                set(list(pattern_counts_today.keys()) + list(pattern_counts_yest.keys())),
-                key=lambda p: (-pattern_counts_today.get(p, 0), -pattern_counts_yest.get(p, 0), p),
-            )
-            txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  各涨停类型数量对比（今日 vs {ref_label}）\n")
-            txt.insert(tk.END, f"{'='*36}\n")
-            for p in all_patterns:
-                t = pattern_counts_today.get(p, 0)
-                y = pattern_counts_yest.get(p, 0)
-                delta = t - y
-                sign = "+" if delta > 0 else ""
-                txt.insert(tk.END, f"  {p:10s}  {y:2d} -> {t:2d}  ({sign}{delta})\n")
-
-            txt.insert(tk.END, f"\n{'='*36}\n")
-            label_date = result.get("yesterday_date", trade_dates[-2] if len(trade_dates) >= 2 else "")
-            txt.insert(tk.END, f"  {ref_label}首板形态分布 ({label_date}, {len(yesterday_classified)} 只)\n")
-            txt.insert(tk.END, f"{'='*36}\n")
-            for p, c in sorted(pattern_counts_yest.items(), key=lambda x: -x[1]):
-                pct = c / max(len(yesterday_classified), 1) * 100
-                bar = "#" * int(pct / 3)
-                txt.insert(tk.END, f"  {p:10s}  {c:3d} 只  {pct:5.1f}%  {bar}\n")
-
-        # 行业分布
-        ind_today = result.get("industry_today", {})
-        ind_yest = result.get("industry_yesterday", {})
-        if ind_today:
-            txt.insert(tk.END, "\n── 今日首板 TOP 行业 ──\n")
-            for k, v in sorted(ind_today.items(), key=lambda x: -x[1])[:8]:
-                txt.insert(tk.END, f"  {k}: {v} 只\n")
-        if ind_yest:
-            txt.insert(tk.END, f"\n── {ref_label}首板 TOP 行业 ──\n")
-            for k, v in sorted(ind_yest.items(), key=lambda x: -x[1])[:8]:
-                txt.insert(tk.END, f"  {k}: {v} 只\n")
-
-        continued = result.get("continued_codes", [])
-        lost = result.get("lost_codes", [])
-        if continued:
-            txt.insert(tk.END, f"\n── {ref_label}首板→今日继续涨停 ({len(continued)}) ──\n")
-            txt.insert(tk.END, "  " + ", ".join(continued) + "\n")
-        if lost:
-            txt.insert(tk.END, f"\n── {ref_label}首板→今日未涨停 ({len(lost)}) ──\n")
-            txt.insert(tk.END, "  " + ", ".join(lost) + "\n")
-        self._zt_summary_text.config(state=tk.DISABLED)
-
-        # ---- 填充今日涨停形态分类表格 ----
-        self._zt_pattern_tree.delete(*self._zt_pattern_tree.get_children())
-        for rec in sorted(today_classified, key=lambda r: r.get("pattern", "")):
-            tag = self._ZT_PATTERN_TAG_MAP.get(rec.get("pattern", ""), "")
-            vals = (
-                rec.get("code", ""),
-                rec.get("name", ""),
-                rec.get("industry", ""),
-                rec.get("limit_up_reason", ""),
-                rec.get("strong_tag", ""),
-                rec.get("pattern", ""),
-                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
-                f"{rec['volume_burst_ratio']:.2f}x" if rec.get("volume_burst_ratio") is not None else "-",
-                f"{rec['distance_ma5_pct']:+.1f}" if rec.get("distance_ma5_pct") is not None else "-",
-                f"{rec['trend_10d_pct']:+.1f}" if rec.get("trend_10d_pct") is not None else "-",
-                f"{rec['position_60d_pct']:.0f}" if rec.get("position_60d_pct") is not None else "-",
-                rec.get("pattern_detail", ""),
-            )
-            self._zt_pattern_tree.insert("", tk.END, values=vals, tags=(tag,) if tag else ())
-
-        # ---- 填充上一交易日首板今日表现表格（带形态） ----
-        self._zt_table_nb.tab(self._zt_yest_tab, text=f"{ref_label}首板今日表现")
-        self._zt_yest_tree.delete(*self._zt_yest_tree.get_children())
-        perf_map = {p["code"]: p for p in result.get("yesterday_first_today_performance", [])}
-        for rec in yesterday_classified:
-            code = rec.get("code", "")
-            perf = perf_map.get(code, {})
-            chg = perf.get("change_pct")
-            close_val = perf.get("close")
-            still = perf.get("still_limit_up", False)
-            if still:
-                status = "晋级"
-            elif chg is not None and chg > 0:
-                status = "高开"
-            elif chg is not None and chg < -3:
-                status = "大跌"
-            elif chg is not None:
-                status = "平开" if chg >= -1 else "低开"
-            else:
-                status = "-"
-            vals = (
-                code,
-                rec.get("name", ""),
-                rec.get("industry", ""),
-                rec.get("limit_up_reason", ""),
-                rec.get("strong_tag", ""),
-                rec.get("pattern", ""),
-                f"{chg:.2f}" if chg is not None else "-",
-                f"{close_val:.2f}" if close_val is not None else "-",
-                "是" if still else "否",
-                status,
-            )
-            self._zt_yest_tree.insert("", tk.END, values=vals)
-
-        self._zt_status_label.config(text="")
-        self.status_var.set(status_message)
-        if persist:
-            self._save_limit_up_compare_snapshot(result)
-        # 同步刷新历史记录下拉，并选中当前结果对应的日期
-        current_today = str(result.get("today_date") or "").strip()
-        self._refresh_compare_history_dates(select=current_today or None)
 
     # ================= 涨停预测 Tab =================
     def setup_predict_tab(self):
@@ -5599,8 +4854,6 @@ class StockMonitorApp:
                 messagebox.showerror("错误", str(exc))
         else:
             self.status_var.set("已保存显示板块筛选设置")
-        # 同步刷新涨停对比
-        self._refresh_zt_compare_display()
         # 同步刷新涨停预测
         self._refresh_predict_display_if_ready()
 
@@ -5616,8 +4869,6 @@ class StockMonitorApp:
             except ValueError as exc:
                 messagebox.showerror("错误", str(exc))
                 return "break" if event is not None else None
-        # 同步刷新涨停对比
-        self._refresh_zt_compare_display()
         # 同步刷新涨停预测
         self._refresh_predict_display_if_ready()
         return "break" if event is not None else None
@@ -6116,25 +5367,6 @@ class StockMonitorApp:
         if not values:
             return ""
         return str(values[0]).strip().zfill(6)
-
-    def on_zt_stock_select(self, event):
-        try:
-            tree = event.widget
-            stock_code = self._get_tree_selected_code(tree)
-            if not stock_code:
-                return
-            self._schedule_show_stock_detail(stock_code)
-        except Exception as e:
-            self._log(f"选择涨停对比股票详情失败: {e}")
-
-    def on_zt_stock_double_click(self, event):
-        tree = event.widget
-        stock_code = self._get_tree_selected_code(tree)
-        if not stock_code:
-            return
-        self._cancel_scheduled_detail()
-        self.show_stock_detail(stock_code, force_refresh=True)
-        self.notebook.select(self.detail_tab_frame)
 
     def _refresh_result_table_if_ready(self) -> None:
         if hasattr(self, "result_tree") and self.filtered_stocks:
