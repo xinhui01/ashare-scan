@@ -3838,6 +3838,30 @@ class StockMonitorApp:
             except Exception:
                 pass
 
+    def _find_best_bucket_for_category(
+        self, cat: str,
+    ) -> Optional[Tuple[Tuple[int, int], Dict[str, Any]]]:
+        """通过 `_get_predict_bucket_rates` 读取 cat 的所有 bucket rates，
+        返回 eligible=True 中 rate 最大的桶，None 表示无 eligible 桶。
+        同 rate 时取分数段更高的（高分往往更稳）。
+
+        统一服务于主类别（cont/first/fresh/wrap/trend）与 cont 子类别
+        （cont_1to2/.../cont_5plus）。带 lazy-load 兜底（cache miss 时拉 DB）。
+        """
+        rates = self._get_predict_bucket_rates(cat)
+        best: Optional[Tuple[Tuple[int, int], Dict[str, Any]]] = None
+        for bucket, info in rates.items():
+            if not info or not info.get("eligible"):
+                continue
+            if best is None:
+                best = (bucket, info)
+                continue
+            b_rate = float(best[1].get("rate") or 0.0)
+            cur_rate = float(info.get("rate") or 0.0)
+            if cur_rate > b_rate or (cur_rate == b_rate and bucket[0] > best[0][0]):
+                best = (bucket, info)
+        return best
+
     def _refresh_predict_best_bucket_labels(self) -> None:
         """读取近 20 日的分数段命中率，找出每类历史命中率最高的桶并更新标签。
 
@@ -3851,23 +3875,9 @@ class StockMonitorApp:
         }
         best_map: Dict[str, Optional[Tuple[int, int]]] = {}
         for cat in ("cont", "first", "fresh", "wrap", "trend"):
-            rates = self._get_predict_bucket_rates(cat)
-            best_bucket: Optional[Tuple[int, int]] = None
-            best_info: Optional[Dict[str, Any]] = None
-            for bucket, info in rates.items():
-                if not info or not info.get("eligible"):
-                    continue
-                if best_info is None:
-                    best_bucket, best_info = bucket, info
-                    continue
-                if (
-                    float(info.get("rate") or 0) > float(best_info.get("rate") or 0)
-                    or (
-                        float(info.get("rate") or 0) == float(best_info.get("rate") or 0)
-                        and bucket[0] > (best_bucket or (0, 0))[0]
-                    )
-                ):
-                    best_bucket, best_info = bucket, info
+            best = self._find_best_bucket_for_category(cat)
+            best_bucket = best[0] if best else None
+            best_info = best[1] if best else None
             best_map[cat] = best_bucket
             lbl = self._predict_best_bucket_labels.get(cat)
             if lbl is None:
@@ -3887,27 +3897,6 @@ class StockMonitorApp:
             except Exception:
                 pass
         self._predict_best_buckets = best_map
-
-    def _find_best_bucket_for_category(
-        self, cat: str,
-    ) -> Optional[Tuple[Tuple[int, int], Dict[str, Any]]]:
-        """从 self._predict_bucket_rates_cache 取 cat 的所有 bucket rates，
-        返回 eligible=True 中 rate 最大的桶，None 表示无 eligible 桶。
-        同 rate 时取分数段更高的（高分往往更稳）。
-        """
-        rates = self._predict_bucket_rates_cache.get(cat) or {}
-        best: Optional[Tuple[Tuple[int, int], Dict[str, Any]]] = None
-        for (lo, hi), info in rates.items():
-            if not info.get("eligible"):
-                continue
-            if best is None:
-                best = ((lo, hi), info)
-                continue
-            b_rate = best[1].get("rate", 0)
-            cur_rate = info.get("rate", 0)
-            if cur_rate > b_rate or (cur_rate == b_rate and lo > best[0][0]):
-                best = ((lo, hi), info)
-        return best
 
     def _refresh_predict_subcategory_best_buckets(self) -> None:
         """刷新 5 个 cont 子类别（cont_1to2/.../cont_5plus）顶部的"最优分数段"Label。
