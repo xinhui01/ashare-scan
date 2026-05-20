@@ -1,8 +1,10 @@
-# 二波接力 / 反包候选新增"历史同类形态命中"加分设计
+# 保留涨停 / 二波接力 / 反包候选新增"历史同类形态命中"加分设计
 
 - 创建日期：2026-05-20
 - 状态：待实施
-- 范围：在 `_score_followthrough_candidate`（二波接力）和 `_score_broken_board_wrap`（反包/承接）评分函数里，新增"近 90 日同类形态成功命中次数"加分维度
+- 范围：
+  1. 在 `_score_continuation`（保留涨停）、`_score_followthrough_candidate`（二波接力）、`_score_broken_board_wrap`（反包/承接）3 个评分函数内新增"近 90 日同类形态成功命中次数"加分
+  2. **所有 5 个 sub-tab 的评分函数** + 辅助评分 `_score_first_board_by_profile`，history days 由 65 **统一**调整到 120
 
 ## 背景
 
@@ -29,7 +31,7 @@
 
 ## 设计
 
-### 新增 2 个 helper（stock_filter.py 模块级或类内 static）
+### 新增 3 个 helper（stock_filter.py 模块级或类内 static）
 
 ```python
 def _count_historical_followthrough(
@@ -68,9 +70,55 @@ def _count_historical_wrap(
     """
 ```
 
+```python
+def _count_historical_continuation(
+    history_df: pd.DataFrame,
+    code: str,
+    lookback_days: int = 90,
+    threshold_fn: Callable[[str], float] = None,
+) -> Tuple[int, Optional[int]]:
+    """扫历史 K 线统计成功连板次数。
+    
+    定义：某日涨停（≥ threshold-0.3%）→ 次日继续涨停 → 计为 1 次连板成功。
+    跳过 today（最后 1 行），避免今日数据自计。
+    
+    返回：(occurrence_count, days_since_last_hit)
+    - occurrence_count：lookback_days 范围内的成功次数
+    - days_since_last_hit：距今最近一次的天数，None 表示无命中
+    """
+```
+
 注意：
 - `threshold_fn(code)` 用现有 `self._limit_up_threshold_pct` 逻辑（主板 ±10%、创业板/科创板 ±20%）
 - `window` 默认 5 与现有 lookback_days=5 一致
+- `_count_historical_continuation` 的"连板"定义是**严格 T+1 继续涨停**（不像 first/wrap 用 5 日窗口），因为 cont 类别预测的就是 T+1 涨停
+
+### 评分集成（_score_continuation）
+
+在现有评分末尾（`return` 前）追加：
+
+```python
+occ_count, last_hit_days = _count_historical_continuation(
+    history, code, lookback_days=90,
+    threshold_fn=self._limit_up_threshold_pct,
+)
+if occ_count >= 3:
+    bonus = 8
+elif occ_count >= 2:
+    bonus = 5
+elif occ_count >= 1:
+    bonus = 2
+else:
+    bonus = 0
+
+if bonus > 0:
+    if last_hit_days is not None and last_hit_days <= 30:
+        bonus = min(bonus + 2, 10)
+        reasons.append(f"近90日{occ_count}次连板成功 (最近{last_hit_days}日内) +{bonus}")
+    else:
+        reasons.append(f"近90日{occ_count}次连板成功 +{bonus}")
+    score += bonus
+```
 
 ### 评分集成（_score_followthrough_candidate）
 
@@ -117,13 +165,23 @@ occ_count, last_hit_days = _count_historical_wrap(
 
 注意：`_count_historical_wrap` 内部找的是"涨停→打回→再涨停"形态。对**强势承接**路径而言，这个 helper 的命中数同样代表"这只股有反包性格"，对承接预测仍有正反馈，文案改成"承接成功"即可。
 
-### history days 调整
+### history days 统一调整为 120
 
-现有 `_score_followthrough_candidate` 内：
-```python
-history = self.fetcher.get_history_data(code, days=65, ...)
-```
-改成 `days=120`（覆盖 90 日 + 余量 + 涨停后 5 日窗口）。同样改 `_score_broken_board_wrap`。
+**所有评分函数的 history 加载 `days=65` 统一改为 `days=120`**，共 6 处：
+
+| 行号 | 函数 | 类别 |
+|---|---|---|
+| ~2654 | `_score_continuation` | cont（保留涨停） |
+| ~2907 | `_score_followthrough_candidate` | first（二波接力） |
+| ~3371 | `_score_fresh_first_board` | fresh（首板涨停） |
+| ~3641 | `_score_broken_board_wrap` | wrap（反包/承接） |
+| ~3966 | `_score_trend_limit_up` | trend（趋势涨停） |
+| ~4610 | `_score_first_board_by_profile` | first（辅助评分函数） |
+
+理由：
+- 统一参数避免 5 个 tab 互相不一致
+- 覆盖 90 日历史扫描窗口 + 余量
+- 即使 fresh/trend 暂不加 bonus，未来若加可零修改
 
 本地 SQLite history 表通常有 ≥250 日，**不会触发额外网络拉取**。
 
@@ -140,14 +198,15 @@ history = self.fetcher.get_history_data(code, days=65, ...)
 
 ## 应用范围
 
-| 类别 | 是否加 | 用哪个 helper |
-|---|---|---|
-| cont（保留涨停） | ❌ 本次不动 | - |
-| first（二波接力） | ✅ | `_count_historical_followthrough` |
-| fresh（首板涨停） | ❌ 本次不动 | - |
-| wrap 路径 A（经典反包） | ✅ | `_count_historical_wrap` |
-| wrap 路径 B（强势承接） | ✅ | `_count_historical_wrap`（同一 helper，承接性格代理指标）|
-| trend（趋势涨停） | ❌ 本次不动 | - |
+| 类别 | 是否加 bonus | 用哪个 helper | history days 改 120 |
+|---|---|---|---|
+| cont（保留涨停） | ✅ | `_count_historical_continuation`（T+1 严格连板）| ✅ |
+| first（二波接力） | ✅ | `_count_historical_followthrough` | ✅ |
+| fresh（首板涨停） | ❌ 本次不动 bonus | - | ✅（统一化） |
+| wrap 路径 A（经典反包） | ✅ | `_count_historical_wrap` | ✅ |
+| wrap 路径 B（强势承接） | ✅ | `_count_historical_wrap`（同一 helper，承接性格代理指标）| ✅ |
+| trend（趋势涨停） | ❌ 本次不动 bonus | - | ✅（统一化） |
+| first 辅助 `_score_first_board_by_profile` | ❌ 不动 bonus | - | ✅（统一化） |
 
 ## 错误处理
 
@@ -161,6 +220,13 @@ history = self.fetcher.get_history_data(code, days=65, ...)
 新增 unit test 覆盖 helper 函数（纯计算逻辑，无 DB / 网络依赖）：
 
 `tests/test_historical_pattern_count.py`：
+- 测 `_count_historical_continuation`：
+  - 空 DataFrame → (0, None)
+  - 1 个涨停无后续 → (0, None)
+  - 1 个涨停 + 次日继续涨停 → (1, last_days)
+  - 涨停 + 间隔 1 日再涨停（不连板）→ 不计入
+  - 创业板 20% 涨停阈值识别正确
+  - 3 连板算 2 次连板成功（[D1↑, D2↑, D3↑] → D1→D2 + D2→D3 共 2 次成功）
 - 测 `_count_historical_followthrough`：
   - 空 DataFrame → (0, None)
   - 1 个涨停无后续 → (0, None)
@@ -179,20 +245,21 @@ history = self.fetcher.get_history_data(code, days=65, ...)
 
 ## 验收标准
 
-1. `_count_historical_followthrough` / `_count_historical_wrap` 实现正确，**新单测全部通过**
-2. 现有 `pytest -q --tb=no` 保持 274 passed + 新增测试数（约 12-15 个）
+1. `_count_historical_continuation` / `_count_historical_followthrough` / `_count_historical_wrap` 实现正确，**新单测全部通过**
+2. 现有 `pytest -q --tb=no` 保持 274 passed + 新增测试数（约 15-20 个）
 3. GUI 启动 6 秒无 traceback
-4. 手动运行一次预测：看到 first / wrap tab 中至少有候选股的"预测依据"列包含新 reason 文案（如"近90日X次..."），证明集成生效
+4. 手动运行一次预测：看到 cont / first / wrap tab 中至少有候选股的"预测依据"列包含新 reason 文案（如"近90日X次连板/二波接力/反包成功 +N"），证明集成生效
 5. 评分**总分**不会因为新 reason 出现 > 100 的异常（封顶逻辑正确）
-6. grep `_count_historical_followthrough\|_count_historical_wrap` 在 stock_filter.py 应命中 2 个 def + 2 个调用 + 单测里若干次
+6. grep `_count_historical_continuation\|_count_historical_followthrough\|_count_historical_wrap` 在 stock_filter.py 应命中 3 个 def + 3 个调用 + 单测里若干次
+7. **grep `days=65` 在 stock_filter.py 内剩余 0 命中**（其他 `days=65` 调用如批量预热 `_prefetch_history_for_pool` 等不动，仍 65）→ 用更精确的 grep：`grep "self\.fetcher\.get_history_data\(code, days=" stock_filter.py` 应全部显示 days=120 才对（评分函数路径全部统一）
 
 ## 不在范围
 
-- 不改其他 3 个类别（cont / fresh / trend）
+- 不为 fresh / trend 添加 bonus（这两类的"同类形态"定义模糊，留作后续评估）
 - 不引入新 DB 表
-- 不批量预热历史（worker 线程的事，与本 spec 无关）
+- 不动批量预热 `_prefetch_history_for_pool` 的 days=65 参数（那是 worker 线程的事，与本 spec 无关）
 - 不重排"预测依据"列内 reason 顺序
-- 不改 history 缓存策略，仅把 days 参数从 65 调到 120
+- 不改 history 缓存策略，仅把评分函数内的 days 参数从 65 调到 120
 
 ## 后续可扩展
 
