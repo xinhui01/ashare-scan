@@ -109,3 +109,106 @@ class TestDeriveFromSpot:
             df = eod._derive_limit_up_pool_from_spot("20260520")
         required = {"代码", "名称", "最新价", "涨跌幅", "换手率", "连板数", "所属行业"}
         assert required.issubset(set(df.columns))
+
+
+class TestLimitUpPoolEmptyRetry:
+    def _build_fetcher(self):
+        instance = StockDataFetcher.__new__(StockDataFetcher)
+        instance._log = lambda msg: None
+        instance._limit_up_pool_cache = {}
+        instance._prev_limit_up_pool_cache = {}
+        return instance
+
+    def test_empty_result_is_not_cached_and_second_call_retries_network(self, monkeypatch):
+        fetcher = self._build_fetcher()
+        calls = {"count": 0}
+
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20260520")
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *args, **kwargs: None)
+
+        def _fake_retry(_fn, date=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return pd.DataFrame()
+            return pd.DataFrame([{"代码": "600000", "名称": "浦发银行", "连板数": 1}])
+
+        monkeypatch.setattr("stock_data._retry_ak_call", _fake_retry)
+
+        first = fetcher.get_limit_up_pool("20260520")
+        second = fetcher.get_limit_up_pool("20260520")
+
+        assert first.empty
+        assert not second.empty
+        assert calls["count"] == 2
+
+    def test_empty_memory_cache_does_not_block_retry(self, monkeypatch):
+        fetcher = self._build_fetcher()
+        fetcher._limit_up_pool_cache["20260520"] = pd.DataFrame()
+
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20260520")
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            "stock_data._retry_ak_call",
+            lambda _fn, date=None: pd.DataFrame([{"代码": "600001", "名称": "测试股", "连板数": 1}]),
+        )
+
+        df = fetcher.get_limit_up_pool("20260520")
+
+        assert not df.empty
+        assert "20260520" in fetcher._limit_up_pool_cache
+        assert not fetcher._limit_up_pool_cache["20260520"].empty
+
+
+def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
+    from src.gui.app import StockMonitorApp
+
+    # 构造 minimal app 实例，绕开完整初始化
+    app = StockMonitorApp.__new__(StockMonitorApp)
+
+    class Var:
+        def __init__(self, v):
+            self.v = v
+        def get(self):
+            return self.v
+        def set(self, val):
+            self.v = val
+
+    class LabelStub:
+        def config(self, **_kwargs):
+            pass
+
+    # 构造 fetcher 与 stock_filter
+    class FetcherStub:
+        def __init__(self):
+            self._limit_up_pool_cache = {"20260520": pd.DataFrame()}
+            self._prev_limit_up_pool_cache = {"20260520": pd.DataFrame()}
+        def _normalize_trade_date(self, d):
+            return "20260520"
+
+    class FilterStub:
+        def __init__(self, fetcher):
+            self.fetcher = fetcher
+            self._log = lambda msg: None
+
+    fetcher = FetcherStub()
+    app.stock_filter = FilterStub(fetcher)
+    app._predict_history_var = Var("")
+    app._predict_date_var = Var("20260520")
+    app._predict_status_label = LabelStub()
+
+    called = {"start": False}
+    def _start_predict():
+        called["start"] = True
+    app._start_predict = _start_predict
+
+    # 执行刷新
+    app._refresh_selected_predict_date()
+
+    # 断言缓存被清除且触发重跑
+    assert "20260520" not in fetcher._limit_up_pool_cache
+    assert "20260520" not in fetcher._prev_limit_up_pool_cache
+    assert called["start"] is True

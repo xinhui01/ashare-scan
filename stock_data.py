@@ -1539,8 +1539,10 @@ class StockDataFetcher:
 
         # 1. 内存缓存
         mem_cached = self._limit_up_pool_cache.get(date_key)
-        if mem_cached is not None:
+        if mem_cached is not None and not mem_cached.empty:
             return mem_cached
+        if mem_cached is not None and mem_cached.empty and self._log:
+            self._log(f"涨停池 {date_key} 内存缓存为空，重新尝试数据源")
 
         # 2. SQLite 持久缓存（也做一次过滤，防止历史脏数据继续展示）
         from stock_store import load_limit_up_pool, save_limit_up_pool
@@ -1592,11 +1594,9 @@ class StockDataFetcher:
             if self._log:
                 self._log(f"涨停池 {date_key} spot 兜底失败: {exc}")
 
-        empty = pd.DataFrame()
-        self._limit_up_pool_cache[date_key] = empty
         if self._log:
-            self._log(f"涨停池 {date_key} 所有源均失败，返回空")
-        return empty
+            self._log(f"涨停池 {date_key} 所有源均失败，返回空（不缓存空结果）")
+        return pd.DataFrame()
 
     def get_previous_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
         """获取指定日期的昨日涨停板池。三级缓存：内存 → SQLite → 网络。"""
@@ -1605,8 +1605,10 @@ class StockDataFetcher:
             return pd.DataFrame()
 
         mem_cached = self._prev_limit_up_pool_cache.get(date_key)
-        if mem_cached is not None:
+        if mem_cached is not None and not mem_cached.empty:
             return mem_cached
+        if mem_cached is not None and mem_cached.empty and self._log:
+            self._log(f"昨日涨停池 {date_key} 内存缓存为空，重新尝试数据源")
 
         from stock_store import load_limit_up_pool, save_limit_up_pool
         db_cached = load_limit_up_pool(date_key, pool_type="previous")
@@ -1646,9 +1648,9 @@ class StockDataFetcher:
             if self._log:
                 self._log(f"昨日涨停池 {date_key} spot 兜底失败: {exc}")
 
-        empty = pd.DataFrame()
-        self._prev_limit_up_pool_cache[date_key] = empty
-        return empty
+        if self._log:
+            self._log(f"昨日涨停池 {date_key} 所有源均失败，返回空（不缓存空结果）")
+        return pd.DataFrame()
 
     def _recent_trade_dates(self, end_date: str, count: int) -> List[str]:
         date_key = self._normalize_trade_date(end_date)

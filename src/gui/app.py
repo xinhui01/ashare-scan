@@ -858,6 +858,28 @@ class StockMonitorApp:
             self._predict_status_label.config(text="请先选择要刷新的日期")
             return
         self._predict_date_var.set(trade_date)
+        # 在重新预测前，主动清除内存中的涨停池缓存，确保会重新走数据源
+        try:
+            fetcher = getattr(self.stock_filter, "fetcher", None)
+            if fetcher is not None:
+                date_key = fetcher._normalize_trade_date(trade_date)
+                if date_key:
+                    try:
+                        fetcher._limit_up_pool_cache.pop(date_key, None)
+                    except Exception:
+                        pass
+                    try:
+                        fetcher._prev_limit_up_pool_cache.pop(date_key, None)
+                    except Exception:
+                        pass
+                    if getattr(self.stock_filter, "_log", None):
+                        try:
+                            self.stock_filter._log(f"已清除内存涨停池缓存 {date_key}，将重新联网拉取")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         self._start_predict()
 
     def _save_result_column_layout(self) -> None:
