@@ -2796,7 +2796,7 @@ class StockFilter:
         try:
             # 只使用本地缓存，不发起网络请求
             history = self.fetcher.get_history_data(
-                code, days=65, force_refresh=False,
+                code, days=120, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-continuation-cache-only"),
             )
         except Exception as exc:
@@ -3071,7 +3071,7 @@ class StockFilter:
         try:
             history = self.fetcher.get_history_data(
                 code,
-                days=65,
+                days=120,
                 force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-followthrough-cache-only"),
             )
@@ -3557,7 +3557,7 @@ class StockFilter:
 
         try:
             history = self.fetcher.get_history_data(
-                code, days=65, force_refresh=False,
+                code, days=120, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-fresh-first-board-cache-only"),
             )
         except Exception as exc:
@@ -3827,7 +3827,7 @@ class StockFilter:
 
         try:
             history = self.fetcher.get_history_data(
-                code, days=65, force_refresh=False,
+                code, days=120, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-broken-wrap-cache-only"),
             )
         except Exception as exc:
@@ -4175,7 +4175,7 @@ class StockFilter:
 
         try:
             history = self.fetcher.get_history_data(
-                code, days=65, force_refresh=False,
+                code, days=120, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-trend-cache-only"),
             )
         except Exception as exc:
@@ -4819,7 +4819,7 @@ class StockFilter:
         try:
             # 只使用本地缓存，不发起网络请求
             history = self.fetcher.get_history_data(
-                code, days=65, force_refresh=False,
+                code, days=120, force_refresh=False,
                 request_plan=self._build_local_cache_history_plan(reason="predict-first-board-cache-only"),
             )
         except Exception as exc:
