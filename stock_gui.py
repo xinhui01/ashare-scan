@@ -56,8 +56,6 @@ from stock_store import (
     backup_database,
     cleanup_all,
     ensure_store_ready,
-    export_watchlist_csv,
-    import_watchlist_csv,
     list_backups,
     list_limit_up_compare_dates,
     list_limit_up_prediction_dates,
@@ -67,15 +65,11 @@ from stock_store import (
     load_limit_up_compare_by_date,
     load_limit_up_prediction_by_date,
     load_scan_snapshot,
-    load_watchlist,
-    load_watchlist_item,
     reset_all_connections,
     restore_database,
     save_app_config,
     save_limit_up_compare_record,
     save_scan_snapshot,
-    save_watchlist_item,
-    delete_watchlist_item,
 )
 
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS"]
@@ -171,7 +165,6 @@ class StockMonitorApp:
         self._run_log_file: Optional[Path] = None
         self._current_scan_allowed_boards: List[str] = []
         self._current_scan_max_stocks: int = 0
-        self.watchlist_items: Dict[str, Dict[str, Any]] = {}
         self.result_columns: tuple[str, ...] = ()
         self.result_headings: Dict[str, tuple[str, int]] = {}
         self.result_column_vars: Dict[str, tk.BooleanVar] = {}
@@ -196,7 +189,6 @@ class StockMonitorApp:
         self._load_last_results()
         self._load_last_limit_up_compare()
         self._load_last_limit_up_prediction()
-        self._load_watchlist_items()
         self._log_drainer.start()
 
     def _set_initial_window_geometry(self) -> None:
@@ -268,9 +260,6 @@ class StockMonitorApp:
         file_menu.add_command(label="导出结果 CSV", command=self.export_results)
         file_menu.add_command(label="导出结果图片", command=self.export_results_image)
         file_menu.add_command(label="复制代码", command=self.copy_selected_stock_code_name, accelerator="Ctrl+C")
-        file_menu.add_separator()
-        file_menu.add_command(label="导出自选股 CSV", command=self._export_watchlist_csv)
-        file_menu.add_command(label="导入自选股 CSV", command=self._import_watchlist_csv)
         file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_close)
 
@@ -489,12 +478,6 @@ class StockMonitorApp:
         row6.pack(fill=tk.X, pady=2)
         ttk.Label(row6, text="只显示:").pack(side=tk.LEFT, padx=5)
 
-        self.only_watchlist_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            row6, text="自选", variable=self.only_watchlist_var,
-            command=self.on_quick_filter_apply,
-        ).pack(side=tk.LEFT, padx=4)
-
         self.only_limit_up_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             row6, text="涨停", variable=self.only_limit_up_var,
@@ -539,7 +522,6 @@ class StockMonitorApp:
         self.setup_intraday_tab()
         self.setup_result_tab()
         self.setup_limit_up_compare_tab()
-        self.setup_watchlist_tab()
         self.setup_log_tab()
 
         # 构建 tab 注册表 + 应用用户配置的可见性（默认只显示预测/详情/分时）
@@ -587,7 +569,6 @@ class StockMonitorApp:
             ("intraday", self.intraday_tab, "分时", False),
             ("result", self.result_tab, "扫描结果", True),
             ("compare", self.compare_tab, "涨停对比", True),
-            ("watchlist", self.watchlist_tab, "自选池", True),
             ("log", self.log_tab, "运行日志", False),
         ]
 
@@ -695,8 +676,6 @@ class StockMonitorApp:
         action_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(action_frame, text="导出结果图片", command=self.export_results_image).pack(side=tk.LEFT)
         ttk.Button(action_frame, text="复制代码", command=self.copy_selected_stock_code_name).pack(side=tk.LEFT, padx=8)
-        ttk.Button(action_frame, text="加入自选", command=self.add_selected_result_to_watchlist).pack(side=tk.LEFT, padx=8)
-        ttk.Button(action_frame, text="移除自选", command=self.remove_selected_result_from_watchlist).pack(side=tk.LEFT)
         ttk.Label(
             action_frame,
             text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
@@ -1167,7 +1146,7 @@ class StockMonitorApp:
         ]
 
     def _format_result_row_values(self, result: Dict[str, Any]) -> Dict[str, str]:
-        context = {"watchlist_items": self.watchlist_items}
+        context: Dict[str, Any] = {}
         return {
             col.id: col.format_cell(result, context)
             for col in RESULT_COLUMNS
@@ -1192,18 +1171,6 @@ class StockMonitorApp:
             return None
         return stock_code, stock_name
 
-    def _load_watchlist_items(self) -> None:
-        items = load_watchlist()
-        self.watchlist_items = {
-            str(item.get("code", "") or "").strip().zfill(6): dict(item)
-            for item in items
-            if str(item.get("code", "") or "").strip()
-        }
-        if hasattr(self, "_watch_tree"):
-            self.refresh_watchlist_view()
-        if self.filtered_stocks:
-            self.update_result_table(self.filtered_stocks, announce=False, persist=False)
-
     def _lookup_result_by_code(self, stock_code: str) -> Optional[Dict[str, Any]]:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
@@ -1215,43 +1182,6 @@ class StockMonitorApp:
             if str(result.get("code", "") or "").strip().zfill(6) == code:
                 return result
         return None
-
-    def _build_watchlist_item_payload(
-        self,
-        stock_code: str,
-        stock_name: str = "",
-        status: str = "",
-        note: Optional[str] = None,
-        detail: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        code = str(stock_code or "").strip().zfill(6)
-        existing = self.watchlist_items.get(code, {})
-        result = self._lookup_result_by_code(code)
-        data = result.get("data", {}) if result else {}
-        analysis = data.get("analysis") if data else {}
-        board = data.get("board", "") if data else ""
-
-        if detail:
-            analysis = detail.get("analysis") or analysis or {}
-            board = detail.get("board", "") or board
-            stock_name = stock_name or str(detail.get("name", "") or "")
-        elif result:
-            stock_name = stock_name or str(result.get("name", "") or "")
-
-        payload = {
-            "code": code,
-            "name": stock_name or existing.get("name", ""),
-            "status": status or existing.get("status", "") or "观察",
-            "note": existing.get("note", "") if note is None else note,
-            "board": board or existing.get("board", ""),
-            "latest_close": analysis.get("latest_close") if isinstance(analysis, dict) else existing.get("latest_close"),
-            "score": analysis.get("score") if isinstance(analysis, dict) else existing.get("score"),
-            "score_breakdown": (
-                analysis.get("score_breakdown", "") if isinstance(analysis, dict) else existing.get("score_breakdown", "")
-            ),
-            "added_at": existing.get("added_at", ""),
-        }
-        return payload
 
     def show_column_picker(self) -> None:
         picker = tk.Toplevel(self.root)
@@ -1383,18 +1313,6 @@ class StockMonitorApp:
             command=self.toggle_detail_summary_section,
         )
         self.detail_summary_toggle_btn.pack(side=tk.LEFT)
-        self.detail_watch_btn = ttk.Button(
-            info_header,
-            text="加入自选",
-            command=self.toggle_current_detail_watchlist,
-        )
-        self.detail_watch_btn.pack(side=tk.LEFT, padx=(8, 0))
-        self.detail_watch_note_btn = ttk.Button(
-            info_header,
-            text="编辑备注",
-            command=self.edit_current_detail_watch_note,
-        )
-        self.detail_watch_note_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.detail_summary_status_var = tk.StringVar(value="历史摘要已收起")
         ttk.Label(info_header, textvariable=self.detail_summary_status_var).pack(side=tk.LEFT, padx=10)
 
@@ -1411,7 +1329,6 @@ class StockMonitorApp:
             ("quote_time", "刷新时间"),
             ("latest_close", "最新收盘"),
             ("score", "综合评分"),
-            ("watch_status", "自选状态"),
             ("latest_ma", f"MA{max(1, int(self.stock_filter.ma_period))}"),
             ("latest_ma10", "MA10"),
             ("latest_volume", "成交量"),
@@ -5144,44 +5061,6 @@ class StockMonitorApp:
             )
         fail_text.config(state=tk.DISABLED)
 
-    def setup_watchlist_tab(self):
-        watch_frame = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(watch_frame, text="自选池")
-        self.watchlist_tab = watch_frame
-
-        action_bar = ttk.Frame(watch_frame)
-        action_bar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(action_bar, text="刷新自选池", command=self.refresh_watchlist_view).pack(side=tk.LEFT)
-        ttk.Button(action_bar, text="加入当前详情", command=self.add_current_detail_to_watchlist).pack(side=tk.LEFT, padx=6)
-        ttk.Button(action_bar, text="编辑备注", command=self.edit_selected_watchlist_item).pack(side=tk.LEFT, padx=6)
-        ttk.Button(action_bar, text="移除", command=self.remove_selected_watchlist_item).pack(side=tk.LEFT)
-        self.watchlist_summary_var = tk.StringVar(value="自选 0 只")
-        ttk.Label(action_bar, textvariable=self.watchlist_summary_var).pack(side=tk.RIGHT)
-
-        columns = ("code", "name", "status", "score", "latest_close", "board", "note", "updated_at")
-        self._watch_tree = ttk.Treeview(watch_frame, columns=columns, show="headings", height=20)
-        headings = {
-            "code": ("代码", 80),
-            "name": ("名称", 110),
-            "status": ("状态", 90),
-            "score": ("评分", 70),
-            "latest_close": ("最新收盘", 90),
-            "board": ("板块", 110),
-            "note": ("备注", 320),
-            "updated_at": ("更新时间", 150),
-        }
-        for col, (label, width) in headings.items():
-            self._watch_tree.heading(col, text=label)
-            anchor = tk.W if col in {"name", "note"} else tk.CENTER
-            self._watch_tree.column(col, width=width, anchor=anchor)
-        sb = ttk.Scrollbar(watch_frame, orient=tk.VERTICAL, command=self._watch_tree.yview)
-        self._watch_tree.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._watch_tree.pack(fill=tk.BOTH, expand=True)
-        self._watch_tree.bind("<<TreeviewSelect>>", self.on_watchlist_select)
-        self._watch_tree.bind("<Double-1>", self.on_watchlist_double_click)
-        self.refresh_watchlist_view()
-
     def setup_log_tab(self):
         log_frame = ttk.Frame(self.notebook, padding="5")
         self.notebook.add(log_frame, text="运行日志")
@@ -5496,27 +5375,6 @@ class StockMonitorApp:
         if "latest_volume" in self.detail_label_caption_vars:
             self.detail_label_caption_vars["latest_volume"].set(f"成交量(近{volume_days}日均量占比):")
 
-    def _sync_watchlist_with_scan_results(self) -> None:
-        if not self.watchlist_items:
-            return
-        changed = False
-        for code, item in list(self.watchlist_items.items()):
-            result = self._lookup_result_by_code(code)
-            if not result:
-                continue
-            payload = self._build_watchlist_item_payload(
-                code,
-                stock_name=str(item.get("name", "") or result.get("name", "") or ""),
-                status=str(item.get("status", "") or "观察"),
-                note=str(item.get("note", "") or ""),
-            )
-            save_watchlist_item(payload)
-            self.watchlist_items[code] = {**item, **payload}
-            changed = True
-        if changed:
-            self.refresh_watchlist_view()
-            self._refresh_result_table_if_ready()
-
     def _filter_results_by_selected_boards(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         allowed = {str(board).strip() for board in self._selected_boards() if str(board).strip()}
         if not allowed:
@@ -5655,13 +5513,10 @@ class StockMonitorApp:
         needle = getattr(self, "search_var", None)
         needle_str = needle.get() if needle is not None else ""
 
-        only_watch = _get_bool_var("only_watchlist_var")
         only_lu = _get_bool_var("only_limit_up_var")
         only_broken = _get_bool_var("only_broken_limit_up_var")
         only_vol = _get_bool_var("only_volume_expand_var")
         only_strong = _get_bool_var("only_strong_ft_var")
-
-        watchlist_codes = set(self.watchlist_items.keys())
 
         output: List[Dict[str, Any]] = []
         for item in results:
@@ -5674,8 +5529,6 @@ class StockMonitorApp:
             if not result_filters.at_least_volume_ratio(item, min_volume_ratio):
                 continue
             if not result_filters.at_least_limit_up_streak(item, min_streak):
-                continue
-            if not result_filters.only_in_watchlist(item, only_watch, watchlist_codes):
                 continue
             if not result_filters.only_limit_up(item, only_lu):
                 continue
@@ -5728,7 +5581,6 @@ class StockMonitorApp:
         self.min_five_day_var.set("")
         self.min_volume_ratio_var.set("")
         self.min_streak_var.set("")
-        self.only_watchlist_var.set(False)
         self.only_limit_up_var.set(False)
         self.only_broken_limit_up_var.set(False)
         self.only_volume_expand_var.set(False)
@@ -6003,7 +5855,6 @@ class StockMonitorApp:
                 return
             self.all_scan_results = results
             self._post_to_ui(lambda res=results, req=request: self.update_result_table(res, request=req))
-            self._post_to_ui(self._sync_watchlist_with_scan_results)
             self._post_to_ui(lambda count=len(results): self.scan_finished(f"扫描完成，命中 {count} 只。"))
         except StopIteration:
             self._post_to_ui(lambda: self._log("扫描已停止。"))
@@ -6146,7 +5997,7 @@ class StockMonitorApp:
 
     def _sort_value_for_column(self, item: Dict[str, Any], column: str):
         col_def = self._result_columns_map.get(column)
-        context = {"watchlist_items": self.watchlist_items}
+        context: Dict[str, Any] = {}
         if col_def is not None:
             return col_def.sort_key(item, context)
         # 未知列名：退回到 latest_change_pct，保持原先的兜底语义
@@ -6280,179 +6131,6 @@ class StockMonitorApp:
     def on_zt_stock_double_click(self, event):
         tree = event.widget
         stock_code = self._get_tree_selected_code(tree)
-        if not stock_code:
-            return
-        self._cancel_scheduled_detail()
-        self.show_stock_detail(stock_code, force_refresh=True)
-        self.notebook.select(self.detail_tab_frame)
-
-    def _get_selected_watchlist_code(self) -> str:
-        if not hasattr(self, "_watch_tree"):
-            return ""
-        return self._get_tree_selected_code(self._watch_tree)
-
-    def add_selected_result_to_watchlist(self) -> None:
-        selection = self._get_selected_result_identity()
-        if selection is None:
-            messagebox.showwarning("提示", "请先在结果表中选中一只股票")
-            return
-        stock_code, stock_name = selection
-        self._add_code_to_watchlist(stock_code, stock_name=stock_name)
-
-    def remove_selected_result_from_watchlist(self) -> None:
-        selection = self._get_selected_result_identity()
-        if selection is None:
-            messagebox.showwarning("提示", "请先在结果表中选中一只股票")
-            return
-        stock_code, _ = selection
-        self._remove_code_from_watchlist(stock_code)
-
-    def add_current_detail_to_watchlist(self) -> None:
-        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
-        if not stock_code:
-            messagebox.showwarning("提示", "请先打开一只股票详情")
-            return
-        stock_name = self.detail_labels.get("name").cget("text") if "name" in self.detail_labels else ""
-        detail_payload = {
-            "code": stock_code,
-            "name": stock_name,
-            "board": self._lookup_result_by_code(stock_code).get("data", {}).get("board", "") if self._lookup_result_by_code(stock_code) else "",
-            "analysis": getattr(self, "_detail_chart_analysis", {}) or {},
-        }
-        self._add_code_to_watchlist(stock_code, stock_name=stock_name, detail=detail_payload)
-
-    def toggle_current_detail_watchlist(self) -> None:
-        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
-        if not stock_code:
-            messagebox.showwarning("提示", "请先打开一只股票详情")
-            return
-        if stock_code in self.watchlist_items:
-            self._remove_code_from_watchlist(stock_code)
-        else:
-            self.add_current_detail_to_watchlist()
-
-    def edit_current_detail_watch_note(self) -> None:
-        stock_code = str(self._current_detail_code or self._detail_request_code or "").strip().zfill(6)
-        if not stock_code:
-            messagebox.showwarning("提示", "请先打开一只股票详情")
-            return
-        if stock_code not in self.watchlist_items:
-            self.add_current_detail_to_watchlist()
-        self._edit_watchlist_item(stock_code)
-
-    def _add_code_to_watchlist(
-        self,
-        stock_code: str,
-        stock_name: str = "",
-        detail: Optional[Dict[str, Any]] = None,
-        status: str = "观察",
-        note: Optional[str] = None,
-    ) -> None:
-        code = str(stock_code or "").strip().zfill(6)
-        if not code:
-            return
-        payload = self._build_watchlist_item_payload(
-            code,
-            stock_name=stock_name,
-            status=status,
-            note=note,
-            detail=detail,
-        )
-        save_watchlist_item(payload)
-        self.watchlist_items[code] = {**self.watchlist_items.get(code, {}), **payload}
-        self.refresh_watchlist_view()
-        self._refresh_result_table_if_ready()
-        self._update_detail_watch_state(code)
-        self.status_var.set(f"{code} 已加入自选池")
-
-    def _remove_code_from_watchlist(self, stock_code: str) -> None:
-        code = str(stock_code or "").strip().zfill(6)
-        if not code:
-            return
-        if code not in self.watchlist_items:
-            return
-        delete_watchlist_item(code)
-        self.watchlist_items.pop(code, None)
-        self.refresh_watchlist_view()
-        self._refresh_result_table_if_ready()
-        self._update_detail_watch_state(code)
-        self.status_var.set(f"{code} 已移除自选池")
-
-    def _edit_watchlist_item(self, stock_code: str) -> None:
-        code = str(stock_code or "").strip().zfill(6)
-        item = self.watchlist_items.get(code) or load_watchlist_item(code)
-        if not item:
-            return
-        current_status = str(item.get("status", "") or "观察")
-        new_status = simpledialog.askstring("自选状态", "请输入状态（观察/重点/持仓/淘汰）:", initialvalue=current_status, parent=self.root)
-        if new_status is None:
-            return
-        new_note = simpledialog.askstring("自选备注", "请输入备注:", initialvalue=str(item.get("note", "") or ""), parent=self.root)
-        if new_note is None:
-            return
-        payload = self._build_watchlist_item_payload(
-            code,
-            stock_name=str(item.get("name", "") or ""),
-            status=str(new_status).strip() or current_status,
-            note=str(new_note).strip(),
-        )
-        save_watchlist_item(payload)
-        self.watchlist_items[code] = {**item, **payload}
-        self.refresh_watchlist_view()
-        self._refresh_result_table_if_ready()
-        self._update_detail_watch_state(code)
-        self.status_var.set(f"{code} 自选备注已更新")
-
-    def edit_selected_watchlist_item(self) -> None:
-        code = self._get_selected_watchlist_code()
-        if not code:
-            messagebox.showwarning("提示", "请先在自选池中选中一只股票")
-            return
-        self._edit_watchlist_item(code)
-
-    def remove_selected_watchlist_item(self) -> None:
-        code = self._get_selected_watchlist_code()
-        if not code:
-            messagebox.showwarning("提示", "请先在自选池中选中一只股票")
-            return
-        self._remove_code_from_watchlist(code)
-
-    def refresh_watchlist_view(self) -> None:
-        if not hasattr(self, "_watch_tree"):
-            return
-        self._watch_tree.delete(*self._watch_tree.get_children())
-        items = sorted(
-            self.watchlist_items.values(),
-            key=lambda item: (str(item.get("status", "") or ""), str(item.get("updated_at", "") or "")),
-            reverse=True,
-        )
-        for item in items:
-            latest_close = item.get("latest_close")
-            score = item.get("score")
-            self._watch_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    item.get("code", ""),
-                    item.get("name", ""),
-                    item.get("status", ""),
-                    "-" if score is None else str(int(score)),
-                    "-" if latest_close is None else f"{float(latest_close):.2f}",
-                    item.get("board", ""),
-                    item.get("note", ""),
-                    item.get("updated_at", ""),
-                ),
-            )
-        self.watchlist_summary_var.set(f"自选 {len(items)} 只")
-
-    def on_watchlist_select(self, event):
-        stock_code = self._get_selected_watchlist_code()
-        if not stock_code:
-            return
-        self._schedule_show_stock_detail(stock_code)
-
-    def on_watchlist_double_click(self, event):
-        stock_code = self._get_selected_watchlist_code()
         if not stock_code:
             return
         self._cancel_scheduled_detail()
@@ -6666,7 +6344,6 @@ class StockMonitorApp:
             "quote_time": "加载中...",
             "latest_close": "加载中...",
             "score": "加载中...",
-            "watch_status": "加载中...",
             "latest_ma": "加载中...",
             "latest_ma10": "加载中...",
             "latest_volume": "加载中...",
@@ -6680,7 +6357,6 @@ class StockMonitorApp:
         for key, value in placeholders.items():
             if key in self.detail_labels:
                 self.detail_labels[key].config(text=value)
-        self._update_detail_watch_state(stock_code)
         self.price_ax.clear()
         self.volume_ax.clear()
         self.flow_ax.clear()
@@ -6706,8 +6382,6 @@ class StockMonitorApp:
             self.detail_labels["name"].config(text="加载失败")
         if "score" in self.detail_labels:
             self.detail_labels["score"].config(text="-")
-        if "watch_status" in self.detail_labels:
-            self.detail_labels["watch_status"].config(text="-")
         if "summary" in self.detail_labels:
             self.detail_labels["summary"].config(text=message or "详情加载失败")
         self.price_ax.clear()
@@ -6796,24 +6470,8 @@ class StockMonitorApp:
             self.detail_labels["boll"].config(text="-")
 
         self.detail_labels["summary"].config(text=analysis.get("summary", "-"))
-        self._update_detail_watch_state(self._current_detail_code)
 
         self._draw_chart(history, analysis)
-
-    def _update_detail_watch_state(self, stock_code: str) -> None:
-        code = str(stock_code or "").strip().zfill(6)
-        item = self.watchlist_items.get(code) or {}
-        if "watch_status" in self.detail_labels:
-            if item:
-                text = str(item.get("status", "") or "观察")
-                note = str(item.get("note", "") or "").strip()
-                if note:
-                    text = f"{text} | {self._short_text(note, max_len=18)}"
-                self.detail_labels["watch_status"].config(text=text)
-            else:
-                self.detail_labels["watch_status"].config(text="未加入")
-        if hasattr(self, "detail_watch_btn"):
-            self.detail_watch_btn.config(text="移除自选" if item else "加入自选")
 
     def _reset_detail_chart_axes(self) -> None:
         self._detail_chart_dates = []
@@ -8207,40 +7865,6 @@ class StockMonitorApp:
             )
         else:
             messagebox.showerror("操作失败", error_text[:500])
-
-    # ================= 自选股导入/导出 =================
-
-    def _export_watchlist_csv(self) -> None:
-        file_path = filedialog.asksaveasfilename(
-            title="导出自选股",
-            defaultextension=".csv",
-            filetypes=[("CSV 文件", "*.csv")],
-            initialfile="watchlist.csv",
-        )
-        if not file_path:
-            return
-        try:
-            count = export_watchlist_csv(file_path)
-            if count > 0:
-                messagebox.showinfo("成功", f"已导出 {count} 只自选股到\n{file_path}")
-            else:
-                messagebox.showwarning("提示", "自选股列表为空，无内容可导出")
-        except Exception as exc:
-            messagebox.showerror("导出失败", str(exc))
-
-    def _import_watchlist_csv(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="导入自选股",
-            filetypes=[("CSV 文件", "*.csv")],
-        )
-        if not file_path:
-            return
-        try:
-            count = import_watchlist_csv(file_path)
-            messagebox.showinfo("成功", f"已导入 {count} 只自选股")
-            self._load_watchlist_items()
-        except Exception as exc:
-            messagebox.showerror("导入失败", str(exc))
 
     # ================= 数据清理 =================
 

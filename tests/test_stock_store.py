@@ -136,31 +136,6 @@ class TestAppConfig(StockStoreTestCase):
         self.assertEqual(load_app_config("k")["v"], 2)
 
 
-class TestWatchlist(StockStoreTestCase):
-    def test_save_load_delete_watchlist(self):
-        from stock_store import save_watchlist_item, load_watchlist, load_watchlist_item, delete_watchlist_item
-        save_watchlist_item({"code": "000001", "name": "平安银行", "score": 85})
-        items = load_watchlist()
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["name"], "平安银行")
-
-        item = load_watchlist_item("000001")
-        self.assertIsNotNone(item)
-        self.assertAlmostEqual(item["score"], 85.0)
-
-        delete_watchlist_item("000001")
-        items = load_watchlist()
-        self.assertEqual(len(items), 0)
-
-    def test_watchlist_upsert(self):
-        from stock_store import save_watchlist_item, load_watchlist
-        save_watchlist_item({"code": "000001", "name": "平安银行", "score": 50})
-        save_watchlist_item({"code": "000001", "name": "平安银行(更新)", "score": 90})
-        items = load_watchlist()
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["name"], "平安银行(更新)")
-
-
 class TestScanSnapshot(StockStoreTestCase):
     def test_save_and_load_snapshot(self):
         from stock_store import save_scan_snapshot, load_scan_snapshot

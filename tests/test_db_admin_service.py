@@ -110,26 +110,5 @@ class TestDBAdminService(DBAdminServiceTestCase):
         self.assertIn("scan_snapshots", result)
 
 
-class TestWatchlistCSV(DBAdminServiceTestCase):
-    def test_export_then_import_roundtrip(self):
-        from src.services import db_admin_service
-        import stock_store
-
-        stock_store.save_watchlist_item({
-            "code": "000001", "name": "A", "status": "watching",
-            "note": "", "board": "主板", "score": 60,
-        })
-        csv_path = Path(self._tmp) / "watch.csv"
-        exported = db_admin_service.export_watchlist_csv(str(csv_path))
-        self.assertEqual(exported, 1)
-
-        # 清掉自选股后再从 CSV 导入
-        stock_store.delete_watchlist_item("000001")
-        self.assertEqual(len(stock_store.load_watchlist()), 0)
-        imported = db_admin_service.import_watchlist_csv(str(csv_path))
-        self.assertEqual(imported, 1)
-        self.assertEqual(len(stock_store.load_watchlist()), 1)
-
-
 if __name__ == "__main__":
     unittest.main()

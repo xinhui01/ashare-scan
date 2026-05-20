@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 
 Extractor = Callable[[Dict[str, Any], Dict[str, Any]], Any]
-"""(result_item, context) -> 原始值。context 是 `{"watchlist_items": {...}}` 这类 GUI 状态。"""
+"""(result_item, context) -> 原始值。context 是 GUI 透传的状态字典（目前为空字典占位）。"""
 
 CellFormatter = Callable[[Any], str]
 SortKey = Callable[[Any, Dict[str, Any]], Any]
@@ -120,12 +120,6 @@ def _extract_code(item: Dict[str, Any], _ctx: Dict[str, Any]) -> str:
     return str(item.get("code", "") or "").strip().zfill(6)
 
 
-def _extract_watch_flag(item: Dict[str, Any], ctx: Dict[str, Any]) -> bool:
-    watchlist = ctx.get("watchlist_items") or {}
-    code = _extract_code(item, ctx)
-    return code in watchlist
-
-
 def _extract_board_or_exchange(item: Dict[str, Any], _ctx: Dict[str, Any]) -> str:
     data = item.get("data", {}) or {}
     return str(data.get("board") or data.get("exchange") or "")
@@ -141,23 +135,19 @@ def _fmt_str(value: Any, placeholder: str = "-") -> str:
     return s or placeholder
 
 
-def _fmt_watch(value: Any) -> str:
-    return "自选" if bool(value) else ""
-
-
 @dataclass(frozen=True)
 class ResultColumn:
     """一列的全部真相。
 
     `kind` 决定 format / sort 的默认行为；当默认不够用时用 `format_override`
-    或 `sort_override` 精调。需要读外部 GUI 状态（比如自选池）就给 `extract`。
+    或 `sort_override` 精调。需要读外部 GUI 状态就给 `extract`。
     """
     id: str
     label: str
     width: int = 90
     path: Optional[str] = None
     extract: Optional[Extractor] = None
-    kind: str = "float"             # "float" | "float-x" | "float-pct" | "int" | "bool-cn" | "str" | "code" | "watch" | "recent-closes"
+    kind: str = "float"             # "float" | "float-x" | "float-pct" | "int" | "bool-cn" | "str" | "code" | "recent-closes"
     default_visible: bool = True
     sort_desc_by_default: bool = False
     anchor: str = "center"
@@ -201,8 +191,6 @@ def _default_format(value: Any, kind: str) -> str:
         return _fmt_str(value)
     if kind == "code":
         return _fmt_code(value)
-    if kind == "watch":
-        return _fmt_watch(value)
     if kind == "recent-closes":
         return _fmt_recent_closes(value)
     # 兜底：strify
@@ -214,7 +202,7 @@ def _default_sort_key(value: Any, kind: str) -> Any:
         return _sort_number(value)
     if kind == "int":
         return _sort_number(value, default=0)
-    if kind in ("bool-cn", "watch"):
+    if kind == "bool-cn":
         return _sort_int_bool(value)
     if kind in ("str", "code"):
         return str(value or "")
@@ -233,10 +221,6 @@ RESULT_COLUMNS: List[ResultColumn] = [
     ),
     ResultColumn(
         id="name", label="名称", width=140, path="name", kind="str", anchor="w",
-    ),
-    ResultColumn(
-        id="watch", label="自选", width=60, kind="watch",
-        extract=_extract_watch_flag, sort_desc_by_default=True,
     ),
     ResultColumn(
         id="score", label="评分", width=70, path="data.analysis.score",

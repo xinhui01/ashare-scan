@@ -82,18 +82,6 @@ def at_least_limit_up_streak(item: Dict[str, Any], min_streak: Optional[int]) ->
 # 布尔"只显示 X"
 # ---------------------------------------------------------------------------
 
-def only_in_watchlist(
-    item: Dict[str, Any],
-    enabled: bool,
-    watchlist_codes: set,
-) -> bool:
-    """勾选时只保留在自选池里的股票。"""
-    if not enabled:
-        return True
-    code = str(item.get("code", "") or "").strip().zfill(6)
-    return code in watchlist_codes
-
-
 def _analysis_bool(item: Dict[str, Any], key: str) -> bool:
     return bool(_analysis(item).get(key))
 

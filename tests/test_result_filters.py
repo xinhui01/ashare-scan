@@ -107,21 +107,6 @@ class TestMinStreak(unittest.TestCase):
         self.assertFalse(rf.at_least_limit_up_streak(_item(limit_up_streak=1), 2))
 
 
-class TestOnlyWatchlist(unittest.TestCase):
-    def test_disabled_keeps_all(self):
-        self.assertTrue(rf.only_in_watchlist(_item(code="000001"), False, set()))
-
-    def test_in_watchlist_passes(self):
-        self.assertTrue(rf.only_in_watchlist(_item(code="000001"), True, {"000001"}))
-
-    def test_not_in_watchlist_rejected(self):
-        self.assertFalse(rf.only_in_watchlist(_item(code="000002"), True, {"000001"}))
-
-    def test_code_is_padded(self):
-        # item code="1" → padded to "000001"
-        self.assertTrue(rf.only_in_watchlist(_item(code="1"), True, {"000001"}))
-
-
 class TestOnlyFlags(unittest.TestCase):
     def test_only_limit_up(self):
         self.assertTrue(rf.only_limit_up(_item(limit_up=True), True))

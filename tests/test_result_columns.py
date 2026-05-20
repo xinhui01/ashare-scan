@@ -65,7 +65,7 @@ class TestWalkPath(unittest.TestCase):
 
 class TestFormatCell(unittest.TestCase):
     def setUp(self):
-        self.ctx = {"watchlist_items": {}}
+        self.ctx = {}
         self.item = _make_item()
         self.by_id = columns_by_id()
 
@@ -104,11 +104,6 @@ class TestFormatCell(unittest.TestCase):
         item = _make_item()
         item["data"]["board"] = ""
         self.assertEqual(self.by_id["board"].format_cell(item, self.ctx), "SZ")
-
-    def test_watch_column(self):
-        ctx = {"watchlist_items": {"000001": {}}}
-        self.assertEqual(self.by_id["watch"].format_cell(self.item, ctx), "自选")
-        self.assertEqual(self.by_id["watch"].format_cell(self.item, {"watchlist_items": {}}), "")
 
     def test_recent_closes_joined(self):
         self.assertEqual(
@@ -156,7 +151,7 @@ class TestFormatCell(unittest.TestCase):
 
 class TestSortKey(unittest.TestCase):
     def setUp(self):
-        self.ctx = {"watchlist_items": {}}
+        self.ctx = {}
         self.by_id = columns_by_id()
 
     def test_float_sort_key(self):
@@ -178,12 +173,6 @@ class TestSortKey(unittest.TestCase):
         item_false["data"]["analysis"]["broken_limit_up"] = False
         self.assertEqual(self.by_id["broken_limit_up"].sort_key(item_true, self.ctx), 1)
         self.assertEqual(self.by_id["broken_limit_up"].sort_key(item_false, self.ctx), 0)
-
-    def test_watch_sort_reads_from_context(self):
-        item = _make_item()
-        self.assertEqual(self.by_id["watch"].sort_key(item, self.ctx), 0)
-        ctx = {"watchlist_items": {"000001": {}}}
-        self.assertEqual(self.by_id["watch"].sort_key(item, ctx), 1)
 
     def test_recent_closes_sort_is_tuple(self):
         item = _make_item()

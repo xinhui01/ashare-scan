@@ -1,8 +1,8 @@
-"""数据库管理员操作：备份、恢复、清理、自选股 CSV 导入导出。
+"""数据库管理员操作：备份、恢复、清理。
 
 与 `stock_store` 的职责切分：
 - `stock_store` 负责 schema / 连接管理 / 业务表的 CRUD
-- 本模块负责跨表的"管理员"动作：整库备份/恢复、定期清理、与外部 CSV 的互转
+- 本模块负责跨表的"管理员"动作：整库备份/恢复、定期清理
 
 为了避免循环导入，本模块只在被调用时读取 `stock_store` 的 module-level 状态
 （`_DATA_DIR`, `_DB_PATH`, `_DB_WRITE_LOCK`, `reset_all_connections`）。
@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import csv
 import shutil
 import sqlite3
 from datetime import datetime
@@ -150,25 +149,6 @@ def cleanup_all(
     }
 
 
-def export_watchlist_csv(file_path: str) -> int:
-    """导出自选股到 CSV，返回导出数量。"""
-    import stock_store
-    items = stock_store.load_watchlist()
-    if not items:
-        return 0
-    fieldnames = [
-        "code", "name", "status", "note", "board",
-        "latest_close", "score", "score_breakdown", "added_at",
-    ]
-    with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for item in items:
-            writer.writerow(item)
-    logger.info("自选股导出完成：%d 只 -> %s", len(items), file_path)
-    return len(items)
-
-
 class SafeRestoreOrchestrator:
     """把 "关闭后台 → 等待线程 → 执行 restore → 清理连接" 的流程聚成一个入口。
 
@@ -211,28 +191,3 @@ class SafeRestoreOrchestrator:
         return ok
 
 
-def import_watchlist_csv(file_path: str) -> int:
-    """从 CSV 导入自选股，返回导入数量。
-
-    CSV 至少需要 code 列，其他列可选。
-    """
-    import stock_store
-    imported = 0
-    with open(file_path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            code = str(row.get("code", "") or "").strip()
-            if not code:
-                continue
-            item = {
-                "code": code,
-                "name": str(row.get("name", "") or ""),
-                "status": str(row.get("status", "") or ""),
-                "note": str(row.get("note", "") or ""),
-                "board": str(row.get("board", "") or ""),
-                "score": row.get("score"),
-            }
-            stock_store.save_watchlist_item(item)
-            imported += 1
-    logger.info("自选股导入完成：%d 只 <- %s", imported, file_path)
-    return imported
