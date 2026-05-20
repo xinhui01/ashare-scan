@@ -1552,28 +1552,50 @@ class StockDataFetcher:
                 self._log(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
             return db_cached
 
-        # 3. 网络请求（涨停池目前仅东财有接口）
-        if _eastmoney_circuit_breaker_open():
-            if self._log:
-                self._log(f"涨停池 {date_key}：东财熔断中，暂无替代数据源。可尝试换 IP 或等待冷却结束。")
-            return pd.DataFrame()
-        try:
-            df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
-            if df is not None and not df.empty:
-                raw_count = len(df)
-                df = self._sanitize_limit_up_pool(df)
-                dropped = raw_count - len(df)
-                self._limit_up_pool_cache[date_key] = df
-                save_limit_up_pool(date_key, df)
+        # 3. 东财涨停池接口（正常路径）
+        em_ok = not _eastmoney_circuit_breaker_open()
+        if em_ok:
+            try:
+                df = _retry_ak_call(ak.stock_zt_pool_em, date=date_key)
+                if df is not None and not df.empty:
+                    raw_count = len(df)
+                    df = self._sanitize_limit_up_pool(df)
+                    dropped = raw_count - len(df)
+                    self._limit_up_pool_cache[date_key] = df
+                    save_limit_up_pool(date_key, df)
+                    if self._log:
+                        drop_note = f"，过滤 {dropped} 条脏数据" if dropped > 0 else ""
+                        self._log(f"涨停池 {date_key} 东财 {len(df)} 只{drop_note}，已保存")
+                    return df
+            except Exception as exc:
                 if self._log:
-                    drop_note = f"，过滤 {dropped} 条脏数据" if dropped > 0 else ""
-                    self._log(f"涨停池 {date_key} 网络获取 {len(df)} 只{drop_note}，已保存到本地")
-                return df
-        except Exception as e:
+                    self._log(f"涨停池 {date_key} 东财失败: {exc}，尝试 spot 兜底")
+        else:
             if self._log:
-                self._log(f"涨停池 {date_key} 获取失败: {e}")
+                self._log(f"涨停池 {date_key} 东财熔断中，尝试 spot 兜底")
+
+        # 4. spot 兜底：从全市场 spot 派生
+        recent = self._recent_trade_dates(date_key, 2)
+        prev_date = recent[0] if len(recent) >= 2 else ""
+        prev_pool = load_limit_up_pool(prev_date) if prev_date else None
+        try:
+            derived = self._derive_limit_up_pool_from_spot(date_key, prev_pool_df=prev_pool)
+            if derived is not None and not derived.empty:
+                derived = self._sanitize_limit_up_pool(derived)
+                if derived is not None and not derived.empty:
+                    self._limit_up_pool_cache[date_key] = derived
+                    save_limit_up_pool(date_key, derived)
+                    if self._log:
+                        self._log(f"涨停池 {date_key} spot 兜底 {len(derived)} 只（连板数推断自昨日 pool），已保存")
+                    return derived
+        except Exception as exc:
+            if self._log:
+                self._log(f"涨停池 {date_key} spot 兜底失败: {exc}")
+
         empty = pd.DataFrame()
         self._limit_up_pool_cache[date_key] = empty
+        if self._log:
+            self._log(f"涨停池 {date_key} 所有源均失败，返回空")
         return empty
 
     def get_previous_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
@@ -1592,19 +1614,38 @@ class StockDataFetcher:
             self._prev_limit_up_pool_cache[date_key] = db_cached
             return db_cached
 
-        if _eastmoney_circuit_breaker_open():
+        # 东财昨日涨停池接口
+        em_ok = not _eastmoney_circuit_breaker_open()
+        if em_ok:
+            try:
+                df = _retry_ak_call(ak.stock_zt_pool_previous_em, date=date_key)
+                if df is not None and not df.empty:
+                    self._prev_limit_up_pool_cache[date_key] = df
+                    save_limit_up_pool(date_key, df, pool_type="previous")
+                    return df
+            except Exception as exc:
+                if self._log:
+                    self._log(f"昨日涨停池 {date_key} 东财失败: {exc}，尝试 spot 兜底")
+        else:
             if self._log:
-                self._log(f"昨日涨停池 {date_key}：东财熔断中，暂无替代数据源。")
-            return pd.DataFrame()
+                self._log(f"昨日涨停池 {date_key} 东财熔断中，尝试 spot 兜底")
+
+        # spot 兜底：用 date_key 当日 spot 派生，prev_pool 用 date_key 的前一交易日 pool
         try:
-            df = _retry_ak_call(ak.stock_zt_pool_previous_em, date=date_key)
-            if df is not None and not df.empty:
-                self._prev_limit_up_pool_cache[date_key] = df
-                save_limit_up_pool(date_key, df, pool_type="previous")
-                return df
-        except Exception as e:
+            recent = self._recent_trade_dates(date_key, 2)
+            prev_date = recent[0] if len(recent) >= 2 else ""
+            prev_pool = load_limit_up_pool(prev_date) if prev_date else None
+            derived = self._derive_limit_up_pool_from_spot(date_key, prev_pool_df=prev_pool)
+            if derived is not None and not derived.empty:
+                self._prev_limit_up_pool_cache[date_key] = derived
+                save_limit_up_pool(date_key, derived, pool_type="previous")
+                if self._log:
+                    self._log(f"昨日涨停池 {date_key} spot 兜底 {len(derived)} 只，已保存")
+                return derived
+        except Exception as exc:
             if self._log:
-                self._log(f"昨日涨停池 {date_key} 获取失败: {e}")
+                self._log(f"昨日涨停池 {date_key} spot 兜底失败: {exc}")
+
         empty = pd.DataFrame()
         self._prev_limit_up_pool_cache[date_key] = empty
         return empty
