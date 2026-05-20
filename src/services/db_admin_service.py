@@ -189,5 +189,3 @@ class SafeRestoreOrchestrator:
             # 恢复成功后再显式重置一次，保证发起恢复的线程本地连接也失效。
             self._reset()
         return ok
-
-

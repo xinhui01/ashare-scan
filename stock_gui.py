@@ -681,7 +681,7 @@ class StockMonitorApp:
             text="导出图片固定仅包含代码和名称两列，按 Ctrl+C 可复制选中股票代码。",
         ).pack(side=tk.RIGHT)
 
-        # 客户端快速过滤栏（搜索/评分/5日涨幅/放量/连板 + 只显示自选/涨停/...）
+        # 客户端快速过滤栏（搜索/评分/5日涨幅/放量/连板 + 只显示涨停/承接强势/...）
         # 仅对扫描结果表生效，因此放在本 tab 内部
         self._build_control_quick_filter_row(result_frame)
 
@@ -1263,7 +1263,6 @@ class StockMonitorApp:
             core = {
                 "code",
                 "name",
-                "watch",
                 "score",
                 "board",
                 "latest_close",

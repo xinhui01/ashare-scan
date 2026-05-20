@@ -1855,7 +1855,7 @@ def cleanup_old_scan_snapshots(keep_count: int = 20) -> int:
     return deleted
 
 
-# DB 管理员操作（备份/恢复/清理/CSV 导入导出）已迁移到 src/services/db_admin_service。
+# DB 管理员操作（备份/恢复/清理）已迁移到 src/services/db_admin_service。
 # 为保持既有调用方（GUI、测试、脚本）无需改动，这里做薄薄的转发。
 def cleanup_all(*args, **kwargs) -> Dict[str, int]:
     from src.services.db_admin_service import cleanup_all as _impl
