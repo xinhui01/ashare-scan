@@ -499,8 +499,10 @@ class StockMonitorApp:
         self._build_control_scan_params_row(control_frame)
         self._build_control_actions_row(control_frame)
         self._build_control_board_filter_row(control_frame)
-        # 扫描专属面板（开始扫描/扫描参数/扫描过滤/价格过滤/快速过滤）全部移到
-        # setup_result_tab 内部，顶部只保留通用的（更新缓存/查询股票/板块/历史源）
+        # 价格过滤为全局生效（涨停预测/扫描结果共用 self.min_price_var / max_price_var）
+        self._build_control_price_filter_row(control_frame)
+        # 扫描专属面板（开始扫描/扫描参数/扫描过滤/快速过滤）放在 setup_result_tab 内部，
+        # 顶部只保留通用的（更新缓存/查询股票/板块/历史源/价格过滤）
 
     def setup_notebook(self, parent):
         self.notebook = ttk.Notebook(parent)
@@ -656,8 +658,6 @@ class StockMonitorApp:
         self._build_scan_only_params_row(result_frame)
         # 扫描流程开关（仅显示近N日有涨停 / 忽略本地结果快照）
         self._build_scan_only_flow_row(result_frame)
-        # 价格过滤（仅对扫描结果有意义）
-        self._build_control_price_filter_row(result_frame)
 
         action_frame = ttk.Frame(result_frame)
         action_frame.pack(fill=tk.X, pady=(0, 6))
