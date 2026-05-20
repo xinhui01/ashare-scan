@@ -33,6 +33,7 @@ from src.gui.result_columns import (
 from src.gui import result_filters
 from src.gui.tree_enhancer import attach_enhancers_recursively as _attach_tree_enhancers
 from src.gui.ui_dispatch import UIDispatcher
+from src.gui.tabs.log import LogTab
 from src.utils.cancel_token import CancelToken, CancelTokenRegistry
 from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day, _previous_trading_day
 from src.services import prediction_accuracy_service
@@ -512,7 +513,7 @@ class StockMonitorApp:
         self.setup_detail_tab()
         self.setup_intraday_tab()
         self.setup_result_tab()
-        self.setup_log_tab()
+        self.log = LogTab(self, self.notebook)
 
         # 构建 tab 注册表 + 应用用户配置的可见性（默认只显示预测/详情/分时）
         self._init_tab_visibility()
@@ -558,7 +559,7 @@ class StockMonitorApp:
             ("detail", self.detail_tab_frame, "股票详情", False),
             ("intraday", self.intraday_tab, "分时", False),
             ("result", self.result_tab, "扫描结果", True),
-            ("log", self.log_tab, "运行日志", False),
+            ("log", self.log.frame, "运行日志", False),
         ]
 
         # 加载用户偏好（首次运行用默认）
@@ -4417,14 +4418,6 @@ class StockMonitorApp:
             )
         fail_text.config(state=tk.DISABLED)
 
-    def setup_log_tab(self):
-        log_frame = ttk.Frame(self.notebook, padding="5")
-        self.notebook.add(log_frame, text="运行日志")
-        self.log_tab = log_frame
-
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=30, width=100)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-
     def setup_status_bar(self):
         self.status_var = tk.StringVar(value="就绪")
         self.progress_text_var = tk.StringVar(value="")
@@ -4468,8 +4461,8 @@ class StockMonitorApp:
         if self._is_closing:
             return
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
-        self.log_text.insert(tk.END, line)
-        self.log_text.see(tk.END)
+        self.log.text.insert(tk.END, line)
+        self.log.text.see(tk.END)
         if self._run_log_file is not None:
             with self._run_log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
