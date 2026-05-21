@@ -18,7 +18,7 @@
 - self.app.detail.show(...) / detail._schedule_show / detail._cancel_scheduled
 - 价格/快速过滤 var / 板块过滤 var 留 App（多 tab 共用偏好）
 - self.app.is_scanning / is_updating_cache（被 update_history_cache 等共用）
-- self.app._selected_boards / _infer_board_from_code / _refresh_predict_display_if_ready
+- self.app._selected_boards / _infer_board_from_code / self.app.predict._refresh_display_if_ready
 """
 from __future__ import annotations
 
@@ -605,7 +605,7 @@ class ResultTab:
         else:
             self.app.status_var.set("已保存显示板块筛选设置")
         # 同步刷新涨停预测
-        self.app._refresh_predict_display_if_ready()
+        self.app.predict._refresh_display_if_ready()
 
     def on_price_filter_changed(self, event=None):
         if self.app.is_scanning:
@@ -620,7 +620,7 @@ class ResultTab:
                 messagebox.showerror("错误", str(exc))
                 return "break" if event is not None else None
         # 同步刷新涨停预测
-        self.app._refresh_predict_display_if_ready()
+        self.app.predict._refresh_display_if_ready()
         return "break" if event is not None else None
 
     def clear_price_filter(self):

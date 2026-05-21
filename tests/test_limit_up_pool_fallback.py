@@ -167,9 +167,13 @@ class TestLimitUpPoolEmptyRetry:
 
 def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
     from src.gui.app import StockMonitorApp
+    from src.gui.tabs.predict import PredictTab
 
-    # 构造 minimal app 实例，绕开完整初始化
+    # 构造 minimal app + predict tab 实例，绕开完整初始化
     app = StockMonitorApp.__new__(StockMonitorApp)
+    predict = PredictTab.__new__(PredictTab)
+    predict.app = app
+    app.predict = predict
 
     class Var:
         def __init__(self, v):
@@ -198,17 +202,17 @@ def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
 
     fetcher = FetcherStub()
     app.stock_filter = FilterStub(fetcher)
-    app._predict_history_var = Var("")
-    app._predict_date_var = Var("20260520")
-    app._predict_status_label = LabelStub()
+    predict.history_var = Var("")
+    predict.date_var = Var("20260520")
+    predict.status_label = LabelStub()
 
     called = {"start": False}
-    def _start_predict():
+    def _start():
         called["start"] = True
-    app._start_predict = _start_predict
+    predict.start = _start
 
     # 执行刷新
-    app._refresh_selected_predict_date()
+    predict.refresh_selected_date()
 
     # 断言缓存被清除且触发重跑
     assert "20260520" not in fetcher._limit_up_pool_cache
