@@ -38,6 +38,7 @@ from src.services.scoring import first as _scoring_first
 from src.services.scoring import fresh as _scoring_fresh
 from src.services.scoring import wrap as _scoring_wrap
 from src.services.scoring import trend as _scoring_trend
+from src.services.scoring import first_board as _scoring_first_board
 
 
 class StockFilter:
@@ -2058,381 +2059,56 @@ class StockFilter:
         zt_codes: set,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> List[Dict[str, Any]]:
-        """用画像匹配候选股（行情和历史数据均已提前缓存）。"""
-        if spot_df is None or spot_df.empty:
-            return []
-
-        strong_stocks = self._filter_strong_stocks(spot_df, zt_codes)
-        ma5_pullback_stocks = self._filter_ma5_pullback_stocks(spot_df, zt_codes)
-
-        seen_codes = set()
-        merged: List[Dict[str, Any]] = []
-        for rec in strong_stocks:
-            if rec["code"] not in seen_codes:
-                seen_codes.add(rec["code"])
-                merged.append(rec)
-        for rec in ma5_pullback_stocks:
-            if rec["code"] not in seen_codes:
-                seen_codes.add(rec["code"])
-                merged.append(rec)
-
-        if not merged:
-            return []
-
-        if self._log:
-            self._log(f"涨停预测：强势股 {len(strong_stocks)} 只 + 回踩MA5 {len(ma5_pullback_stocks)} 只，"
-                      f"合并去重后 {len(merged)} 只")
-
-        # 历史数据已在阶段3统一预取，这里直接评分
-        candidates = []
-        total = len(merged)
-        for idx, rec in enumerate(merged):
-            score_info = self._score_first_board_by_profile(rec, hot_industries, profile)
-            if score_info["score"] >= 50:
-                candidates.append(score_info)
-            if progress_callback:
-                progress_callback(idx + 1, total, f"首板匹配 {rec['code']} {rec.get('name', '')}")
-
-        candidates.sort(key=lambda x: -x["score"])
-        return candidates[:50]
+        """用画像匹配候选股（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.scan_first_board_candidates_cached(
+            today_pool_df,
+            hot_industries,
+            profile,
+            spot_df,
+            zt_codes,
+            progress_callback,
+            fetcher=self.fetcher,
+            log_fn=self._log,
+            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
+        )
 
     @staticmethod
     def _parse_lhb_jiedu(jiedu: str) -> Dict[str, Any]:
-        """解析龙虎榜「解读」字段。
-
-        返回:
-          institution_buy: 机构买入家数
-          institution_sell: 机构卖出家数
-          main_t_trade: 是否"主力做T"
-          hot_money_region: 命中的知名游资地区（西藏/宁波/上海/江苏/深圳/广东/浙江），无则 None
-          ordinary_seats_only: 是否只是"普通席位"（弱信号）
-          top1_dominant: 是否"买一主买"（单一席位主导）
-          success_rate: 历史接力成功率 %（None=无）
-          is_buy_dominant: 整体偏买入还是卖出
-        """
-        info: Dict[str, Any] = {
-            "institution_buy": 0,
-            "institution_sell": 0,
-            "main_t_trade": False,
-            "hot_money_region": None,
-            "ordinary_seats_only": False,
-            "top1_dominant": False,
-            "success_rate": None,
-            "is_buy_dominant": False,
-        }
-        if not jiedu:
-            return info
-        import re
-        m = re.search(r"(\d+)家机构买入", jiedu)
-        if m:
-            info["institution_buy"] = int(m.group(1))
-            info["is_buy_dominant"] = True
-        m = re.search(r"(\d+)家机构卖出", jiedu)
-        if m:
-            info["institution_sell"] = int(m.group(1))
-        if "主力做T" in jiedu or "营业部接力T接" in jiedu:
-            info["main_t_trade"] = True
-            if "买入" in jiedu or "T接" in jiedu:
-                info["is_buy_dominant"] = True
-        for region in ("西藏", "宁波", "上海", "江苏", "深圳", "广东", "浙江", "北京"):
-            if region in jiedu and "买入" in jiedu and "卖出" not in jiedu.split(region, 1)[1][:20]:
-                info["hot_money_region"] = region
-                info["is_buy_dominant"] = True
-                break
-        if "普通席位" in jiedu:
-            info["ordinary_seats_only"] = True
-        if "买一主买" in jiedu:
-            info["top1_dominant"] = True
-            info["is_buy_dominant"] = True
-        m = re.search(r"成功率(\d+(?:\.\d+)?)%", jiedu)
-        if m:
-            try:
-                info["success_rate"] = float(m.group(1))
-            except ValueError:
-                pass
-        return info
+        """解析龙虎榜「解读」字段（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.parse_lhb_jiedu(jiedu)
 
     def _load_lhb_for_date(self, trade_date: str) -> Dict[str, Dict[str, Any]]:
-        """加载指定交易日的龙虎榜数据。
-
-        返回 dict: code → {
-            "net_buy": 净买入额,
-            "buy": 买入额,
-            "sell": 卖出额,
-            "reason": 上榜原因,
-            "jiedu": 解读原文,
-            "jiedu_parsed": 解析后的 dict（机构家数/游资地区/成功率等）
-        }
-        网络失败/无数据返回空 dict（不阻塞预测）。
-
-        缓存键: stock_filter_lhb_<trade_date>
-        """
-        from stock_store import load_app_config, save_app_config
-        cache_key = f"stock_filter_lhb_{str(trade_date).strip()}"
-        cached = load_app_config(cache_key, default=None)
-        # 旧缓存里没有 jiedu_parsed，需要重建一次
-        if isinstance(cached, dict) and cached:
-            sample = next(iter(cached.values())) if cached else None
-            if isinstance(sample, dict) and "jiedu_parsed" in sample:
-                return cached  # type: ignore[return-value]
-
-        try:
-            import akshare as ak
-            from stock_data import _retry_ak_call
-            df = _retry_ak_call(
-                ak.stock_lhb_detail_em,
-                start_date=str(trade_date).strip(),
-                end_date=str(trade_date).strip(),
-            )
-        except Exception as exc:
-            if self._log:
-                self._log(f"涨停预测：龙虎榜拉取失败 {exc}")
-            return {}
-
-        if df is None or df.empty:
-            return {}
-
-        result: Dict[str, Dict[str, Any]] = {}
-        for _, row in df.iterrows():
-            try:
-                code = str(row.get("代码", "")).strip().zfill(6)
-                if not code or len(code) != 6:
-                    continue
-                net = float(row.get("龙虎榜净买额") or 0)
-                buy = float(row.get("龙虎榜买入额") or 0)
-                sell = float(row.get("龙虎榜卖出额") or 0)
-                reason = str(row.get("上榜原因") or "").strip()
-                jiedu = str(row.get("解读") or "").strip()
-                # 同一天可能多次上榜，累加金额并保留首次解读
-                if code in result:
-                    result[code]["net_buy"] += net
-                    result[code]["buy"] += buy
-                    result[code]["sell"] += sell
-                else:
-                    result[code] = {
-                        "net_buy": net,
-                        "buy": buy,
-                        "sell": sell,
-                        "reason": reason,
-                        "jiedu": jiedu,
-                        "jiedu_parsed": self._parse_lhb_jiedu(jiedu),
-                    }
-            except (TypeError, ValueError):
-                continue
-
-        if result:
-            try:
-                save_app_config(cache_key, result)
-            except Exception:
-                pass
-        return result
+        """加载指定交易日的龙虎榜数据（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.load_lhb_for_date(trade_date, log_fn=self._log)
 
     def _load_industry_board_strength(self) -> Dict[str, float]:
-        """加载东财行业板块涨跌幅，识别强势板块。
-
-        返回 dict: 行业名 → 当日涨跌幅 %
-        """
-        from stock_store import load_app_config, save_app_config
-        from datetime import datetime as _dt
-        today_key = _dt.now().strftime("%Y%m%d_%H")  # 小时级缓存（盘中变化）
-        cache_key = f"stock_filter_board_strength_{today_key}"
-        cached = load_app_config(cache_key, default=None)
-        if isinstance(cached, dict) and cached:
-            return cached  # type: ignore[return-value]
-
-        try:
-            import akshare as ak
-            from stock_data import _retry_ak_call
-            df = _retry_ak_call(ak.stock_board_industry_name_em)
-        except Exception as exc:
-            if self._log:
-                self._log(f"涨停预测：板块涨跌幅拉取失败 {exc}")
-            return {}
-
-        if df is None or df.empty:
-            return {}
-
-        result: Dict[str, float] = {}
-        for _, row in df.iterrows():
-            try:
-                name = str(row.get("板块名称", "")).strip()
-                chg = float(row.get("涨跌幅") or 0)
-                if name:
-                    result[name] = chg
-            except (TypeError, ValueError):
-                continue
-
-        if result:
-            try:
-                save_app_config(cache_key, result)
-            except Exception:
-                pass
-        return result
+        """加载东财行业板块涨跌幅（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.load_industry_board_strength(log_fn=self._log)
 
     def _load_northbound_accumulation(self) -> Dict[str, float]:
-        """加载北向资金 3 日加仓榜（沪股通 + 深股通合并）。
-
-        返回 dict: code → 3 日持股市值变化（万元）
-        正值表示北向加仓，负值表示北向减仓。
-
-        北向数据 T+1 才公布，预测时只能取最近一个交易日的快照。
-        当日缓存 24h，避免重复拉取。
-        """
-        from stock_store import load_app_config, save_app_config
-        from datetime import datetime as _dt
-        today_key = _dt.now().strftime("%Y%m%d")
-        cache_key = f"stock_filter_northbound_{today_key}"
-        cached = load_app_config(cache_key, default=None)
-        if isinstance(cached, dict) and cached:
-            return cached  # type: ignore[return-value]
-
-        result: Dict[str, float] = {}
-        try:
-            import akshare as ak
-            from stock_data import _retry_ak_call
-            for market in ("沪股通", "深股通"):
-                try:
-                    df = _retry_ak_call(
-                        ak.stock_hsgt_hold_stock_em,
-                        market=market,
-                        indicator="3日排行",
-                    )
-                except Exception as exc:
-                    if self._log:
-                        self._log(f"涨停预测：北向 {market} 拉取失败 {exc}")
-                    continue
-                if df is None or df.empty:
-                    continue
-                # 列名形如 "3日增持估计-市值"（万元，正=北向加仓，负=减仓）
-                value_col = next(
-                    (c for c in df.columns
-                     if "增持" in str(c) and "市值" in str(c) and "增幅" not in str(c)),
-                    None,
-                )
-                if value_col is None:
-                    # 兼容旧版列名
-                    value_col = next(
-                        (c for c in df.columns if "市值变化" in str(c) and "3日" in str(c)),
-                        None,
-                    )
-                if value_col is None:
-                    continue
-                for _, row in df.iterrows():
-                    try:
-                        code = str(row.get("代码", "")).strip().zfill(6)
-                        if not code or len(code) != 6:
-                            continue
-                        change = float(row.get(value_col) or 0)
-                        # 同一只票如果在两个市场都有持股不会重复（沪/深分离），累加保险
-                        result[code] = result.get(code, 0.0) + change
-                    except (TypeError, ValueError):
-                        continue
-        except Exception as exc:
-            if self._log:
-                self._log(f"涨停预测：北向资金加载失败 {exc}")
-            return {}
-
-        if result:
-            try:
-                save_app_config(cache_key, result)
-            except Exception:
-                pass
-        return result
+        """加载北向资金 3 日加仓榜（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.load_northbound_accumulation(log_fn=self._log)
 
     def _fetch_spot_snapshot(self) -> Optional[pd.DataFrame]:
-        """获取全市场实时行情快照（只调一次 API）。
-        优先东财，东财熔断时自动回退到新浪。
-        """
-        import akshare as ak
-        from stock_data import _retry_ak_call, _eastmoney_circuit_breaker_open
-        # 东财可用时优先东财
-        if not _eastmoney_circuit_breaker_open():
-            try:
-                if self._log:
-                    self._log("涨停预测：正在获取全市场实时行情快照（东财）...")
-                return _retry_ak_call(ak.stock_zh_a_spot_em)
-            except Exception as e:
-                if self._log:
-                    self._log(f"涨停预测：东财实时行情失败: {e}，尝试新浪备选...")
-        # 新浪备选
-        try:
-            if self._log:
-                self._log("涨停预测：正在获取全市场实时行情快照（新浪，约30s）...")
-            df = _retry_ak_call(ak.stock_zh_a_spot)
-            if df is not None and not df.empty:
-                # 新浪代码带交易所前缀（如 sh600000），去掉前缀统一为纯数字
-                if "代码" in df.columns:
-                    df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.strip().str.zfill(6)
-                return df
-        except Exception as e2:
-            if self._log:
-                self._log(f"涨停预测：新浪实时行情也失败: {e2}")
-        return None
+        """获取全市场实时行情快照（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.fetch_spot_snapshot(log_fn=self._log)
 
     @staticmethod
     def _parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
-        """从实时行情行中解析基础记录，返回 None 表示需跳过。"""
-        code = str(row.get("代码", "")).strip().zfill(6)
-        if code in exclude_codes:
-            return None
-        name = str(row.get("名称", ""))
-        if "ST" in name.upper():
-            return None
-        close = float(row["最新价"]) if pd.notna(row.get("最新价")) else None
-        if close is None or close <= 0:
-            return None
-        change_pct = float(row["涨跌幅"]) if pd.notna(row.get("涨跌幅")) else None
-        amount_val = float(row["成交额"]) if pd.notna(row.get("成交额")) else None
-        if amount_val is not None and amount_val < 5000_0000:
-            return None
-        volume_val = float(row["成交量"]) if pd.notna(row.get("成交量")) else None
-        turnover = float(row["换手率"]) if pd.notna(row.get("换手率")) else None
-        industry = str(
-            row.get("所属行业", row.get("行业", row.get("板块", ""))) or ""
-        ).strip()
-        return {
-            "code": code, "name": name, "change_pct": change_pct,
-            "close": close, "volume": volume_val, "amount": amount_val,
-            "turnover": turnover, "industry": industry,
-        }
+        """从实时行情行中解析基础记录（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.parse_spot_record(row, exclude_codes)
 
     def _filter_strong_stocks(
         self, spot_df: pd.DataFrame, exclude_codes: set
     ) -> List[Dict[str, Any]]:
-        """从行情快照中筛选涨幅 3%~9.95% 的强势股（含擦边没封板的 9.x% 票）。
-
-        历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
-        """
-        records = []
-        for _, row in spot_df.iterrows():
-            rec = self._parse_spot_record(row, exclude_codes)
-            if rec is None:
-                continue
-            chg = rec.get("change_pct")
-            if chg is None or chg < 3.0 or chg >= 9.95:
-                continue
-            records.append(rec)
-        records.sort(key=lambda x: -(x.get("change_pct") or 0))
-        return records
+        """从行情快照筛选 +3%~+9.95% 强势股（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.filter_strong_stocks(spot_df, exclude_codes)
 
     def _filter_ma5_pullback_stocks(
         self, spot_df: pd.DataFrame, exclude_codes: set
     ) -> List[Dict[str, Any]]:
-        """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（用于反包/承接候选）。
-
-        历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
-        """
-        records = []
-        for _, row in spot_df.iterrows():
-            rec = self._parse_spot_record(row, exclude_codes)
-            if rec is None:
-                continue
-            chg = rec.get("change_pct")
-            if chg is None or chg < -5.0 or chg >= 3.0:
-                continue
-            records.append(rec)
-        records.sort(key=lambda x: -(x.get("amount") or 0))
-        return records
+        """从行情快照筛选 -5%~+3% 回踩MA5 候选（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.filter_ma5_pullback_stocks(spot_df, exclude_codes)
 
     def _score_first_board_by_profile(
         self,
@@ -2440,216 +2116,12 @@ class StockFilter:
         hot_industries: Dict[str, int],
         profile: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """用涨停前兆画像对强势股打分。
-
-        核心思路：把当前股票的特征和画像中涨停股 T-1 日特征对比，
-        越接近画像中位数/均值的，得分越高。
-        """
-        code = rec["code"]
-        name = rec.get("name", "")
-        score = 0.0
-        reasons: List[str] = []
-        change_pct = rec.get("change_pct", 0)
-        turnover = rec.get("turnover")
-
-        # 当日涨幅
-        if change_pct is not None:
-            if change_pct >= 8:
-                score += 18
-                reasons.append(f"涨{change_pct:.1f}%接近涨停+18")
-            elif change_pct >= 6:
-                score += 12
-                reasons.append(f"涨{change_pct:.1f}%+12")
-            elif change_pct >= 3:
-                score += 6
-                reasons.append(f"涨{change_pct:.1f}%+6")
-
-        # 获取历史数据计算特征（已预取到缓存，直接读取）
-        try:
-            # 只使用本地缓存，不发起网络请求
-            history = self.fetcher.get_history_data(
-                code, days=120, force_refresh=False,
-                request_plan=self._build_local_cache_history_plan(reason="predict-first-board-cache-only"),
-            )
-        except Exception as exc:
-            logger.debug("预测首板获取历史 %s 失败: %s", code, exc)
-            history = None
-
-        industry = ""
-        vol_ratio = None
-        position_60d = None
-        trend_10d = None
-        ma_bullish = False
-
-        if history is not None and not history.empty and len(history) >= 10:
-            df = history.sort_values("date").reset_index(drop=True)
-            close = pd.to_numeric(df["close"], errors="coerce")
-            volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
-            amount = pd.to_numeric(df.get("amount"), errors="coerce") if "amount" in df.columns else pd.Series(dtype=float)
-            latest_close = float(close.iloc[-1]) if not pd.isna(close.iloc[-1]) else None
-            t = len(df) - 1  # 当前最新一行
-
-            ma5 = close.rolling(5, min_periods=5).mean()
-            ma10 = close.rolling(10, min_periods=10).mean()
-            ma20 = close.rolling(20, min_periods=20).mean()
-            ma5_val = float(ma5.iloc[t]) if not pd.isna(ma5.iloc[t]) else None
-            ma10_val = float(ma10.iloc[t]) if not pd.isna(ma10.iloc[t]) else None
-            ma20_val = float(ma20.iloc[t]) if not pd.isna(ma20.iloc[t]) else None
-
-            # --- 量比匹配 ---
-            if len(volume) >= 6 and not pd.isna(volume.iloc[t]):
-                vol_window = volume.iloc[max(0, t - 5):t].dropna()
-                if not vol_window.empty and float(vol_window.mean()) > 0:
-                    vol_ratio = round(float(volume.iloc[t]) / float(vol_window.mean()), 2)
-                    p = profile.get("vol_ratio_t1", {})
-                    p_med = p.get("median")
-                    p_p25 = p.get("p25")
-                    p_p75 = p.get("p75")
-                    if p_med is not None and p_p25 is not None and p_p75 is not None:
-                        if p_p25 <= vol_ratio <= p_p75:
-                            score += 15
-                            reasons.append(f"量比{vol_ratio:.1f}x吻合画像[{p_p25:.1f}~{p_p75:.1f}]+15")
-                        elif vol_ratio >= p_med * 0.6:
-                            score += 8
-                            reasons.append(f"量比{vol_ratio:.1f}x接近画像+8")
-                    elif vol_ratio >= 1.5:
-                        score += 8
-                        reasons.append(f"放量{vol_ratio:.1f}x+8")
-
-            # --- 额比匹配 ---
-            if len(amount) >= 6 and not pd.isna(amount.iloc[t]):
-                amt_window = amount.iloc[max(0, t - 5):t].dropna()
-                if not amt_window.empty and float(amt_window.mean()) > 0:
-                    amt_ratio = round(float(amount.iloc[t]) / float(amt_window.mean()), 2)
-                    p = profile.get("amt_ratio_t1", {})
-                    p_med = p.get("median")
-                    if p_med is not None and amt_ratio >= p_med * 0.8:
-                        score += 5
-                        reasons.append(f"额比{amt_ratio:.1f}x匹配+5")
-
-            # --- 均线匹配 ---
-            if ma5_val is not None and ma10_val is not None and ma20_val is not None:
-                if ma5_val > ma10_val > ma20_val:
-                    ma_bullish = True
-                    p_bull = profile.get("ma_bullish", {})
-                    if p_bull.get("ratio", 0) >= 50:
-                        score += 10
-                        reasons.append(f"多头排列(画像{p_bull['ratio']:.0f}%)+10")
-                    else:
-                        score += 5
-                        reasons.append("多头排列+5")
-
-            # 站上MA5
-            if latest_close is not None and ma5_val is not None and latest_close > ma5_val:
-                p_above = profile.get("above_ma5", {})
-                if p_above.get("ratio", 0) >= 60:
-                    score += 5
-                    reasons.append(f"站上MA5(画像{p_above['ratio']:.0f}%)+5")
-
-            # --- MA5 距离匹配 ---
-            if latest_close and ma5_val and ma5_val > 0:
-                dist_ma5 = round((latest_close / ma5_val - 1) * 100, 2)
-                p = profile.get("dist_ma5_pct", {})
-                p_p25 = p.get("p25")
-                p_p75 = p.get("p75")
-                if p_p25 is not None and p_p75 is not None:
-                    if p_p25 <= dist_ma5 <= p_p75:
-                        score += 5
-                        reasons.append(f"距MA5 {dist_ma5:+.1f}%吻合+5")
-
-            # --- 回踩MA5检测 ---
-            # 收盘接近或略低于MA5（-3%~+1%），且前几日曾站上MA5
-            if latest_close and ma5_val and ma5_val > 0:
-                dist_ma5_now = (latest_close / ma5_val - 1) * 100
-                if -3.0 <= dist_ma5_now <= 1.0:
-                    was_above_ma5 = False
-                    for lb in range(2, min(6, t + 1)):
-                        idx_b = t - lb
-                        if idx_b >= 0 and not pd.isna(close.iloc[idx_b]) and not pd.isna(ma5.iloc[idx_b]):
-                            if float(close.iloc[idx_b]) > float(ma5.iloc[idx_b]) * 1.01:
-                                was_above_ma5 = True
-                                break
-                    if was_above_ma5:
-                        # 回踩MA5，这是涨停前常见形态
-                        p_pb = profile.get("ma5_pullback", {})
-                        pb_ratio = p_pb.get("ratio", 0)
-                        if pb_ratio >= 20:
-                            score += 15
-                            reasons.append(f"回踩MA5(画像{pb_ratio:.0f}%)+15")
-                        else:
-                            score += 10
-                            reasons.append(f"回踩MA5(距{dist_ma5_now:+.1f}%)+10")
-
-            # --- 60日位置匹配 ---
-            if len(close) >= 20 and latest_close is not None:
-                window = close.tail(min(60, len(close))).dropna()
-                if len(window) >= 10:
-                    position_60d = round(float((window < latest_close).sum()) / len(window) * 100, 1)
-                    p = profile.get("position_60d", {})
-                    p_med = p.get("median")
-                    p_p25 = p.get("p25")
-                    p_p75 = p.get("p75")
-                    if p_med is not None and p_p25 is not None and p_p75 is not None:
-                        if p_p25 <= position_60d <= p_p75:
-                            score += 8
-                            reasons.append(f"位置{position_60d:.0f}%吻合画像[{p_p25:.0f}~{p_p75:.0f}]+8")
-                        elif position_60d < 30:
-                            score += 5
-                            reasons.append(f"低位{position_60d:.0f}%+5")
-
-            # --- 10日趋势 ---
-            if t >= 10 and not pd.isna(close.iloc[t - 10]) and close.iloc[t - 10] > 0:
-                trend_10d = round((float(close.iloc[t]) / float(close.iloc[t - 10]) - 1) * 100, 1)
-
-            # --- 缩量蓄势匹配 ---
-            if len(volume) >= 6:
-                vol_3 = volume.iloc[max(0, t - 3):t].dropna()
-                vol_5 = volume.iloc[max(0, t - 5):t].dropna()
-                if not vol_3.empty and not vol_5.empty and float(vol_5.mean()) > 0:
-                    shrink = round(float(vol_3.mean()) / float(vol_5.mean()), 2)
-                    p = profile.get("shrink_ratio_t1", {})
-                    p_med = p.get("median")
-                    if p_med is not None and shrink <= p_med and vol_ratio is not None and vol_ratio >= 1.5:
-                        score += 10
-                        reasons.append(f"缩量蓄势后放量(缩{shrink:.2f}/量比{vol_ratio:.1f}x)+10")
-
-        # 板块热度
-        if industry and hot_industries.get(industry, 0) >= 3:
-            score += 10
-            reasons.append(f"热门板块({hot_industries[industry]}只)+10")
-        elif industry and hot_industries.get(industry, 0) >= 2:
-            score += 5
-            reasons.append(f"板块有{hot_industries[industry]}只+5")
-
-        # 换手率
-        if turnover is not None:
-            p = profile.get("turnover_t1", {})
-            p_p25 = p.get("p25")
-            p_p75 = p.get("p75")
-            if p_p25 is not None and p_p75 is not None:
-                if p_p25 <= turnover <= p_p75:
-                    score += 5
-                    reasons.append(f"换手{turnover:.1f}%吻合画像+5")
-            elif 3 <= turnover <= 20:
-                score += 3
-                reasons.append(f"换手{turnover:.1f}%适中+3")
-            if turnover > 40:
-                score -= 5
-                reasons.append(f"换手{turnover:.1f}%过高-5")
-
-        final_score = max(0, min(100, int(round(score))))
-        return {
-            "code": code,
-            "name": name,
-            "industry": industry,
-            "close": rec.get("close"),
-            "change_pct": change_pct,
-            "turnover": turnover,
-            "vol_ratio": vol_ratio,
-            "position_60d": position_60d,
-            "trend_10d": trend_10d,
-            "ma_bullish": ma_bullish,
-            "score": final_score,
-            "reasons": " / ".join(reasons[:8]),
-            "predict_type": "首板候选",
-        }
+        """用涨停前兆画像对强势股打分（thin delegate -> scoring/first_board.py）。"""
+        return _scoring_first_board.score_first_board_by_profile(
+            rec,
+            hot_industries,
+            profile,
+            fetcher=self.fetcher,
+            log_fn=self._log,
+            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
+        )
