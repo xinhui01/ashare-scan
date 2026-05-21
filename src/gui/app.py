@@ -1340,6 +1340,11 @@ class StockMonitorApp:
             sent_bar, text="点击右侧「刷新」分析市场情绪", foreground="#666",
         )
         self._sentiment_summary_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 数据源指示标签（在预测完成后由 _refresh_data_source_label 更新）
+        self._predict_data_source_label = ttk.Label(
+            sent_bar, text="", foreground="#888",
+        )
+        self._predict_data_source_label.pack(side=tk.RIGHT, padx=(8, 4))
         ttk.Button(
             sent_bar, text="详情", width=6,
             command=self._show_sentiment_detail,
@@ -2982,6 +2987,32 @@ class StockMonitorApp:
         "turnover_t1": "T-1换手率%",
     }
 
+    def _refresh_data_source_label(self, trade_date: str) -> None:
+        """根据涨停池数据源更新顶部指示标签。
+
+        调用时机：每次 _apply_predict_result 后。
+        """
+        if not hasattr(self, "_predict_data_source_label"):
+            return
+        try:
+            source = self.stock_filter.fetcher.get_pool_source(trade_date)
+        except Exception:
+            source = "unknown"
+        label = self._predict_data_source_label
+        source_text = {
+            "eastmoney": ("数据: 东财", "#888"),
+            "cache_memory": ("数据: 本地缓存", "#888"),
+            "cache_db": ("数据: 本地缓存", "#888"),
+            "spot_fallback": ("数据: spot 兜底 ⚠️", "#d08000"),  # 橙色
+            "empty": ("数据: 无 ❌", "#c62828"),  # 红色
+            "unknown": ("", "#888"),
+        }
+        text, fg = source_text.get(source, ("", "#888"))
+        try:
+            label.configure(text=text, foreground=fg)
+        except Exception:
+            pass
+
     def _apply_predict_result(self, result: Dict[str, Any]):
         self._predict_result = result
         # 先加载该日期的命中结果，再注入到 record（让"结果"列可参与排序）
@@ -3171,6 +3202,10 @@ class StockMonitorApp:
 
         # 启动后台预热：把候选股分时和详情 payload 缓起来，方便用户后续秒开
         self._start_predict_prewarm(result)
+
+        # 更新数据源指示标签
+        predict_date = str(result.get("trade_date") or result.get("today_date") or "").strip()
+        self._refresh_data_source_label(predict_date)
 
         # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
         # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
