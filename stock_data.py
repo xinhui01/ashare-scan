@@ -1569,10 +1569,36 @@ class StockDataFetcher:
                         prev_lookup[c] = n
 
         out: List[Dict[str, Any]] = []
+        derive_failed = 0
         for row in rows:
             code = str(row.get("代码", "")).strip()
             prev_n = prev_lookup.get(code, 0)
             boards = prev_n + 1 if prev_n > 0 else 1
+
+            # 派生 首次封板时间 + 炸板次数（从 1min 分时计算）
+            seal_time = ""
+            breaks_count = 0
+            try:
+                limit_up_price = _safe_float(row.get("最新价"), 0.0) or 0.0
+                if limit_up_price > 0:
+                    intraday_df = self.get_intraday_data(
+                        code,
+                        day_offset=0,
+                        target_trade_date=trade_date,
+                        include_meta=False,
+                    )
+                    if intraday_df is not None and not intraday_df.empty:
+                        seal_time = _derive_seal_time_from_intraday(
+                            intraday_df, limit_up_price, tolerance_pct=0.1,
+                        ) or ""
+                        breaks_count = _count_intraday_breaks(
+                            intraday_df, limit_up_price, tolerance_pct=0.1,
+                        )
+            except Exception as exc:
+                derive_failed += 1
+                if self._log:
+                    self._log(f"涨停池 {trade_date} {code} intraday 派生失败: {exc}")
+
             out.append({
                 "代码": code,
                 "名称": str(row.get("名称", "") or ""),
@@ -1582,13 +1608,15 @@ class StockDataFetcher:
                 "流通市值": row.get("流通市值"),
                 "总市值": row.get("总市值"),
                 "连板数": boards,
-                "首次封板时间": "",
+                "首次封板时间": seal_time,
                 "最后封板时间": "",
-                "炸板次数": 0,
+                "炸板次数": breaks_count,
                 "所属行业": str(row.get("所属行业", "") or ""),
                 "涨停统计": "",
                 "涨停原因": "",
             })
+        if derive_failed > 0 and self._log:
+            self._log(f"涨停池 {trade_date} intraday 派生失败 {derive_failed}/{len(rows)} 只")
         return pd.DataFrame(out)
 
     def get_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
