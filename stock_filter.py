@@ -40,7 +40,10 @@ from src.services.scoring import wrap as _scoring_wrap
 from src.services.scoring import trend as _scoring_trend
 from src.services.scoring import first_board as _scoring_first_board
 from src.services.scoring import predict as _scoring_predict
+from src.services.scoring import filter as _scoring_filter
 from src.services.scanning import orchestrator as _scanning
+from src.services import stock_detail_service as _stock_detail_service
+from src.services import intraday_query_service as _intraday_query_service
 
 
 class StockFilter:
@@ -83,122 +86,32 @@ class StockFilter:
         )
 
     def _resolve_stock_identity(self, universe: Optional[pd.DataFrame], stock_code: str) -> Dict[str, str]:
-        code = str(stock_code or "").strip().zfill(6)
-        cached_meta = load_limit_up_stock_meta(code) or {}
-        if universe is None or universe.empty or not code:
-            return {
-                "name": str(cached_meta.get("name", "") or ""),
-                "board": "",
-                "exchange": "",
-                "industry": str(cached_meta.get("industry", "") or ""),
-                "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
-            }
-        try:
-            match = universe[universe["code"].astype(str).str.zfill(6) == code]
-        except Exception:
-            match = pd.DataFrame()
-        if match.empty:
-            return {
-                "name": str(cached_meta.get("name", "") or ""),
-                "board": "",
-                "exchange": "",
-                "industry": str(cached_meta.get("industry", "") or ""),
-                "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
-            }
-        row = match.iloc[0]
-        return {
-            "name": str(row.get("name", "") or "") or str(cached_meta.get("name", "") or ""),
-            "board": str(row.get("board", "") or ""),
-            "exchange": str(row.get("exchange", "") or ""),
-            "industry": str(cached_meta.get("industry", "") or ""),
-            "last_limit_up_trade_date": str(cached_meta.get("last_limit_up_trade_date", "") or ""),
-        }
+        """thin delegate → stock_detail_service.resolve_stock_identity"""
+        return _stock_detail_service.resolve_stock_identity(universe, stock_code)
 
     def _enrich_analysis_with_history_snapshot(
         self,
         analysis: Dict[str, Any],
         history: Optional[pd.DataFrame],
     ) -> None:
-        if history is not None and not history.empty:
-            latest_row = history.iloc[-1]
-            analysis["latest_volume"] = latest_row.get("volume")
-            analysis["latest_amount"] = latest_row.get("amount")
-            analysis["quote_time"] = str(latest_row.get("date", "") or "")
-            return
-        analysis["latest_volume"] = None
-        analysis["latest_amount"] = None
-        analysis["quote_time"] = ""
+        """thin delegate → stock_detail_service.enrich_analysis_with_history_snapshot"""
+        _stock_detail_service.enrich_analysis_with_history_snapshot(analysis, history)
 
     def _enrich_analysis_with_fund_flow(
         self,
         analysis: Dict[str, Any],
         fund_flow_df: Optional[pd.DataFrame],
     ) -> None:
-        if fund_flow_df is not None and not fund_flow_df.empty:
-            latest_flow = fund_flow_df.iloc[-1]
-            analysis["flow_date"] = str(latest_flow.get("date", "") or "")
-            analysis["main_force_amount"] = latest_flow.get("main_force_amount")
-            analysis["big_order_amount"] = latest_flow.get("big_order_amount")
-            analysis["super_big_order_amount"] = latest_flow.get("super_big_order_amount")
-            analysis["main_force_ratio"] = latest_flow.get("main_force_ratio")
-            analysis["big_order_ratio"] = latest_flow.get("big_order_ratio")
-            analysis["super_big_order_ratio"] = latest_flow.get("super_big_order_ratio")
-            analysis["fund_flow_history"] = fund_flow_df.to_dict("records")
-            return
-        analysis["flow_date"] = ""
-        analysis["main_force_amount"] = None
-        analysis["big_order_amount"] = None
-        analysis["super_big_order_amount"] = None
-        analysis["main_force_ratio"] = None
-        analysis["big_order_ratio"] = None
-        analysis["super_big_order_ratio"] = None
-        analysis["fund_flow_history"] = []
+        """thin delegate → stock_detail_service.enrich_analysis_with_fund_flow"""
+        _stock_detail_service.enrich_analysis_with_fund_flow(analysis, fund_flow_df)
 
     def _enrich_analysis_with_indicators(
         self,
         analysis: Dict[str, Any],
         history: Optional[pd.DataFrame],
     ) -> None:
-        """在 analysis 字典中追加 MACD/KDJ/RSI/BOLL 最新值。"""
-        if history is None or history.empty or "close" not in history.columns:
-            analysis["macd_dif"] = None
-            analysis["macd_dea"] = None
-            analysis["macd_bar"] = None
-            analysis["kdj_k"] = None
-            analysis["kdj_d"] = None
-            analysis["kdj_j"] = None
-            analysis["rsi_6"] = None
-            analysis["rsi_12"] = None
-            analysis["boll_upper"] = None
-            analysis["boll_mid"] = None
-            analysis["boll_lower"] = None
-            return
-        try:
-            from stock_indicators import calc_macd, calc_kdj, calc_rsi, calc_boll
-            close = pd.to_numeric(history["close"], errors="coerce")
-            m = calc_macd(close)
-            analysis["macd_dif"] = round(float(m["dif"].iloc[-1]), 3) if not pd.isna(m["dif"].iloc[-1]) else None
-            analysis["macd_dea"] = round(float(m["dea"].iloc[-1]), 3) if not pd.isna(m["dea"].iloc[-1]) else None
-            analysis["macd_bar"] = round(float(m["macd"].iloc[-1]), 3) if not pd.isna(m["macd"].iloc[-1]) else None
-
-            if all(c in history.columns for c in ("high", "low")):
-                k = calc_kdj(history["high"], history["low"], close)
-                analysis["kdj_k"] = round(float(k["k"].iloc[-1]), 2) if not pd.isna(k["k"].iloc[-1]) else None
-                analysis["kdj_d"] = round(float(k["d"].iloc[-1]), 2) if not pd.isna(k["d"].iloc[-1]) else None
-                analysis["kdj_j"] = round(float(k["j"].iloc[-1]), 2) if not pd.isna(k["j"].iloc[-1]) else None
-            else:
-                analysis["kdj_k"] = analysis["kdj_d"] = analysis["kdj_j"] = None
-
-            r = calc_rsi(close, periods=(6, 12))
-            analysis["rsi_6"] = round(float(r["rsi_6"].iloc[-1]), 2) if not pd.isna(r["rsi_6"].iloc[-1]) else None
-            analysis["rsi_12"] = round(float(r["rsi_12"].iloc[-1]), 2) if not pd.isna(r["rsi_12"].iloc[-1]) else None
-
-            b = calc_boll(close)
-            analysis["boll_upper"] = round(float(b["upper"].iloc[-1]), 2) if not pd.isna(b["upper"].iloc[-1]) else None
-            analysis["boll_mid"] = round(float(b["mid"].iloc[-1]), 2) if not pd.isna(b["mid"].iloc[-1]) else None
-            analysis["boll_lower"] = round(float(b["lower"].iloc[-1]), 2) if not pd.isna(b["lower"].iloc[-1]) else None
-        except Exception as exc:
-            logger.debug("技术指标计算失败: %s", exc)
+        """thin delegate → stock_detail_service.enrich_analysis_with_indicators"""
+        _stock_detail_service.enrich_analysis_with_indicators(analysis, history)
 
     def _build_stock_detail_payload(
         self,
@@ -207,16 +120,10 @@ class StockFilter:
         history: Optional[pd.DataFrame],
         analysis: Dict[str, Any],
     ) -> Dict[str, Any]:
-        return {
-            "code": str(stock_code).strip().zfill(6),
-            "name": str(stock_identity.get("name", "") or ""),
-            "board": str(stock_identity.get("board", "") or ""),
-            "exchange": str(stock_identity.get("exchange", "") or ""),
-            "industry": str(stock_identity.get("industry", "") or ""),
-            "last_limit_up_trade_date": str(stock_identity.get("last_limit_up_trade_date", "") or ""),
-            "history": history,
-            "analysis": analysis,
-        }
+        """thin delegate → stock_detail_service.build_stock_detail_payload"""
+        return _stock_detail_service.build_stock_detail_payload(
+            stock_code, stock_identity, history, analysis,
+        )
 
     def get_settings(self) -> FilterSettings:
         return FilterSettings(
@@ -302,10 +209,9 @@ class StockFilter:
     def check_close_above_ma(
         self, history_data: pd.DataFrame, streak_days: int, ma_period: int
     ) -> bool:
-        return self._build_analysis_service().check_close_above_ma(
-            history_data,
-            streak_days=streak_days,
-            ma_period=ma_period,
+        """thin delegate → scoring/filter.check_close_above_ma"""
+        return _scoring_filter.check_close_above_ma(
+            self.get_settings(), history_data, streak_days, ma_period,
         )
 
     def _resolve_analysis_config(
@@ -318,9 +224,10 @@ class StockFilter:
         volume_expand_enabled: Optional[bool] = None,
         volume_expand_factor: Optional[float] = None,
     ) -> HistoryAnalysisConfig:
-        return HistoryAnalysisConfig.from_filter_settings(
+        """thin delegate → scoring/filter.resolve_analysis_config"""
+        return _scoring_filter.resolve_analysis_config(
             self.get_settings(),
-            trend_days=streak_days,
+            streak_days=streak_days,
             ma_period=ma_period,
             limit_up_lookback_days=limit_up_lookback_days,
             volume_lookback_days=volume_lookback_days,
@@ -338,7 +245,9 @@ class StockFilter:
         volume_expand_enabled: Optional[bool] = None,
         volume_expand_factor: Optional[float] = None,
     ) -> HistoryAnalysisService:
-        config = self._resolve_analysis_config(
+        """thin delegate → scoring/filter.build_analysis_service"""
+        return _scoring_filter.build_analysis_service(
+            self.get_settings(),
             streak_days=streak_days,
             ma_period=ma_period,
             limit_up_lookback_days=limit_up_lookback_days,
@@ -346,24 +255,17 @@ class StockFilter:
             volume_expand_enabled=volume_expand_enabled,
             volume_expand_factor=volume_expand_factor,
         )
-        return HistoryAnalysisService(config)
 
     def _limit_up_threshold(self, board: str = "", stock_name: str = "") -> float:
-        return self._build_analysis_service().limit_up_threshold(
-            board=board,
-            stock_name=stock_name,
+        """thin delegate → scoring/filter.limit_up_threshold"""
+        return _scoring_filter.limit_up_threshold(
+            self.get_settings(), board=board, stock_name=stock_name,
         )
 
     @staticmethod
     def _calculate_limit_up_streak(mask: pd.Series) -> int:
-        """计算从最新交易日往前数的连续涨停天数。"""
-        streak = 0
-        for flag in reversed(mask.tolist()):
-            if bool(flag):
-                streak += 1
-            else:
-                break
-        return streak
+        """thin delegate → scoring/filter.calculate_limit_up_streak"""
+        return _scoring_filter.calculate_limit_up_streak(mask)
 
     def _calculate_trade_score(
         self,
@@ -372,11 +274,10 @@ class StockFilter:
         ma_period: int,
         volume_enabled: bool,
     ) -> tuple[int, str]:
-        return self._build_analysis_service(
-            streak_days=streak_days,
-            ma_period=ma_period,
-            volume_expand_enabled=volume_enabled,
-        ).calculate_trade_score(result)
+        """thin delegate → scoring/filter.calculate_trade_score"""
+        return _scoring_filter.calculate_trade_score(
+            self.get_settings(), result, streak_days, ma_period, volume_enabled,
+        )
 
     def analyze_history(
         self,
@@ -391,15 +292,16 @@ class StockFilter:
         stock_name: str = "",
         stock_code: str = "",
     ) -> Dict[str, Any]:
-        return self._build_analysis_service(
-            streak_days=streak_days,
-            ma_period=ma_period,
-            limit_up_lookback_days=limit_up_lookback_days,
-            volume_lookback_days=volume_lookback_days,
-            volume_expand_enabled=volume_expand_enabled,
-            volume_expand_factor=volume_expand_factor,
-        ).analyze_history(
+        """thin delegate → scoring/filter.analyze_history"""
+        return _scoring_filter.analyze_history(
+            self.get_settings(),
             history_data,
+            streak_days,
+            ma_period,
+            limit_up_lookback_days,
+            volume_lookback_days,
+            volume_expand_enabled,
+            volume_expand_factor,
             board=board,
             stock_name=stock_name,
             stock_code=stock_code,
@@ -412,26 +314,14 @@ class StockFilter:
         board: str,
         exchange: str,
     ) -> Dict[str, Any]:
-        result = {
-            "code": str(stock_code).strip().zfill(6),
-            "name": stock_name or "",
-            "passed": False,
-            "reasons": [],
-            "data": {},
-        }
-        if board:
-            result["data"]["board"] = board
-        if exchange:
-            result["data"]["exchange"] = exchange
-        return result
+        """thin delegate → scoring/filter.build_filter_result_shell"""
+        return _scoring_filter.build_filter_result_shell(
+            stock_code, stock_name, board, exchange,
+        )
 
     def _resolve_filter_history_days(self) -> int:
-        return max(
-            14,
-            self.trend_days + self.ma_period + 4,
-            self.limit_up_lookback_days + self.ma_period + 4,
-            self.volume_lookback_days + 4,
-        )
+        """thin delegate → scoring/filter.resolve_filter_history_days"""
+        return _scoring_filter.resolve_filter_history_days(self.get_settings())
 
     def _attach_filter_analysis(
         self,
@@ -441,86 +331,43 @@ class StockFilter:
         stock_name: str,
         board: str,
     ) -> Dict[str, Any]:
-        analysis = self.analyze_history(
-            history_data,
-            self.trend_days,
-            self.ma_period,
-            self.limit_up_lookback_days,
-            self.volume_lookback_days,
-            self.volume_expand_enabled,
-            self.volume_expand_factor,
-            board=board,
-            stock_name=stock_name,
-            stock_code=stock_code,
+        """thin delegate → scoring/filter.attach_filter_analysis"""
+        return _scoring_filter.attach_filter_analysis(
+            self.get_settings(),
+            result, history_data, stock_code, stock_name, board,
         )
-        result["data"]["analysis"] = analysis
-        result["data"]["history_tail"] = history_data.tail(max(self.trend_days, self.limit_up_lookback_days)).copy()
-        return analysis
 
     def _apply_limit_up_requirement_failure(
         self,
         result: Dict[str, Any],
         analysis: Dict[str, Any],
     ) -> bool:
-        if not self.require_limit_up_within_days or analysis.get("limit_up_within_days"):
-            return False
-        analysis["summary"] = (
-            f"{analysis['summary']}；未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
-            if analysis.get("summary")
-            else f"未命中过去{self.limit_up_lookback_days}个交易日涨停条件"
+        """thin delegate → scoring/filter.apply_limit_up_requirement_failure"""
+        return _scoring_filter.apply_limit_up_requirement_failure(
+            self.get_settings(), result, analysis,
         )
-        result["reasons"].append(analysis["summary"])
-        return True
 
     def _apply_strong_followthrough_failure(
         self,
         result: Dict[str, Any],
         analysis: Dict[str, Any],
     ) -> bool:
-        """当开启"承接强势"过滤时，未命中形态的股票直接淘汰。"""
-        if not getattr(self, "strong_ft_enabled", False):
-            return False
-        ft = analysis.get("strong_followthrough") or {}
-        if ft.get("has_strong_followthrough"):
-            return False
-        reason = self._build_strong_ft_failure_reason(ft)
-        analysis["summary"] = (
-            f"{analysis['summary']}；{reason}" if analysis.get("summary") else reason
+        """thin delegate → scoring/filter.apply_strong_followthrough_failure"""
+        return _scoring_filter.apply_strong_followthrough_failure(
+            self.get_settings(), result, analysis,
         )
-        result["reasons"].append(reason)
-        return True
 
     def _build_strong_ft_failure_reason(self, ft: Dict[str, Any]) -> str:
-        """把 followthrough 结果翻译成人类友好的失败原因。"""
-        if ft.get("limit_up_is_today"):
-            return f"{ft.get('limit_up_date')} 刚涨停，次日走势还未出现，无法判断承接"
-        if not ft.get("limit_up_date"):
-            return f"近{self.limit_up_lookback_days}日未找到可承接的涨停日"
-        parts = [f"{ft['limit_up_date']} 涨停后"]
-        if not ft.get("is_pullback_day"):
-            parts.append("次日未回落（未形成承接形态）")
-        if not ft.get("pullback_within_limit"):
-            parts.append(
-                f"回撤过深（{ft.get('pullback_pct', 0):.1f}% > {self.strong_ft_max_pullback_pct:.1f}%）"
-            )
-        if not ft.get("volume_shrunk"):
-            parts.append(
-                f"未缩量（次日量比 {ft.get('pullback_volume_ratio', 0):.0%} > {self.strong_ft_max_volume_ratio:.0%}）"
-            )
-        if not ft.get("holds_above_pullback_low"):
-            parts.append("后续跌破回落日最低价")
-        elif ft.get("hold_days", 0) < ft.get("min_hold_days", 0):
-            parts.append(f"站稳天数不足（{ft.get('hold_days', 0)} < {ft.get('min_hold_days', 0)}）")
-        return "；".join(parts)
+        """thin delegate → scoring/filter.build_strong_ft_failure_reason"""
+        return _scoring_filter.build_strong_ft_failure_reason(self.get_settings(), ft)
 
     def _finalize_filter_result(
         self,
         result: Dict[str, Any],
         analysis: Dict[str, Any],
     ) -> Dict[str, Any]:
-        result["passed"] = bool(analysis.get("passed"))
-        result["reasons"].append(analysis["summary"])
-        return result
+        """thin delegate → scoring/filter.finalize_filter_result"""
+        return _scoring_filter.finalize_filter_result(result, analysis)
 
     def filter_stock(
         self,
@@ -532,38 +379,22 @@ class StockFilter:
         mirror_pool: Optional[List[str]] = None,
         history_plan: Optional[HistoryRequestPlan] = None,
     ) -> Dict[str, Any]:
-        result = self._build_filter_result_shell(stock_code, stock_name, board, exchange)
-        history_data = self.fetcher.get_history_data(
-            stock_code,
-            days=self._resolve_filter_history_days(),
-            preferred_mirror=history_mirror,
+        """thin delegate → scoring/filter.filter_stock"""
+        return _scoring_filter.filter_stock(
+            self.get_settings(),
+            fetcher=self.fetcher,
+            stock_code=stock_code,
+            stock_name=stock_name,
+            board=board,
+            exchange=exchange,
+            history_mirror=history_mirror,
             mirror_pool=mirror_pool,
-            request_plan=history_plan,
+            history_plan=history_plan,
         )
-        result["data"]["history"] = history_data
-        if history_data is None or history_data.empty:
-            result["reasons"].append("无法获取历史数据")
-            return result
-
-        analysis = self._attach_filter_analysis(result, history_data, stock_code, stock_name, board)
-        if self._apply_limit_up_requirement_failure(result, analysis):
-            return result
-        if self._apply_strong_followthrough_failure(result, analysis):
-            return result
-        return self._finalize_filter_result(result, analysis)
 
     def _result_sort_key(self, item: Dict[str, Any]):
-        analysis = (item.get("data", {}) or {}).get("analysis") or {}
-        five_day_return = analysis.get("five_day_return")
-        volume_expand_ratio = analysis.get("volume_expand_ratio")
-        latest_change_pct = analysis.get("latest_change_pct")
-        return (
-            five_day_return if five_day_return is not None else float("-inf"),
-            volume_expand_ratio if volume_expand_ratio is not None else float("-inf"),
-            1 if analysis.get("limit_up_within_days") else 0,
-            latest_change_pct if latest_change_pct is not None else float("-inf"),
-            str(item.get("code", "")),
-        )
+        """thin delegate → scoring/filter.result_sort_key"""
+        return _scoring_filter.result_sort_key(item)
 
     def _filter_scan_universe(
         self,
@@ -824,30 +655,13 @@ class StockFilter:
         )
 
     def get_stock_detail_quick(self, stock_code: str) -> Dict[str, Any]:
-        code = str(stock_code).strip().zfill(6)
-        history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
-        history = self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=history_days),
-            timeout_sec=15.0,
-            fallback=None,
-            task_name=f"详情历史 {code}",
-        )
-        analysis = self.analyze_history(
-            history,
-            self.trend_days,
-            self.ma_period,
-            self.limit_up_lookback_days,
-            self.volume_lookback_days,
-            self.volume_expand_enabled,
-            self.volume_expand_factor,
-            stock_code=stock_code,
-        )
-        self._enrich_analysis_with_history_snapshot(analysis, history)
-        return self._build_stock_detail_payload(
-            code,
-            {"name": "", "board": "", "exchange": ""},
-            history,
-            analysis,
+        """thin delegate → stock_detail_service.get_stock_detail_quick"""
+        return _stock_detail_service.get_stock_detail_quick(
+            stock_code,
+            settings=self.get_settings(),
+            fetcher=self.fetcher,
+            analyze_history_fn=self.analyze_history,
+            call_with_timeout_fn=self._call_with_timeout,
         )
 
     def get_stock_detail(
@@ -855,64 +669,23 @@ class StockFilter:
         stock_code: str,
         preloaded_history: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
-        code = str(stock_code).strip().zfill(6)
-        history_days = max(80, self.trend_days + self.limit_up_lookback_days + self.ma_period + 20)
-
-        # ---- 并行获取：历史 / 股票池同时发起 ----
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        history = preloaded_history
-        universe = None
-        fund_flow_df = None
-
-        tasks = {}
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="detail") as pool:
-            if history is None:
-                tasks["history"] = pool.submit(
-                    self._call_with_timeout,
-                    lambda: self.fetcher.get_history_data(code, days=history_days),
-                    15.0, None, f"详情历史 {code}",
-                )
-            tasks["universe"] = pool.submit(
-                self._call_with_timeout,
-                lambda: self.fetcher.get_all_stocks(),
-                8.0, None, f"详情股票池 {code}",
-            )
-            for key, fut in tasks.items():
-                try:
-                    result = fut.result()
-                    if key == "history":
-                        history = result
-                    elif key == "universe":
-                        universe = result
-                except Exception as exc:
-                    logger.debug("预取数据 %s 异常: %s", key, exc)
-
-        stock_identity = self._resolve_stock_identity(universe, code)
-        analysis = self.analyze_history(
-            history,
-            self.trend_days,
-            self.ma_period,
-            self.limit_up_lookback_days,
-            self.volume_lookback_days,
-            self.volume_expand_enabled,
-            self.volume_expand_factor,
-            board=stock_identity["board"],
-            stock_name=stock_identity["name"],
-            stock_code=stock_code,
+        """thin delegate → stock_detail_service.get_stock_detail"""
+        return _stock_detail_service.get_stock_detail(
+            stock_code,
+            preloaded_history,
+            settings=self.get_settings(),
+            fetcher=self.fetcher,
+            analyze_history_fn=self.analyze_history,
+            call_with_timeout_fn=self._call_with_timeout,
         )
-        self._enrich_analysis_with_history_snapshot(analysis, history)
-        self._enrich_analysis_with_fund_flow(analysis, fund_flow_df)
-        self._enrich_analysis_with_indicators(analysis, history)
-        return self._build_stock_detail_payload(code, stock_identity, history, analysis)
 
     def get_stock_detail_history(self, stock_code: str, days: int) -> Optional[pd.DataFrame]:
-        code = str(stock_code).strip().zfill(6)
-        history_days = max(60, int(days))
-        return self._call_with_timeout(
-            lambda: self.fetcher.get_history_data(code, days=history_days),
-            timeout_sec=15.0,
-            fallback=None,
-            task_name=f"补充详情历史 {code}",
+        """thin delegate → stock_detail_service.get_stock_detail_history"""
+        return _stock_detail_service.get_stock_detail_history(
+            stock_code,
+            days,
+            fetcher=self.fetcher,
+            call_with_timeout_fn=self._call_with_timeout,
         )
 
     # ================= 涨停技术形态分类 =================
@@ -971,28 +744,10 @@ class StockFilter:
         history_df: Optional[pd.DataFrame],
         selected_trade_date: str,
     ) -> Optional[float]:
-        if history_df is None or history_df.empty or "close" not in history_df.columns:
-            return None
-
-        df = history_df.copy()
-        if "date" in df.columns:
-            df["date"] = df["date"].astype(str).str.strip()
-        else:
-            df["date"] = ""
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
-        if df.empty:
-            return None
-
-        target_date = str(selected_trade_date or "").strip()
-        if target_date:
-            previous_rows = df[df["date"] < target_date]
-            if not previous_rows.empty:
-                return float(previous_rows.iloc[-1]["close"])
-
-        if len(df) >= 2:
-            return float(df.iloc[-2]["close"])
-        return float(df.iloc[-1]["close"])
+        """thin delegate → intraday_query_service.resolve_intraday_prev_close"""
+        return _intraday_query_service.resolve_intraday_prev_close(
+            history_df, selected_trade_date,
+        )
 
     def get_stock_intraday(
         self,
@@ -1000,65 +755,14 @@ class StockFilter:
         day_offset: int = 0,
         target_trade_date: str = "",
     ) -> Dict[str, Any]:
-        code = str(stock_code).strip().zfill(6)
-
-        # ---- 并行获取：分时数据 + 历史(昨收)同时发起 ----
-        from concurrent.futures import ThreadPoolExecutor
-        intraday_payload = {}
-        history_df = None
-
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="intraday") as pool:
-            fut_intraday = pool.submit(
-                self._call_with_timeout,
-                lambda: self.fetcher.get_intraday_data(
-                    code, day_offset=day_offset,
-                    target_trade_date=target_trade_date, include_meta=True,
-                ),
-                12.0, {}, f"分时 {code}",
-            )
-            fut_history = pool.submit(
-                self._call_with_timeout,
-                lambda: self.fetcher.get_history_data(code, days=20),
-                6.0, None, f"分时昨收 {code}",
-            )
-            try:
-                intraday_payload = fut_intraday.result() or {}
-            except Exception as exc:
-                logger.debug("分时数据获取失败 %s: %s", code, exc)
-                intraday_payload = {}
-            try:
-                history_df = fut_history.result()
-            except Exception as exc:
-                logger.debug("历史数据获取失败 %s: %s", code, exc)
-                history_df = None
-
-        intraday_df = None
-        selected_trade_date = ""
-        available_trade_dates: List[str] = []
-        applied_day_offset = 0
-        auction_snapshot = None
-        if isinstance(intraday_payload, dict):
-            intraday_df = intraday_payload.get("intraday")
-            selected_trade_date = str(intraday_payload.get("selected_trade_date") or "")
-            available_trade_dates = [str(d) for d in (intraday_payload.get("available_trade_dates") or [])]
-            raw_auction = intraday_payload.get("auction")
-            if isinstance(raw_auction, dict):
-                auction_snapshot = raw_auction
-            try:
-                applied_day_offset = int(intraday_payload.get("applied_day_offset") or 0)
-            except (TypeError, ValueError):
-                applied_day_offset = 0
-
-        prev_close = self._resolve_intraday_prev_close(history_df, selected_trade_date)
-        return {
-            "code": code,
-            "intraday": intraday_df,
-            "prev_close": prev_close,
-            "selected_trade_date": selected_trade_date,
-            "available_trade_dates": available_trade_dates,
-            "applied_day_offset": applied_day_offset,
-            "auction": auction_snapshot,
-        }
+        """thin delegate → intraday_query_service.get_stock_intraday"""
+        return _intraday_query_service.get_stock_intraday(
+            stock_code,
+            day_offset,
+            target_trade_date,
+            fetcher=self.fetcher,
+            call_with_timeout_fn=self._call_with_timeout,
+        )
 
     # ================= 涨停预测 =================
 
