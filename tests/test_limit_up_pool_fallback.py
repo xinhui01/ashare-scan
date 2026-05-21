@@ -117,6 +117,8 @@ class TestLimitUpPoolEmptyRetry:
         instance._log = lambda msg: None
         instance._limit_up_pool_cache = {}
         instance._prev_limit_up_pool_cache = {}
+        instance._last_pool_source = {}
+        instance._last_prev_pool_source = {}
         return instance
 
     def test_empty_result_is_not_cached_and_second_call_retries_network(self, monkeypatch):

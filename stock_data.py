@@ -591,6 +591,9 @@ class StockDataFetcher:
         self._strong_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
+        # 跟踪每个日期涨停池数据来源："cache_memory" / "cache_db" / "eastmoney" / "spot_fallback" / "empty"
+        self._last_pool_source: Dict[str, str] = {}
+        self._last_prev_pool_source: Dict[str, str] = {}
         self._limit_up_reason_cache: Dict[str, Dict[str, Dict[str, str]]] = _LRUCache(maxsize=30)
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
@@ -1632,6 +1635,7 @@ class StockDataFetcher:
         # 1. 内存缓存
         mem_cached = self._limit_up_pool_cache.get(date_key)
         if mem_cached is not None and not mem_cached.empty:
+            self._last_pool_source[date_key] = "cache_memory"
             return mem_cached
         if mem_cached is not None and mem_cached.empty and self._log:
             self._log(f"涨停池 {date_key} 内存缓存为空，重新尝试数据源")
@@ -1642,6 +1646,7 @@ class StockDataFetcher:
         if db_cached is not None and not db_cached.empty:
             db_cached = self._sanitize_limit_up_pool(db_cached)
             self._limit_up_pool_cache[date_key] = db_cached
+            self._last_pool_source[date_key] = "cache_db"
             if self._log:
                 self._log(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
             return db_cached
@@ -1657,11 +1662,13 @@ class StockDataFetcher:
                     dropped = raw_count - len(df)
                     self._limit_up_pool_cache[date_key] = df
                     save_limit_up_pool(date_key, df)
+                    self._last_pool_source[date_key] = "eastmoney"
                     if self._log:
                         drop_note = f"，过滤 {dropped} 条脏数据" if dropped > 0 else ""
                         self._log(f"涨停池 {date_key} 东财 {len(df)} 只{drop_note}，已保存")
                     return df
                 # 东财返空（非异常）：合法结果（如节假日），不触发 spot 兜底（避免无谓 30s 等）
+                self._last_pool_source[date_key] = "empty"
                 if self._log:
                     self._log(f"涨停池 {date_key} 东财返空，返回空（不缓存，下次重试）")
                 return pd.DataFrame()
@@ -1683,6 +1690,7 @@ class StockDataFetcher:
                 if derived is not None and not derived.empty:
                     self._limit_up_pool_cache[date_key] = derived
                     save_limit_up_pool(date_key, derived)
+                    self._last_pool_source[date_key] = "spot_fallback"
                     if self._log:
                         self._log(f"涨停池 {date_key} spot 兜底 {len(derived)} 只（连板数推断自昨日 pool），已保存")
                     return derived
@@ -1690,6 +1698,7 @@ class StockDataFetcher:
             if self._log:
                 self._log(f"涨停池 {date_key} spot 兜底失败: {exc}")
 
+        self._last_pool_source[date_key] = "empty"
         if self._log:
             self._log(f"涨停池 {date_key} 所有源均失败，返回空（不缓存空结果）")
         return pd.DataFrame()
@@ -1702,6 +1711,7 @@ class StockDataFetcher:
 
         mem_cached = self._prev_limit_up_pool_cache.get(date_key)
         if mem_cached is not None and not mem_cached.empty:
+            self._last_prev_pool_source[date_key] = "cache_memory"
             return mem_cached
         if mem_cached is not None and mem_cached.empty and self._log:
             self._log(f"昨日涨停池 {date_key} 内存缓存为空，重新尝试数据源")
@@ -1710,6 +1720,7 @@ class StockDataFetcher:
         db_cached = load_limit_up_pool(date_key, pool_type="previous")
         if db_cached is not None and not db_cached.empty:
             self._prev_limit_up_pool_cache[date_key] = db_cached
+            self._last_prev_pool_source[date_key] = "cache_db"
             return db_cached
 
         # 东财昨日涨停池接口
@@ -1720,8 +1731,10 @@ class StockDataFetcher:
                 if df is not None and not df.empty:
                     self._prev_limit_up_pool_cache[date_key] = df
                     save_limit_up_pool(date_key, df, pool_type="previous")
+                    self._last_prev_pool_source[date_key] = "eastmoney"
                     return df
                 # 东财返空（非异常）：不触发 spot 兜底
+                self._last_prev_pool_source[date_key] = "empty"
                 if self._log:
                     self._log(f"昨日涨停池 {date_key} 东财返空，返回空")
                 return pd.DataFrame()
@@ -1741,6 +1754,7 @@ class StockDataFetcher:
             if derived is not None and not derived.empty:
                 self._prev_limit_up_pool_cache[date_key] = derived
                 save_limit_up_pool(date_key, derived, pool_type="previous")
+                self._last_prev_pool_source[date_key] = "spot_fallback"
                 if self._log:
                     self._log(f"昨日涨停池 {date_key} spot 兜底 {len(derived)} 只，已保存")
                 return derived
@@ -1748,9 +1762,27 @@ class StockDataFetcher:
             if self._log:
                 self._log(f"昨日涨停池 {date_key} spot 兜底失败: {exc}")
 
+        self._last_prev_pool_source[date_key] = "empty"
         if self._log:
             self._log(f"昨日涨停池 {date_key} 所有源均失败，返回空（不缓存空结果）")
         return pd.DataFrame()
+
+    def get_pool_source(self, date_key: str, *, previous: bool = False) -> str:
+        """返回最近一次 get_limit_up_pool / get_previous_limit_up_pool 对该日期的数据来源。
+
+        取值：
+        - "cache_memory" — 内存缓存命中
+        - "cache_db" — SQLite 缓存命中
+        - "eastmoney" — 东财在线
+        - "spot_fallback" — spot 兜底派生
+        - "empty" — 所有源失败 / 东财返空
+        - "unknown" — 未查询过此日期
+        """
+        key = str(date_key or "").strip()
+        if not key:
+            return "unknown"
+        source_map = self._last_prev_pool_source if previous else self._last_pool_source
+        return source_map.get(key, "unknown")
 
     def _recent_trade_dates(self, end_date: str, count: int) -> List[str]:
         date_key = self._normalize_trade_date(end_date)
