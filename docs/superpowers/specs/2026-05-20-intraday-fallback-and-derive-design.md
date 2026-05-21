@@ -38,26 +38,16 @@
 
 ## 3 phase 划分
 
-### Phase 1 — intraday 新浪/腾讯兜底
+### Phase 1 — intraday 新浪兜底（已存在，跳过）
 
-**目标**：暴露统一的"取分时 K 线"接口，内部自动东财→新浪→腾讯级联。东财正常时 0 行为改动。
+**调查发现**：项目当前已实现 intraday 的东财→新浪双源级联：
+- `DATA_SOURCE_OPTIONS["intraday"]` = `("auto", "eastmoney", "sina")`
+- `build_intraday_request_plan("auto")` 在东财熔断时自动切换 `provider_sequence=("sina", "eastmoney")`
+- `stock_data.py:2429-2461` 的循环按 plan 顺序遍历 provider
 
-**新增**：
-- `src/sources/sina/intraday.py`（或 src/sources/sina_intraday.py）：实现新浪 `ak.stock_intraday_sina(symbol=...)` 包装
-- `src/sources/tencent/intraday.py`（或 src/sources/tencent_intraday.py）：实现腾讯 1min 分时包装（akshare 用 `ak.stock_zh_a_minute(symbol=..., period='1', adjust='')`）
-- `src/sources/intraday_fallback.py`：编排级联——东财熔断检查 → 东财 → 新浪 → 腾讯
+腾讯作为第 3 源 ROI 不高（sina 稳定性已够，3 源都失败的概率极低）。**Phase 1 整体跳过**，无需新代码。
 
-**修改**：
-- `src/sources/eastmoney/intraday.py` 现有 `fetch_intraday_xxx` 在最外层调用点的地方包一层 try/except → 失败时调 `intraday_fallback`
-
-**单测**（`tests/test_intraday_fallback.py`）：
-- 东财成功 → 不调新浪/腾讯
-- 东财抛 → 新浪成功
-- 东财抛 + 新浪抛 → 腾讯成功
-- 全部抛 → 返回 None
-- 列名归一化：3 源返回的 DataFrame 都应统一列名（时间 / 开 / 收 / 高 / 低 / 量），调用方无需感知差异
-
-**估算**：1-2 commit
+如果未来 sina 也不稳定，再单独 spec 加 tencent 第 3 源。
 
 ### Phase 2 — 从 intraday 派生 首次封板时间 + 炸板次数
 
