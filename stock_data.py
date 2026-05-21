@@ -521,6 +521,70 @@ _build_a_share_universe = _src_universe.build_a_share_universe
 from src.utils.lru_cache import LRUCache as _LRUCache
 
 
+def _derive_seal_time_from_intraday(
+    intraday_df: "pd.DataFrame",
+    limit_up_price: float,
+    tolerance_pct: float = 0.1,
+) -> Optional[str]:
+    """从 1min 分时找首次封板时间。
+
+    定义：close ≥ limit_up_price × (1 - tolerance_pct/100) 即视为封板。
+    返回 "HH:MM:SS" 字符串，无封板返回 None。
+    """
+    if intraday_df is None or intraday_df.empty or "close" not in intraday_df.columns:
+        return None
+    if "time" not in intraday_df.columns:
+        return None
+    if not limit_up_price or limit_up_price <= 0:
+        return None
+    threshold = float(limit_up_price) * (1 - float(tolerance_pct) / 100)
+    for _, row in intraday_df.iterrows():
+        try:
+            close = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if close >= threshold:
+            t = row.get("time")
+            if pd.isna(t):
+                continue
+            # 兼容 datetime / Timestamp / str
+            if hasattr(t, "strftime"):
+                return t.strftime("%H:%M:%S")
+            return str(t)[-8:]  # 取末 8 字符 "HH:MM:SS"
+    return None
+
+
+def _count_intraday_breaks(
+    intraday_df: "pd.DataFrame",
+    limit_up_price: float,
+    tolerance_pct: float = 0.1,
+) -> int:
+    """数封板后又跌破涨停价的次数（炸板次数）。
+
+    定义：进入"封板状态"（close ≥ threshold）后又出现 close < threshold → 1 次炸板。
+    """
+    if intraday_df is None or intraday_df.empty or "close" not in intraday_df.columns:
+        return 0
+    if not limit_up_price or limit_up_price <= 0:
+        return 0
+    threshold = float(limit_up_price) * (1 - float(tolerance_pct) / 100)
+    breaks = 0
+    state_sealed = False
+    for _, row in intraday_df.iterrows():
+        try:
+            close = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if state_sealed:
+            if close < threshold:
+                breaks += 1
+                state_sealed = False
+        else:
+            if close >= threshold:
+                state_sealed = True
+    return breaks
+
+
 class StockDataFetcher:
     def __init__(self):
         self._log: Optional[Callable[[str], None]] = None
