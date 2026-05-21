@@ -40,6 +40,7 @@ from src.services.scoring import wrap as _scoring_wrap
 from src.services.scoring import trend as _scoring_trend
 from src.services.scoring import first_board as _scoring_first_board
 from src.services.scoring import predict as _scoring_predict
+from src.services.scanning import orchestrator as _scanning
 
 
 class StockFilter:
@@ -571,50 +572,24 @@ class StockFilter:
         allowed_exchanges: Optional[List[str]],
         log: Optional[Callable[[str], None]] = None,
     ) -> pd.DataFrame:
-        filtered = all_stocks
-        if allowed_boards and "board" in filtered.columns:
-            allowed_board_set = {str(x).strip() for x in allowed_boards if str(x).strip()}
-            if allowed_board_set:
-                before = len(filtered)
-                filtered = filtered[filtered["board"].astype(str).isin(allowed_board_set)]
-                if log:
-                    log(f"板块过滤：保留 {len(filtered)}/{before} 只，目标板块 {', '.join(sorted(allowed_board_set))}")
-
-        if allowed_exchanges and "exchange" in filtered.columns:
-            allowed_exchange_set = {str(x).strip() for x in allowed_exchanges if str(x).strip()}
-            if allowed_exchange_set:
-                before = len(filtered)
-                filtered = filtered[filtered["exchange"].astype(str).isin(allowed_exchange_set)]
-                if log:
-                    log(f"交易所过滤：保留 {len(filtered)}/{before} 只，目标交易所 {', '.join(sorted(allowed_exchange_set))}")
-        return filtered
+        """股票池板块 / 交易所过滤（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.filter_scan_universe(all_stocks, allowed_boards, allowed_exchanges, log=log)
 
     def _limit_scan_subset(self, all_stocks: pd.DataFrame, max_stocks: int) -> pd.DataFrame:
-        if max_stocks and max_stocks > 0:
-            return all_stocks.head(max_stocks).reset_index(drop=True)
-        return all_stocks.reset_index(drop=True)
+        """裁剪扫描子集（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.limit_scan_subset(all_stocks, max_stocks)
 
     def _resolve_scan_workers(self, max_workers: Optional[int]) -> Tuple[int, int]:
-        if max_workers is None:
-            try:
-                max_workers = int(os.environ.get("ASHARE_SCAN_SCAN_WORKERS", "3").strip() or "3")
-            except ValueError:
-                max_workers = 3
-        requested_workers = max(1, min(int(max_workers), 16))
-        history_workers = max(1, int(self.fetcher.history_request_concurrency_limit()))
-        return requested_workers, min(requested_workers, history_workers)
+        """解析并发线程数（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.resolve_scan_workers(max_workers, fetcher=self.fetcher)
 
     def _build_scan_history_plan(self, history_source: str, local_history_only: bool) -> HistoryRequestPlan:
-        if local_history_only:
-            return HistoryRequestPlan(
-                mode="cache_only",
-                provider_sequence=("local-cache",),
-                mirror_urls=(),
-                reason="scan-local-cache-only",
-            )
-        return self.fetcher.build_history_request_plan(
-            source=history_source,
-            force_refresh=False,
+        """构建扫描历史请求计划（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.build_scan_history_plan(
+            history_source,
+            local_history_only,
+            fetcher=self.fetcher,
+            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
         )
 
     @staticmethod
@@ -631,16 +606,8 @@ class StockFilter:
         subset: pd.DataFrame,
         available_mirrors: List[str],
     ) -> Tuple[List[Tuple[Dict[str, Any], Optional[str]]], Dict[str, int]]:
-        rows = subset.to_dict("records")
-        random.Random(int(time.time())).shuffle(rows)
-        assigned_jobs: List[Tuple[Dict[str, Any], Optional[str]]] = []
-        mirror_counts: Dict[str, int] = {}
-        for idx, row in enumerate(rows):
-            mirror = available_mirrors[idx % len(available_mirrors)] if available_mirrors else None
-            if mirror:
-                mirror_counts[mirror] = mirror_counts.get(mirror, 0) + 1
-            assigned_jobs.append((row, mirror))
-        return assigned_jobs, mirror_counts
+        """随机分配扫描任务到镜像（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.assign_scan_jobs(subset, available_mirrors)
 
     def _log_scan_history_context(
         self,
@@ -649,23 +616,8 @@ class StockFilter:
         history_plan: HistoryRequestPlan,
         local_history_only: bool,
     ) -> None:
-        if not log:
-            return
-        log(
-            f"历史缓存覆盖率：{coverage.get('covered_count', 0)}/{coverage.get('universe_count', 0)} "
-            f"({coverage.get('coverage_ratio', 0.0) * 100:.1f}%)，最新交易日 {coverage.get('latest_trade_date') or '-'}"
-        )
-        log(f"历史数据源策略：{'/'.join(history_plan.provider_sequence)}")
-        if history_plan.cache_only:
-            if history_plan.reason and history_plan.reason != "scan-local-cache-only":
-                log(f"历史接口镜像当前不可用，最近探测失败示例：{history_plan.reason}")
-            if history_plan.reason == "scan-local-cache-only":
-                log("本轮扫描使用本地历史缓存，不发起公网历史请求；未命中缓存的股票会被跳过。")
-            else:
-                log("历史接口暂不可用，本轮改为缓存优先扫描；未命中本地缓存的股票会被跳过。")
-            return
-        if not history_plan.mirror_urls and history_plan.provider_sequence and history_plan.provider_sequence[0] != "eastmoney":
-            log("当前扫描已切换到非东方财富历史源。")
+        """打印扫描历史上下文日志（thin delegate -> scanning/orchestrator.py）。"""
+        _scanning.log_scan_history_context(log, coverage, history_plan, local_history_only)
 
     def _log_scan_execution_context(
         self,
@@ -678,24 +630,19 @@ class StockFilter:
         available_mirrors: List[str],
         mirror_counts: Dict[str, int],
     ) -> None:
-        if not log:
-            return
-        log(f"【阶段 2/3】股票池 {total_universe} 只，本次扫描 {total} 只，最近{self.trend_days}日收盘 > MA{self.ma_period}，并发 {workers} 线程。")
-        if requested_workers != workers:
-            log(f"并发保护已生效：你请求 {requested_workers} 线程，但历史接口当前只允许 {workers} 个并发，以降低东方财富限流风险。")
-        log("说明：扫描阶段只拉历史日线，不拉实时、资金流或内外盘。")
-        if local_history_only:
-            log("说明：扫描阶段默认只读本地缓存；首次或缓存不足时请先执行“更新历史缓存”。")
-        else:
-            log("说明：历史请求优先使用所选数据源；若为自动模式，会在东财失败后切换到腾讯/新浪。")
-        if available_mirrors:
-            mirror_summary = "，".join(
-                f"{mirror.split('//', 1)[-1].split('/', 1)[0]}={mirror_counts.get(mirror, 0)}"
-                for mirror in available_mirrors
-            )
-            log(f"历史镜像分区：{mirror_summary}")
-        else:
-            log("历史镜像分区：cache-only")
+        """打印扫描执行上下文日志（thin delegate -> scanning/orchestrator.py）。"""
+        _scanning.log_scan_execution_context(
+            log,
+            total_universe,
+            total,
+            workers,
+            requested_workers,
+            local_history_only,
+            available_mirrors,
+            mirror_counts,
+            trend_days=self.trend_days,
+            ma_period=self.ma_period,
+        )
 
     def _submit_scan_tasks(
         self,
@@ -704,55 +651,34 @@ class StockFilter:
         available_mirrors: List[str],
         history_plan: HistoryRequestPlan,
     ) -> Dict[Any, Tuple[str, str, str, str, Optional[str]]]:
-        future_to_meta = {}
-        for row, mirror in assigned_jobs:
-            code = str(row["code"]).strip().zfill(6)
-            name = str(row.get("name", "") or "")
-            board = str(row.get("board", "") or "")
-            exchange = str(row.get("exchange", "") or "")
-            future = executor.submit(
-                self.filter_stock,
-                code,
-                name,
-                board,
-                exchange,
-                mirror,
-                available_mirrors,
-                history_plan,
-            )
-            future_to_meta[future] = (code, name, board, exchange, mirror)
-        return future_to_meta
+        """向线程池提交扫描任务（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.submit_scan_tasks(
+            executor,
+            assigned_jobs,
+            available_mirrors,
+            history_plan,
+            filter_stock_fn=self.filter_stock,
+        )
 
     def _pending_scan_sample_text(
         self,
         pending,
         future_to_meta: Dict[Any, Tuple[str, str, str, str, Optional[str]]],
     ) -> str:
-        sample = [
-            (
-                f"{future_to_meta[f][0]}@{future_to_meta[f][4].split('//', 1)[-1].split('/', 1)[0]}"
-                if future_to_meta[f][4]
-                else f"{future_to_meta[f][0]}@cache-only"
-            )
-            for f in list(pending)[:3]
-        ]
-        return "、".join(sample) if sample else "-"
+        """生成待处理任务的样例代码文本（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.pending_scan_sample_text(pending, future_to_meta)
 
     def _scan_mirror_label(self, mirror: Optional[str]) -> str:
-        if not mirror:
-            return "cache-only"
-        return mirror.split("//", 1)[-1].split("/", 1)[0]
+        """生成镜像简短标签（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.scan_mirror_label(mirror)
 
     def _should_stop_scan(
         self,
         should_stop: Optional[Callable[[], bool]],
         log: Optional[Callable[[str], None]],
     ) -> bool:
-        if not should_stop or not should_stop():
-            return False
-        if log:
-            log("收到停止信号，正在取消未完成任务...")
-        return True
+        """判断是否应停止扫描（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.should_stop_scan(should_stop, log)
 
     def _log_pending_scan_wait(
         self,
@@ -765,16 +691,17 @@ class StockFilter:
         started_at: float,
         last_report: float,
     ) -> float:
-        now = time.time()
-        if not log or now - last_report < 10:
-            return last_report
-        elapsed = now - started_at
-        sample_text = self._pending_scan_sample_text(pending, future_to_meta)
-        log(
-            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
-            f"仍在等待历史数据返回，示例代码 {sample_text}"
+        """打印扫描等待日志（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.log_pending_scan_wait(
+            log,
+            pending,
+            future_to_meta,
+            completed,
+            total,
+            results,
+            started_at,
+            last_report,
         )
-        return now
 
     def _build_scan_error_result(
         self,
@@ -786,15 +713,8 @@ class StockFilter:
         error: Exception,
         log: Optional[Callable[[str], None]],
     ) -> Dict[str, Any]:
-        if log:
-            log(f"  {code} {name} 检测异常[{self._scan_mirror_label(mirror)}]: {error}")
-        return {
-            "code": code,
-            "name": name,
-            "passed": False,
-            "reasons": [str(error)],
-            "data": {"board": board, "exchange": exchange},
-        }
+        """构造扫描异常结果（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.build_scan_error_result(code, name, board, exchange, mirror, error, log)
 
     def _resolve_scan_future_result(
         self,
@@ -802,12 +722,8 @@ class StockFilter:
         future_to_meta: Dict[Any, Tuple[str, str, str, str, Optional[str]]],
         log: Optional[Callable[[str], None]],
     ) -> Tuple[str, str, str, str, Optional[str], Dict[str, Any]]:
-        code, name, board, exchange, mirror = future_to_meta[fut]
-        try:
-            filter_result = fut.result()
-        except Exception as exc:
-            filter_result = self._build_scan_error_result(code, name, board, exchange, mirror, exc, log)
-        return code, name, board, exchange, mirror, filter_result
+        """解析单个扫描 future 结果（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.resolve_scan_future_result(fut, future_to_meta, log)
 
     def _log_scan_pass_result(
         self,
@@ -818,12 +734,9 @@ class StockFilter:
         name: str,
         filter_result: Dict[str, Any],
     ) -> None:
-        if not log or not filter_result.get("passed"):
-            return
-        analysis = filter_result.get("data", {}).get("analysis") or {}
-        log(
-            f"  通过 {completed}/{total} {code} {name} "
-            f"最新收盘 {analysis.get('latest_close', 0):.2f} / MA{self.ma_period} {analysis.get('latest_ma', 0):.2f}"
+        """打印通过日志（thin delegate -> scanning/orchestrator.py）。"""
+        _scanning.log_scan_pass_result(
+            log, completed, total, code, name, filter_result, ma_period=self.ma_period
         )
 
     def _append_scan_hit(
@@ -834,13 +747,8 @@ class StockFilter:
         board: str,
         exchange: str,
     ) -> None:
-        if not filter_result.get("passed"):
-            return
-        filter_result["name"] = name
-        filter_result.setdefault("data", {})
-        filter_result["data"].setdefault("board", board)
-        filter_result["data"].setdefault("exchange", exchange)
-        results.append(filter_result)
+        """追加扫描命中结果（thin delegate -> scanning/orchestrator.py）。"""
+        _scanning.append_scan_hit(results, filter_result, name, board, exchange)
 
     def _notify_scan_progress(
         self,
@@ -850,12 +758,8 @@ class StockFilter:
         code: str,
         name: str,
     ) -> None:
-        if not progress_callback:
-            return
-        try:
-            progress_callback(completed, total, code, name)
-        except StopIteration:
-            raise
+        """触发扫描进度回调（thin delegate -> scanning/orchestrator.py）。"""
+        _scanning.notify_scan_progress(progress_callback, completed, total, code, name)
 
     def _maybe_log_scan_progress(
         self,
@@ -870,15 +774,19 @@ class StockFilter:
         name: str,
         mirror: Optional[str],
     ) -> float:
-        now = time.time()
-        if not log or (completed % report_every != 0 and now - last_report < 10):
-            return last_report
-        elapsed = now - started_at
-        log(
-            f"进度 {completed}/{total}，命中 {len(results)} 只，已用时 {elapsed:.1f}s，"
-            f"当前 {code} {name} @ {self._scan_mirror_label(mirror)}"
+        """节流地打印扫描进度（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.maybe_log_scan_progress(
+            log,
+            completed,
+            total,
+            results,
+            started_at,
+            last_report,
+            report_every,
+            code,
+            name,
+            mirror,
         )
-        return now
 
     def scan_all_stocks(
         self,
@@ -893,120 +801,27 @@ class StockFilter:
         allowed_exchanges: Optional[List[str]] = None,
         cancel_token: Optional[CancelToken] = None,
     ) -> List[Dict[str, Any]]:
-        # 兼容旧接口：将 should_stop 回调与 CancelToken 合并成同一个谓词
-        should_stop = coerce_should_stop(cancel_token, should_stop)
-        log = self._log
-        t0 = time.time()
-        if log:
-            log("【阶段 1/3】加载股票池...")
-        self._log_runtime_diagnostics("扫描前")
-
-        all_stocks = self.fetcher.get_all_stocks(force_refresh=refresh_universe)
-        if all_stocks.empty:
-            if log:
-                log("股票池为空，扫描终止。")
-            return []
-
-        total_universe = len(all_stocks)
-        all_stocks = self._filter_scan_universe(all_stocks, allowed_boards, allowed_exchanges, log=log)
-        subset = self._limit_scan_subset(all_stocks, max_stocks)
-        total = len(subset)
-        requested_workers, workers = self._resolve_scan_workers(max_workers)
-
-        coverage = self.fetcher.get_history_cache_summary()
-        history_plan = self._build_scan_history_plan(history_source, local_history_only)
-        available_mirrors = list(history_plan.mirror_urls)
-        self._log_scan_history_context(log, coverage, history_plan, local_history_only)
-        assigned_jobs, mirror_counts = self._assign_scan_jobs(subset, available_mirrors)
-        self._log_scan_execution_context(
-            log,
-            total_universe,
-            total,
-            workers,
-            requested_workers,
-            local_history_only,
-            available_mirrors,
-            mirror_counts,
+        """扫描所有股票（thin delegate -> scanning/orchestrator.py）。"""
+        return _scanning.scan_all_stocks(
+            max_stocks=max_stocks,
+            progress_callback=progress_callback,
+            max_workers=max_workers,
+            history_source=history_source,
+            local_history_only=local_history_only,
+            should_stop=should_stop,
+            refresh_universe=refresh_universe,
+            allowed_boards=allowed_boards,
+            allowed_exchanges=allowed_exchanges,
+            cancel_token=cancel_token,
+            fetcher=self.fetcher,
+            log_fn=self._log,
+            trend_days=self.trend_days,
+            ma_period=self.ma_period,
+            filter_stock_fn=self.filter_stock,
+            result_sort_key_fn=self._result_sort_key,
+            log_runtime_diagnostics_fn=self._log_runtime_diagnostics,
+            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
         )
-
-        results: List[Dict[str, Any]] = []
-        completed = 0
-        last_report = time.time()
-        report_every = 25
-
-        # 提交前再检查一次：用户可能在加载股票池阶段就点了停止
-        if self._should_stop_scan(should_stop, log):
-            return results
-
-        executor = DaemonThreadPoolExecutor(max_workers=workers)
-        try:
-            future_to_meta = self._submit_scan_tasks(executor, assigned_jobs, available_mirrors, history_plan)
-            if log:
-                log("【阶段 3/3】开始逐只拉取历史日线并计算结果...")
-
-            pending = set(future_to_meta)
-            while pending:
-                # 更短的轮询周期，让取消信号更快生效；同时在每轮起点主动检查一次
-                if self._should_stop_scan(should_stop, log):
-                    for fut in pending:
-                        fut.cancel()
-                    break
-                done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                if not done:
-                    if self._should_stop_scan(should_stop, log):
-                        for fut in pending:
-                            fut.cancel()
-                        break
-                    last_report = self._log_pending_scan_wait(
-                        log,
-                        pending,
-                        future_to_meta,
-                        completed,
-                        total,
-                        results,
-                        t0,
-                        last_report,
-                    )
-                    continue
-
-                for fut in done:
-                    if self._should_stop_scan(should_stop, log):
-                        for p in pending:
-                            p.cancel()
-                        pending.clear()
-                        break
-                    code, name, board, exchange, mirror, filter_result = self._resolve_scan_future_result(
-                        fut,
-                        future_to_meta,
-                        log,
-                    )
-                    completed += 1
-                    self._log_scan_pass_result(log, completed, total, code, name, filter_result)
-                    self._append_scan_hit(results, filter_result, name, board, exchange)
-                    self._notify_scan_progress(progress_callback, completed, total, code, name)
-                    last_report = self._maybe_log_scan_progress(
-                        log,
-                        completed,
-                        total,
-                        results,
-                        t0,
-                        last_report,
-                        report_every,
-                        code,
-                        name,
-                        mirror,
-                    )
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
-
-        results.sort(key=self._result_sort_key, reverse=True)
-
-        if log:
-            elapsed = time.time() - t0
-            log(f"【完成】扫描结束，命中 {len(results)} 只，用时 {elapsed:.1f}s。")
-        self._log_runtime_diagnostics("扫描后")
-
-        return results
 
     def get_stock_detail_quick(self, stock_code: str) -> Dict[str, Any]:
         code = str(stock_code).strip().zfill(6)
