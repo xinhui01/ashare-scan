@@ -1661,6 +1661,10 @@ class StockDataFetcher:
                         drop_note = f"，过滤 {dropped} 条脏数据" if dropped > 0 else ""
                         self._log(f"涨停池 {date_key} 东财 {len(df)} 只{drop_note}，已保存")
                     return df
+                # 东财返空（非异常）：合法结果（如节假日），不触发 spot 兜底（避免无谓 30s 等）
+                if self._log:
+                    self._log(f"涨停池 {date_key} 东财返空，返回空（不缓存，下次重试）")
+                return pd.DataFrame()
             except Exception as exc:
                 if self._log:
                     self._log(f"涨停池 {date_key} 东财失败: {exc}，尝试 spot 兜底")
@@ -1668,7 +1672,7 @@ class StockDataFetcher:
             if self._log:
                 self._log(f"涨停池 {date_key} 东财熔断中，尝试 spot 兜底")
 
-        # 4. spot 兜底：从全市场 spot 派生
+        # 4. spot 兜底：仅在东财异常/熔断时触发，从全市场 spot 派生
         recent = self._recent_trade_dates(date_key, 2)
         prev_date = recent[0] if len(recent) >= 2 else ""
         prev_pool = load_limit_up_pool(prev_date) if prev_date else None
@@ -1717,6 +1721,10 @@ class StockDataFetcher:
                     self._prev_limit_up_pool_cache[date_key] = df
                     save_limit_up_pool(date_key, df, pool_type="previous")
                     return df
+                # 东财返空（非异常）：不触发 spot 兜底
+                if self._log:
+                    self._log(f"昨日涨停池 {date_key} 东财返空，返回空")
+                return pd.DataFrame()
             except Exception as exc:
                 if self._log:
                     self._log(f"昨日涨停池 {date_key} 东财失败: {exc}，尝试 spot 兜底")
