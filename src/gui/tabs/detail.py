@@ -258,7 +258,7 @@ class DetailTab:
         self._show_loading(code)
         # 进入详情前先用扫描结果中的名称占位（若有）
         prefilled_name = ""
-        for result in self.app.filtered_stocks:
+        for result in self.app.result.filtered_stocks:
             if str(result.get("code", "")).strip().zfill(6) == code:
                 prefilled_name = str(result.get("name", "") or "")
                 break
@@ -283,7 +283,7 @@ class DetailTab:
                         self.app._log(f"渲染内存缓存详情失败，回退到完整加载: {e}")
 
         detail_payload = None
-        for result in self.app.filtered_stocks:
+        for result in self.app.result.filtered_stocks:
             if str(result.get("code", "")).strip().zfill(6) == code:
                 data = result.get("data", {}) or {}
                 detail_payload = {
