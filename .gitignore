@@ -9,6 +9,5 @@ cache/
 .vscode/
 data/
 .claude/
-docs/*
-!docs/superpowers/
+docs/
 _diag_wrap.py
