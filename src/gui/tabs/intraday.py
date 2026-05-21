@@ -95,7 +95,7 @@ class IntradayTab:
         self.open_view_with_offset(stock_code, day_offset=0)
 
     def navigate_day(self, delta: int):
-        code = str(self.request_code or self.app._current_detail_code or "").strip().zfill(6)
+        code = str(self.request_code or getattr(getattr(self.app, "detail", None), "current_code", "") or "").strip().zfill(6)
         if not code:
             return
         try:
