@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 # 模块级 K 线历史形态 helper 已迁移到 src/services/scoring/helpers.py
 # 保留 re-export 以兼容 `from stock_filter import _count_historical_*` 老调用方
 from src.services.scoring.helpers import (
+    _count_historical_any_limit_up,
     _count_historical_continuation,
     _count_historical_followthrough,
     _count_historical_wrap,
@@ -1115,6 +1116,7 @@ class StockFilter:
             fetcher=self.fetcher,
             log_fn=self._log,
             build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
+            limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
         )
 
     @staticmethod
@@ -1169,4 +1171,5 @@ class StockFilter:
             fetcher=self.fetcher,
             log_fn=self._log,
             build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
+            limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
         )

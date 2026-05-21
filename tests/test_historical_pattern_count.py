@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from stock_filter import (
+    _count_historical_any_limit_up,
     _count_historical_continuation,
     _count_historical_followthrough,
     _count_historical_wrap,
@@ -277,3 +278,110 @@ class TestHistoricalWrap:
             drop_threshold=-3.0, threshold_fn=_threshold_main_board,
         )
         assert cnt == 2
+
+
+# ============== _count_historical_any_limit_up ==============
+
+class TestHistoricalAnyLimitUp:
+    def test_empty_df_returns_zero(self):
+        cnt, last = _count_historical_any_limit_up(
+            pd.DataFrame(), "000001", lookback_days=60,
+            threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 0
+        assert last is None
+
+    def test_no_limit_up_in_history(self):
+        # 历史里没有涨停
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 10.5),  # +5%
+            ("2024-01-03", 10.7),
+            ("2024-01-04", 10.8),  # today
+        ])
+        cnt, last = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 0
+        assert last is None
+
+    def test_single_limit_up_counts_one(self):
+        # 单次涨停（无 T+1 跟进也算）
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 11.0),  # +10% 涨停
+            ("2024-01-03", 10.5),  # 跌
+            ("2024-01-04", 10.5),  # today
+        ])
+        cnt, last = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 1
+        assert last is not None
+
+    def test_multiple_scattered_limit_ups(self):
+        # 多次散点涨停（不要求连续 / 同形态）
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 11.0),   # +10%
+            ("2024-01-03", 10.5),
+            ("2024-01-04", 10.0),
+            ("2024-01-05", 11.0),   # +10%
+            ("2024-01-06", 10.5),
+            ("2024-01-07", 10.0),
+            ("2024-01-08", 11.0),   # +10%
+            ("2024-01-09", 10.8),   # today
+        ])
+        cnt, last = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 3
+
+    def test_today_is_skipped(self):
+        # today 即使是涨停也不计入（避免自计）
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 10.2),
+            ("2024-01-03", 11.22),  # today: +10% 但要被跳过
+        ])
+        cnt, last = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 0
+        assert last is None
+
+    def test_growth_board_20pct_threshold(self):
+        # 创业板 +11% 不算涨停（阈值 20%）
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 11.1),  # +11% 主板算涨停，创业板不算
+            ("2024-01-03", 11.5),
+        ])
+        cnt, _ = _count_historical_any_limit_up(
+            df, "300001", lookback_days=60, threshold_fn=_threshold_growth_board,
+        )
+        assert cnt == 0
+
+    def test_lookback_filter(self):
+        # 80 日前的涨停不计入（超出 lookback=60）
+        dates = pd.date_range("2024-01-01", periods=90, freq="D")
+        closes = [10.0] * 90
+        closes[1] = 11.0  # +10%，距 today=89 共 88 日 > 60
+        df = _make_df([(d.strftime("%Y-%m-%d"), c) for d, c in zip(dates, closes)])
+        cnt, _ = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert cnt == 0
+
+    def test_last_hit_days_recent(self):
+        # 最后一次涨停距 today 的偏移正确
+        df = _make_df([
+            ("2024-01-01", 10.0),
+            ("2024-01-02", 11.0),  # +10% (idx=1)
+            ("2024-01-03", 10.5),  # idx=2
+            ("2024-01-04", 10.5),  # today idx=3
+        ])
+        _, last = _count_historical_any_limit_up(
+            df, "000001", lookback_days=60, threshold_fn=_threshold_main_board,
+        )
+        assert last == 2  # today_idx(3) - hit_idx(1) = 2

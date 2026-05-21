@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring import shared as _shared
+from src.services.scoring.helpers import _count_historical_any_limit_up
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +310,27 @@ def score_fresh_first_board(
         elif latest_cont_rate < 25:
             score -= 5
             reasons.append(f"昨日晋级率{latest_cont_rate:.0f}%-5")
+
+    # 9. 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚
+    occ_count, last_hit_days = _count_historical_any_limit_up(
+        history, code, lookback_days=60, threshold_fn=threshold_fn,
+    )
+    if occ_count >= 5:
+        stock_bonus, label = 6, "妖股性"
+    elif occ_count >= 3:
+        stock_bonus, label = 4, "股性活跃"
+    elif occ_count >= 1:
+        stock_bonus, label = 2, "曾涨停"
+    else:
+        stock_bonus, label = -3, "僵尸股"
+    if stock_bonus > 0 and last_hit_days is not None and last_hit_days <= 20:
+        stock_bonus = min(stock_bonus + 1, 6)
+        reasons.append(f"近60日{occ_count}次涨停{label}(最近{last_hit_days}日){stock_bonus:+d}")
+    elif stock_bonus > 0:
+        reasons.append(f"近60日{occ_count}次涨停{label}{stock_bonus:+d}")
+    else:
+        reasons.append(f"近60日无涨停{label}{stock_bonus:+d}")
+    score += stock_bonus
 
     final_score = max(0, min(100, int(round(score))))
     return {

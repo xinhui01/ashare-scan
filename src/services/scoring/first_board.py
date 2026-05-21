@@ -21,7 +21,19 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 
+from src.services.scoring.helpers import _count_historical_any_limit_up
+
 logger = logging.getLogger(__name__)
+
+
+def _default_limit_up_threshold_pct(code: str) -> float:
+    """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
+    c = (code or "").strip()
+    if c.startswith(("30", "68")):
+        return 19.5
+    if c.startswith(("43", "83", "87", "88", "92")):
+        return 29.5
+    return 9.5
 
 
 def parse_lhb_jiedu(jiedu: str) -> Dict[str, Any]:
@@ -406,14 +418,17 @@ def score_first_board_by_profile(
     fetcher,
     log_fn: Optional[Callable[[str], None]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
+    limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
 ) -> Dict[str, Any]:
     """用涨停前兆画像对强势股打分。
 
     核心思路：把当前股票的特征和画像中涨停股 T-1 日特征对比，
     越接近画像中位数/均值的，得分越高。
 
-    迁自 StockFilter._score_first_board_by_profile；行为零变化。
+    迁自 StockFilter._score_first_board_by_profile；2026-05-21 加入"股性活跃度"加分。
     """
+    threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
+
     code = rec["code"]
     name = rec.get("name", "")
     score = 0.0
@@ -611,6 +626,28 @@ def score_first_board_by_profile(
             score -= 5
             reasons.append(f"换手{turnover:.1f}%过高-5")
 
+    # 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚
+    if history is not None and not history.empty:
+        occ_count, last_hit_days = _count_historical_any_limit_up(
+            history, code, lookback_days=60, threshold_fn=threshold_fn,
+        )
+        if occ_count >= 5:
+            stock_bonus, label = 6, "妖股性"
+        elif occ_count >= 3:
+            stock_bonus, label = 4, "股性活跃"
+        elif occ_count >= 1:
+            stock_bonus, label = 2, "曾涨停"
+        else:
+            stock_bonus, label = -3, "僵尸股"
+        if stock_bonus > 0 and last_hit_days is not None and last_hit_days <= 20:
+            stock_bonus = min(stock_bonus + 1, 6)
+            reasons.append(f"近60日{occ_count}次涨停{label}(最近{last_hit_days}日){stock_bonus:+d}")
+        elif stock_bonus > 0:
+            reasons.append(f"近60日{occ_count}次涨停{label}{stock_bonus:+d}")
+        else:
+            reasons.append(f"近60日无涨停{label}{stock_bonus:+d}")
+        score += stock_bonus
+
     final_score = max(0, min(100, int(round(score))))
     return {
         "code": code,
@@ -640,6 +677,7 @@ def scan_first_board_candidates_cached(
     fetcher,
     log_fn: Optional[Callable[[str], None]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
+    limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
 ) -> List[Dict[str, Any]]:
     """用画像匹配候选股（行情和历史数据均已提前缓存）。
 
@@ -678,6 +716,7 @@ def scan_first_board_candidates_cached(
             fetcher=fetcher,
             log_fn=log_fn,
             build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
+            limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         )
         if score_info["score"] >= 50:
             candidates.append(score_info)

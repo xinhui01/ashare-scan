@@ -1,6 +1,6 @@
-"""K 线历史形态统计 helper：识别"成功二波接力/连板/反包"形态。
+"""K 线历史形态统计 helper：识别"成功二波接力/连板/反包"形态 + 任意涨停次数。
 
-3 个函数无状态，输入是 history DataFrame + 配置参数，输出是 (occurrence_count, days_since_last_hit) 元组。
+4 个函数无状态，输入是 history DataFrame + 配置参数，输出是 (occurrence_count, days_since_last_hit) 元组。
 """
 from __future__ import annotations
 
@@ -49,6 +49,47 @@ def _count_historical_continuation(
         if chg_next >= threshold - 0.3:
             occ += 1
             last_hit_idx = i + 1
+    last_days = (t - last_hit_idx) if last_hit_idx is not None else None
+    return (occ, last_days)
+
+
+def _count_historical_any_limit_up(
+    history_df: "pd.DataFrame",
+    code: str,
+    lookback_days: int = 60,
+    threshold_fn=None,
+):
+    """扫历史 K 线统计近 N 日内任意涨停次数（不要求 T+1 连板），作为"股性活跃度"代理。
+
+    用于首板评分：凡历史涨停过的股更易再次涨停；长期不涨停的"僵尸股"首板成功率低。
+    与 _count_historical_continuation 的区别：这里只统计单次涨停事件，不要求 T+1 继续涨停。
+
+    跳过最后一行（today），避免今日数据自计。
+
+    返回 (occurrence_count, days_since_last_hit)。
+    """
+    if history_df is None or len(history_df) < 2:
+        return (0, None)
+    if threshold_fn is None:
+        def threshold_fn(_c):
+            return 10.0
+    df = history_df.sort_values("date").reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    n = len(df)
+    t = n - 1  # today index (skip)
+    threshold = float(threshold_fn(code))
+    cutoff_idx = max(1, t - int(lookback_days))
+    occ = 0
+    last_hit_idx = None
+    for i in range(cutoff_idx, t):
+        if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
+            continue
+        if float(close.iloc[i - 1]) <= 0:
+            continue
+        chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        if chg_i >= threshold - 0.3:
+            occ += 1
+            last_hit_idx = i
     last_days = (t - last_hit_idx) if last_hit_idx is not None else None
     return (occ, last_days)
 
