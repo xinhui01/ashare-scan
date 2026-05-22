@@ -187,10 +187,10 @@ def predict_limit_up_candidates(
                     log_fn(f"涨停预测：获取涨停池失败 (get_limit_up_pool): {e}")
 
             try:
-                # 全市场行情：东财约5秒，新浪约30秒
-                from stock_data import _eastmoney_circuit_breaker_open
-                _spot_timeout = 45.0 if _eastmoney_circuit_breaker_open() else 20.0
-                future_spot.result(timeout=_spot_timeout)
+                # 全市场行情上限 60s：东财快路径 5s 内 return；
+                # 东财 RST/熔断时，需要给"东财重试 ~15s + 新浪 ~30s"留足时间，否则
+                # 主线程会在新浪刚开始时就超时放弃，导致首板候选筛选每次都被跳过。
+                future_spot.result(timeout=60.0)
             except FutureTimeoutError as e:
                 if log_fn:
                     log_fn(f"涨停预测：获取全市场行情超时 (5000+只股票): {e}")
