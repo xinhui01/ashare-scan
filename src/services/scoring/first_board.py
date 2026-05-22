@@ -228,76 +228,14 @@ def load_northbound_accumulation(
     *,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, float]:
-    """加载北向资金 3 日加仓榜（沪股通 + 深股通合并）。
+    """北向资金 3 日加仓榜——数据源已停更。
 
-    返回 dict: code → 3 日持股市值变化（万元）
-    正值表示北向加仓，负值表示北向减仓。
-
-    北向数据 T+1 才公布，预测时只能取最近一个交易日的快照。
-    当日缓存 24h，避免重复拉取。
-
-    迁自 StockFilter._load_northbound_accumulation；行为零变化。
+    港交所 2024-08-17 起把"北向资金每日成交/持股明细"改为按季度披露，
+    东财 `RPT_MUTUAL_STOCK_NORTHSTA` 表自此不再产出新数据，所有公开免费
+    源（akshare / 东财 datacenter / 同花顺 / 新浪）都无法获取日级数据。
+    保留函数签名仅为向后兼容上游 thin delegate，永远返回空 dict。
     """
-    from stock_store import load_app_config, save_app_config
-    from datetime import datetime as _dt
-    today_key = _dt.now().strftime("%Y%m%d")
-    cache_key = f"stock_filter_northbound_{today_key}"
-    cached = load_app_config(cache_key, default=None)
-    if isinstance(cached, dict) and cached:
-        return cached  # type: ignore[return-value]
-
-    result: Dict[str, float] = {}
-    try:
-        import akshare as ak
-        from stock_data import _retry_ak_call
-        for market in ("沪股通", "深股通"):
-            try:
-                df = _retry_ak_call(
-                    ak.stock_hsgt_hold_stock_em,
-                    market=market,
-                    indicator="3日排行",
-                )
-            except Exception as exc:
-                if log_fn:
-                    log_fn(f"涨停预测：北向 {market} 拉取失败 {exc}")
-                continue
-            if df is None or df.empty:
-                continue
-            # 列名形如 "3日增持估计-市值"（万元，正=北向加仓，负=减仓）
-            value_col = next(
-                (c for c in df.columns
-                 if "增持" in str(c) and "市值" in str(c) and "增幅" not in str(c)),
-                None,
-            )
-            if value_col is None:
-                # 兼容旧版列名
-                value_col = next(
-                    (c for c in df.columns if "市值变化" in str(c) and "3日" in str(c)),
-                    None,
-                )
-            if value_col is None:
-                continue
-            for _, row in df.iterrows():
-                try:
-                    code = str(row.get("代码", "")).strip().zfill(6)
-                    if not code or len(code) != 6:
-                        continue
-                    change = float(row.get(value_col) or 0)
-                    # 同一只票如果在两个市场都有持股不会重复（沪/深分离），累加保险
-                    result[code] = result.get(code, 0.0) + change
-                except (TypeError, ValueError):
-                    continue
-    except Exception as exc:
-        if log_fn:
-            log_fn(f"涨停预测：北向资金加载失败 {exc}")
-        return {}
-
-    if result:
-        try:
-            save_app_config(cache_key, result)
-        except Exception:
-            pass
-    return result
+    return {}
 
 
 def fetch_spot_snapshot(

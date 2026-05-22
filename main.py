@@ -22,8 +22,24 @@ def _check_runtime() -> None:
         )
 
 
+def _drop_dead_http_proxies() -> None:
+    """清除指向死代理的 HTTP(S)_PROXY 环境变量。
+
+    历史遗留：曾在 env 里手动设过 http://118.89.136.118:31283，
+    但该代理早已下线，导致 requests/akshare 默认调用全部卡死。
+    BYPASS_PROXY=True 已经能让项目内 Session 走 trust_env=False，
+    但 pip / 其它子进程仍会读到这条 env，所以从根上清掉。
+    """
+    DEAD_HOSTS = ("118.89.136.118:31283",)
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"):
+        val = os.environ.get(key, "")
+        if any(h in val for h in DEAD_HOSTS):
+            os.environ.pop(key, None)
+
+
 def main():
     _check_runtime()
+    _drop_dead_http_proxies()
     if BYPASS_PROXY:
         os.environ["ASHARE_SCAN_BYPASS_PROXY"] = "1"
     else:

@@ -296,27 +296,23 @@ def predict_limit_up_candidates(
     elif log_fn:
         log_fn("涨停预测：未找到题材聚类缓存（如需题材加分，请先在涨停对比 tab 跑一次 AI 题材聚类）")
 
-    # 阶段2.6：加载龙虎榜 + 北向资金（失败不影响预测）
-    # 历史模式：这些都是"当前时刻"的指标，对历史日期没意义，全部置空
+    # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
+    # 北向逐日明细自 2024-08-17 起停止披露，永久置空。
+    # 历史模式：实时指标对历史日期没意义，全部置空
+    northbound_map: Dict[str, float] = {}
     if historical_mode:
         if log_fn:
-            log_fn("涨停预测[历史模式]：跳过龙虎榜 / 北向 / 板块强度（实时指标）")
+            log_fn("涨停预测[历史模式]：跳过龙虎榜 / 板块强度（实时指标）")
         lhb_map = {}
-        northbound_map = {}
         board_strength = {}
     else:
         if log_fn:
-            log_fn("涨停预测：正在加载龙虎榜 / 北向资金...")
+            log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
         try:
             lhb_map = _first_board.load_lhb_for_date(trade_date, log_fn=log_fn)
         except Exception as exc:
             logger.debug("龙虎榜加载异常: %s", exc)
             lhb_map = {}
-        try:
-            northbound_map = _first_board.load_northbound_accumulation(log_fn=log_fn)
-        except Exception as exc:
-            logger.debug("北向资金加载异常: %s", exc)
-            northbound_map = {}
 
         try:
             board_strength = _first_board.load_industry_board_strength(log_fn=log_fn)
@@ -331,8 +327,7 @@ def predict_limit_up_candidates(
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
         board_summary = "、".join(f"{k}({v:.1f}%)" for k, v in top_boards)
         log_fn(
-            f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 北向 3 日榜 {len(northbound_map)} 只 / "
-            f"板块强弱榜 TOP5 {board_summary}"
+            f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 板块强弱榜 TOP5 {board_summary}"
         )
 
     # 市场情绪评分（供二波接力等评分调节，冰点情绪下降权）
@@ -550,11 +545,6 @@ def predict_limit_up_candidates(
             summary_lines.append(
                 f"龙虎榜净买 TOP3：{'、'.join(f'{c}({v/1e8:.2f}亿)' for c, v in top_lhb)}"
             )
-    if northbound_map:
-        top_nb = sorted(northbound_map.items(), key=lambda x: -x[1])[:3]
-        summary_lines.append(
-            f"北向 3 日加仓 TOP3：{'、'.join(f'{c}({v/1e4:.2f}亿)' for c, v in top_nb if v > 0)}"
-        )
     if board_strength:
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
         summary_lines.append(
