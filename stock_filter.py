@@ -1030,8 +1030,7 @@ class StockFilter:
             log_fn=self._log,
             limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
             build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
-            filter_strong_stocks_fn=self._filter_strong_stocks,
-            filter_ma5_pullback_stocks_fn=self._filter_ma5_pullback_stocks,
+            filter_wrap_candidate_stocks_fn=_scoring_first_board.filter_wrap_candidate_stocks,
         )
 
     def _score_broken_board_wrap(
@@ -1043,7 +1042,7 @@ class StockFilter:
         lookback_days: int = 5,
         drop_threshold_pct: float = -3.0,
     ) -> Optional[Dict[str, Any]]:
-        """对断板反包 / 强势承接候选评分（thin delegate → scoring/wrap.py）。"""
+        """对断板反包候选评分（thin delegate → scoring/wrap.py）。"""
         return _scoring_wrap.score_broken_board_wrap(
             rec,
             hot_industries,

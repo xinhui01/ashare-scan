@@ -37,7 +37,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     "continuation_candidates": "保留涨停",
     "first_board_candidates": "二波接力",
     "fresh_first_board_candidates": "首板涨停",
-    "broken_board_wrap_candidates": "反包/承接",
+    "broken_board_wrap_candidates": "反包",
     "trend_limit_up_candidates": "趋势涨停",
 }
 

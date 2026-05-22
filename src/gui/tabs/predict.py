@@ -1,7 +1,7 @@
 """涨停预测 Tab：5 sub-tab 候选 + 预测/对比/策略/回测/AI 短报。
 
 这是项目最复杂的 tab，包含：
-- 涨停预测 5 sub-tab notebook（保留涨停/二波接力/首板涨停/反包承接/趋势涨停）
+- 涨停预测 5 sub-tab notebook（保留涨停/二波接力/首板涨停/反包/趋势涨停）
   以及 概念炒作 sub-tab
 - 顶部 action_bar（开始预测/历史日期/命中对比/策略分析/批量回测/AI 博弈短报/NIM Key）
 - 市场情绪条（sent_bar：评分/建议/详情/刷新）
@@ -512,7 +512,7 @@ class PredictTab:
 
         # 断板反包候选 Tab（近期涨停被打掉，今日逼近反包）
         wrap_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(wrap_tab, text="反包/承接候选")
+        self.table_nb.add(wrap_tab, text="反包候选")
         wrap_stat = ttk.Label(wrap_tab, text="历史命中率: -", foreground="#444",
                               anchor=tk.W, padding=(6, 2))
         wrap_stat.pack(side=tk.TOP, fill=tk.X)
@@ -1880,7 +1880,7 @@ class PredictTab:
                 _append_log("")
                 _append_log("=== 命中率汇总（按类别）===")
                 for cat, lbl in [("cont", "保留涨停"), ("first", "二波接力"),
-                                 ("fresh", "首板涨停"), ("wrap", "反包/承接"),
+                                 ("fresh", "首板涨停"), ("wrap", "反包"),
                                  ("trend", "趋势涨停")]:
                     d = stats.get(cat) or {}
                     b = int(d.get("buyable") or 0)
@@ -2077,7 +2077,7 @@ class PredictTab:
 
         if wrap_list:
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  反包/承接候选 TOP10\n")
+            txt.insert(tk.END, f"  反包候选 TOP10\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for rec in wrap_list[:10]:
                 chg = rec.get("change_pct")
@@ -2574,9 +2574,9 @@ class PredictTab:
             )
             self.fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
 
-        # ---- 填充反包/承接候选表格 ----
+        # ---- 填充反包候选表格 ----
         self.wrap_tree.delete(*self.wrap_tree.get_children())
-        _PATTERN_LABELS = {"wrap": "断板反包", "hold_strong": "强势承接"}
+        _PATTERN_LABELS = {"wrap": "断板反包"}
         for rec in wrap_list:
             res_text, hit_tag = _result_cell("wrap", rec.get("code", ""))
             tag = self._row_tag("wrap", hit_tag, rec.get("score", 0))
@@ -2635,7 +2635,7 @@ class PredictTab:
         self.table_nb.tab(0, text=_label("保留涨停候选", len(cont_list), total_cont))
         self.table_nb.tab(1, text=_label("二波接力候选", len(first_list), total_first))
         self.table_nb.tab(2, text=_label("首板涨停候选", len(fresh_list), total_fresh))
-        self.table_nb.tab(3, text=_label("反包/承接候选", len(wrap_list), total_wrap))
+        self.table_nb.tab(3, text=_label("反包候选", len(wrap_list), total_wrap))
         self.table_nb.tab(4, text=_label("趋势涨停候选", len(trend_list), total_trend))
 
         shown_total = len(cont_list) + len(first_list) + len(fresh_list) + len(wrap_list) + len(trend_list)
@@ -2741,7 +2741,7 @@ class PredictTab:
         stats_yesterday = stats_yesterday or {}
         category_names = {
             "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
-            "wrap": "反包/承接", "trend": "趋势涨停",
+            "wrap": "反包", "trend": "趋势涨停",
             "cont_1to2": "1进2", "cont_2to3": "2进3", "cont_3to4": "3进4",
             "cont_4to5": "4进5", "cont_5plus": "5进6+",
         }
@@ -2858,7 +2858,7 @@ class PredictTab:
         """
         category_display = {
             "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
-            "wrap": "反包/承接", "trend": "趋势涨停",
+            "wrap": "反包", "trend": "趋势涨停",
         }
         best_map: Dict[str, Optional[Tuple[int, int]]] = {}
         for cat in ("cont", "first", "fresh", "wrap", "trend"):
@@ -3148,7 +3148,7 @@ class PredictTab:
 
         ttk.Label(top, text="类别:").pack(side=tk.LEFT)
         category_var = tk.StringVar(value="全部")
-        cat_options = ["全部", "保留涨停", "二波接力", "首板涨停", "反包/承接", "趋势涨停"]
+        cat_options = ["全部", "保留涨停", "二波接力", "首板涨停", "反包", "趋势涨停"]
         cat_combo = ttk.Combobox(top, textvariable=category_var, values=cat_options,
                                  width=12, state="readonly")
         cat_combo.pack(side=tk.LEFT, padx=(2, 12))
@@ -3207,7 +3207,7 @@ class PredictTab:
         # 渲染逻辑
         cat_label_to_key = {
             "全部": None, "保留涨停": "cont", "二波接力": "first",
-            "首板涨停": "fresh", "反包/承接": "wrap", "趋势涨停": "trend",
+            "首板涨停": "fresh", "反包": "wrap", "趋势涨停": "trend",
         }
 
         def _reload():

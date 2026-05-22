@@ -11,6 +11,7 @@
 - parse_spot_record: 从实时行情行解析基础记录（静态纯函数）
 - filter_strong_stocks: 从行情快照筛选 +3%~+9.95% 强势股
 - filter_ma5_pullback_stocks: 从行情快照筛选 -5%~+3% 回踩 MA5 候选
+- filter_wrap_candidate_stocks: 从行情快照筛选 -10.5%~+3% 断板反包候选（专供反包）
 
 依赖：StockDataFetcher（fetcher 参数）+ 可选 log_fn / build_local_cache_history_plan_fn。
 """
@@ -329,7 +330,7 @@ def filter_strong_stocks(
 def filter_ma5_pullback_stocks(
     spot_df: pd.DataFrame, exclude_codes: set
 ) -> List[Dict[str, Any]]:
-    """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（用于反包/承接候选）。
+    """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（供 trend 趋势涨停候选使用）。
 
     历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
 
@@ -342,6 +343,34 @@ def filter_ma5_pullback_stocks(
             continue
         chg = rec.get("change_pct")
         if chg is None or chg < -5.0 or chg >= 3.0:
+            continue
+        records.append(rec)
+    records.sort(key=lambda x: -(x.get("amount") or 0))
+    return records
+
+
+def filter_wrap_candidate_stocks(
+    spot_df: pd.DataFrame, exclude_codes: set
+) -> List[Dict[str, Any]]:
+    """筛选"断板反包"候选 T0 形态池（chg ∈ [-10.5%, +3%)），专供反包评分。
+
+    回测口径（91185 个 T0 事件，T+1 反包基线 4.42%）：
+      T0 ∈ [-10.5%, -5%)   硬阴线，反包率 6.06-6.53%
+      T0 ∈ [-5%, -3%)      小阴线，反包率 4.85%
+      T0 ∈ [-3%, +3%)      消化区，反包率 3.10-4.05%（仍可进，靠"连板数"过滤）
+      T0 ∈ [-?, -10.5%)    跌停打死，反包率 2.39%   ← 砍
+      T0 ∈ [+3%, +9.95%)   强势上涨，不算反包形态（归 trend/fresh）  ← 砍
+
+    精度由下游 score_broken_board_wrap 的"前置连板数 ≥2"硬性条件保证：
+    1 板反包率仅 3.97%，2 板 6.53%，3 板 7.92%，≥4 板 8.80%，每板近线性提升。
+    """
+    records = []
+    for _, row in spot_df.iterrows():
+        rec = parse_spot_record(row, exclude_codes)
+        if rec is None:
+            continue
+        chg = rec.get("change_pct")
+        if chg is None or chg < -10.5 or chg >= 3.0:
             continue
         records.append(rec)
     records.sort(key=lambda x: -(x.get("amount") or 0))

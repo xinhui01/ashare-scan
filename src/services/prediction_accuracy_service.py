@@ -60,7 +60,7 @@ CATEGORY_LABELS: Dict[str, str] = {
     "cont": "保留涨停",
     "first": "二波接力",
     "fresh": "首板涨停",
-    "wrap": "反包/承接",
+    "wrap": "反包",
     "trend": "趋势涨停",
     "cont_1to2": "1进2",
     "cont_2to3": "2进3",

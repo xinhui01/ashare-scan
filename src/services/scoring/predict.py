@@ -495,8 +495,7 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_strong_stocks_fn=_first_board.filter_strong_stocks,
-        filter_ma5_pullback_stocks_fn=_first_board.filter_ma5_pullback_stocks,
+        filter_wrap_candidate_stocks_fn=_first_board.filter_wrap_candidate_stocks,
     )
 
     # 阶段8：趋势涨停候选（多头排列、稳健上行）
@@ -520,7 +519,7 @@ def predict_limit_up_candidates(
         f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
         f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
         f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=45）",
-        f"反包/承接候选：{len(broken_board_wrap_candidates)} 只（近期涨停被打掉反包 / 不破前涨停价承接，得分>=50）",
+        f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=50）",
         f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=65）",
     ]
     latest_cont_rate = compare_context.get("latest_continuation_rate")
