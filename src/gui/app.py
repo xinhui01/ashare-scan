@@ -44,6 +44,19 @@ plt.rcParams["axes.unicode_minus"] = False
 
 
 class StockMonitorApp:
+    # 日志环形缓冲上限：超过后裁掉最旧的，避免长时间运行内存膨胀
+    _LOG_BUFFER_MAX = 5000
+    # 命中即标记为错误（红色），并保留在「只显示警告/错误」过滤中
+    _LOG_ERROR_KEYWORDS = (
+        "失败", "错误", "异常", "Traceback", "崩溃", "[ERROR]",
+        "Exception", "无法", "拒绝", "超时", "未能",
+    )
+    # 命中即标记为警告（橙色），并保留在「只显示警告/错误」过滤中
+    _LOG_WARN_KEYWORDS = (
+        "警告", "[WARN]", "Warning", "重试", "回退", "降级",
+        "弃用", "补位",
+    )
+
     def __init__(self, root: tk.Tk):
         ensure_store_ready()
         self.root = root
@@ -80,6 +93,9 @@ class StockMonitorApp:
         # GUI 设置统一存储在 SQLite app_config 表中（key: result_column_layout / board_filter_layout / app_settings）
         self._main_thread_id = threading.get_ident()
         self._ui = UIDispatcher(self.root)
+        # 日志环形缓冲：每条 = (完整行包含时间戳, 级别 "err"/"warn"/"")。
+        # 切换「只显示警告/错误」时按缓冲重渲染，不会丢历史。
+        self._log_buffer: List[Tuple[str, str]] = []
         self._log_drainer = LogDrainer(
             dispatcher=self._ui,
             main_thread_id=self._main_thread_id,
@@ -738,11 +754,49 @@ class StockMonitorApp:
         if self._is_closing:
             return
         line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
-        self.log.text.insert(tk.END, line)
-        self.log.text.see(tk.END)
+        level = self._classify_log_level(message)
+
+        self._log_buffer.append((line, level))
+        overflow = len(self._log_buffer) - self._LOG_BUFFER_MAX
+        if overflow > 0:
+            del self._log_buffer[:overflow]
+
         if self._run_log_file is not None:
             with self._run_log_file.open("a", encoding="utf-8") as f:
                 f.write(line)
+
+        if self.log.show_only_errors_var.get() and level not in ("err", "warn"):
+            return
+
+        self._append_log_line(line, level)
+
+    def _classify_log_level(self, message: str) -> str:
+        for kw in self._LOG_ERROR_KEYWORDS:
+            if kw in message:
+                return "err"
+        for kw in self._LOG_WARN_KEYWORDS:
+            if kw in message:
+                return "warn"
+        return ""
+
+    def _append_log_line(self, line: str, level: str) -> None:
+        start = self.log.text.index("end-1c")
+        self.log.text.insert(tk.END, line)
+        if level:
+            end = self.log.text.index("end-1c")
+            self.log.text.tag_add(level, start, end)
+        self.log.text.see(tk.END)
+
+    def _rerender_log(self) -> None:
+        """根据当前「只显示警告/错误」开关重渲染整个日志区域。在主线程调用。"""
+        if self._is_closing:
+            return
+        self.log.text.delete("1.0", tk.END)
+        only_errors = self.log.show_only_errors_var.get()
+        for line, level in self._log_buffer:
+            if only_errors and level not in ("err", "warn"):
+                continue
+            self._append_log_line(line, level)
 
     def _log_async(self, message: str) -> None:
         self._log_drainer.enqueue(message)

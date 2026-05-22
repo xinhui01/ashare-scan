@@ -1959,8 +1959,6 @@ class StockDataFetcher:
         # ---- L1: 进程内 TTL 缓存（60s）盘中反复进入秒开 ----
         mem_hit = _intraday_mem_get(mem_key)
         if mem_hit is not None:
-            if self._log:
-                self._log(f"分时 {code} 内存缓存命中")
             return _return(mem_hit)
 
         # ---- L2: SQLite 缓存——过去日期永久；今日数据收盘后（15:30+）也复用 ----
@@ -1986,8 +1984,6 @@ class StockDataFetcher:
                                     auction_snapshot["time"] = pd.to_datetime(auction_snapshot["time"], errors="coerce")
                             except Exception:
                                 auction_snapshot = None
-                        if self._log:
-                            self._log(f"分时 {code} {requested_date} 从本地缓存读取 ({len(intraday_df)} 行)")
                         payload = {
                             "intraday": intraday_df,
                             "selected_trade_date": requested_date,
