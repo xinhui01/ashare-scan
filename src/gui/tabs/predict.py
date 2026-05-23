@@ -886,7 +886,7 @@ class PredictTab:
         except Exception:
             pass
 
-        self.start()
+        self.start(historical_mode=True)
 
     def _refresh_display_if_ready(self):
         """顶部价格/板块筛选变化时同步刷新涨停预测表（如已有预测结果）。"""
@@ -1136,7 +1136,7 @@ class PredictTab:
 
     # ============================== 预测启停 + 主流程 ==============================
 
-    def start(self):
+    def start(self, historical_mode: bool = False):
         if self.thread is not None and self.thread.is_alive():
             return
         trade_date = self.date_var.get().strip()
@@ -1169,10 +1169,16 @@ class PredictTab:
         self.thread, _ = self.app._start_background_job(
             self._load,
             name="limit-up-predict",
-            args=(trade_date, lookback),
+            args=(trade_date, lookback, historical_mode),
         )
 
-    def _load(self, trade_date: str, lookback_days: int, cancel_token: CancelToken):
+    def _load(
+        self,
+        trade_date: str,
+        lookback_days: int,
+        historical_mode: bool,
+        cancel_token: CancelToken,
+    ):
         try:
             if cancel_token.is_cancelled():
                 return
@@ -1183,7 +1189,10 @@ class PredictTab:
                     self.status_label.config(text=f"预测分析 {c}/{t}: {i}"))
 
             result = self.app.stock_filter.predict_limit_up_candidates(
-                trade_date, lookback_days=lookback_days, progress_callback=_progress,
+                trade_date,
+                lookback_days=lookback_days,
+                progress_callback=_progress,
+                historical_mode=historical_mode,
             )
             if cancel_token.is_cancelled():
                 return

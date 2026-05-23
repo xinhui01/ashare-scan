@@ -93,8 +93,8 @@ def fetch_hist_direct(
         return pd.DataFrame()
 
     big_df = big_df.iloc[:, :6]
-    big_df.columns = ["date", "open", "close", "high", "low", "amount"]
-    for col in ["open", "close", "high", "low", "amount"]:
+    big_df.columns = ["date", "open", "close", "high", "low", "volume"]
+    for col in ["open", "close", "high", "low", "volume"]:
         big_df[col] = pd.to_numeric(big_df[col], errors="coerce")
     big_df["date"] = pd.to_datetime(big_df["date"], errors="coerce").dt.date.astype(str)
     big_df = big_df.drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)

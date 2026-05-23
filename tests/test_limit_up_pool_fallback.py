@@ -206,9 +206,10 @@ def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
     predict.date_var = Var("20260520")
     predict.status_label = LabelStub()
 
-    called = {"start": False}
-    def _start():
+    called = {"start": False, "historical_mode": None}
+    def _start(historical_mode=False):
         called["start"] = True
+        called["historical_mode"] = historical_mode
     predict.start = _start
 
     # 执行刷新
@@ -218,3 +219,4 @@ def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
     assert "20260520" not in fetcher._limit_up_pool_cache
     assert "20260520" not in fetcher._prev_limit_up_pool_cache
     assert called["start"] is True
+    assert called["historical_mode"] is True

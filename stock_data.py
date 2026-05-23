@@ -927,7 +927,9 @@ class StockDataFetcher:
                 reason=reason,
             )
 
-        _non_em_providers = ("tencent", "sina", "netease", "baidu", "sohu", "ths", "wscn")
+        # sina/ths 提供完整成交额（amount）字段，tencent 源天生缺少成交额，
+        # 因此将 sina 和 ths 优先排在 tencent 之前，确保 auto 模式下尽可能拿到真实成交额。
+        _non_em_providers = ("sina", "ths", "tencent", "netease", "baidu", "sohu", "wscn")
         if _eastmoney_circuit_breaker_open():
             # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
             return HistoryRequestPlan(
