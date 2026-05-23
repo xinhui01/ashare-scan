@@ -58,6 +58,23 @@ def estimate_last_trade_date() -> str:
     return (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
+def history_meta_requires_repair(meta: Optional[dict]) -> bool:
+    """历史缓存元数据是否提示该票仍需补齐。
+
+    规则：
+    - `needs_repair=1` 或 `partial_fields` 非空：直接视为残缺缓存
+    - 兼容历史遗留：`source=tencent` 但未打标时，也视为待修复
+      （腾讯历史源天生缺失 amount，旧版本未把它写入 partial_fields）
+    """
+    if not isinstance(meta, dict):
+        return False
+    if int(meta.get("needs_repair") or 0):
+        return True
+    if str(meta.get("partial_fields") or "").strip():
+        return True
+    return str(meta.get("source") or "").strip().lower() == "tencent"
+
+
 def is_history_cache_fresh(
     stock_code: str,
     min_rows: int,
@@ -72,6 +89,13 @@ def is_history_cache_fresh(
     """
     meta = _load_history_meta_store(stock_code)
     if meta is None:
+        return False
+    if history_meta_requires_repair(meta):
+        if log:
+            partial = str(meta.get("partial_fields") or "").strip()
+            source = str(meta.get("source") or "").strip()
+            hint = partial or (f"source={source}" if source else "needs_repair=1")
+            log(f"历史 {stock_code} 缓存命中但字段残缺({hint})，视为不新鲜，需补齐。")
         return False
     latest_td_raw = str(meta.get("latest_trade_date") or "").strip()
     row_count = int(meta.get("row_count") or 0)

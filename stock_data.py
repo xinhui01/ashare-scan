@@ -347,15 +347,6 @@ _parse_eastmoney_hist_json = _em_history_parser.parse_hist_json
 _normalize_history_frame = _sources_common.normalize_history_frame
 
 
-# ---- 腾讯证券镜像池 ----
-# 实现已迁移到 src/sources/tencent.py；下面用别名保持调用方零修改。
-from src.sources import tencent as _tencent
-_TENCENT_HISTORY_MIRRORS = _tencent.HISTORY_MIRRORS
-_get_healthy_tencent_mirrors = _tencent._get_healthy_mirrors
-_fetch_tencent_hist_direct = _tencent.fetch_hist_direct
-_fetch_tencent_hist_frame = _tencent.fetch_hist_frame
-
-
 # ---- 新浪财经反封保护 ----
 # 实现已迁移到 src/sources/sina.py；下面是公共函数别名。
 from src.sources import sina as _src_sina
@@ -476,6 +467,7 @@ _today_ymd = _cache_fresh.today_ymd
 _should_refresh_today_row = _cache_fresh.should_refresh_today_row
 _estimate_last_trade_date = _cache_fresh.estimate_last_trade_date
 _is_history_cache_fresh = _cache_fresh.is_history_cache_fresh
+_history_meta_requires_repair = _cache_fresh.history_meta_requires_repair
 
 
 # 分时进程内 TTL 缓存：盘中 60s 内重复访问同股秒开
@@ -483,6 +475,32 @@ _is_history_cache_fresh = _cache_fresh.is_history_cache_fresh
 # payload_dict 与 get_intraday_data(include_meta=True) 返回结构一致
 _INTRADAY_MEM_CACHE: Dict[Tuple[str, str, int], Tuple[float, Dict[str, Any]]] = {}
 _INTRADAY_MEM_TTL_SECONDS = 60.0
+
+
+def _latest_trade_date_from_history_df(df: Optional[pd.DataFrame]) -> str:
+    if df is None or df.empty or "date" not in df.columns:
+        return ""
+    raw_date = str(df["date"].iloc[-1]).strip()
+    try:
+        normalized = raw_date.replace("/", "-").replace(".", "-")
+        if len(normalized) == 8 and normalized.isdigit():
+            return f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+        return normalized
+    except Exception:
+        return raw_date
+
+
+def _history_partial_fields(df: Optional[pd.DataFrame]) -> str:
+    """识别历史 K 线里会显著影响评分的缺失字段。"""
+    if df is None or df.empty:
+        return ""
+    missing: List[str] = []
+    for col in ("open", "high", "low"):
+        if col not in df.columns or pd.to_numeric(df[col], errors="coerce").notna().sum() == 0:
+            missing.append(col)
+    if "amount" not in df.columns or pd.to_numeric(df["amount"], errors="coerce").notna().sum() == 0:
+        missing.append("amount")
+    return ",".join(missing)
 
 
 def _intraday_market_closed_now() -> bool:
@@ -609,7 +627,7 @@ class StockDataFetcher:
     def _build_multi_source_plans(self, source: str) -> List[HistoryRequestPlan]:
         """构建多源并行请求计划列表，用于批量更新时分流。
         将可用的 eastmoney 镜像各自作为一个独立 plan，
-        再加上 tencent 和 sina 作为补充源，实现负载均衡。
+        再加上其它完整历史源作为补充源，实现负载均衡。
         """
         normalized = self.normalize_history_source(source)
 
@@ -631,16 +649,7 @@ class StockDataFetcher:
                         reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
                     ))
 
-        # 腾讯/新浪/网易/百度/搜狐：作为补充分流通道（跳过正在冷却的源）
-        if normalized in ("auto", "tencent"):
-            tencent_healthy = _get_healthy_tencent_mirrors()
-            if tencent_healthy:
-                plans.append(HistoryRequestPlan(
-                    mode="network",
-                    provider_sequence=("tencent",),
-                    mirror_urls=(),
-                    reason="multi-source-tencent",
-                ))
+        # 新浪/网易/百度/搜狐/同花顺/华尔街见闻：作为补充分流通道（跳过正在冷却的源）
         if normalized in ("auto", "sina"):
             if not _global_host_on_cooldown("finance.sina.com.cn"):
                 plans.append(HistoryRequestPlan(
@@ -855,13 +864,6 @@ class StockDataFetcher:
 
     def build_history_request_plan(self, source: str = "auto", force_refresh: bool = False) -> HistoryRequestPlan:
         normalized = self.normalize_history_source(source)
-        if normalized == "tencent":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("tencent",),
-                mirror_urls=(),
-                reason="history-provider=tencent",
-            )
         if normalized == "sina":
             return HistoryRequestPlan(
                 mode="network",
@@ -927,9 +929,7 @@ class StockDataFetcher:
                 reason=reason,
             )
 
-        # sina/ths 提供完整成交额（amount）字段，tencent 源天生缺少成交额，
-        # 因此将 sina 和 ths 优先排在 tencent 之前，确保 auto 模式下尽可能拿到真实成交额。
-        _non_em_providers = ("sina", "ths", "tencent", "netease", "baidu", "sohu", "wscn")
+        _non_em_providers = ("sina", "ths", "netease", "baidu", "sohu", "wscn")
         if _eastmoney_circuit_breaker_open():
             # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
             return HistoryRequestPlan(
@@ -1723,12 +1723,14 @@ class StockDataFetcher:
             stock_code = str(stock_code).strip().zfill(6)
             end_date = datetime.now().strftime('%Y%m%d')
             min_rows = max(1, days)
+            history_meta = None if force_refresh else load_history_meta_store(stock_code)
+            cache_requires_repair = _history_meta_requires_repair(history_meta)
             if request_plan is None:
                 request_plan = self.build_history_request_plan(source=self._default_history_source, force_refresh=False)
 
             if not force_refresh:
                 # ---- 企业级缓存策略：先查 meta 判断新鲜度，再查数据 ----
-                if _is_history_cache_fresh(stock_code, min_rows, self._log):
+                if (not cache_requires_repair) and _is_history_cache_fresh(stock_code, min_rows, self._log):
                     history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
                     if history_df is not None and not history_df.empty:
                         _increment_history_diagnostic("cache_hits")
@@ -1737,9 +1739,15 @@ class StockDataFetcher:
                 history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
                 if history_df is not None and not history_df.empty:
                     _increment_history_diagnostic("cache_hits")
-                    if not _should_refresh_today_row(history_df):
+                    if cache_requires_repair:
+                        if self._log:
+                            partial = str((history_meta or {}).get("partial_fields") or "").strip()
+                            source = str((history_meta or {}).get("source") or "").strip()
+                            hint = partial or (f"source={source}" if source else "needs_repair=1")
+                            self._log(f"历史 {stock_code} 命中缓存但字段残缺({hint})，继续联网补齐。")
+                    elif not _should_refresh_today_row(history_df):
                         return history_df.tail(days).reset_index(drop=True)
-                    if self._log:
+                    elif self._log:
                         self._log(f"历史 {stock_code} 命中当天缓存，但尚未收盘，改为刷新最新日线。")
 
             eastmoney_only = bool(request_plan.provider_sequence) and all(
@@ -1774,7 +1782,9 @@ class StockDataFetcher:
             }
 
             last_error: Optional[BaseException] = None
-            for provider in provider_sequence:
+            best_partial: Optional[Tuple[pd.DataFrame, str, str]] = None
+            for idx, provider in enumerate(provider_sequence):
+                provider_used = provider
                 # 跳过正在冷却中的源，避免无意义的调用和日志刷屏
                 host = _PROVIDER_HOST.get(provider)
                 if host and _global_host_on_cooldown(host):
@@ -1810,21 +1820,6 @@ class StockDataFetcher:
                             self._log(f"历史 {stock_code} 使用东财源失败，准备切换备用源: {e}")
                         continue
                     df = _normalize_history_frame(df)
-                elif provider == "tencent":
-                    try:
-                        if self._log:
-                            self._log(f"历史 {stock_code} 正在使用腾讯源补位。")
-                        df = _history_retry_ak_call(
-                            _fetch_tencent_hist_frame,
-                            stock_code,
-                            start_date,
-                            end_date,
-                        )
-                    except Exception as e:
-                        last_error = e
-                        if self._log:
-                            self._log(f"历史 {stock_code} 使用腾讯源失败，准备切换下一个备用源: {e}")
-                        continue
                 elif provider == "sina":
                     try:
                         if self._log:
@@ -1898,24 +1893,62 @@ class StockDataFetcher:
                     last_error = RuntimeError(f"{provider}-empty-history")
                     continue
 
+                partial_fields = _history_partial_fields(df)
+                needs_repair = int(bool(partial_fields))
+                if partial_fields:
+                    if self._log:
+                        self._log(f"历史 {stock_code} {provider_used} 返回字段残缺({partial_fields})。")
+                    if best_partial is None:
+                        best_partial = (df, provider_used, partial_fields)
+                    if idx < len(provider_sequence) - 1:
+                        last_error = RuntimeError(f"{provider_used}-partial-history:{partial_fields}")
+                        continue
+
                 _save_history_store(stock_code, df)
-                # 保存缓存元数据，用于后续新鲜度判断
-                latest_td = ""
-                if "date" in df.columns and not df.empty:
-                    raw_date = str(df["date"].iloc[-1]).strip()
-                    # 统一日期格式为 YYYY-MM-DD，避免后续比较出错
-                    try:
-                        normalized = raw_date.replace("/", "-").replace(".", "-")
-                        if len(normalized) == 8 and normalized.isdigit():
-                            latest_td = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
-                        else:
-                            latest_td = normalized
-                    except Exception:
-                        latest_td = raw_date
-                save_history_meta_store(stock_code, latest_td, len(df), source=provider)
+                latest_td = _latest_trade_date_from_history_df(df)
+                save_history_meta_store(
+                    stock_code,
+                    latest_td,
+                    len(df),
+                    source=provider_used,
+                    partial_fields=partial_fields,
+                    needs_repair=needs_repair,
+                )
+                return df.tail(days).reset_index(drop=True)
+
+            if best_partial is not None and (history_df is None or history_df.empty):
+                df, provider, partial_fields = best_partial
+                _save_history_store(stock_code, df)
+                latest_td = _latest_trade_date_from_history_df(df)
+                save_history_meta_store(
+                    stock_code,
+                    latest_td,
+                    len(df),
+                    source=provider,
+                    partial_fields=partial_fields,
+                    needs_repair=1,
+                )
+                if self._log:
+                    self._log(
+                        f"历史 {stock_code} 完整源均失败，暂存 {provider} 残缺缓存({partial_fields})，后续继续修复。"
+                    )
                 return df.tail(days).reset_index(drop=True)
 
             if history_df is not None and not history_df.empty:
+                if cache_requires_repair and history_meta is not None:
+                    latest_td = _latest_trade_date_from_history_df(history_df)
+                    partial_fields = str(history_meta.get("partial_fields") or "").strip()
+                    if not partial_fields and str(history_meta.get("source") or "").strip().lower() == "tencent":
+                        partial_fields = "amount"
+                    save_history_meta_store(
+                        stock_code,
+                        latest_td or str(history_meta.get("latest_trade_date") or ""),
+                        len(history_df),
+                        source=str(history_meta.get("source") or ""),
+                        partial_fields=partial_fields,
+                        needs_repair=1,
+                        source_failure_streak=history_meta.get("source_failure_streak"),
+                    )
                 if self._log:
                     self._log(f"历史 {stock_code} 全部数据源失败，回退本地缓存: {last_error}")
                 _increment_history_diagnostic("fallback_cache_returns")

@@ -91,12 +91,12 @@ class HistoryMetaSchemaTestCase(unittest.TestCase):
         import stock_store
         stock_store.ensure_store_ready()
         for code in ("000001", "000002", "600000"):
-            stock_store.save_history_meta(code, "2026-04-22", 60, "tencent")
+            stock_store.save_history_meta(code, "2026-04-22", 60, "sina")
         mapping = stock_store.load_all_history_meta_map()
         self.assertEqual(set(mapping.keys()), {"000001", "000002", "600000"})
         self.assertEqual(mapping["000001"]["latest_trade_date"], "2026-04-22")
         # 6 位代码补零行为要体现在 map 的 key 上
-        stock_store.save_history_meta("1", "2026-04-22", 10, "tencent")
+        stock_store.save_history_meta("1", "2026-04-22", 10, "sina")
         mapping = stock_store.load_all_history_meta_map()
         self.assertIn("000001", mapping)  # "1" 被 zfill(6)
 

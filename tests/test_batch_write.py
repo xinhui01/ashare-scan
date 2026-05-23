@@ -131,7 +131,7 @@ class BatchWriteTestCase(unittest.TestCase):
     def test_meta_batch_success(self):
         import stock_store
         metas = [
-            {"code": "000001", "latest_trade_date": "2026-04-22", "row_count": 60, "source": "tencent"},
+            {"code": "000001", "latest_trade_date": "2026-04-22", "row_count": 60, "source": "sina"},
             {"code": "000002", "latest_trade_date": "2026-04-22", "row_count": 60, "source": "sina",
              "partial_fields": "open,high", "needs_repair": 1},
         ]
