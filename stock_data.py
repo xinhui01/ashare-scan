@@ -1717,11 +1717,14 @@ class StockDataFetcher:
         preferred_mirror: Optional[str] = None,
         mirror_pool: Optional[List[str]] = None,
         request_plan: Optional[HistoryRequestPlan] = None,
+        as_of_trade_date: str = "",
     ) -> Optional[pd.DataFrame]:
         history_df: Optional[pd.DataFrame] = None
         try:
             stock_code = str(stock_code).strip().zfill(6)
-            end_date = datetime.now().strftime('%Y%m%d')
+            end_date = str(as_of_trade_date or "").strip().replace("-", "")
+            if len(end_date) != 8 or not end_date.isdigit():
+                end_date = datetime.now().strftime('%Y%m%d')
             min_rows = max(1, days)
             history_meta = None if force_refresh else load_history_meta_store(stock_code)
             cache_requires_repair = _history_meta_requires_repair(history_meta)

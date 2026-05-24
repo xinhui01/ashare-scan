@@ -47,14 +47,25 @@ class _AsOfHistoryFetcher:
         mirror_pool: Optional[List[str]] = None,
         request_plan: Optional[Any] = None,
     ):
-        df = self.base_fetcher.get_history_data(
-            stock_code,
-            days=max(int(days or 0), 120),
-            force_refresh=force_refresh,
-            preferred_mirror=preferred_mirror,
-            mirror_pool=mirror_pool,
-            request_plan=request_plan,
-        )
+        try:
+            df = self.base_fetcher.get_history_data(
+                stock_code,
+                days=max(int(days or 0), 120),
+                force_refresh=force_refresh,
+                preferred_mirror=preferred_mirror,
+                mirror_pool=mirror_pool,
+                request_plan=request_plan,
+                as_of_trade_date=self.as_of_trade_date,
+            )
+        except TypeError:
+            df = self.base_fetcher.get_history_data(
+                stock_code,
+                days=max(int(days or 0), 120),
+                force_refresh=force_refresh,
+                preferred_mirror=preferred_mirror,
+                mirror_pool=mirror_pool,
+                request_plan=request_plan,
+            )
         if df is None or df.empty or "date" not in df.columns:
             return df
 

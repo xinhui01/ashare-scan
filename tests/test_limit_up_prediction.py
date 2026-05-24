@@ -344,6 +344,22 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
 
         self.assertEqual(df["date"].tolist(), ["2026-05-20", "2026-05-21"])
 
+    def test_as_of_history_fetcher_passes_cutoff_to_base_fetcher(self):
+        calls = []
+
+        class _BaseFetcher:
+            def get_history_data(self, code, days=120, force_refresh=False, preferred_mirror=None, mirror_pool=None, request_plan=None, as_of_trade_date=""):
+                calls.append(as_of_trade_date)
+                return pd.DataFrame({
+                    "date": ["2026-05-20", "2026-05-21", "2026-05-22"],
+                    "close": [4.27, 3.96, 4.36],
+                })
+
+        fetcher = _AsOfHistoryFetcher(_BaseFetcher(), "20260521")
+        fetcher.get_history_data("002421", days=120)
+
+        self.assertEqual(calls, ["20260521"])
+
 
 if __name__ == "__main__":
     unittest.main()
