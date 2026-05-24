@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -26,6 +27,48 @@ from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AsOfHistoryFetcher:
+    """历史回放专用 fetcher 代理：所有日线读取都截断到 as-of 当天。"""
+    base_fetcher: Any
+    as_of_trade_date: str
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.base_fetcher, name)
+
+    def get_history_data(
+        self,
+        stock_code: str,
+        days: int = 10,
+        force_refresh: bool = False,
+        preferred_mirror: Optional[str] = None,
+        mirror_pool: Optional[List[str]] = None,
+        request_plan: Optional[Any] = None,
+    ):
+        df = self.base_fetcher.get_history_data(
+            stock_code,
+            days=max(int(days or 0), 120),
+            force_refresh=force_refresh,
+            preferred_mirror=preferred_mirror,
+            mirror_pool=mirror_pool,
+            request_plan=request_plan,
+        )
+        if df is None or df.empty or "date" not in df.columns:
+            return df
+
+        as_of = str(self.as_of_trade_date or "").strip()
+        if len(as_of) == 8 and as_of.isdigit():
+            as_of = f"{as_of[:4]}-{as_of[4:6]}-{as_of[6:8]}"
+
+        date_col = (
+            df["date"].astype(str).str.replace("/", "-", regex=False).str.replace(".", "-", regex=False)
+        )
+        trimmed = df.loc[date_col <= as_of].copy()
+        if trimmed.empty:
+            return trimmed
+        return trimmed.tail(days).reset_index(drop=True)
 
 
 def build_compare_market_context(
@@ -130,6 +173,11 @@ def predict_limit_up_candidates(
     profile: Dict[str, Any] = {}
     feature_samples: List[Dict[str, Any]] = []
     compare_context = build_compare_market_context(trade_date, lookback_days, fetcher=fetcher)
+    scoring_fetcher = (
+        _AsOfHistoryFetcher(fetcher, trade_date)
+        if historical_mode
+        else fetcher
+    )
 
     # 阶段2：获取今日涨停池 + 全市场行情
     if log_fn:
@@ -353,6 +401,8 @@ def predict_limit_up_candidates(
     # 让 cont 评分识别"板块独苗高板龙头"vs"高位跟风票"
     industry_max_boards: Dict[str, int] = {}
     industry_top_codes: Dict[str, set] = {}
+    market_max_boards = 0
+    market_top_codes: set = set()
     for r in all_pool_records:
         ind = str(r.get("industry") or "").strip()
         if not ind:
@@ -361,8 +411,13 @@ def predict_limit_up_candidates(
             b = int(r.get("consecutive_boards") or 1)
         except (TypeError, ValueError):
             b = 1
-        cur_max = industry_max_boards.get(ind, 0)
         code = str(r.get("code") or "").strip()
+        if b > market_max_boards:
+            market_max_boards = b
+            market_top_codes = {code} if code else set()
+        elif b == market_max_boards and code:
+            market_top_codes.add(code)
+        cur_max = industry_max_boards.get(ind, 0)
         if b > cur_max:
             industry_max_boards[ind] = b
             industry_top_codes[ind] = {code}
@@ -370,6 +425,8 @@ def predict_limit_up_candidates(
             industry_top_codes.setdefault(ind, set()).add(code)
     compare_context["industry_max_boards"] = industry_max_boards
     compare_context["industry_top_codes"] = industry_top_codes
+    compare_context["market_max_boards"] = market_max_boards
+    compare_context["market_top_codes"] = market_top_codes
 
     # 题材阶段映射（来自 concept_hype 服务）：code → 该票所在题材的最佳阶段
     # 萌芽 > 主升 > 末期 > 退潮 优先级，让连板股能识别自己处在主线还是末班车
@@ -432,7 +489,7 @@ def predict_limit_up_candidates(
                f"（涨停池{len(pool_codes)} + 候选{len(candidate_codes)}）")
     # 只使用本地缓存，不发起网络请求
     _classifiers.prefetch_history_for_pool(
-        fetcher, all_codes, 65, progress_callback, True, log_fn=log_fn,
+        scoring_fetcher, all_codes, 65, progress_callback, True, log_fn=log_fn,
     )
     if log_fn:
         log_fn("涨停预测：阶段3完成 - 历史数据预取结束")
@@ -443,13 +500,25 @@ def predict_limit_up_candidates(
 
     continuation_candidates = []
     for idx, rec in enumerate(all_pool_records):
+        classify_fn = classify_limit_up_pattern_fn
+        if historical_mode:
+            classify_fn = (
+                lambda stock_code, stock_name="", board="":
+                _classifiers.classify_limit_up_pattern(
+                    scoring_fetcher,
+                    stock_code,
+                    stock_name=stock_name,
+                    board=board,
+                    log_fn=log_fn,
+                )
+            )
         score_info = _cont.score_continuation_by_compare(
             rec, hot_industries, compare_context,
-            fetcher=fetcher,
+            fetcher=scoring_fetcher,
             log_fn=log_fn,
             build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
             limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
-            classify_limit_up_pattern_fn=classify_limit_up_pattern_fn,
+            classify_limit_up_pattern_fn=classify_fn,
         )
         # 门槛 40→50：30 天数据显示 0-49 段命中仅 15.2%（n=277），50+ 段才有
         # 22.5% 区分度，进一步过滤减少 false positive
@@ -466,7 +535,7 @@ def predict_limit_up_candidates(
 
     first_board_candidates = _first.scan_followthrough_candidates_cached(
         hot_industries, spot_df, zt_codes, compare_context, progress_callback,
-        fetcher=fetcher,
+        fetcher=scoring_fetcher,
         lookback_days=lookback_days,
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
@@ -479,7 +548,7 @@ def predict_limit_up_candidates(
         log_fn("涨停预测：阶段6 - 识别首板涨停候选...")
     fresh_first_board_candidates = _fresh.scan_fresh_first_board_candidates_cached(
         spot_df, zt_codes, hot_industries, compare_context, progress_callback,
-        fetcher=fetcher,
+        fetcher=scoring_fetcher,
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
@@ -491,7 +560,7 @@ def predict_limit_up_candidates(
         log_fn("涨停预测：阶段7 - 识别断板反包候选...")
     broken_board_wrap_candidates = _wrap.scan_broken_board_wrap_candidates_cached(
         spot_df, zt_codes, hot_industries, compare_context, progress_callback,
-        fetcher=fetcher,
+        fetcher=scoring_fetcher,
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
@@ -503,7 +572,7 @@ def predict_limit_up_candidates(
         log_fn("涨停预测：阶段8 - 识别趋势涨停候选...")
     trend_limit_up_candidates = _trend.scan_trend_limit_up_candidates_cached(
         spot_df, zt_codes, hot_industries, compare_context, progress_callback,
-        fetcher=fetcher,
+        fetcher=scoring_fetcher,
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
@@ -519,7 +588,7 @@ def predict_limit_up_candidates(
         f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
         f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
         f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=45）",
-        f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=50）",
+        f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=75）",
         f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=65）",
     ]
     latest_cont_rate = compare_context.get("latest_continuation_rate")

@@ -186,7 +186,7 @@ def classify_limit_up_pattern(
         and latest_close is not None
     ):
         threshold_low = threshold - 0.2
-        lookback = min(5, len(close) - 1)
+        lookback = min(max(5, len(close) - 1), 20)
         start = max(0, len(close) - 1 - lookback)
         prior_lu_idx: Optional[int] = None
         for i in range(len(close) - 2, start - 1, -1):

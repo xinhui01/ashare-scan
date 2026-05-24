@@ -314,6 +314,16 @@ def score_continuation_by_compare(
             score += 5
             reasons.append(f"板块并列{boards}板龙头({len(top_codes)}只)+5")
 
+    # 1.5. 市场板位：当前是否就是全市场最高板
+    market_max = int(compare_context.get("market_max_boards") or 0)
+    if market_max > 0 and boards >= 2:
+        if boards == market_max:
+            score += 8
+            reasons.append(f"市场最高{boards}板+8")
+        elif market_max - boards >= 2:
+            score -= 4
+            reasons.append(f"距市场最高板差{market_max - boards}板-4")
+
     # 2. 题材阶段：萌芽/主升 加分；末期/退潮 重扣
     phase = (compare_context.get("code_to_concept_phase") or {}).get(code, "")
     if phase == "萌芽":

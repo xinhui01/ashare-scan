@@ -74,7 +74,8 @@ def scan_broken_board_wrap_candidates_cached(
             limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
             build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         )
-        if score_info is not None and score_info["score"] >= 50:
+        # 反包分支优先追求命中率，默认只保留高置信候选。
+        if score_info is not None and score_info["score"] >= 75:
             candidates.append(score_info)
         if progress_callback:
             progress_callback(idx + 1, total, f"反包筛选 {rec['code']} {rec.get('name', '')}")
@@ -141,37 +142,36 @@ def score_broken_board_wrap(
 
     threshold = threshold_fn(code)
 
-    # 1) 在 [t-lookback_days, t-1] 找最近一次涨停
-    start = max(1, t - lookback_days)
+    # 1) 在更合理的历史窗口里找“最近一次满足前置连板条件的涨停”。
+    # lookback_days 仍保留为对“近期性”的偏好参数，但实际反包前置涨停
+    # 可能比 5 日更早；如果把窗口卡死，会漏掉典型的中期断板反包。
+    search_days = max(int(lookback_days or 0), 20)
+    start = max(1, t - search_days)
     prior_lu_idx: Optional[int] = None
+    streak = 0
     for i in range(t - 1, start - 1, -1):
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
         if chg_i >= threshold - 0.3:
-            prior_lu_idx = i
-            break
+            streak = 1
+            j = i - 1
+            while j >= 1:
+                if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]) or float(close.iloc[j - 1]) <= 0:
+                    break
+                chg_j = (float(close.iloc[j]) / float(close.iloc[j - 1]) - 1) * 100
+                if chg_j < threshold - 0.3:
+                    break
+                streak += 1
+                j -= 1
+            if streak >= 2:
+                prior_lu_idx = i
+                break
     if prior_lu_idx is None:
         return None
 
     prior_lu_close = float(close.iloc[prior_lu_idx])
     if prior_lu_close <= 0:
-        return None
-
-    # 1.5) 硬性条件：前置连板数 ≥ 2（从 prior_lu_idx 往前数连续涨停日）。
-    # 回测 91185 个事件：1 板反包率 3.97%、2 板 6.53%、3 板 7.92%、≥4 板 8.80%，
-    # 单板反包动力不足，砍掉可消除 ~84% 噪音同时把基线从 4.42% 拉到 6.5%+。
-    streak = 1
-    j = prior_lu_idx - 1
-    while j >= 1:
-        if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]) or float(close.iloc[j - 1]) <= 0:
-            break
-        chg_j = (float(close.iloc[j]) / float(close.iloc[j - 1]) - 1) * 100
-        if chg_j < threshold - 0.3:
-            break
-        streak += 1
-        j -= 1
-    if streak < 2:
         return None
 
     # 2) 统计涨停日到今日（含今日）之间的阴线
@@ -189,13 +189,11 @@ def score_broken_board_wrap(
             if worst_drop is None or chg_j < worst_drop:
                 worst_drop = chg_j
 
-    # 3) 反包硬性条件：今日 < 前涨停价 + 缺口 ≤ 11% + 期间有断板阴线
+    # 3) 反包硬性条件：今日 < 前涨停价 + 缺口 ≤ 11%
     wrap_gap_pct = (prior_lu_close / latest_close - 1) * 100
     if wrap_gap_pct <= 0:
         return None
     if wrap_gap_pct > 11.0:
-        return None
-    if worst_drop is None:
         return None
     pattern_kind = "wrap"
     predict_type = "断板反包"
@@ -215,76 +213,114 @@ def score_broken_board_wrap(
         score += 5
         reasons.append("2连板被砸+5")
 
+    # 市场板位：当前连板如果已经是全市场最高板，资金更偏向继续做高标，
+    # 反包优先级应下降；如果不是市场最高板，修复型反包更有性价比。
+    market_max = int(compare_context.get("market_max_boards") or 0)
+    if market_max > 0 and streak >= 2:
+        if streak == market_max and streak >= 3:
+            score -= 8
+            reasons.append(f"已是市场最高{streak}板-8")
+        elif market_max - streak >= 2:
+            score += 4
+            reasons.append(f"非市场最高板，修复空间大+4")
+        elif market_max - streak == 1 and streak >= 3:
+            score -= 4
+            reasons.append(f"接近市场最高板{streak}板-4")
+
+    # ---- 市场情绪：冰点更容易走超跌修复/反包，火热时更偏向追高标 ----
+    sent_score = int(compare_context.get("sentiment_score") or 50)
+    if sent_score < 35:
+        score += 10
+        reasons.append(f"情绪冰点{sent_score}超跌反包+10")
+        if change_pct is not None and change_pct <= -3.0:
+            score += 4
+            reasons.append("冰点深跌修复+4")
+    elif sent_score < 50:
+        score += 4
+        reasons.append(f"情绪偏冷{sent_score}修复+4")
+    elif sent_score >= 70:
+        score -= 4
+        reasons.append(f"情绪火热{sent_score}追高优先-4")
+
     # ---- 反包缺口分（缺口 1~5% 最佳，越远越难单板覆盖）----
     if wrap_gap_pct <= 2.0:
-        score += 22
-        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%临界+22")
+        score += 18
+        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%临界+18")
     elif wrap_gap_pct <= 5.0:
-        score += 18
-        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%甜区+18")
+        score += 16
+        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%甜区+16")
     elif wrap_gap_pct <= 8.0:
-        score += 18
-        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%可达+18")
+        score += 14
+        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%可达+14")
     else:  # 8~11%
-        score += 12
-        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%深缺口+12")
+        score += 10
+        reasons.append(f"距前涨停{wrap_gap_pct:.1f}%深缺口+10")
 
-    # ---- 今日 T0 形态（U 形：硬阴线/微红高，消化区低）----
-    # 回测 T+1 反包率：
-    #   -10.5~-7% 6.06%，-7~-5% 6.53%（硬阴线带）
-    #   -5~-3% 4.85%，-3~+3% 3.10-4.05%（消化区低谷）
-    #   +5%以上才再次走高（被剥离到 trend/fresh）
-    if change_pct is not None:
-        if change_pct <= -7.0:
-            score += 15
-            reasons.append(f"今跌{change_pct:.1f}%深坑+15")
-        elif change_pct <= -5.0:
-            score += 12
-            reasons.append(f"今跌{change_pct:.1f}%硬阴+12")
-        elif change_pct <= -3.0:
-            score += 6
-            reasons.append(f"今跌{change_pct:.1f}%小阴+6")
-        elif change_pct <= -1.0:
-            score += 3
-            reasons.append(f"今跌{change_pct:.1f}%弱消化+3")
-        elif change_pct >= 6.0:
-            score += 20
-            reasons.append(f"今涨{change_pct:.1f}%放量上攻+20")
-        elif change_pct >= 3.0:
-            score += 12
-            reasons.append(f"今涨{change_pct:.1f}%企稳+12")
-        elif change_pct >= 1.0:
-            score += 6
-            reasons.append(f"今涨{change_pct:.1f}%温和+6")
-        # 平淡区 (-1~+1) 不加不扣
-
-    # ---- 量比（5 日 + 20 日双校验，弱权重——回测显示影响仅 1-2 个百分点）----
+    # ---- 量能优先（反包成功更依赖放量承接）----
     vol_ratio, vol_ratio_20 = _shared.vol_ratio_with_baseline(volume, t)
     if vol_ratio is not None:
-        if vol_ratio >= 2.0:
-            score += 8
-            reasons.append(f"量比{vol_ratio:.1f}x爆量+8")
+        if vol_ratio >= 3.0:
+            score += 28
+            reasons.append(f"量比{vol_ratio:.1f}x爆量承接+28")
+        elif vol_ratio >= 2.0:
+            score += 22
+            reasons.append(f"量比{vol_ratio:.1f}x强放量+22")
         elif vol_ratio >= 1.4:
-            score += 5
-            reasons.append(f"量比{vol_ratio:.1f}x放量+5")
-        elif vol_ratio < 0.5:
-            score -= 2
-            reasons.append(f"量比{vol_ratio:.1f}x极缩-2")
-        # 0.5~1.4 中性区不加不扣（缩量止跌是中性偏好）
+            score += 16
+            reasons.append(f"量比{vol_ratio:.1f}x放量+16")
+        elif vol_ratio >= 1.0:
+            score += 8
+            reasons.append(f"量比{vol_ratio:.1f}x温和+8")
+        elif vol_ratio < 0.7:
+            score -= 5
+            reasons.append(f"量比{vol_ratio:.1f}x过弱-5")
 
-        # 5 日量比看似放量、但 20 日量比仍 <0.9 → 假放量（缩量调整里的小反弹）
         if vol_ratio >= 1.4 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
-            score -= 4
-            reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-4")
+            score -= 6
+            reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
 
-    # ---- 阴线深度（瞬时或历史最深阴线，权重提高）----
+    # ---- 今日 T0 形态（U 形：硬阴线/微红高，消化区低）----
+    # 断板涨幅只做低权重修正，不再作为硬门槛。
+    if change_pct is not None:
+        if change_pct <= -7.0:
+            score += 5
+            reasons.append(f"今跌{change_pct:.1f}%深坑+5")
+        elif change_pct <= -5.0:
+            score += 4
+            reasons.append(f"今跌{change_pct:.1f}%硬阴+4")
+        elif change_pct <= -3.0:
+            score += 2
+            reasons.append(f"今跌{change_pct:.1f}%小阴+2")
+        elif change_pct <= -1.0:
+            score += 1
+            reasons.append(f"今跌{change_pct:.1f}%弱消化+1")
+        elif change_pct >= 6.0:
+            score += 4
+            reasons.append(f"今涨{change_pct:.1f}%放量上攻+4")
+        elif change_pct >= 3.0:
+            score += 2
+            reasons.append(f"今涨{change_pct:.1f}%企稳+2")
+        elif change_pct >= 1.0:
+            score += 1
+            reasons.append(f"今涨{change_pct:.1f}%温和+1")
+        # 平淡区 (-1~+1) 不加不扣
+
+    # ---- 弱断板修正：没有出现 -3% 以上的深跌，也允许进候选池 ----
     if worst_drop is not None:
         if worst_drop <= -7.0:
-            score += 12
-            reasons.append(f"最深阴{worst_drop:.1f}%深坑+12")
+            score += 4
+            reasons.append(f"最深阴{worst_drop:.1f}%深坑+4")
         elif worst_drop <= -5.0:
-            score += 8
-            reasons.append(f"最深阴{worst_drop:.1f}%+8")
+            score += 3
+            reasons.append(f"最深阴{worst_drop:.1f}%+3")
+        elif worst_drop <= -3.0:
+            score += 1
+            reasons.append(f"最深阴{worst_drop:.1f}%+1")
+
+    # 高量弱断板：核心过滤特征
+    if vol_ratio is not None and vol_ratio >= 2.0 and (change_pct is None or change_pct > -3.0):
+        score += 8
+        reasons.append(f"高量弱断板+8")
 
     # ---- 距前涨停天数 ----
     days_since_lu = t - prior_lu_idx
@@ -300,13 +336,18 @@ def score_broken_board_wrap(
 
     # ---- 联合因子：高连板 × 硬阴线（深坑反包黄金组合）----
     if streak >= 3 and change_pct is not None and change_pct <= -5.0:
-        score += 10
-        reasons.append(f"{streak}连板+今跌{change_pct:.1f}%深坑反包+10")
+        score += 5
+        reasons.append(f"{streak}连板+今跌{change_pct:.1f}%深坑反包+5")
 
     # ---- 联合因子：高连板 × 深缺口（≥3板 + 缺口5-11% = 砸出来的黄金坑）----
     if streak >= 3 and wrap_gap_pct >= 5.0:
+        score += 4
+        reasons.append(f"{streak}连板+{wrap_gap_pct:.1f}%深缺口+4")
+
+    # ---- 联合因子：高连板 × 放量 ----
+    if streak >= 3 and vol_ratio is not None and vol_ratio >= 2.0:
         score += 6
-        reasons.append(f"{streak}连板+{wrap_gap_pct:.1f}%深缺口+6")
+        reasons.append(f"{streak}连板+{vol_ratio:.1f}x放量+6")
 
     # ---- 换手率（反包前夜的多空换手强度）----
     if turnover is not None:

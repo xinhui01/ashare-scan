@@ -4,6 +4,7 @@ import pandas as pd
 
 from scan_models import FilterSettings
 from stock_filter import StockFilter
+from src.services.scoring.predict import _AsOfHistoryFetcher
 
 
 class _CompareFetcher:
@@ -44,6 +45,57 @@ class _HistoryFetcher:
             "change_pct": [0.5, 1.1, 1.1, 2.2, 3.2, 10.0, -1.6, -0.95, -0.48, -0.48, 5.5],
             "volume": [1_000_000, 1_100_000, 1_150_000, 1_200_000, 1_300_000, 6_000_000, 2_300_000, 1_800_000, 1_550_000, 1_420_000, 7_000_000],
             "amount": [9_000_000, 10_000_000, 10_500_000, 11_300_000, 12_600_000, 64_000_000, 24_000_000, 18_700_000, 16_000_000, 14_600_000, 76_000_000],
+        })
+
+
+class _WrapHistoryFetcher:
+    """5/31 这类中期断板反包：前涨停不在 5 日内，但仍应识别。"""
+    def get_history_data(self, code, days=120, force_refresh=False, request_plan=None):
+        return pd.DataFrame({
+            "date": [
+                "2026-05-19",
+                "2026-05-20",
+                "2026-05-21",
+                "2026-05-22",
+                "2026-05-25",
+                "2026-05-26",
+                "2026-05-27",
+                "2026-05-28",
+                "2026-05-29",
+                "2026-05-31",
+            ],
+            "open":  [4.00, 4.38, 4.84, 5.20, 4.70, 4.45, 4.55, 4.42, 4.50, 4.55],
+            "high":  [4.05, 4.40, 4.88, 5.22, 4.72, 4.58, 4.60, 4.55, 4.58, 4.62],
+            "low":   [3.96, 4.00, 4.36, 4.70, 4.28, 4.30, 4.38, 4.35, 4.45, 4.48],
+            "close": [4.00, 4.40, 4.84, 4.48, 4.44, 4.52, 4.42, 4.50, 4.55, 4.50],
+            "change_pct": [0.0, 10.0, 10.0, -7.4, -0.9, 1.8, -2.2, 1.8, 1.1, -1.1],
+            "volume": [400_000_000, 520_000_000, 910_000_000, 650_000_000, 430_000_000, 470_000_000, 420_000_000, 390_000_000, 360_000_000, 380_000_000],
+            "amount": [1_700_000_000, 2_200_000_000, 3_900_000_000, 2_700_000_000, 1_800_000_000, 1_900_000_000, 1_700_000_000, 1_600_000_000, 1_500_000_000, 1_600_000_000],
+        })
+
+
+class _WeakDropWrapHistoryFetcher:
+    """弱断板但放量承接：不出现 -3% 以上深阴线，也应保留进反包评分。"""
+    def get_history_data(self, code, days=120, force_refresh=False, request_plan=None):
+        return pd.DataFrame({
+            "date": [
+                "2026-05-13",
+                "2026-05-14",
+                "2026-05-15",
+                "2026-05-16",
+                "2026-05-17",
+                "2026-05-18",
+                "2026-05-19",
+                "2026-05-20",
+                "2026-05-21",
+            ],
+            "open":  [8.20, 8.30, 8.40, 8.50, 8.95, 9.00, 9.90, 10.89, 10.62],
+            "high":  [8.30, 8.40, 8.50, 8.60, 9.05, 9.10, 10.89, 11.98, 10.75],
+            "low":   [8.15, 8.20, 8.30, 8.40, 8.90, 8.95, 9.88, 10.86, 10.50],
+            "close": [8.25, 8.35, 8.45, 8.55, 9.00, 9.90, 10.89, 11.98, 11.68],
+            "change_pct": [0.0, 1.2, 1.2, 1.2, 10.0, 10.0, 10.0, 10.0, -2.5],
+            "volume": [80_000_000, 82_000_000, 84_000_000, 86_000_000, 90_000_000, 100_000_000, 320_000_000, 610_000_000, 950_000_000],
+            "amount": [660_000_000, 680_000_000, 710_000_000, 730_000_000, 810_000_000, 900_000_000, 3_200_000_000, 6_100_000_000, 9_500_000_000],
         })
 
 
@@ -137,6 +189,160 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
         )
 
         self.assertIsNone(result)
+
+    def test_score_continuation_by_compare_rewards_market_top_board(self):
+        from src.services.scoring.cont import score_continuation_by_compare
+
+        rec = {
+            "code": "000001",
+            "name": "测试股",
+            "industry": "机器人",
+            "consecutive_boards": 3,
+            "close": 10.95,
+            "change_pct": 5.5,
+            "turnover": 12.0,
+            "break_count": 0,
+            "first_board_time": "09:30",
+        }
+        base = score_continuation_by_compare(
+            rec,
+            {"机器人": 3},
+            {},
+            fetcher=_HistoryFetcher(),
+        )
+        top = score_continuation_by_compare(
+            rec,
+            {"机器人": 3},
+            {"market_max_boards": 3},
+            fetcher=_HistoryFetcher(),
+        )
+
+        self.assertGreater(top["score"], base["score"])
+        self.assertIn("市场最高", top["reasons"])
+
+    def test_score_broken_board_wrap_finds_mid_term_wrap(self):
+        from src.services.scoring.wrap import score_broken_board_wrap
+
+        rec = {
+            "code": "002421",
+            "name": "达实智能",
+            "industry": "软件开发",
+            "close": 4.50,
+            "change_pct": -1.1,
+            "turnover": 8.5,
+        }
+        result = score_broken_board_wrap(
+            rec,
+            {"软件开发": 3},
+            {},
+            fetcher=_WrapHistoryFetcher(),
+            lookback_days=5,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["predict_type"], "断板反包")
+        self.assertEqual(result["prior_lu_date"], "2026-05-21")
+        self.assertEqual(result["days_since_lu"], 7)
+        self.assertGreater(result["score"], 0)
+
+    def test_score_broken_board_wrap_penalizes_market_top_board(self):
+        from src.services.scoring.wrap import score_broken_board_wrap
+
+        rec = {
+            "code": "000417",
+            "name": "合百集团",
+            "industry": "商业百货",
+            "close": 11.68,
+            "change_pct": -2.5,
+            "turnover": 8.5,
+        }
+        normal = score_broken_board_wrap(
+            rec,
+            {"商业百货": 3},
+            {"market_max_boards": 6},
+            fetcher=_WeakDropWrapHistoryFetcher(),
+            lookback_days=5,
+        )
+        top = score_broken_board_wrap(
+            rec,
+            {"商业百货": 3},
+            {"market_max_boards": 4},
+            fetcher=_WeakDropWrapHistoryFetcher(),
+            lookback_days=5,
+        )
+
+        self.assertIsNotNone(normal)
+        self.assertIsNotNone(top)
+        self.assertGreater(normal["score"], top["score"])
+        self.assertIn("市场最高", top["reasons"])
+
+    def test_score_broken_board_wrap_accepts_weak_drop_with_volume(self):
+        from src.services.scoring.wrap import score_broken_board_wrap
+
+        rec = {
+            "code": "000417",
+            "name": "合百集团",
+            "industry": "商业百货",
+            "close": 11.68,
+            "change_pct": -2.5,
+            "turnover": 8.5,
+        }
+        result = score_broken_board_wrap(
+            rec,
+            {"商业百货": 3},
+            {},
+            fetcher=_WeakDropWrapHistoryFetcher(),
+            lookback_days=5,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["predict_type"], "断板反包")
+        self.assertIsNone(result["worst_drop"])
+        self.assertGreater(result["score"], 0)
+
+    def test_score_broken_board_wrap_rewards_oversold_rebound_when_sentiment_cold(self):
+        from src.services.scoring.wrap import score_broken_board_wrap
+
+        rec = {
+            "code": "000417",
+            "name": "合百集团",
+            "industry": "商业百货",
+            "close": 11.68,
+            "change_pct": -2.5,
+            "turnover": 8.5,
+        }
+        neutral = score_broken_board_wrap(
+            rec,
+            {"商业百货": 3},
+            {"market_max_boards": 6, "sentiment_score": 50},
+            fetcher=_WeakDropWrapHistoryFetcher(),
+            lookback_days=5,
+        )
+        cold = score_broken_board_wrap(
+            rec,
+            {"商业百货": 3},
+            {"market_max_boards": 6, "sentiment_score": 28},
+            fetcher=_WeakDropWrapHistoryFetcher(),
+            lookback_days=5,
+        )
+
+        self.assertIsNotNone(neutral)
+        self.assertIsNotNone(cold)
+        self.assertGreater(cold["score"], neutral["score"])
+        self.assertIn("超跌反包", cold["reasons"])
+
+    def test_as_of_history_fetcher_trims_future_rows(self):
+        class _BaseFetcher:
+            def get_history_data(self, code, days=120, force_refresh=False, preferred_mirror=None, mirror_pool=None, request_plan=None):
+                return pd.DataFrame({
+                    "date": ["2026-05-20", "2026-05-21", "2026-05-22"],
+                    "close": [4.27, 3.96, 4.36],
+                })
+
+        fetcher = _AsOfHistoryFetcher(_BaseFetcher(), "20260521")
+        df = fetcher.get_history_data("002421", days=120)
+
+        self.assertEqual(df["date"].tolist(), ["2026-05-20", "2026-05-21"])
 
 
 if __name__ == "__main__":
