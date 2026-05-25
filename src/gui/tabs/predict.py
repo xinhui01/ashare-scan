@@ -2574,16 +2574,14 @@ class PredictTab:
 
     # ============== 涨停预测准确率（命中对比） ==============
     def _refresh_accuracy_async(self, current_date: str = "") -> None:
-        """后台触发待回填的准确率，并刷新 5 个 tab 的命中率标签。"""
-        def _worker():
-            try:
-                # 仅评估尚未评估且 T+1 已就绪的日期，幂等
-                # refresh_stale=True：早上 K 线没到位时会按需 fetch 最新数据，
-                # 避免"昨日命中率"因本地缓存陈旧而显示一片 suspended
-                prediction_accuracy_service.evaluate_all_pending(refresh_stale=True)
-            except Exception:
-                pass
-            # 拉取分类统计：近 20 日 + 昨日（最近一个已评估交易日）
+        """后台刷新 5 个 tab 的命中率标签 + 触发待回填的准确率。
+
+        两阶段：
+        1) 先用数据库里已有数据 query 一遍，立刻 push 到 UI（秒级，避免开 app 先看见一片 "-"）
+        2) 再跑 evaluate_all_pending 把 T+1 已就绪但未评估的日期补上，完了再 query 一次
+           push 一次，让 UI 静默刷新成最新数据
+        """
+        def _query_and_push():
             try:
                 stats = prediction_accuracy_service.query_category_stats(lookback_dates=20)
             except Exception:
@@ -2592,15 +2590,12 @@ class PredictTab:
                 stats_yesterday = prediction_accuracy_service.query_category_stats_yesterday()
             except Exception:
                 stats_yesterday = {}
-            # 重新加载当前日期的逐行结果
             results_map = {}
             if current_date:
                 try:
                     results_map = prediction_accuracy_service.get_per_code_results(current_date)
                 except Exception:
                     results_map = {}
-            # 提前拉取每类的分数段命中率（在 worker 线程做 DB 查询，避免 UI 卡顿）
-            # 用于 _apply_accuracy 后续计算"历史最优段"
             bucket_rates_by_cat: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
             for cat in (
                 "cont", "first", "fresh", "wrap",
@@ -2616,6 +2611,17 @@ class PredictTab:
                 lambda s=stats, y=stats_yesterday, m=results_map, br=bucket_rates_by_cat:
                 self._apply_accuracy(s, m, y, br)
             )
+
+        def _worker():
+            # 阶段 1：秒级用既有数据填 UI
+            _query_and_push()
+            # 阶段 2：refresh_stale=True 把早上 K 线没到位的"昨日命中率"补齐 + 新日期评估
+            try:
+                prediction_accuracy_service.evaluate_all_pending(refresh_stale=True)
+            except Exception:
+                pass
+            # 评估完后再 query 一遍，静默把 UI 刷成最新
+            _query_and_push()
 
         threading.Thread(target=_worker, daemon=True).start()
 
