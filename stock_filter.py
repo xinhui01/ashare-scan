@@ -98,14 +98,6 @@ class StockFilter:
         """thin delegate → stock_detail_service.enrich_analysis_with_history_snapshot"""
         _stock_detail_service.enrich_analysis_with_history_snapshot(analysis, history)
 
-    def _enrich_analysis_with_fund_flow(
-        self,
-        analysis: Dict[str, Any],
-        fund_flow_df: Optional[pd.DataFrame],
-    ) -> None:
-        """thin delegate → stock_detail_service.enrich_analysis_with_fund_flow"""
-        _stock_detail_service.enrich_analysis_with_fund_flow(analysis, fund_flow_df)
-
     def _enrich_analysis_with_indicators(
         self,
         analysis: Dict[str, Any],

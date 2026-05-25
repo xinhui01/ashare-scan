@@ -1,9 +1,9 @@
-"""股票详情 Tab：历史摘要 + K 线图 + 大单净额图。
+"""股票详情 Tab：历史摘要 + K 线图。
 
 包含：
 - ttk.Frame 容器（self.frame）
 - 历史摘要折叠区（labels / label_caption_vars）
-- matplotlib Figure / 3 个 axes（price / volume / flow）
+- matplotlib Figure / 2 个 axes（price / volume）
 - 滑块控制 K 线窗口
 - K 线点击/拖拽事件（触发分时 tab 跳转）
 - 数据加载/缓存
@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -34,12 +35,14 @@ from matplotlib.ticker import FuncFormatter
 
 from src.utils.cancel_token import CancelToken
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from src.gui.app import StockMonitorApp
 
 
 class DetailTab:
-    """股票详情 tab：K 线 + 摘要 + 大单流。"""
+    """股票详情 tab：K 线 + 摘要。"""
 
     # 详情 payload 的 GUI 层 LRU 缓存上限
     _DETAIL_CACHE_MAX = 20
@@ -71,7 +74,6 @@ class DetailTab:
         self.chart_loaded_days: int = 0
         self.summary_expanded: bool = False
         self.chart_expanded: bool = True
-        self.flow_expanded: bool = False
         self.payload_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
         self.last_revalidate_ts: Dict[str, float] = {}
         self._build(notebook)
@@ -145,27 +147,18 @@ class DetailTab:
         self.chart_status_var = tk.StringVar(value="历史K线已展开")
         ttk.Label(chart_header, textvariable=self.chart_status_var).pack(side=tk.LEFT, padx=10)
 
-        self.flow_toggle_btn = ttk.Button(
-            chart_header,
-            text="展开大单净额",
-            command=self.toggle_flow_section,
-        )
-        self.flow_toggle_btn.pack(side=tk.RIGHT)
-        self.flow_status_var = tk.StringVar(value="大单净额已收起")
-        ttk.Label(chart_header, textvariable=self.flow_status_var).pack(side=tk.RIGHT, padx=10)
-
         self.chart_frame = ttk.LabelFrame(detail_frame, text="K线图", padding="5")
         self.chart_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.chart_body = ttk.Frame(self.chart_frame)
         self.chart_body.pack(fill=tk.BOTH, expand=True)
 
-        self.fig, (self.price_ax, self.volume_ax, self.flow_ax) = plt.subplots(
-            3,
+        self.fig, (self.price_ax, self.volume_ax) = plt.subplots(
+            2,
             1,
-            figsize=(12.8, 10.0),
+            figsize=(12.8, 8.4),
             sharex=True,
-            gridspec_kw={"height_ratios": [4.8, 1.25, 1.25]},
+            gridspec_kw={"height_ratios": [5.0, 1.5]},
         )
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_body)
         canvas_widget = self.canvas.get_tk_widget()
@@ -379,8 +372,8 @@ class DetailTab:
             self.payload_cache.move_to_end(code)
             while len(self.payload_cache) > self._DETAIL_CACHE_MAX:
                 self.payload_cache.popitem(last=False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("详情 LRU 缓存写入失败 %s: %s", code, exc)
 
     def _finish_status(self, stock_code: str) -> None:
         code = str(stock_code).strip().zfill(6)
@@ -420,13 +413,10 @@ class DetailTab:
                 self.labels[key].config(text=value)
         self.price_ax.clear()
         self.volume_ax.clear()
-        self.flow_ax.clear()
         self.price_ax.text(0.5, 0.5, "正在加载详情...", ha="center", va="center", fontsize=14)
         self.volume_ax.text(0.5, 0.5, "请稍候", ha="center", va="center", fontsize=11)
-        self.flow_ax.text(0.5, 0.5, "正在加载大单净额...", ha="center", va="center", fontsize=11)
         self.price_ax.set_axis_off()
         self.volume_ax.set_axis_off()
-        self.flow_ax.set_axis_off()
         self.canvas.draw()
 
     def _show_error(self, stock_code: str, message: str) -> None:
@@ -447,13 +437,10 @@ class DetailTab:
             self.labels["summary"].config(text=message or "详情加载失败")
         self.price_ax.clear()
         self.volume_ax.clear()
-        self.flow_ax.clear()
         self.price_ax.text(0.5, 0.5, "详情加载失败", ha="center", va="center", fontsize=14, color="#b22222")
         self.volume_ax.text(0.5, 0.5, "请查看运行日志", ha="center", va="center", fontsize=11)
-        self.flow_ax.text(0.5, 0.5, "请稍后重试", ha="center", va="center", fontsize=11)
         self.price_ax.set_axis_off()
         self.volume_ax.set_axis_off()
-        self.flow_ax.set_axis_off()
         self.canvas.draw()
 
     # ======================== UI 刷新 ========================
@@ -539,10 +526,8 @@ class DetailTab:
         self.chart_dates = []
         self.price_ax.clear()
         self.volume_ax.clear()
-        self.flow_ax.clear()
         self.price_ax.set_axis_on()
         self.volume_ax.set_axis_on()
-        self.flow_ax.set_axis_on()
 
     def _show_empty_chart(self, message: str) -> None:
         self.chart_history = None
@@ -624,27 +609,6 @@ class DetailTab:
         self.price_ax.legend(loc="upper left")
         self.price_ax.grid(True, alpha=0.25)
 
-    def _build_flow_series(self, dates: List[str], analysis: Dict[str, Any]):
-        flow_history = (analysis or {}).get("fund_flow_history") or []
-        flow_map = {}
-        for item in flow_history:
-            if not isinstance(item, dict):
-                continue
-            flow_date = str(item.get("date", "") or "").strip()
-            if flow_date:
-                flow_map[flow_date] = item
-
-        values = []
-        colors = []
-        for date_str in dates:
-            flow_item = flow_map.get(date_str, {})
-            amount = pd.to_numeric(pd.Series([flow_item.get("big_order_amount")]), errors="coerce").iloc[0]
-            if pd.isna(amount):
-                amount = 0.0
-            values.append(float(amount))
-            colors.append("#d94b4b" if amount >= 0 else "#1f8b4c")
-        return values, colors
-
     def _draw_volume_panel(self, chart_data: Dict[str, Any]) -> None:
         x = chart_data["x"]
         opens = chart_data["opens"]
@@ -669,21 +633,6 @@ class DetailTab:
         self.volume_ax.yaxis.set_major_formatter(FuncFormatter(self.app._format_axis_volume))
         self.volume_ax.yaxis.get_offset_text().set_visible(False)
         self.volume_ax.grid(True, alpha=0.2)
-
-    def _draw_flow_panel(self, chart_data: Dict[str, Any], analysis: Dict[str, Any]) -> None:
-        flow_history = (analysis or {}).get("fund_flow_history") or []
-        if not self.flow_expanded or not flow_history:
-            self.flow_ax.set_visible(False)
-            self.flow_ax.set_axis_off()
-            return
-
-        flow_values, flow_colors = self._build_flow_series(chart_data["dates"], analysis)
-        self.flow_ax.set_visible(True)
-        self.flow_ax.bar(chart_data["x"], flow_values, width=0.6, color=flow_colors, alpha=0.85)
-        self.flow_ax.axhline(0, color="#666666", linewidth=0.8, alpha=0.6)
-        self.flow_ax.set_ylabel("大\n单\n净\n额", rotation=0, labelpad=14, va="center")
-        self.flow_ax.set_xlabel("日期")
-        self.flow_ax.grid(True, alpha=0.2)
 
     def _resolve_chart_window(self, total: int, keep_window: bool = False) -> Dict[str, int]:
         window = max(15, min(int(self.chart_window_size), max(15, total)))
@@ -710,8 +659,6 @@ class DetailTab:
         if x:
             self.price_ax.set_xlim(start - 0.5, end - 0.5)
             self.volume_ax.set_xlim(start - 0.5, end - 0.5)
-            if self.flow_expanded:
-                self.flow_ax.set_xlim(start - 0.5, end - 0.5)
 
         view_len = max(1, end - start)
         tick_step = max(1, view_len // 8)
@@ -724,15 +671,9 @@ class DetailTab:
 
         self.price_ax.set_xticks(tick_positions)
         self.price_ax.tick_params(axis="x", labelbottom=False)
-        if self.flow_expanded:
-            self.volume_ax.set_xticklabels([""] * len(tick_positions))
-            self.volume_ax.tick_params(axis="x", labelbottom=False)
-            self.flow_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-            self.flow_ax.tick_params(axis="x", labelbottom=True)
-        else:
-            self.flow_ax.tick_params(axis="x", labelbottom=False)
-            self.volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-            self.volume_ax.tick_params(axis="x", labelbottom=True)
+        self.volume_ax.set_xticks(tick_positions)
+        self.volume_ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+        self.volume_ax.tick_params(axis="x", labelbottom=True)
 
         if dates:
             self.chart_window_label_var.set(f"窗口: {dates[start]} ~ {dates[end - 1]}")
@@ -749,7 +690,6 @@ class DetailTab:
 
         self._draw_price_panel(chart_data)
         self._draw_volume_panel(chart_data)
-        self._draw_flow_panel(chart_data, analysis or {})
         window_meta = self._resolve_chart_window(len(chart_data["x"]), keep_window=keep_window)
         self._apply_chart_window(chart_data, window_meta)
         self.fig.tight_layout()
@@ -787,17 +727,6 @@ class DetailTab:
                 self.chart_frame.pack_forget()
             self.chart_toggle_btn.config(text="展开历史K线")
             self.chart_status_var.set("历史K线已收起")
-
-    def toggle_flow_section(self):
-        self.flow_expanded = not self.flow_expanded
-        if self.flow_expanded:
-            self.flow_toggle_btn.config(text="收起大单净额")
-            self.flow_status_var.set("大单净额已展开")
-        else:
-            self.flow_toggle_btn.config(text="展开大单净额")
-            self.flow_status_var.set("大单净额已收起")
-        if self.chart_history is not None:
-            self._draw_chart(self.chart_history, self.chart_analysis, keep_window=True)
 
     # ======================== 滑块/滚动/拖拽事件 ========================
 
@@ -938,7 +867,7 @@ class DetailTab:
         if event is None:
             return
         inaxes = getattr(event, "inaxes", None)
-        if inaxes is not None and inaxes not in (self.price_ax, self.volume_ax, self.flow_ax):
+        if inaxes is not None and inaxes not in (self.price_ax, self.volume_ax):
             return
         if self.chart_history is None or getattr(self.chart_history, "empty", True):
             return
@@ -959,7 +888,7 @@ class DetailTab:
     def on_chart_click(self, event):
         if event is None:
             return
-        if event.inaxes not in (self.price_ax, self.volume_ax, self.flow_ax):
+        if event.inaxes not in (self.price_ax, self.volume_ax):
             return
         if getattr(event, "button", None) not in (1, None):
             return
@@ -982,7 +911,7 @@ class DetailTab:
     def on_chart_drag_motion(self, event):
         if not self.chart_dragging:
             return
-        if event is None or getattr(event, "inaxes", None) not in (self.price_ax, self.volume_ax, self.flow_ax):
+        if event is None or getattr(event, "inaxes", None) not in (self.price_ax, self.volume_ax):
             return
         if self.chart_history is None or getattr(self.chart_history, "empty", True):
             return

@@ -7,7 +7,6 @@
 
 analysis 增强：
 - enrich_analysis_with_history_snapshot
-- enrich_analysis_with_fund_flow
 - enrich_analysis_with_indicators
 
 payload 组装：
@@ -24,7 +23,6 @@ call_with_timeout_fn / FilterSettings 派生参数。
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional
 
 import pandas as pd
@@ -84,31 +82,6 @@ def enrich_analysis_with_history_snapshot(
     analysis["latest_volume"] = None
     analysis["latest_amount"] = None
     analysis["quote_time"] = ""
-
-
-def enrich_analysis_with_fund_flow(
-    analysis: Dict[str, Any],
-    fund_flow_df: Optional[pd.DataFrame],
-) -> None:
-    if fund_flow_df is not None and not fund_flow_df.empty:
-        latest_flow = fund_flow_df.iloc[-1]
-        analysis["flow_date"] = str(latest_flow.get("date", "") or "")
-        analysis["main_force_amount"] = latest_flow.get("main_force_amount")
-        analysis["big_order_amount"] = latest_flow.get("big_order_amount")
-        analysis["super_big_order_amount"] = latest_flow.get("super_big_order_amount")
-        analysis["main_force_ratio"] = latest_flow.get("main_force_ratio")
-        analysis["big_order_ratio"] = latest_flow.get("big_order_ratio")
-        analysis["super_big_order_ratio"] = latest_flow.get("super_big_order_ratio")
-        analysis["fund_flow_history"] = fund_flow_df.to_dict("records")
-        return
-    analysis["flow_date"] = ""
-    analysis["main_force_amount"] = None
-    analysis["big_order_amount"] = None
-    analysis["super_big_order_amount"] = None
-    analysis["main_force_ratio"] = None
-    analysis["big_order_ratio"] = None
-    analysis["super_big_order_ratio"] = None
-    analysis["fund_flow_history"] = []
 
 
 def enrich_analysis_with_indicators(
@@ -194,6 +167,9 @@ def get_stock_detail_quick(
         fallback=None,
         task_name=f"详情历史 {code}",
     )
+    # cached_meta 里通常已存 name / industry / last_limit_up_trade_date，
+    # 秒开时就用上，避免要等 full 路径才闪出行业。
+    stock_identity = resolve_stock_identity(None, code)
     analysis = analyze_history_fn(
         history,
         settings.trend_days,
@@ -202,15 +178,12 @@ def get_stock_detail_quick(
         settings.volume_lookback_days,
         settings.volume_expand_enabled,
         settings.volume_expand_factor,
+        stock_name=stock_identity["name"],
         stock_code=stock_code,
     )
     enrich_analysis_with_history_snapshot(analysis, history)
-    return build_stock_detail_payload(
-        code,
-        {"name": "", "board": "", "exchange": ""},
-        history,
-        analysis,
-    )
+    enrich_analysis_with_indicators(analysis, history)
+    return build_stock_detail_payload(code, stock_identity, history, analysis)
 
 
 def get_stock_detail(
@@ -228,33 +201,21 @@ def get_stock_detail(
         settings.trend_days + settings.limit_up_lookback_days + settings.ma_period + 20,
     )
 
-    # ---- 并行获取：历史 / 股票池同时发起 ----
+    # quick 路径已拉 history 并完整 analyze 过；这一段只补 universe → 行业/板块身份。
     history = preloaded_history
     universe = None
-    fund_flow_df = None
-
-    tasks = {}
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="detail") as pool:
-        if history is None:
-            tasks["history"] = pool.submit(
-                call_with_timeout_fn,
-                lambda: fetcher.get_history_data(code, days=history_days),
-                15.0, None, f"详情历史 {code}",
-            )
-        tasks["universe"] = pool.submit(
-            call_with_timeout_fn,
+    if history is None:
+        history = call_with_timeout_fn(
+            lambda: fetcher.get_history_data(code, days=history_days),
+            15.0, None, f"详情历史 {code}",
+        )
+    try:
+        universe = call_with_timeout_fn(
             lambda: fetcher.get_all_stocks(),
             8.0, None, f"详情股票池 {code}",
         )
-        for key, fut in tasks.items():
-            try:
-                result = fut.result()
-                if key == "history":
-                    history = result
-                elif key == "universe":
-                    universe = result
-            except Exception as exc:
-                logger.debug("预取数据 %s 异常: %s", key, exc)
+    except Exception as exc:
+        logger.debug("预取股票池异常: %s", exc)
 
     stock_identity = resolve_stock_identity(universe, code)
     analysis = analyze_history_fn(
@@ -270,7 +231,6 @@ def get_stock_detail(
         stock_code=stock_code,
     )
     enrich_analysis_with_history_snapshot(analysis, history)
-    enrich_analysis_with_fund_flow(analysis, fund_flow_df)
     enrich_analysis_with_indicators(analysis, history)
     return build_stock_detail_payload(code, stock_identity, history, analysis)
 

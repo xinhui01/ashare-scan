@@ -2182,7 +2182,8 @@ class StockDataFetcher:
                     _fetch_eastmoney_intraday_1min, code,
                     ndays=ndays, logger=None,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("分时预热 %s 抓取失败: %s", code, exc)
                 return False
             if raw is None or getattr(raw, "empty", True):
                 return False
@@ -2254,7 +2255,8 @@ class StockDataFetcher:
                 code = futs[fut]
                 try:
                     ok = fut.result()
-                except Exception:
+                except Exception as exc:
+                    logger.debug("分时预热 worker %s 异常: %s", code, exc)
                     ok = False
                 done += 1
                 if not ok:
@@ -2294,7 +2296,8 @@ class StockDataFetcher:
             try:
                 df = self.get_fund_flow_data(code, days=days, force_refresh=False)
                 return df is not None and not df.empty
-            except Exception:
+            except Exception as exc:
+                logger.debug("资金流预热 %s 抓取失败: %s", code, exc)
                 return False
 
         done = 0
@@ -2307,7 +2310,8 @@ class StockDataFetcher:
                 code = futs[fut]
                 try:
                     ok = fut.result()
-                except Exception:
+                except Exception as exc:
+                    logger.debug("资金流预热 worker %s 异常: %s", code, exc)
                     ok = False
                 done += 1
                 if not ok:
