@@ -25,6 +25,21 @@ from src.utils import parsing as _utils_parsing
 _safe_float = _utils_parsing.safe_float
 
 
+def normalize_sina_spot_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """规范新浪 spot 返回；遇到反爬页或异常结构时返回 None。"""
+    if df is None or df.empty:
+        return df
+    if "代码" not in df.columns:
+        return None
+    out = df.copy()
+    out["代码"] = (
+        out["代码"].astype(str)
+        .str.replace(r"^(sh|sz|bj)", "", regex=True)
+        .str.strip().str.zfill(6)
+    )
+    return out
+
+
 # ============== 模块级 intraday 派生 helper ==============
 
 def derive_seal_time_from_intraday(
@@ -117,15 +132,8 @@ def fetch_spot_with_fallback(
     try:
         if log_fn:
             log_fn("全市场 spot 快照：新浪兜底（约 30s）...")
-        df = _retry_ak_call(ak.stock_zh_a_spot)
+        df = normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
         if df is not None and not df.empty:
-            if "代码" in df.columns:
-                df = df.copy()
-                df["代码"] = (
-                    df["代码"].astype(str)
-                    .str.replace(r"^(sh|sz|bj)", "", regex=True)
-                    .str.strip().str.zfill(6)
-                )
             return df
     except Exception as exc:
         if log_fn:

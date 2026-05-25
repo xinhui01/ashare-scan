@@ -457,7 +457,8 @@ def analyze_market_sentiment(
                 pass
         logger.info(msg)
 
-    end = _normalize_date(end_date or "")
+    requested_end = _normalize_date(end_date or "")
+    end = requested_end
     all_dates = stock_store.list_limit_up_pool_trade_dates() or []
     if not all_dates:
         return {
@@ -469,8 +470,29 @@ def analyze_market_sentiment(
             "raw": {},
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-    if not end or end not in all_dates:
+    if not end:
         end = all_dates[-1]
+    elif end not in all_dates:
+        required_dates = _required_pool_dates(end)
+        missing_dates = _ensure_pool_dates_ready(required_dates, log=_l)
+        all_dates = stock_store.list_limit_up_pool_trade_dates() or []
+        if end not in all_dates:
+            return {
+                "trade_date": end,
+                "score": 50,
+                "position_suggest": _position_advice(50),
+                "signals": [],
+                "summary": (
+                    f"{end} 情绪依赖数据不完整，缺少涨停池: "
+                    + "、".join(missing_dates or [end])
+                    + "。已尝试自动补齐，但仍未成功，请稍后重试。"
+                ),
+                "raw": {
+                    "required_pool_dates": required_dates,
+                    "missing_pool_dates": missing_dates or [end],
+                },
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
 
     required_dates = _required_pool_dates(end)
     missing_dates = _ensure_pool_dates_ready(required_dates, log=_l)

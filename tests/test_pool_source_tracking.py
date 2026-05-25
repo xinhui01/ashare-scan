@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import pandas as pd
-import pytest
-from unittest.mock import patch
 
 from stock_data import StockDataFetcher
 
@@ -102,3 +100,12 @@ class TestPoolSourceTracking:
         df = f.get_limit_up_pool("20260520")
         assert df.empty
         assert f.get_pool_source("20260520") == "empty"
+
+    def test_fetch_spot_with_fallback_sina_invalid_shape_returns_none(self, monkeypatch):
+        f = _build_fetcher()
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+        monkeypatch.setattr(
+            "stock_data._retry_ak_call",
+            lambda _fn, *args, **kwargs: pd.DataFrame([{"foo": "bar"}]),
+        )
+        assert f._fetch_spot_with_fallback() is None

@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring.helpers import _count_historical_any_limit_up
+from src.sources.limit_up_pool_service import normalize_sina_spot_df
 
 logger = logging.getLogger(__name__)
 
@@ -263,11 +264,8 @@ def fetch_spot_snapshot(
     try:
         if log_fn:
             log_fn("涨停预测：正在获取全市场实时行情快照（新浪，约30s）...")
-        df = _retry_ak_call(ak.stock_zh_a_spot)
+        df = normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
         if df is not None and not df.empty:
-            # 新浪代码带交易所前缀（如 sh600000），去掉前缀统一为纯数字
-            if "代码" in df.columns:
-                df["代码"] = df["代码"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.strip().str.zfill(6)
             return df
     except Exception as e2:
         if log_fn:
