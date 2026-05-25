@@ -38,7 +38,6 @@ from src.services.scoring import cont as _scoring_cont
 from src.services.scoring import first as _scoring_first
 from src.services.scoring import fresh as _scoring_fresh
 from src.services.scoring import wrap as _scoring_wrap
-from src.services.scoring import trend as _scoring_trend
 from src.services.scoring import first_board as _scoring_first_board
 from src.services.scoring import predict as _scoring_predict
 from src.services.scoring import filter as _scoring_filter
@@ -1042,46 +1041,6 @@ class StockFilter:
             fetcher=self.fetcher,
             lookback_days=lookback_days,
             drop_threshold_pct=drop_threshold_pct,
-            log_fn=self._log,
-            limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
-            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
-        )
-
-    def _scan_trend_limit_up_candidates_cached(
-        self,
-        spot_df: Optional[pd.DataFrame],
-        zt_codes: set,
-        hot_industries: Dict[str, int],
-        compare_context: Dict[str, Any],
-        progress_callback: Optional[Callable[[int, int, str], None]] = None,
-    ) -> List[Dict[str, Any]]:
-        """识别"趋势涨停"候选（thin delegate → scoring/trend.py）。"""
-        return _scoring_trend.scan_trend_limit_up_candidates_cached(
-            spot_df,
-            zt_codes,
-            hot_industries,
-            compare_context,
-            progress_callback,
-            fetcher=self.fetcher,
-            log_fn=self._log,
-            limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
-            build_local_cache_history_plan_fn=self._build_local_cache_history_plan,
-            filter_strong_stocks_fn=self._filter_strong_stocks,
-            filter_ma5_pullback_stocks_fn=self._filter_ma5_pullback_stocks,
-        )
-
-    def _score_trend_limit_up(
-        self,
-        rec: Dict[str, Any],
-        hot_industries: Dict[str, int],
-        compare_context: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """对趋势涨停候选评分（thin delegate → scoring/trend.py）。"""
-        return _scoring_trend.score_trend_limit_up(
-            rec,
-            hot_industries,
-            compare_context,
-            fetcher=self.fetcher,
             log_fn=self._log,
             limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
             build_local_cache_history_plan_fn=self._build_local_cache_history_plan,

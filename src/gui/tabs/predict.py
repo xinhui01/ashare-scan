@@ -1,7 +1,7 @@
-"""涨停预测 Tab：5 sub-tab 候选 + 预测/对比/策略/回测/AI 短报。
+"""涨停预测 Tab：4 sub-tab 候选 + 预测/对比/策略/回测/AI 短报。
 
 这是项目最复杂的 tab，包含：
-- 涨停预测 5 sub-tab notebook（保留涨停/二波接力/首板涨停/反包/趋势涨停）
+- 涨停预测 4 sub-tab notebook（保留涨停/二波接力/首板涨停/反包）
   以及 概念炒作 sub-tab
 - 顶部 action_bar（开始预测/历史日期/命中对比/策略分析/批量回测/AI 博弈短报/NIM Key）
 - 市场情绪条（sent_bar：评分/建议/详情/刷新）
@@ -87,8 +87,6 @@ class PredictTab:
         self.fresh_sort_reverse: bool = True
         self.wrap_sort_column: str = "score"
         self.wrap_sort_reverse: bool = True
-        self.trend_sort_column: str = "score"
-        self.trend_sort_reverse: bool = True
         # 按历史命中段排序时，缓存每个类别的 {(lo, hi): {rate, eligible, ...}}
         self.bucket_rates_cache: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
         # 每个主类别的"历史最优分数段" (lo, hi)
@@ -555,53 +553,6 @@ class PredictTab:
         self.wrap_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
         self.wrap_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
-        # 趋势涨停候选 Tab（多头排列稳健上行）
-        trend_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(trend_tab, text="趋势涨停候选")
-        trend_stat = ttk.Label(trend_tab, text="历史命中率: -", foreground="#444",
-                               anchor=tk.W, padding=(6, 2))
-        trend_stat.pack(side=tk.TOP, fill=tk.X)
-        self.stat_labels["trend"] = trend_stat
-        trend_best = ttk.Label(trend_tab, text="历史最优段: -",
-                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
-        trend_best.pack(side=tk.TOP, fill=tk.X)
-        self.best_bucket_labels["trend"] = trend_best
-        trend_cols = ("code", "name", "industry", "change_pct", "close",
-                      "ma_spread", "dist_ma5", "ma20_slope",
-                      "trend_5d", "trend_10d", "position_60d",
-                      "volume_ratio", "score", "result", "reasons")
-        self.trend_tree = ttk.Treeview(
-            trend_tab, columns=trend_cols, show="headings", height=22, style="Predict.Treeview",
-        )
-        for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
-            "ma_spread": ("多头开口%", 75), "dist_ma5": ("距MA5%", 65),
-            "ma20_slope": ("MA20斜率%", 80),
-            "trend_5d": ("5日涨幅%", 70), "trend_10d": ("10日涨幅%", 75),
-            "position_60d": ("60日位置%", 75),
-            "volume_ratio": ("量比", 60),
-            "score": ("预测分", 65), "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
-        }.items():
-            self.trend_tree.heading(
-                col, text=heading,
-                command=lambda c=col: self._on_heading_click("trend", c),
-            )
-            self.trend_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
-        sb_trend = ttk.Scrollbar(trend_tab, orient=tk.VERTICAL, command=self.trend_tree.yview)
-        self.trend_tree.configure(yscrollcommand=sb_trend.set)
-        sb_trend.pack(side=tk.RIGHT, fill=tk.Y)
-        self.trend_tree.pack(fill=tk.BOTH, expand=True)
-        self.trend_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
-        self.trend_tree.bind("<Double-1>", self._on_stock_double_click)
-        self.trend_tree.tag_configure("score_high", background="#c8e6c9", foreground="#1f1f1f")
-        self.trend_tree.tag_configure("score_mid", background="#fff9c4", foreground="#1f1f1f")
-        self.trend_tree.tag_configure("score_low", background="#ffecb3", foreground="#1f1f1f")
-        self.trend_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
-        self.trend_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
-        self.trend_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
-
         # 概念炒作 Tab（按"题材"维度看：哪些概念在被炒、持续多久、主线/龙头/潜伏）
         self._setup_concept_hype_subtab(self.table_nb)
 
@@ -1012,10 +963,6 @@ class PredictTab:
             column = self.wrap_sort_column
             reverse = self.wrap_sort_reverse
             secondary = ["score", "wrap_gap", "change_pct", "volume_ratio"]
-        elif table_kind == "trend":
-            column = self.trend_sort_column
-            reverse = self.trend_sort_reverse
-            secondary = ["score", "ma_spread", "change_pct", "volume_ratio"]
         else:
             column = self.first_sort_column
             reverse = self.first_sort_reverse
@@ -1062,7 +1009,7 @@ class PredictTab:
             return None
         cat_key = {
             "cont": "cont", "first": "first", "fresh": "fresh",
-            "wrap": "wrap", "trend": "trend",
+            "wrap": "wrap",
         }.get(table_kind)
         if cat_key is None:
             return None
@@ -1115,15 +1062,6 @@ class PredictTab:
                 self.wrap_sort_column = column
                 # 反包缺口越小越好，因此 wrap_gap / days_since_lu 默认升序
                 self.wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close"}
-        elif table_kind == "trend":
-            if column == self.trend_sort_column:
-                self.trend_sort_reverse = not self.trend_sort_reverse
-            else:
-                self.trend_sort_column = column
-                self.trend_sort_reverse = column in {
-                    "score", "change_pct", "close", "volume_ratio", "ma_spread",
-                    "ma20_slope", "trend_5d", "trend_10d", "position_60d",
-                }
         else:
             if column == self.first_sort_column:
                 self.first_sort_reverse = not self.first_sort_reverse
@@ -1859,8 +1797,7 @@ class PredictTab:
                                          f"[{x}/{n}] {td} → cont={len(r.get('continuation_candidates', []))} "
                                          f"first={len(r.get('first_board_candidates', []))} "
                                          f"fresh={len(r.get('fresh_first_board_candidates', []))} "
-                                         f"wrap={len(r.get('broken_board_wrap_candidates', []))} "
-                                         f"trend={len(r.get('trend_limit_up_candidates', []))}"
+                                         f"wrap={len(r.get('broken_board_wrap_candidates', []))}"
                                      ))
                     evaluated_dates.append(d)
                 except Exception as exc:
@@ -1889,8 +1826,7 @@ class PredictTab:
                 _append_log("")
                 _append_log("=== 命中率汇总（按类别）===")
                 for cat, lbl in [("cont", "保留涨停"), ("first", "二波接力"),
-                                 ("fresh", "首板涨停"), ("wrap", "反包"),
-                                 ("trend", "趋势涨停")]:
+                                 ("fresh", "首板涨停"), ("wrap", "反包")]:
                     d = stats.get(cat) or {}
                     b = int(d.get("buyable") or 0)
                     h = int(d.get("hit_primary") or d.get("hit_strict") or 0)
@@ -1998,7 +1934,6 @@ class PredictTab:
         first_list = self._sort_records(_enrich(list(result.get("first_board_candidates", [])), "first"), "first")
         fresh_list = self._sort_records(_enrich(list(result.get("fresh_first_board_candidates", [])), "fresh"), "fresh")
         wrap_list = self._sort_records(_enrich(list(result.get("broken_board_wrap_candidates", [])), "wrap"), "wrap")
-        trend_list = self._sort_records(_enrich(list(result.get("trend_limit_up_candidates", [])), "trend"), "trend")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
         compare_context = result.get("compare_context", {})
@@ -2097,19 +2032,6 @@ class PredictTab:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {gap_text:7s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
-        if trend_list:
-            txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  趋势涨停候选 TOP10\n")
-            txt.insert(tk.END, f"{'='*36}\n")
-            for rec in trend_list[:10]:
-                chg = rec.get("change_pct")
-                chg_text = f"{chg:.1f}%" if chg is not None else "-"
-                spread = rec.get("ma_spread_pct")
-                spread_text = f"开口{spread:.1f}%" if spread is not None else "-"
-                txt.insert(tk.END,
-                    f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {spread_text:9s}  "
-                    f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
-
         # 明日热点板块预测（基于今日涨停股的行业分布；今日热点延续到明日）
         if hot_industries:
             sorted_inds = sorted(hot_industries.items(), key=lambda x: -x[1])
@@ -2135,17 +2057,17 @@ class PredictTab:
                            "综合判断。\n")
         self.summary_text.config(state=tk.DISABLED)
 
-        # 保存原始 5 类候选，供筛选实时重渲染
+        # 保存原始 4 类候选，供筛选实时重渲染
         self.lists = {
             "cont": cont_list, "first": first_list, "fresh": fresh_list,
-            "wrap": wrap_list, "trend": trend_list,
+            "wrap": wrap_list,
         }
         self.compare_context = compare_context
 
         # 刷新行业下拉选项
         self._refresh_industry_options()
 
-        # 渲染 5 个候选表（应用当前筛选）
+        # 渲染 4 个候选表（应用当前筛选）
         self._render_trees()
 
         # 同步刷新历史记录下拉，并选中当前结果对应的日期
@@ -2161,19 +2083,18 @@ class PredictTab:
         predict_date = str(result.get("trade_date") or result.get("today_date") or "").strip()
         self._refresh_data_source_label(predict_date)
 
-        # 冷启动检测：保留涨停有数据但其他 4 类全空，通常是本地历史K线缓存还没预热
+        # 冷启动检测：保留涨停有数据但其他 3 类全空，通常是本地历史K线缓存还没预热
         # （这些类目都依赖 65 日 K 线评分，cache_only 模式拿不到就直接被过滤）
         if (
             len(cont_list) > 0
             and len(first_list) == 0
             and len(fresh_list) == 0
             and len(wrap_list) == 0
-            and len(trend_list) == 0
         ):
             messagebox.showwarning(
                 "历史数据未就绪",
                 "本地历史 K 线缓存尚未预热，\n"
-                "「二波接力 / 首板涨停 / 断板反包 / 趋势涨停」候选暂时为空。\n\n"
+                "「二波接力 / 首板涨停 / 断板反包」候选暂时为空。\n\n"
                 "首次点击会触发后台缓存预取，\n"
                 "请稍等几秒后再次点击「预测涨停数据」按钮，\n"
                 "即可看到完整候选列表。",
@@ -2205,7 +2126,6 @@ class PredictTab:
         for key in (
             "continuation_candidates", "first_board_candidates",
             "fresh_first_board_candidates", "broken_board_wrap_candidates",
-            "trend_limit_up_candidates",
         ):
             for cand in result.get(key, []) or []:
                 if not isinstance(cand, dict):
@@ -2484,7 +2404,6 @@ class PredictTab:
         first_list = self._filter_records(self.lists.get("first", []))
         fresh_list = self._filter_records(self.lists.get("fresh", []))
         wrap_list = self._filter_records(self.lists.get("wrap", []))
-        trend_list = self._filter_records(self.lists.get("trend", []))
 
         # 取本次预测对应日期的命中结果（若已回填）
         results_map = self.results_map or {}
@@ -2608,47 +2527,21 @@ class PredictTab:
             )
             self.wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
 
-        # ---- 填充趋势涨停候选表格 ----
-        self.trend_tree.delete(*self.trend_tree.get_children())
-        for rec in trend_list:
-            res_text, hit_tag = _result_cell("trend", rec.get("code", ""))
-            tag = self._row_tag("trend", hit_tag, rec.get("score", 0))
-            vals = (
-                rec.get("code", ""),
-                rec.get("name", ""),
-                rec.get("industry", ""),
-                f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
-                f"{rec['ma_spread_pct']:.2f}" if rec.get("ma_spread_pct") is not None else "-",
-                f"{rec['dist_ma5_pct']:+.1f}" if rec.get("dist_ma5_pct") is not None else "-",
-                f"{rec['ma20_slope_pct']:.2f}" if rec.get("ma20_slope_pct") is not None else "-",
-                f"{rec['trend_5d']:+.1f}" if rec.get("trend_5d") is not None else "-",
-                f"{rec['trend_10d']:+.1f}" if rec.get("trend_10d") is not None else "-",
-                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
-                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
-                str(rec.get("score", 0)),
-                res_text,
-                rec.get("reasons", ""),
-            )
-            self.trend_tree.insert("", tk.END, values=vals, tags=(tag,))
-
         # 更新 Tab 标题：显示「筛选后/总数」
         raw = self.lists or {}
         total_cont = len(raw.get("cont", []))
         total_first = len(raw.get("first", []))
         total_fresh = len(raw.get("fresh", []))
         total_wrap = len(raw.get("wrap", []))
-        total_trend = len(raw.get("trend", []))
         def _label(name: str, shown: int, total: int) -> str:
             return f"{name}({shown}/{total})" if shown != total else f"{name}({total})"
         self.table_nb.tab(0, text=_label("保留涨停候选", len(cont_list), total_cont))
         self.table_nb.tab(1, text=_label("二波接力候选", len(first_list), total_first))
         self.table_nb.tab(2, text=_label("首板涨停候选", len(fresh_list), total_fresh))
         self.table_nb.tab(3, text=_label("反包候选", len(wrap_list), total_wrap))
-        self.table_nb.tab(4, text=_label("趋势涨停候选", len(trend_list), total_trend))
 
-        shown_total = len(cont_list) + len(first_list) + len(fresh_list) + len(wrap_list) + len(trend_list)
-        raw_total = total_cont + total_first + total_fresh + total_wrap + total_trend
+        shown_total = len(cont_list) + len(first_list) + len(fresh_list) + len(wrap_list)
+        raw_total = total_cont + total_first + total_fresh + total_wrap
         if shown_total != raw_total:
             self.filter_count_label.config(text=f"筛选后 {shown_total}/{raw_total}")
         else:
@@ -2657,7 +2550,7 @@ class PredictTab:
         self.status_label.config(text="")
         self.app.status_var.set(
             f"涨停预测完成: 保留涨停{total_cont} / 二波接力{total_first} / "
-            f"首板{total_fresh} / 反包{total_wrap} / 趋势{total_trend}"
+            f"首板{total_fresh} / 反包{total_wrap}"
         )
 
     def _on_stock_select(self, event):
@@ -2710,7 +2603,7 @@ class PredictTab:
             # 用于 _apply_accuracy 后续计算"历史最优段"
             bucket_rates_by_cat: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = {}
             for cat in (
-                "cont", "first", "fresh", "wrap", "trend",
+                "cont", "first", "fresh", "wrap",
                 "cont_1to2", "cont_2to3", "cont_3to4", "cont_4to5", "cont_5plus",
             ):
                 try:
@@ -2750,7 +2643,7 @@ class PredictTab:
         stats_yesterday = stats_yesterday or {}
         category_names = {
             "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
-            "wrap": "反包", "trend": "趋势涨停",
+            "wrap": "反包",
             "cont_1to2": "1进2", "cont_2to3": "2进3", "cont_3to4": "3进4",
             "cont_4to5": "4进5", "cont_5plus": "5进6+",
         }
@@ -2841,7 +2734,7 @@ class PredictTab:
         返回 eligible=True 中 rate 最大的桶，None 表示无 eligible 桶。
         同 rate 时取分数段更高的（高分往往更稳）。
 
-        统一服务于主类别（cont/first/fresh/wrap/trend）与 cont 子类别
+        统一服务于主类别（cont/first/fresh/wrap）与 cont 子类别
         （cont_1to2/.../cont_5plus）。带 lazy-load 兜底（cache miss 时拉 DB）。
         """
         rates = self._get_bucket_rates(cat)
@@ -2867,10 +2760,10 @@ class PredictTab:
         """
         category_display = {
             "cont": "保留涨停", "first": "二波接力", "fresh": "首板涨停",
-            "wrap": "反包", "trend": "趋势涨停",
+            "wrap": "反包",
         }
         best_map: Dict[str, Optional[Tuple[int, int]]] = {}
-        for cat in ("cont", "first", "fresh", "wrap", "trend"):
+        for cat in ("cont", "first", "fresh", "wrap"):
             best = self._find_best_bucket_for_category(cat)
             best_bucket = best[0] if best else None
             best_info = best[1] if best else None
@@ -3157,7 +3050,7 @@ class PredictTab:
 
         ttk.Label(top, text="类别:").pack(side=tk.LEFT)
         category_var = tk.StringVar(value="全部")
-        cat_options = ["全部", "保留涨停", "二波接力", "首板涨停", "反包", "趋势涨停"]
+        cat_options = ["全部", "保留涨停", "二波接力", "首板涨停", "反包"]
         cat_combo = ttk.Combobox(top, textvariable=category_var, values=cat_options,
                                  width=12, state="readonly")
         cat_combo.pack(side=tk.LEFT, padx=(2, 12))
@@ -3216,7 +3109,7 @@ class PredictTab:
         # 渲染逻辑
         cat_label_to_key = {
             "全部": None, "保留涨停": "cont", "二波接力": "first",
-            "首板涨停": "fresh", "反包": "wrap", "趋势涨停": "trend",
+            "首板涨停": "fresh", "反包": "wrap",
         }
 
         def _reload():

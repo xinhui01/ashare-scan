@@ -330,7 +330,7 @@ def filter_strong_stocks(
 def filter_ma5_pullback_stocks(
     spot_df: pd.DataFrame, exclude_codes: set
 ) -> List[Dict[str, Any]]:
-    """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选（供 trend 趋势涨停候选使用）。
+    """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选。
 
     历史 K 线已统一从本地缓存读取，无需再做 top-N 截断。
 
