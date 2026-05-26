@@ -2006,6 +2006,49 @@ class PredictTab:
 
         txt.insert(tk.END, result.get("summary", "") + "\n")
 
+        # ---- 数据健康度（让用户一眼看出本次预测哪些维度是真数据、哪些是 fallback）----
+        dq = result.get("data_quality") or {}
+        if dq:
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  数据健康度\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            mode = "历史模式" if dq.get("historical_mode") else "实时模式"
+            txt.insert(tk.END, f"  运行模式: {mode}（生成于 {dq.get('generated_at', '-')}）\n")
+            spot = dq.get("spot") or {}
+            txt.insert(tk.END,
+                f"  spot 快照: {spot.get('rows', 0)} 行 ({spot.get('source', '-')})"
+                f" · 行业缺失 {spot.get('industry_missing', 0)} 只\n"
+            )
+            lup = dq.get("limit_up_pool") or {}
+            txt.insert(tk.END, f"  涨停池: {lup.get('rows', 0)} 只 ({lup.get('source', '-')})\n")
+            th = dq.get("themes") or {}
+            th_state = "已加载" if th.get("loaded") else "未加载"
+            txt.insert(tk.END,
+                f"  AI 题材聚类: {th_state}（{th.get('themes', 0)} 个题材 / "
+                f"覆盖 {th.get('covered_codes', 0)} 只涨停股）\n"
+            )
+            lhb = dq.get("lhb") or {}
+            bs = dq.get("board_strength") or {}
+            txt.insert(tk.END,
+                f"  龙虎榜: {'已加载' if lhb.get('loaded') else '未启用'} "
+                f"({lhb.get('rows', 0)} 只)   "
+                f"板块强度: {'已加载' if bs.get('loaded') else '未启用'} "
+                f"({bs.get('rows', 0)} 个)\n"
+            )
+            sent = dq.get("sentiment") or {}
+            sent_disp = (
+                f"{sent.get('score')}/100 {sent.get('label', '')}"
+                if sent.get("loaded") else "未加载"
+            )
+            if sent.get("degraded"):
+                sent_disp += "  ⚠降级"
+            txt.insert(tk.END, f"  市场情绪: {sent_disp}\n")
+            warnings = dq.get("warnings") or []
+            if warnings:
+                txt.insert(tk.END, f"\n  ⚠ 注意 ({len(warnings)} 条):\n")
+                for w in warnings:
+                    txt.insert(tk.END, f"    · {w}\n")
+
         # 兼容旧结果：若存在画像字段则仍展示
         if profile:
             txt.insert(tk.END, f"\n{'='*36}\n")

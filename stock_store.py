@@ -608,8 +608,8 @@ def load_spot_snapshot_at(trade_date: str) -> Optional[pd.DataFrame]:
 
     `trade_date` 接受 YYYYMMDD 或 YYYY-MM-DD（history 表里实际存的是带横线格式）。
 
-    注：universe 表无 industry 字段，所属行业一律置空；候选筛选不依赖行业，
-    仅 hot_industries 统计在历史模式下会变成空字典。
+    所属行业从 limit_up_stock_meta 表 LEFT JOIN 补行业（只覆盖曾涨停过的票），
+    未涨停过的票"所属行业"为空字符串；后续可通过补 code_industry_map 表扩展。
     """
     if not _DB_PATH.is_file():
         return None
@@ -624,15 +624,16 @@ def load_spot_snapshot_at(trade_date: str) -> Optional[pd.DataFrame]:
 
     sql = """
         SELECT h.code AS "代码",
-               COALESCE(u.name, '') AS "名称",
+               COALESCE(u.name, COALESCE(m.name, '')) AS "名称",
                h.close AS "最新价",
                h.change_pct AS "涨跌幅",
                h.amount AS "成交额",
                h.volume AS "成交量",
                h.turnover_rate AS "换手率",
-               '' AS "所属行业"
+               COALESCE(m.industry, '') AS "所属行业"
         FROM history h
         LEFT JOIN universe u ON h.code = u.code
+        LEFT JOIN limit_up_stock_meta m ON h.code = m.code
         WHERE h.trade_date = ?
     """
 

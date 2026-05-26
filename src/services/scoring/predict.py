@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
@@ -174,11 +175,40 @@ def predict_limit_up_candidates(
     )
     from stock_data import DaemonThreadPoolExecutor
 
-    # 阶段1：回看最近 N 日涨停对比环境
-    if log_fn:
-        log_fn(f"涨停预测：阶段1 - 统计最近 {lookback_days} 日涨停对比环境...")
+    # ===== auto-promote historical_mode =====
+    # 若 trade_date 早于今日，强制切到历史模式。原因：实时 spot / 板块强度 /
+    # 龙虎榜等接口都不带 date 参数，永远返回"当前时刻"，跨天调用会拉到错误
+    # 日期的盘中数据，导致两台机器（或同一台机器不同时间）跑同一历史日期
+    # 结果不一致。auto-promote 后历史 spot 从本地 history 表合成，结果稳定。
+    if not historical_mode and trade_date:
+        today_key = datetime.now().strftime("%Y%m%d")
+        td_digits = str(trade_date).strip().replace("-", "").replace("/", "")
+        if td_digits and td_digits.isdigit() and len(td_digits) == 8 \
+                and td_digits < today_key:
+            historical_mode = True
+            if log_fn:
+                log_fn(
+                    f"涨停预测：trade_date={trade_date} ≠ 今日({today_key})，"
+                    f"自动切到历史模式（spot 从本地 history 合成，板块/龙虎榜等"
+                    f"实时指标置空，保证两台机器结果一致）"
+                )
     if progress_callback:
         progress_callback(0, 1, "统计最近涨停对比环境...")
+
+    # 数据健康度收集：每个数据源在哪个分支被读到、是否降级，全部记一笔
+    # 用户看 UI 时能直接判断"这次预测哪些维度是真数据、哪些是 fallback"
+    data_quality: Dict[str, Any] = {
+        "historical_mode": bool(historical_mode),
+        "trade_date": trade_date,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "spot": {"rows": 0, "industry_missing": 0, "source": "none"},
+        "limit_up_pool": {"rows": 0, "source": "none"},
+        "themes": {"loaded": False, "themes": 0, "covered_codes": 0},
+        "lhb": {"loaded": False, "rows": 0},
+        "board_strength": {"loaded": False, "rows": 0},
+        "sentiment": {"loaded": False, "score": None, "degraded": False},
+        "warnings": [],
+    }
 
     profile: Dict[str, Any] = {}
     feature_samples: List[Dict[str, Any]] = []
@@ -209,19 +239,31 @@ def predict_limit_up_candidates(
         import stock_store as _stock_store
         try:
             spot_df = _stock_store.load_spot_snapshot_at(trade_date)
+            cnt = 0 if spot_df is None else len(spot_df)
+            data_quality["spot"]["source"] = "local_history"
+            data_quality["spot"]["rows"] = int(cnt)
+            if spot_df is not None and "所属行业" in spot_df.columns:
+                missing = int((spot_df["所属行业"].fillna("") == "").sum())
+                data_quality["spot"]["industry_missing"] = missing
+            if cnt == 0:
+                data_quality["warnings"].append(
+                    f"历史 spot 为空：本地 history 表无 {trade_date} 数据，"
+                    f"首板候选将无法筛选（请在线时打开软件触发当日 K 线下载）"
+                )
             if log_fn:
-                cnt = 0 if spot_df is None else len(spot_df)
                 log_fn(f"涨停预测[历史模式]：从 history 合成 spot 快照 {cnt} 行")
         except Exception as e:
             if log_fn:
                 log_fn(f"涨停预测[历史模式]：合成 spot 失败: {e}")
             spot_df = None
+            data_quality["warnings"].append(f"历史 spot 合成异常: {e}")
         # 涨停池仍然走 get_limit_up_pool —— 本地 SQLite 命中即可，未命中才联网
         try:
             _fetch_pool()
         except Exception as e:
             if log_fn:
                 log_fn(f"涨停预测[历史模式]：获取涨停池失败: {e}")
+            data_quality["warnings"].append(f"涨停池拉取失败: {e}")
     else:
         def _fetch_spot():
             nonlocal spot_df
@@ -260,6 +302,15 @@ def predict_limit_up_candidates(
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+        # 记一笔实时 spot 行数（实时模式下行业字段由源接口直接给出）
+        if spot_df is not None:
+            data_quality["spot"]["source"] = "realtime"
+            data_quality["spot"]["rows"] = int(len(spot_df))
+            if "所属行业" in spot_df.columns:
+                data_quality["spot"]["industry_missing"] = int(
+                    (spot_df["所属行业"].fillna("") == "").sum()
+                )
+
     if today_pool_df is None or today_pool_df.empty:
         non_trading = False
         try:
@@ -274,6 +325,7 @@ def predict_limit_up_candidates(
             if non_trading
             else f"{trade_date} 未获取到涨停池数据"
         )
+        data_quality["warnings"].append(summary)
         result = {
             "trade_date": trade_date,
             "profile": profile,
@@ -284,6 +336,7 @@ def predict_limit_up_candidates(
             "broken_board_wrap_candidates": [],
             "hot_industries": {},
             "summary": summary,
+            "data_quality": data_quality,
         }
         try:
             save_last_limit_up_prediction(result)
@@ -294,6 +347,18 @@ def predict_limit_up_candidates(
         except Exception:
             pass
         return result
+
+    # 涨停池就绪 → 记录来源 + 行数
+    data_quality["limit_up_pool"]["rows"] = int(len(today_pool_df))
+    try:
+        # fetcher 内部维护了 _last_pool_source[date]，标识 cache_memory / cache_db /
+        # eastmoney / spot_fallback / empty，便于 UI 显示"涨停池数据来自哪里"。
+        td_norm = fetcher._normalize_trade_date(trade_date)
+        data_quality["limit_up_pool"]["source"] = (
+            getattr(fetcher, "_last_pool_source", {}).get(td_norm, "unknown")
+        )
+    except Exception:
+        data_quality["limit_up_pool"]["source"] = "unknown"
 
     all_pool_records = _shared.parse_full_pool(today_pool_df)
     if log_fn:
@@ -347,11 +412,18 @@ def predict_limit_up_candidates(
     compare_context["industry_theme_heat"] = industry_theme_heat
     compare_context["code_theme_map"] = code_theme_map
     compare_context["theme_size_map"] = theme_size_map
+    data_quality["themes"]["loaded"] = bool(themes)
+    data_quality["themes"]["themes"] = len(themes) if themes else 0
+    data_quality["themes"]["covered_codes"] = len(code_theme_map)
     if log_fn and themes:
         log_fn(f"涨停预测：加载题材聚类缓存 {len(themes)} 个题材，"
                f"覆盖 {len(code_theme_map)} 只涨停股 / {len(industry_theme_heat)} 个行业")
     elif log_fn:
         log_fn("涨停预测：未找到题材聚类缓存（如需题材加分，请先在涨停对比 tab 跑一次 AI 题材聚类）")
+    if not themes:
+        data_quality["warnings"].append(
+            "题材聚类缓存缺失：题材热度加分维度未启用（先在涨停对比 tab 跑一次 AI 题材聚类）"
+        )
 
     # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
     # 北向逐日明细自 2024-08-17 起停止披露，永久置空。
@@ -362,6 +434,10 @@ def predict_limit_up_candidates(
             log_fn("涨停预测[历史模式]：跳过龙虎榜 / 板块强度（实时指标）")
         lhb_map = {}
         board_strength = {}
+        data_quality["warnings"].append(
+            "历史模式：龙虎榜 / 板块强度 / 北向资金等实时指标未启用"
+            "（akshare 这几个接口无历史日期参数）"
+        )
     else:
         if log_fn:
             log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
@@ -370,12 +446,19 @@ def predict_limit_up_candidates(
         except Exception as exc:
             logger.debug("龙虎榜加载异常: %s", exc)
             lhb_map = {}
+            data_quality["warnings"].append(f"龙虎榜拉取失败: {exc}")
 
         try:
             board_strength = _first_board.load_industry_board_strength(log_fn=log_fn)
         except Exception as exc:
             logger.debug("板块涨跌幅加载异常: %s", exc)
             board_strength = {}
+            data_quality["warnings"].append(f"板块涨跌幅拉取失败: {exc}")
+
+    data_quality["lhb"]["loaded"] = bool(lhb_map)
+    data_quality["lhb"]["rows"] = len(lhb_map)
+    data_quality["board_strength"]["loaded"] = bool(board_strength)
+    data_quality["board_strength"]["rows"] = len(board_strength)
 
     compare_context["lhb_map"] = lhb_map
     compare_context["northbound_map"] = northbound_map
@@ -397,6 +480,16 @@ def predict_limit_up_candidates(
         compare_context["sentiment_label"] = (
             (sent.get("position_suggest") or {}).get("label", "")
         )
+        data_quality["sentiment"]["loaded"] = True
+        data_quality["sentiment"]["score"] = compare_context["sentiment_score"]
+        data_quality["sentiment"]["label"] = compare_context.get("sentiment_label", "")
+        # 检查 sentiment 自身是否降级（跌停 / 上证拉失败时 raw.external.ok=False）
+        sent_external = ((sent.get("raw") or {}).get("external") or {})
+        if not sent_external.get("ok", True):
+            data_quality["sentiment"]["degraded"] = True
+            data_quality["warnings"].append(
+                "市场情绪外部数据降级：跌停池/上证指数未完整拉到，sentiment 部分维度不可信"
+            )
         if log_fn:
             log_fn(
                 f"涨停预测：市场情绪 {compare_context['sentiment_score']}/100"
@@ -405,6 +498,8 @@ def predict_limit_up_candidates(
     except Exception as exc:
         logger.debug("接入市场情绪评分失败: %s", exc)
         compare_context["sentiment_score"] = 50
+        data_quality["sentiment"]["degraded"] = True
+        data_quality["warnings"].append(f"市场情绪评分失败，默认 50 中性: {exc}")
 
     # 龙头身份预算：同板块今日最高板数 + 持有该板数的代码集合
     # 让 cont 评分识别"板块独苗高板龙头"vs"高位跟风票"
@@ -625,6 +720,7 @@ def predict_limit_up_candidates(
         "hot_industries": hot_industries,
         "compare_context": compare_context,
         "summary": "\n".join(summary_lines),
+        "data_quality": data_quality,
     }
     try:
         save_last_limit_up_prediction(result)
