@@ -2004,10 +2004,20 @@ class PredictTab:
         self.summary_text.delete("1.0", tk.END)
         txt = self.summary_text
 
+        # 中止预测时（数据未就位）顶部状态条变红 + 标题更明显
+        dq = result.get("data_quality") or {}
+        if dq.get("blocked"):
+            try:
+                self.status_label.config(
+                    text=f"⛔ 预测中止 — {len(dq.get('missing') or [])} 项数据未就位（详见摘要）",
+                    foreground="#b71c1c",
+                )
+            except Exception:
+                pass
+
         txt.insert(tk.END, result.get("summary", "") + "\n")
 
         # ---- 数据健康度（让用户一眼看出本次预测哪些维度是真数据、哪些是 fallback）----
-        dq = result.get("data_quality") or {}
         if dq:
             txt.insert(tk.END, f"\n{'='*36}\n")
             txt.insert(tk.END, "  数据健康度\n")

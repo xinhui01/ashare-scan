@@ -135,6 +135,95 @@ def build_compare_market_context(
     }
 
 
+def _check_prerequisites(
+    *,
+    historical_mode: bool,
+    pool_source: str,
+    concept_themes_count: int,
+    lhb_map: Dict[str, Any],
+    board_strength: Dict[str, Any],
+    sentiment_degraded: bool,
+    zt_codes: set,
+    fetcher,
+    build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
+) -> List[str]:
+    """硬校验所有预测必备数据是否就位。返回缺失项列表（空列表 = 通过）。
+
+    用户原则：宁可不出预测，也别用兜底数据骗用户。任一项缺失，predict 直接
+    返回"中止结果"，并把这份清单显示给用户去逐项修复。
+    """
+    missing: List[str] = []
+
+    # 1. 涨停池来源必须可信
+    trusted_sources = {"cache_db", "eastmoney", "cache_memory"}
+    if pool_source not in trusted_sources:
+        missing.append(
+            f"❌ 涨停池数据源不可信（当前 = {pool_source!r}）→ "
+            f"请检查东财涨停池接口 / 网络 / 清缓存重试"
+        )
+
+    # 2. 概念炒作分析必须识别出题材
+    if concept_themes_count <= 0:
+        missing.append(
+            "❌ 概念炒作分析未识别出题材 → "
+            "可能原因：最近 10 个交易日的涨停池数据不足 / 概念库未刷新。"
+            "请到「概念炒作」tab 检查是否能看到题材列表，"
+            "若题材列表为空请先补足涨停池历史 + 刷新概念库"
+        )
+
+    # 3. 龙虎榜（仅实时模式必备；历史模式 akshare 无对应日期接口，跳过）
+    if not historical_mode and not lhb_map:
+        missing.append(
+            "❌ 龙虎榜数据缺失 → 请检查 akshare 龙虎榜接口可用性"
+        )
+
+    # 4. 板块强度（仅实时模式必备；历史模式无历史接口）
+    if not historical_mode and not board_strength:
+        missing.append(
+            "❌ 板块强度（行业涨跌榜）数据缺失 → 请检查东财板块接口"
+        )
+
+    # 5. 市场情绪不得降级
+    if sentiment_degraded:
+        missing.append(
+            "❌ 市场情绪数据降级（跌停池 / 上证指数未完整拉到）→ "
+            "请检查网络 / akshare 接口，或点「刷新（强制重拉外部数据）」重试"
+        )
+
+    # 6. 所有涨停股个股历史 K 线 ≥ 10 行（cont scorer 必备）
+    missing_kline: List[str] = []
+    if zt_codes:
+        try:
+            request_plan = (
+                build_local_cache_history_plan_fn(
+                    reason="predict-prereq-check-cache-only",
+                )
+                if build_local_cache_history_plan_fn is not None
+                else None
+            )
+        except Exception:
+            request_plan = None
+        for code in sorted(zt_codes):
+            try:
+                history = fetcher.get_history_data(
+                    code, days=120, force_refresh=False,
+                    request_plan=request_plan,
+                )
+            except Exception:
+                history = None
+            if history is None or history.empty or len(history) < 10:
+                missing_kline.append(code)
+    if missing_kline:
+        preview = "、".join(missing_kline[:10])
+        tail = f" 等 {len(missing_kline)} 只" if len(missing_kline) > 10 else ""
+        missing.append(
+            f"❌ 个股历史 K 线不足 10 行: {preview}{tail} → "
+            f"请在「K 线缓存」tab 用「批量补历史」更新这些票"
+        )
+
+    return missing
+
+
 def predict_limit_up_candidates(
     trade_date: str,
     lookback_days: int = 5,
@@ -372,36 +461,58 @@ def predict_limit_up_candidates(
         if log_fn:
             log_fn(f"涨停预测：提取涨停股代码 {len(zt_codes)} 只")
 
-    # 阶段2.5：尝试读取已缓存的 AI 题材聚类，作为预测打分的题材热度维度
-    # 仅使用缓存，不主动触发 LLM 调用；缓存缺失则跳过题材加分
+    # 阶段2.5：概念炒作分析（concept_hype 服务）
+    # 这是题材维度的【唯一入口】：内部已合并三源（涨停池行业 + 概念库反查 +
+    # LLM 题材缓存若有），同时给出题材阶段（萌芽/主升/末期/退潮）。
+    # 不再单独调 llm_theme_clustering（涨停对比 tab 已下线，那条入口已 dead）。
     try:
-        from llm_theme_clustering import load_cached_themes
-        themes_payload = load_cached_themes(trade_date) or {}
+        from src.services.concept_hype_service import analyze_concept_hype
+        hype = analyze_concept_hype(trade_date, lookback=10, log=log_fn)
     except Exception as exc:
-        logger.debug("加载题材聚类缓存失败: %s", exc)
-        themes_payload = {}
+        logger.debug("加载概念炒作分析失败: %s", exc)
+        hype = {}
 
-    themes = themes_payload.get("themes") or []
+    concepts = hype.get("concepts") or []
     code_industry_map: Dict[str, str] = {
         r["code"]: r.get("industry", "") for r in all_pool_records
     }
-    code_theme_map: Dict[str, str] = {}
-    theme_size_map: Dict[str, int] = {}
-    industry_theme_heat: Dict[str, int] = {}
-    for theme in themes:
+    code_theme_map: Dict[str, str] = {}        # code → 该票最具代表性的题材名
+    theme_size_map: Dict[str, int] = {}        # 题材名 → 成员数
+    industry_theme_heat: Dict[str, int] = {}   # 行业 → 关联到的最大题材规模
+    code_to_phase: Dict[str, str] = {}         # code → 该票所在题材的最佳阶段
+    phase_priority = {"萌芽": 4, "主升": 3, "末期": 2, "退潮": 1}
+
+    for c in concepts:
         try:
-            name = str(theme.get("name", "")).strip()
-            codes_in_theme = [str(c).strip().zfill(6) for c in (theme.get("codes") or [])]
+            name = str(c.get("name") or "").strip()
+            phase = str(c.get("phase") or "")
+            members = c.get("members") or []
+            codes_in_theme = [
+                str(m.get("code") or "").strip().zfill(6)
+                for m in members if m.get("code")
+            ]
+            codes_in_theme = [x for x in codes_in_theme if x]
         except Exception:
             continue
         if not name or len(codes_in_theme) < 2:
             continue
         size = len(codes_in_theme)
-        theme_size_map[name] = size
+        # 题材规模取最大命中（同名题材跨多 source 时合并）
+        if theme_size_map.get(name, 0) < size:
+            theme_size_map[name] = size
         inds_in_theme: set = set()
-        for c in codes_in_theme:
-            code_theme_map[c] = name
-            ind = code_industry_map.get(c) or ""
+        for code in codes_in_theme:
+            # code → theme：选 size 较大的题材作为该票代表
+            existing = code_theme_map.get(code)
+            if not existing or theme_size_map.get(existing, 0) < size:
+                code_theme_map[code] = name
+            # code → phase：萌芽/主升 优先
+            existing_phase = code_to_phase.get(code)
+            if (not existing_phase
+                    or phase_priority.get(phase, 0)
+                    > phase_priority.get(existing_phase, 0)):
+                code_to_phase[code] = phase
+            ind = code_industry_map.get(code) or ""
             if ind:
                 inds_in_theme.add(ind)
         for ind in inds_in_theme:
@@ -412,18 +523,30 @@ def predict_limit_up_candidates(
     compare_context["industry_theme_heat"] = industry_theme_heat
     compare_context["code_theme_map"] = code_theme_map
     compare_context["theme_size_map"] = theme_size_map
-    data_quality["themes"]["loaded"] = bool(themes)
-    data_quality["themes"]["themes"] = len(themes) if themes else 0
+    compare_context["code_to_concept_phase"] = code_to_phase
+
+    data_quality["themes"]["loaded"] = bool(concepts)
+    data_quality["themes"]["themes"] = len(concepts)
     data_quality["themes"]["covered_codes"] = len(code_theme_map)
-    if log_fn and themes:
-        log_fn(f"涨停预测：加载题材聚类缓存 {len(themes)} 个题材，"
-               f"覆盖 {len(code_theme_map)} 只涨停股 / {len(industry_theme_heat)} 个行业")
-    elif log_fn:
-        log_fn("涨停预测：未找到题材聚类缓存（如需题材加分，请先在涨停对比 tab 跑一次 AI 题材聚类）")
-    if not themes:
-        data_quality["warnings"].append(
-            "题材聚类缓存缺失：题材热度加分维度未启用（先在涨停对比 tab 跑一次 AI 题材聚类）"
-        )
+    data_quality["themes"]["source"] = "concept_hype"
+
+    if log_fn:
+        if concepts:
+            log_fn(
+                f"涨停预测：概念炒作识别 {len(concepts)} 个题材，"
+                f"覆盖 {len(code_theme_map)} 只涨停股 / "
+                f"{len(industry_theme_heat)} 个行业 / "
+                f"阶段映射 {len(code_to_phase)} 只 "
+                f"(萌芽 {sum(1 for v in code_to_phase.values() if v == '萌芽')} / "
+                f"主升 {sum(1 for v in code_to_phase.values() if v == '主升')} / "
+                f"末期 {sum(1 for v in code_to_phase.values() if v == '末期')} / "
+                f"退潮 {sum(1 for v in code_to_phase.values() if v == '退潮')})"
+            )
+        else:
+            log_fn(
+                "涨停预测：概念炒作分析未识别出题材"
+                "（最近 10 日 limit_up_pool 数据可能不足）"
+            )
 
     # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
     # 北向逐日明细自 2024-08-17 起停止披露，永久置空。
@@ -488,7 +611,7 @@ def predict_limit_up_candidates(
         if not sent_external.get("ok", True):
             data_quality["sentiment"]["degraded"] = True
             data_quality["warnings"].append(
-                "市场情绪外部数据降级：跌停池/上证指数未完整拉到，sentiment 部分维度不可信"
+                "市场情绪外部数据降级：跌停池/上证指数未完整拉到"
             )
         if log_fn:
             log_fn(
@@ -499,7 +622,53 @@ def predict_limit_up_candidates(
         logger.debug("接入市场情绪评分失败: %s", exc)
         compare_context["sentiment_score"] = 50
         data_quality["sentiment"]["degraded"] = True
-        data_quality["warnings"].append(f"市场情绪评分失败，默认 50 中性: {exc}")
+        data_quality["warnings"].append(f"市场情绪评分失败: {exc}")
+
+    # ============== 预测前置硬校验 ==============
+    # 所有必备数据必须就位才允许预测。任一项缺失 → 直接中止 + 列出待修复清单。
+    # 原则：宁可不出预测，也不让用户被兜底数据骗。
+    prereq_missing = _check_prerequisites(
+        historical_mode=historical_mode,
+        pool_source=data_quality["limit_up_pool"].get("source", "unknown"),
+        concept_themes_count=int(data_quality["themes"].get("themes") or 0),
+        lhb_map=lhb_map,
+        board_strength=board_strength,
+        sentiment_degraded=bool(data_quality["sentiment"].get("degraded")),
+        zt_codes=zt_codes,
+        fetcher=scoring_fetcher,
+        build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
+    )
+    if prereq_missing:
+        data_quality["blocked"] = True
+        data_quality["missing"] = prereq_missing
+        if log_fn:
+            log_fn(f"涨停预测：前置校验失败，中止预测（{len(prereq_missing)} 项待修复）")
+            for m in prereq_missing:
+                log_fn(f"  {m}")
+        summary = (
+            f"❌ 预测中止 — {trade_date} 数据未就位（{len(prereq_missing)} 项待修复）\n\n"
+            + "\n\n".join(prereq_missing)
+            + "\n\n修复后请重新点「开始预测」。"
+        )
+        result = {
+            "trade_date": trade_date,
+            "profile": profile,
+            "profile_samples": feature_samples,
+            "continuation_candidates": [],
+            "first_board_candidates": [],
+            "fresh_first_board_candidates": [],
+            "broken_board_wrap_candidates": [],
+            "hot_industries": {},
+            "compare_context": compare_context,
+            "summary": summary,
+            "data_quality": data_quality,
+        }
+        try:
+            save_last_limit_up_prediction(result)
+        except Exception:
+            pass
+        # 注意：中止结果不写入 prediction_record 历史表，避免污染历史
+        return result
 
     # 龙头身份预算：同板块今日最高板数 + 持有该板数的代码集合
     # 让 cont 评分识别"板块独苗高板龙头"vs"高位跟风票"
@@ -532,35 +701,7 @@ def predict_limit_up_candidates(
     compare_context["market_max_boards"] = market_max_boards
     compare_context["market_top_codes"] = market_top_codes
 
-    # 题材阶段映射（来自 concept_hype 服务）：code → 该票所在题材的最佳阶段
-    # 萌芽 > 主升 > 末期 > 退潮 优先级，让连板股能识别自己处在主线还是末班车
-    try:
-        from src.services.concept_hype_service import analyze_concept_hype
-        hype = analyze_concept_hype(trade_date, lookback=10, log=log_fn)
-        phase_priority = {"萌芽": 4, "主升": 3, "末期": 2, "退潮": 1}
-        code_to_phase: Dict[str, str] = {}
-        for c in hype.get("concepts") or []:
-            phase = str(c.get("phase") or "")
-            for m in c.get("members") or []:
-                code = str(m.get("code") or "").strip()
-                if not code:
-                    continue
-                existing = code_to_phase.get(code)
-                if (not existing or
-                        phase_priority.get(phase, 0) > phase_priority.get(existing, 0)):
-                    code_to_phase[code] = phase
-        compare_context["code_to_concept_phase"] = code_to_phase
-        if log_fn:
-            log_fn(
-                f"涨停预测：题材阶段映射 {len(code_to_phase)} 只票，"
-                f"萌芽 {sum(1 for v in code_to_phase.values() if v == '萌芽')} / "
-                f"主升 {sum(1 for v in code_to_phase.values() if v == '主升')} / "
-                f"末期 {sum(1 for v in code_to_phase.values() if v == '末期')} / "
-                f"退潮 {sum(1 for v in code_to_phase.values() if v == '退潮')}"
-            )
-    except Exception as exc:
-        logger.debug("接入题材阶段映射失败: %s", exc)
-        compare_context["code_to_concept_phase"] = {}
+    # 题材阶段映射已在阶段 2.5（concept_hype）一并完成，无需重复调用。
 
     # 阶段3：统一预取所有需要的历史数据（一次搞定）
     if log_fn:

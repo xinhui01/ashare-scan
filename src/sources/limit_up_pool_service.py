@@ -197,26 +197,41 @@ def derive_limit_up_pool_from_spot(
     if not rows:
         return pd.DataFrame()
 
-    # 递推连板数
+    # 递推连板数：必须有昨日 pool 才能推断；否则整批 spot_fallback 拒绝产出，
+    # 避免把真实 3~5 板的票当首板（boards=1）喂给 scorer。
     prev_lookup: Dict[str, int] = {}
-    if prev_pool_df is not None and not prev_pool_df.empty and "代码" in prev_pool_df.columns:
-        prev_pool_df = prev_pool_df.copy()
-        prev_pool_df["代码"] = prev_pool_df["代码"].astype(str).str.strip().str.zfill(6)
-        if "连板数" in prev_pool_df.columns:
-            for _, r in prev_pool_df.iterrows():
-                c = str(r.get("代码") or "").strip()
-                try:
-                    n = int(r.get("连板数") or 0)
-                except (TypeError, ValueError):
-                    n = 0
-                if c and n > 0:
-                    prev_lookup[c] = n
+    prev_pool_usable = (
+        prev_pool_df is not None
+        and not prev_pool_df.empty
+        and "代码" in prev_pool_df.columns
+        and "连板数" in prev_pool_df.columns
+    )
+    if not prev_pool_usable:
+        if log_fn:
+            log_fn(
+                f"涨停池 {trade_date} spot_fallback 拒绝出池：昨日 pool 缺失，"
+                f"无法推断连板数（避免把 N 板票当首板）"
+            )
+        return pd.DataFrame()
+
+    prev_pool_df = prev_pool_df.copy()
+    prev_pool_df["代码"] = prev_pool_df["代码"].astype(str).str.strip().str.zfill(6)
+    for _, r in prev_pool_df.iterrows():
+        c = str(r.get("代码") or "").strip()
+        try:
+            n = int(r.get("连板数") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if c and n > 0:
+            prev_lookup[c] = n
 
     out: List[Dict[str, Any]] = []
     derive_failed = 0
     for row in rows:
         code = str(row.get("代码", "")).strip()
         prev_n = prev_lookup.get(code, 0)
+        # prev_lookup 命中 → 续板；未命中 → 今日新涨停，首板（boards=1）
+        # 此分支只有 prev_pool 有效时才走，所以"未命中=首板"才是合理推断
         boards = prev_n + 1 if prev_n > 0 else 1
 
         # 派生 首次封板时间 + 炸板次数（从 1min 分时计算）
