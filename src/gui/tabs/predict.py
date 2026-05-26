@@ -1466,7 +1466,7 @@ class PredictTab:
             return
         win = tk.Toplevel(self.app.root)
         win.title(f"市场情绪明细 · {r.get('trade_date', '-')}")
-        win.geometry("560x460")
+        win.geometry("760x640")
         win.transient(self.app.root)
 
         body = ttk.Frame(win, padding=10)
@@ -1488,29 +1488,90 @@ class PredictTab:
         ).pack(side=tk.LEFT, padx=10)
 
         ttk.Label(
-            body, text=r.get("summary", ""), wraplength=520,
+            body, text=r.get("summary", ""), wraplength=720,
             foreground="#333",
         ).pack(anchor=tk.W, pady=(0, 8))
 
         # 信号明细表
         cols = ("name", "value", "delta", "note")
-        tree = ttk.Treeview(body, columns=cols, show="headings", height=10)
-        for col, (h, w, anc) in {
-            "name": ("信号", 90, tk.W),
-            "value": ("数值", 110, tk.W),
-            "delta": ("加减分", 60, tk.CENTER),
-            "note": ("解读", 270, tk.W),
-        }.items():
+        signals = r.get("signals") or []
+        tree_height = max(len(signals), 7)
+        tree = ttk.Treeview(body, columns=cols, show="headings", height=tree_height)
+        col_specs = {
+            "name": ("信号", 90, tk.W, False),
+            "value": ("数值", 110, tk.W, False),
+            "delta": ("加减分", 60, tk.CENTER, False),
+            "note": ("解读", 460, tk.W, True),
+        }
+        for col, (h, w, anc, stretch) in col_specs.items():
             tree.heading(col, text=h)
-            tree.column(col, width=w, anchor=anc)
-        for s in r.get("signals") or []:
+            tree.column(col, width=w, anchor=anc, stretch=stretch)
+        for s in signals:
             d = int(s.get("delta", 0))
             tree.insert("", tk.END, values=(
                 s.get("name", ""), s.get("value", ""),
                 f"+{d}" if d > 0 else (str(d) if d < 0 else "0"),
                 s.get("note", ""),
             ))
-        tree.pack(fill=tk.BOTH, expand=True)
+        tree.pack(fill=tk.X)
+
+        # ===== 数据明细（铺出 raw 里 7 个信号未体现的字段）=====
+        raw = r.get("raw") or {}
+        today_raw = raw.get("today") or {}
+        external_raw = raw.get("external") or {}
+        prior_counts = raw.get("prior_counts") or {}
+        yest_date = raw.get("yesterday_date") or "-"
+        yest_lu = int(raw.get("yesterday_lu") or 0)
+        today_continued = int(raw.get("today_continued") or 0)
+        avg5 = float(raw.get("avg5") or 0.0)
+
+        detail = ttk.LabelFrame(body, text="数据明细", padding=8)
+        detail.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        cont_rate = (today_continued / yest_lu * 100) if yest_lu else 0.0
+        lines: List[str] = []
+        lines.append(
+            f"基准日: {r.get('trade_date', '-')}  ·  "
+            f"对比日: {yest_date}（昨日涨停 {yest_lu} 只，今日继续 {today_continued} 只"
+            + (f" = {cont_rate:.1f}%）" if yest_lu else "）")
+        )
+        if prior_counts:
+            parts = [f"{d}={c}" for d, c in sorted(prior_counts.items())]
+            lines.append(
+                f"前 {len(prior_counts)} 日涨停数: " + "  ·  ".join(parts)
+                + f"   → 平均 {avg5:.1f}"
+            )
+        elif avg5:
+            lines.append(f"5 日均值: {avg5:.1f}（每日明细缺失）")
+
+        lines.append(
+            f"今日明细: 涨停 {today_raw.get('lu_count', 0)} 只  ·  "
+            f"炸过板 {today_raw.get('broken_count', 0)} 只 / "
+            f"炸板总次数 {today_raw.get('broken_total_times', 0)}  ·  "
+            f"最高 {today_raw.get('max_boards', 0)} 板  ·  "
+            f"4+板 {today_raw.get('high_board_count_4plus', 0)} 只"
+        )
+
+        codes = today_raw.get("codes") or []
+        if codes:
+            shown = "、".join(codes[:20])
+            tail = f" … 共 {len(codes)} 只" if len(codes) > 20 else ""
+            lines.append(f"今日涨停代码: {shown}{tail}")
+
+        sh_pct = external_raw.get("sh_index_pct")
+        dt_cnt = external_raw.get("down_limit_count")
+        fetched_at = external_raw.get("fetched_at") or "-"
+        sh_disp = f"{sh_pct:+.2f}%" if sh_pct is not None else "—"
+        dt_disp = f"{dt_cnt} 只" if dt_cnt is not None else "—"
+        lines.append(
+            f"外部数据: 上证 {sh_disp}  ·  跌停 {dt_disp}  ·  拉取于 {fetched_at}"
+        )
+
+        for line in lines:
+            ttk.Label(
+                detail, text=line, anchor=tk.W, foreground="#444",
+                wraplength=700, justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=1)
 
         ttk.Label(
             body, text=f"生成于: {r.get('generated_at', '-')}",

@@ -191,23 +191,26 @@ def _load_pool_aggregates(date_key: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _avg_lu_count_5d(end_date: str) -> Tuple[float, List[str]]:
-    """end_date 之前最近 5 个真实交易日的平均涨停数。"""
+def _avg_lu_count_5d(end_date: str) -> Tuple[float, List[str], Dict[str, int]]:
+    """end_date 之前最近 5 个真实交易日的平均涨停数。
+
+    返回 (平均值, 参与平均的日期顺序, {日期: 当日涨停数}).
+    """
     prior = _previous_trade_dates(end_date, 5)
     if not prior:
         # 交易日历不可用时，退回旧逻辑：按已缓存日期近似。
         all_dates = stock_store.list_limit_up_pool_trade_dates() or []
         prior = [d for d in all_dates if d < end_date][-5:]
     if not prior:
-        return 0.0, []
-    counts: List[int] = []
+        return 0.0, [], {}
+    counts_map: Dict[str, int] = {}
     for d in prior:
         df = stock_store.load_limit_up_pool(d)
         if df is not None and not df.empty:
-            counts.append(len(df))
-    if not counts:
-        return 0.0, prior
-    return sum(counts) / len(counts), prior
+            counts_map[d] = len(df)
+    if not counts_map:
+        return 0.0, prior, {}
+    return sum(counts_map.values()) / len(counts_map), prior, counts_map
 
 
 def _continuation_today_from_yesterday(
@@ -526,7 +529,7 @@ def analyze_market_sentiment(
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    avg5, prior_dates = _avg_lu_count_5d(end)
+    avg5, prior_dates, prior_counts = _avg_lu_count_5d(end)
     yest_date = _previous_pool_date(end)
     yest_agg = _load_pool_aggregates(yest_date) if yest_date else None
     yest_codes = (yest_agg or {}).get("codes", [])
@@ -617,6 +620,7 @@ def analyze_market_sentiment(
             "today_continued": today_continued,
             "avg5": avg5,
             "prior_dates": prior_dates,
+            "prior_counts": prior_counts,
             "required_pool_dates": required_dates,
             "external": external,
         },
