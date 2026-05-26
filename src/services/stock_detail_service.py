@@ -33,6 +33,38 @@ from stock_store import load_limit_up_stock_meta
 logger = logging.getLogger(__name__)
 
 
+def _fetch_history_with_sina_fallback(
+    code: str,
+    *,
+    days: int,
+    fetcher,
+    call_with_timeout_fn: Callable[..., Any],
+    task_label: str,
+    primary_timeout: float = 15.0,
+    sina_timeout: float = 15.0,
+) -> Optional[pd.DataFrame]:
+    """主源（默认 auto，东财优先）15s 超时/失败后，再单独走一次新浪。"""
+    history = call_with_timeout_fn(
+        lambda: fetcher.get_history_data(code, days=days),
+        timeout_sec=primary_timeout,
+        fallback=None,
+        task_name=task_label,
+    )
+    if history is not None and not getattr(history, "empty", True):
+        return history
+    try:
+        sina_plan = fetcher.build_history_request_plan(source="sina")
+    except Exception as exc:
+        logger.debug("构建新浪 plan 失败: %s", exc)
+        return history
+    return call_with_timeout_fn(
+        lambda: fetcher.get_history_data(code, days=days, request_plan=sina_plan),
+        timeout_sec=sina_timeout,
+        fallback=None,
+        task_name=f"{task_label}(新浪兜底)",
+    )
+
+
 def resolve_stock_identity(
     universe: Optional[pd.DataFrame],
     stock_code: str,
@@ -161,11 +193,12 @@ def get_stock_detail_quick(
         80,
         settings.trend_days + settings.limit_up_lookback_days + settings.ma_period + 20,
     )
-    history = call_with_timeout_fn(
-        lambda: fetcher.get_history_data(code, days=history_days),
-        timeout_sec=15.0,
-        fallback=None,
-        task_name=f"详情历史 {code}",
+    history = _fetch_history_with_sina_fallback(
+        code,
+        days=history_days,
+        fetcher=fetcher,
+        call_with_timeout_fn=call_with_timeout_fn,
+        task_label=f"详情历史 {code}",
     )
     # cached_meta 里通常已存 name / industry / last_limit_up_trade_date，
     # 秒开时就用上，避免要等 full 路径才闪出行业。
@@ -205,9 +238,12 @@ def get_stock_detail(
     history = preloaded_history
     universe = None
     if history is None:
-        history = call_with_timeout_fn(
-            lambda: fetcher.get_history_data(code, days=history_days),
-            15.0, None, f"详情历史 {code}",
+        history = _fetch_history_with_sina_fallback(
+            code,
+            days=history_days,
+            fetcher=fetcher,
+            call_with_timeout_fn=call_with_timeout_fn,
+            task_label=f"详情历史 {code}",
         )
     try:
         universe = call_with_timeout_fn(
@@ -244,9 +280,10 @@ def get_stock_detail_history(
 ) -> Optional[pd.DataFrame]:
     code = str(stock_code).strip().zfill(6)
     history_days = max(60, int(days))
-    return call_with_timeout_fn(
-        lambda: fetcher.get_history_data(code, days=history_days),
-        timeout_sec=15.0,
-        fallback=None,
-        task_name=f"补充详情历史 {code}",
+    return _fetch_history_with_sina_fallback(
+        code,
+        days=history_days,
+        fetcher=fetcher,
+        call_with_timeout_fn=call_with_timeout_fn,
+        task_label=f"补充详情历史 {code}",
     )
