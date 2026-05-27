@@ -7,6 +7,7 @@
 - load_industry_board_strength_for_date: 加载历史日各行业涨跌幅（按日缓存）
 - load_industry_board_strength_for_date_ths: 同花顺历史日 K 估算行业涨跌（EM 死时 fallback）
 - backfill_universe_industries: 一次性回填 universe.industry 字段（同花顺成分股 scrape）
+- backfill_universe_industries_baostock: 一次性回填 universe.industry（Baostock 证监会行业，单接口拉全市场，比 THS scrape 稳）
 - fetch_spot_snapshot: 获取全市场实时行情快照（东财→新浪 fallback）
 - parse_spot_record: 从实时行情行解析基础记录（静态纯函数）
 - filter_strong_stocks: 从行情快照筛选 +3%~+9.95% 强势股
@@ -433,6 +434,130 @@ def backfill_universe_industries(
         "updated": updated,
         "errors": errors,
     }
+
+
+def backfill_universe_industries_baostock(
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """用 Baostock 一次性回填 universe.industry（证监会行业分类）。
+
+    与 THS scrape 版的差异：
+    - 一次 ``bs.query_stock_industry()`` 拉全市场 5500+ 票，无需逐行业爬，10s 内完成
+    - 接口稳定不会 401/限流，盘后可重复运行
+    - 行业命名是证监会（GB/T 4754）标准，如 "C39 计算机、通信和其他电子设备制造业"
+      → 这里去掉前缀代码（"C39"）只留中文名，方便和 THS / EM 命名风格对齐
+    - **CSRC 行业较粗（≈80 个一级行业），而 THS / EM 用的是更细的板块概念**；
+      混用时 ``load_spot_snapshot_at`` 走 ``COALESCE(NULLIF(u.industry,''), m.industry, '')``
+      universe 优先：如果先用 baostock 跑过再用 THS 跑会被 THS 覆盖（行为符合预期）
+
+    返回 dict: {industries, mapped_codes, updated, errors}（结构与 THS 版一致，便于上层复用）
+    """
+    import re
+    from stock_store import update_universe_industries
+
+    errors: List[str] = []
+
+    try:
+        import baostock as bs  # type: ignore
+    except ImportError as exc:
+        msg = f"未安装 baostock：{exc}（pip install baostock）"
+        if log_fn:
+            log_fn(f"补全行业(baostock)：{msg}")
+        return {"industries": 0, "mapped_codes": 0, "updated": 0, "errors": [msg]}
+
+    if progress_callback:
+        progress_callback(0, 1, "登录 Baostock")
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        msg = f"Baostock 登录失败：{lg.error_code} {lg.error_msg}"
+        if log_fn:
+            log_fn(f"补全行业(baostock)：{msg}")
+        return {"industries": 0, "mapped_codes": 0, "updated": 0, "errors": [msg]}
+
+    try:
+        if progress_callback:
+            progress_callback(0, 1, "拉取行业映射")
+        rs = bs.query_stock_industry()
+        if rs.error_code != "0":
+            msg = f"query_stock_industry 失败：{rs.error_code} {rs.error_msg}"
+            if log_fn:
+                log_fn(f"补全行业(baostock)：{msg}")
+            return {"industries": 0, "mapped_codes": 0, "updated": 0, "errors": [msg]}
+
+        rows: List[List[str]] = []
+        while rs.next():
+            rows.append(rs.get_row_data())
+        if not rows:
+            msg = "query_stock_industry 返回空"
+            if log_fn:
+                log_fn(f"补全行业(baostock)：{msg}")
+            return {"industries": 0, "mapped_codes": 0, "updated": 0, "errors": [msg]}
+
+        fields = rs.fields
+        code_idx = fields.index("code") if "code" in fields else 1
+        ind_idx = fields.index("industry") if "industry" in fields else 3
+
+        # 形如 "C39计算机、通信和其他电子设备制造业" → "计算机、通信和其他电子设备制造业"
+        # 部分行业前缀是单字母+两位数（C39/J66），少数是单字母+一位数（A01）
+        prefix_re = re.compile(r"^[A-Z]\d{1,2}\s*")
+
+        code_to_industry: Dict[str, str] = {}
+        empty_count = 0
+        for row in rows:
+            bs_code = str(row[code_idx]).strip()
+            industry_raw = str(row[ind_idx]).strip()
+            if not bs_code:
+                continue
+            # "sh.600000" → "600000"，"sz.000001" → "000001"，"bj.430047" → "430047"
+            if "." in bs_code:
+                _, digit = bs_code.split(".", 1)
+            else:
+                digit = bs_code
+            digit = digit.strip()
+            if not digit.isdigit():
+                continue
+            if not industry_raw:
+                empty_count += 1
+                continue
+            industry = prefix_re.sub("", industry_raw).strip()
+            if not industry:
+                empty_count += 1
+                continue
+            code_to_industry[digit] = industry
+
+        if log_fn:
+            log_fn(
+                f"补全行业(baostock)：API 返回 {len(rows)} 行，"
+                f"映射 {len(code_to_industry)} 只票，{empty_count} 只无行业字段"
+            )
+
+        if progress_callback:
+            progress_callback(1, 1, "写入数据库")
+        updated = update_universe_industries(code_to_industry)
+
+        # 统计有多少不同的行业名（用于报告"覆盖了多少个 CSRC 行业"）
+        unique_industries = len(set(code_to_industry.values()))
+
+        if log_fn:
+            log_fn(
+                f"补全行业(baostock)：完成，覆盖 {unique_industries} 个证监会行业，"
+                f"映射 {len(code_to_industry)} 只票，DB 写入 {updated} 行"
+            )
+
+        return {
+            "industries": unique_industries,
+            "mapped_codes": len(code_to_industry),
+            "updated": updated,
+            "errors": errors,
+        }
+    finally:
+        try:
+            bs.logout()
+        except Exception:
+            pass
 
 
 def fetch_spot_snapshot(

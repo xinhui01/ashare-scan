@@ -249,9 +249,15 @@ class StockMonitorApp:
         self.update_cache_btn.pack(side=tk.LEFT, padx=5)
 
         self.backfill_industry_btn = ttk.Button(
-            row2, text="补全行业信息", command=self.start_industry_backfill,
+            row2, text="补全行业(THS)", command=self.start_industry_backfill,
         )
         self.backfill_industry_btn.pack(side=tk.LEFT, padx=5)
+
+        self.backfill_industry_baostock_btn = ttk.Button(
+            row2, text="补全行业(证监会)",
+            command=self.start_industry_backfill_baostock,
+        )
+        self.backfill_industry_baostock_btn.pack(side=tk.LEFT, padx=5)
 
         self.stop_btn = ttk.Button(row2, text="停止", command=lambda: self.result.stop_scan(), state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
@@ -1113,6 +1119,85 @@ class StockMonitorApp:
                 self._post_to_ui(lambda e=exc: self.status_var.set(f"补全行业失败：{e}"))
             finally:
                 self._industry_backfill_running = False
+                self._post_to_ui(
+                    lambda: self.backfill_industry_btn.config(state=tk.NORMAL)
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def start_industry_backfill_baostock(self):
+        """用 Baostock 一次拉全市场证监会行业，回填 universe.industry。
+
+        相比 THS scrape 版：单接口拉 5500+ 票，10s 完成、不会限流；
+        命名是证监会标准（如"计算机、通信和其他电子设备制造业"），比 THS 短名粗。
+        """
+        def _industry_coverage():
+            import sqlite3
+            from pathlib import Path
+            db_path = Path("data/stock_store.sqlite3")
+            if not db_path.is_file():
+                return (0, 0)
+            with sqlite3.connect(str(db_path)) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+                with_ind = conn.execute(
+                    "SELECT COUNT(*) FROM universe WHERE industry != ''"
+                ).fetchone()[0]
+            return (total, with_ind)
+
+        if getattr(self, "_industry_backfill_running", False):
+            return
+        self._industry_backfill_running = True
+        self.backfill_industry_baostock_btn.config(state=tk.DISABLED)
+        self.backfill_industry_btn.config(state=tk.DISABLED)
+        self._open_run_log()
+        self._log("开始补全 universe.industry（Baostock 证监会行业，单接口拉全市场）...")
+        self.status_var.set("补全行业(证监会)：登录 Baostock...")
+
+        def _run():
+            try:
+                from src.services.scoring import first_board as _fb
+
+                before_total, before_with = _industry_coverage()
+                self._log_async(
+                    f"补全行业(证监会)：当前 universe {before_total} 只，"
+                    f"已有行业 {before_with} 只 ({before_with / max(before_total,1) * 100:.1f}%)"
+                )
+
+                def _progress(cur, total, msg):
+                    self._post_to_ui(
+                        lambda c=cur, t=total, m=msg: self.status_var.set(
+                            f"补全行业(证监会) · {m}"
+                        )
+                    )
+
+                result = _fb.backfill_universe_industries_baostock(
+                    log_fn=self._log_async, progress_callback=_progress,
+                )
+                after_total, after_with = _industry_coverage()
+                msg = (
+                    f"补全行业(证监会)完成：覆盖 {result.get('industries', 0)} 个证监会行业，"
+                    f"映射 {result.get('mapped_codes', 0)} 只票，"
+                    f"DB 写入 {result.get('updated', 0)} 行 · "
+                    f"行业覆盖 {before_with} → {after_with} / {after_total} "
+                    f"({after_with / max(after_total,1) * 100:.1f}%)"
+                )
+                errors = result.get("errors") or []
+                if errors:
+                    msg += f"，{len(errors)} 项问题"
+                self._log_async(msg)
+                if errors:
+                    self._log_async("补全行业(证监会) 失败明细（前 5 条）：")
+                    for line in errors[:5]:
+                        self._log_async(f"  · {line}")
+                self._post_to_ui(lambda m=msg: self.status_var.set(m))
+            except Exception as exc:
+                self._log_async(f"补全行业(证监会)失败：{exc}")
+                self._post_to_ui(lambda e=exc: self.status_var.set(f"补全行业(证监会)失败：{e}"))
+            finally:
+                self._industry_backfill_running = False
+                self._post_to_ui(
+                    lambda: self.backfill_industry_baostock_btn.config(state=tk.NORMAL)
+                )
                 self._post_to_ui(
                     lambda: self.backfill_industry_btn.config(state=tk.NORMAL)
                 )
