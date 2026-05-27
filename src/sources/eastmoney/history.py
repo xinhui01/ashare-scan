@@ -29,8 +29,6 @@ from src.sources.eastmoney.throttling import (
 
 HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://82.push2his.eastmoney.com/api/qt/stock/kline/get",
-    "https://40.push2his.eastmoney.com/api/qt/stock/kline/get",
 ]
 
 

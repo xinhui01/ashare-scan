@@ -115,3 +115,7 @@ def record_failure() -> None:
 
 def record_success() -> None:
     EMCircuitBreaker.instance().record_success()
+
+
+def reset() -> None:
+    EMCircuitBreaker.instance().reset()

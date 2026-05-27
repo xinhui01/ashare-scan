@@ -1041,6 +1041,19 @@ class StockMonitorApp:
 
     def start_industry_backfill(self):
         """从东财一级行业反向遍历成分股，回填 universe.industry 字段。"""
+        def _industry_coverage():
+            import sqlite3
+            from pathlib import Path
+            db_path = Path("data/stock_store.sqlite3")
+            if not db_path.is_file():
+                return (0, 0)
+            with sqlite3.connect(str(db_path)) as conn:
+                total = conn.execute("SELECT COUNT(*) FROM universe").fetchone()[0]
+                with_ind = conn.execute(
+                    "SELECT COUNT(*) FROM universe WHERE industry != ''"
+                ).fetchone()[0]
+            return (total, with_ind)
+
         if getattr(self, "_industry_backfill_running", False):
             return
         self._industry_backfill_running = True
@@ -1051,7 +1064,21 @@ class StockMonitorApp:
 
         def _run():
             try:
+                # 用户主动点了按钮就清掉之前 EM 熔断状态，给一次完整重试机会；
+                # 如果真的还是连挂，熔断器会在 3 次失败后自动重新跳闸。
+                from src.utils import em_circuit_breaker as _emcb
+                if _emcb.is_open():
+                    _emcb.reset()
+                    self._log_async("补全行业：检测到东财熔断中，已手动重置（用户主动操作）")
+
                 from src.services.scoring import first_board as _fb
+
+                # 前后对比，方便用户判断是否真的有效果
+                before_total, before_with = _industry_coverage()
+                self._log_async(
+                    f"补全行业：当前 universe {before_total} 只，"
+                    f"已有行业 {before_with} 只 ({before_with / max(before_total,1) * 100:.1f}%)"
+                )
 
                 def _progress(cur, total, msg):
                     self._post_to_ui(
@@ -1063,10 +1090,13 @@ class StockMonitorApp:
                 result = _fb.backfill_universe_industries(
                     log_fn=self._log_async, progress_callback=_progress,
                 )
+                after_total, after_with = _industry_coverage()
                 msg = (
                     f"补全行业完成：覆盖 {result.get('industries', 0)} 个东财行业，"
                     f"映射 {result.get('mapped_codes', 0)} 只票，"
-                    f"DB 写入 {result.get('updated', 0)} 行"
+                    f"DB 写入 {result.get('updated', 0)} 行 · "
+                    f"行业覆盖 {before_with} → {after_with} / {after_total} "
+                    f"({after_with / max(after_total,1) * 100:.1f}%)"
                 )
                 if result.get("errors"):
                     msg += f"，{len(result['errors'])} 个行业拉取失败"

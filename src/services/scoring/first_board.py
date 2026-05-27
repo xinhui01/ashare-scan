@@ -179,6 +179,83 @@ def load_lhb_for_date(
     return result
 
 
+def load_lhb_for_date_sina(
+    trade_date: str,
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """新浪龙虎榜 fallback — 字段比东财少。
+
+    新浪 ``stock_lhb_detail_daily_sina`` 只给"上榜股票 + 指标(上榜原因)"，
+    **没有净买额 / 买入额 / 卖出额 / 解读** 这些维度。所以：
+    - net_buy / buy / sell 全部填 0 — 下游 capital_flow_bonus 基础净买分将归零
+    - jiedu / jiedu_parsed 留空 — 下游解读细分加分也不参与
+    - reason 保留指标文本（如"日涨幅偏离值达7%的证券"）
+    - source 字段标记 "sina"，便于排查
+    主要价值：保留"该股上 LHB"事实，让 GUI"仅 LHB"筛选可用。
+
+    缓存键: stock_filter_lhb_sina_<trade_date>
+    """
+    from stock_store import load_app_config, save_app_config
+    cache_key = f"stock_filter_lhb_sina_{str(trade_date).strip()}"
+    cached = load_app_config(cache_key, default=None)
+    if isinstance(cached, dict) and cached:
+        sample = next(iter(cached.values())) if cached else None
+        if isinstance(sample, dict) and sample.get("source") == "sina":
+            return cached  # type: ignore[return-value]
+
+    try:
+        import akshare as ak
+        from stock_data import _retry_ak_call
+        df = _retry_ak_call(ak.stock_lhb_detail_daily_sina, date=str(trade_date).strip())
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"涨停预测：新浪龙虎榜拉取失败 {exc}")
+        return {}
+
+    if df is None or df.empty:
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        try:
+            code = str(row.get("股票代码", "")).strip().zfill(6)
+            if not code or len(code) != 6:
+                continue
+            indicator = str(row.get("指标") or "").strip()
+            mapped_value = row.get("对应值")
+            reason = (
+                f"{indicator}（对应值={mapped_value}）"
+                if indicator and mapped_value is not None
+                else indicator
+            )
+            if code in result:
+                # 多次上榜累加 reason
+                if reason and reason not in result[code]["reason"]:
+                    result[code]["reason"] = (
+                        result[code]["reason"] + " / " + reason
+                    ).strip(" /")
+            else:
+                result[code] = {
+                    "net_buy": 0.0,
+                    "buy": 0.0,
+                    "sell": 0.0,
+                    "reason": reason,
+                    "jiedu": "",
+                    "jiedu_parsed": {},
+                    "source": "sina",
+                }
+        except (TypeError, ValueError):
+            continue
+
+    if result:
+        try:
+            save_app_config(cache_key, result)
+        except Exception:
+            pass
+    return result
+
+
 def load_industry_board_strength(
     *,
     log_fn: Optional[Callable[[str], None]] = None,
@@ -284,6 +361,84 @@ def load_industry_board_strength_for_date(
         result[name] = round(chg, 2)
         if log_fn and (idx + 1) % 20 == 0:
             log_fn(f"涨停预测[历史]：行业板块强度进度 {idx + 1}/{len(industry_names)}")
+
+    if result:
+        try:
+            save_app_config(cache_key, result)
+        except Exception:
+            pass
+    return result
+
+
+def load_industry_board_strength_for_date_ths(
+    trade_date: str,
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Dict[str, float]:
+    """同花顺历史日各行业涨跌幅 — 当东财死掉时的二级 fallback。
+
+    用 ``ak.stock_board_industry_index_ths(symbol=行业名, start_date, end_date)``
+    每行业拉一根日 K，按 (close/open - 1) * 100 估算当日涨跌幅。
+
+    注意命名差异：THS 行业名跟东财不一致（"半导体" vs "半导体及元件"），
+    下游 ``board_strength.get(industry)`` 会因 EM 命名而 lookup miss 一部分。
+    所以这只是"东财死时让日志至少有板块强度可看"的兜底，不保证完美匹配。
+
+    缓存键: stock_filter_board_strength_ths_<trade_date>
+    """
+    from stock_store import load_app_config, save_app_config
+    td = str(trade_date or "").strip()
+    if not td:
+        return {}
+    cache_key = f"stock_filter_board_strength_ths_{td}"
+    cached = load_app_config(cache_key, default=None)
+    if isinstance(cached, dict) and cached:
+        return {str(k): float(v) for k, v in cached.items()}
+
+    try:
+        import akshare as ak
+        from stock_data import _retry_ak_call
+        names_df = _retry_ak_call(ak.stock_board_industry_name_ths)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"涨停预测[THS]：拉同花顺行业列表失败 {exc}")
+        return {}
+    if names_df is None or names_df.empty or "name" not in names_df.columns:
+        return {}
+
+    industry_names = [
+        str(n).strip() for n in names_df["name"].tolist() if str(n).strip()
+    ]
+    result: Dict[str, float] = {}
+    for idx, name in enumerate(industry_names):
+        try:
+            import akshare as ak
+            from stock_data import _retry_ak_call
+            df = _retry_ak_call(
+                ak.stock_board_industry_index_ths,
+                symbol=name,
+                start_date=td,
+                end_date=td,
+            )
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        try:
+            row = df.iloc[0]
+            open_p = float(row["开盘价"])
+            close_p = float(row["收盘价"])
+            if open_p <= 0:
+                continue
+            # THS 没直接返回涨跌幅，按当日 open→close 估算
+            chg = round((close_p / open_p - 1) * 100, 2)
+            result[name] = chg
+        except (TypeError, ValueError, KeyError):
+            continue
+        if log_fn and (idx + 1) % 20 == 0:
+            log_fn(
+                f"涨停预测[THS]：行业板块强度进度 {idx + 1}/{len(industry_names)}"
+            )
 
     if result:
         try:

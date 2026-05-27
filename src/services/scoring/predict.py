@@ -624,45 +624,95 @@ def predict_limit_up_candidates(
             )
 
     # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
-    # - 龙虎榜：akshare stock_lhb_detail_em 支持 start_date/end_date，历史 / 实时同一条路径
-    # - 板块强度：实时模式拉东财行业涨跌；历史模式从合成 spot 按行业聚合涨跌幅
+    # 龙虎榜 fallback 链：东财 (stock_lhb_detail_em) → 新浪 (stock_lhb_detail_daily_sina)
+    #   - 新浪只给"上榜 + 指标"，无净买额 / 解读，下游评分会少几个维度
+    # 板块强度 fallback 链：
+    #   - 历史模式：东财历史日 K → 同花顺历史日 K → 合成 spot 按行业聚合
+    #   - 实时模式：东财行业列表 → 同花顺当日日 K → 合成 spot 按行业聚合
+    #   THS 命名跟东财不一致，下游 lookup miss 一部分，但聊胜于无
     if log_fn:
         log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
+
     try:
         lhb_map = _first_board.load_lhb_for_date(trade_date, log_fn=log_fn)
     except Exception as exc:
-        logger.debug("龙虎榜加载异常: %s", exc)
+        logger.debug("龙虎榜（东财）加载异常: %s", exc)
         lhb_map = {}
-        data_quality["warnings"].append(f"龙虎榜拉取失败: {exc}")
+    if not lhb_map:
+        try:
+            lhb_map = _first_board.load_lhb_for_date_sina(trade_date, log_fn=log_fn)
+            if lhb_map and log_fn:
+                log_fn(
+                    f"涨停预测：东财龙虎榜空 → 新浪 LHB {len(lhb_map)} 只"
+                    f"（无净买额字段，基础净买分将不参与）"
+                )
+        except Exception as exc:
+            logger.debug("龙虎榜（新浪）加载异常: %s", exc)
+            data_quality["warnings"].append(f"龙虎榜拉取失败（东财+新浪均挂）: {exc}")
 
     if historical_mode:
-        # A3 优先：东财历史行业 K 线 → 各行业当日涨跌幅，跟实时模式同源
-        # 兜底：从合成 spot 按行业聚合（仅在 A3 网络挂 / 数据空时启用，方向准但口径差）
         try:
             board_strength = _first_board.load_industry_board_strength_for_date(
                 trade_date, log_fn=log_fn,
             )
         except Exception as exc:
-            logger.debug("历史行业板块强度拉取异常: %s", exc)
+            logger.debug("历史行业板块强度（东财）拉取异常: %s", exc)
             board_strength = {}
+        if not board_strength:
+            try:
+                board_strength = (
+                    _first_board.load_industry_board_strength_for_date_ths(
+                        trade_date, log_fn=log_fn,
+                    )
+                )
+                if board_strength and log_fn:
+                    log_fn(
+                        f"涨停预测[历史模式]：东财死 → 同花顺行业 K 线 "
+                        f"{len(board_strength)} 个板块（命名跟 EM 不一致，部分 lookup 会 miss）"
+                    )
+            except Exception as exc:
+                logger.debug("历史行业板块强度（同花顺）拉取异常: %s", exc)
         if not board_strength:
             board_strength = _derive_board_strength_from_spot(spot_df)
             if log_fn:
                 log_fn(
-                    f"涨停预测[历史模式]：东财历史行业接口空 → "
+                    f"涨停预测[历史模式]：东财 + THS 均空 → "
                     f"合成 spot 兜底聚合 {len(board_strength)} 个板块"
                 )
-        elif log_fn:
+        elif log_fn and not board_strength.get("__source_already_logged__"):
             log_fn(
-                f"涨停预测[历史模式]：东财历史行业接口 {len(board_strength)} 个板块"
+                f"涨停预测[历史模式]：板块强度共 {len(board_strength)} 个板块"
             )
     else:
         try:
             board_strength = _first_board.load_industry_board_strength(log_fn=log_fn)
         except Exception as exc:
-            logger.debug("板块涨跌幅加载异常: %s", exc)
+            logger.debug("板块涨跌幅（东财）拉取异常: %s", exc)
             board_strength = {}
-            data_quality["warnings"].append(f"板块涨跌幅拉取失败: {exc}")
+        if not board_strength:
+            # 实时 THS：用今日做 trade_date
+            from datetime import datetime as _dt_now
+            today_key = _dt_now.now().strftime("%Y%m%d")
+            try:
+                board_strength = (
+                    _first_board.load_industry_board_strength_for_date_ths(
+                        today_key, log_fn=log_fn,
+                    )
+                )
+                if board_strength and log_fn:
+                    log_fn(
+                        f"涨停预测：东财板块强度空 → 同花顺当日 K "
+                        f"{len(board_strength)} 个板块（命名跟 EM 不一致，部分 lookup 会 miss）"
+                    )
+            except Exception as exc:
+                logger.debug("板块涨跌幅（同花顺）拉取异常: %s", exc)
+        if not board_strength:
+            board_strength = _derive_board_strength_from_spot(spot_df)
+            if log_fn:
+                log_fn(
+                    f"涨停预测：东财 + THS 均空 → "
+                    f"合成 spot 兜底聚合 {len(board_strength)} 个板块"
+                )
 
     data_quality["lhb"]["loaded"] = bool(lhb_map)
     data_quality["lhb"]["rows"] = len(lhb_map)
