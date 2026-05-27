@@ -1092,15 +1092,21 @@ class StockMonitorApp:
                 )
                 after_total, after_with = _industry_coverage()
                 msg = (
-                    f"补全行业完成：覆盖 {result.get('industries', 0)} 个东财行业，"
+                    f"补全行业完成：覆盖 {result.get('industries', 0)} 个 THS 行业，"
                     f"映射 {result.get('mapped_codes', 0)} 只票，"
                     f"DB 写入 {result.get('updated', 0)} 行 · "
                     f"行业覆盖 {before_with} → {after_with} / {after_total} "
                     f"({after_with / max(after_total,1) * 100:.1f}%)"
                 )
-                if result.get("errors"):
-                    msg += f"，{len(result['errors'])} 个行业拉取失败"
+                errors = result.get("errors") or []
+                if errors:
+                    msg += f"，{len(errors)} 个行业拉取失败"
                 self._log_async(msg)
+                if errors:
+                    # 单独把失败明细打到日志（前 5 条），便于排查
+                    self._log_async("补全行业 失败明细（前 5 条）：")
+                    for line in errors[:5]:
+                        self._log_async(f"  · {line}")
                 self._post_to_ui(lambda m=msg: self.status_var.set(m))
             except Exception as exc:
                 self._log_async(f"补全行业失败：{exc}")

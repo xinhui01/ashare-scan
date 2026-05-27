@@ -521,11 +521,27 @@ def _ths_industry_constituents(
             if log_fn:
                 log_fn(f"补全行业：THS {industry_code} page {page} 请求失败 {exc}")
             break
+        # 401 / 403 多半是临时风控，sleep 5s 重试一次再放弃
+        if r.status_code in (401, 403):
+            if log_fn:
+                log_fn(
+                    f"补全行业：THS {industry_code} page {page} HTTP {r.status_code} "
+                    f"（疑似临时风控），sleep 5s 后重试..."
+                )
+            _time.sleep(5.0)
+            try:
+                r = sess.get(url, timeout=10)
+            except Exception as exc:
+                if log_fn:
+                    log_fn(
+                        f"补全行业：THS {industry_code} page {page} 重试失败 {exc}"
+                    )
+                break
         if r.status_code != 200:
             if log_fn:
                 log_fn(
                     f"补全行业：THS {industry_code} page {page} HTTP {r.status_code}，"
-                    f"可能限速，停止该行业的分页"
+                    f"放弃该行业的分页"
                 )
             break
 
