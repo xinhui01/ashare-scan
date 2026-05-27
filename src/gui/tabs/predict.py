@@ -257,12 +257,6 @@ class PredictTab:
             "<<ComboboxSelected>>", lambda _e: self._on_filter_changed(),
         )
 
-        self.filter_lhb_only = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            filter_bar, text="仅 LHB", variable=self.filter_lhb_only,
-            command=self._on_filter_changed,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
         self.filter_theme_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             filter_bar, text="仅命中题材", variable=self.filter_theme_only,
@@ -2031,12 +2025,9 @@ class PredictTab:
                 f"  AI 题材聚类: {th_state}（{th.get('themes', 0)} 个题材 / "
                 f"覆盖 {th.get('covered_codes', 0)} 只涨停股）\n"
             )
-            lhb = dq.get("lhb") or {}
             bs = dq.get("board_strength") or {}
             txt.insert(tk.END,
-                f"  龙虎榜: {'已加载' if lhb.get('loaded') else '未启用'} "
-                f"({lhb.get('rows', 0)} 只)   "
-                f"板块强度: {'已加载' if bs.get('loaded') else '未启用'} "
+                f"  板块强度: {'已加载' if bs.get('loaded') else '未启用'} "
                 f"({bs.get('rows', 0)} 个)\n"
             )
             sent = dq.get("sentiment") or {}
@@ -2414,7 +2405,6 @@ class PredictTab:
         self.filter_min_score.set(0)
         self.filter_keyword.set("")
         self.filter_industry.set("全部")
-        self.filter_lhb_only.set(False)
         self.filter_theme_only.set(False)
         self._render_trees()
 
@@ -2481,11 +2471,6 @@ class PredictTab:
 
         ctx = self.compare_context or {}
         code = (rec.get("code") or "").strip().zfill(6)
-
-        if self.filter_lhb_only.get():
-            lhb = (ctx.get("lhb_map") or {}).get(code)
-            if not lhb or float((lhb or {}).get("net_buy") or 0) <= 0:
-                return False
 
         if self.filter_theme_only.get():
             theme_map = ctx.get("code_theme_map") or {}

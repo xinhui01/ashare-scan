@@ -1069,15 +1069,6 @@ class StockFilter:
             limit_up_threshold_pct_fn=self._limit_up_threshold_pct,
         )
 
-    @staticmethod
-    def _parse_lhb_jiedu(jiedu: str) -> Dict[str, Any]:
-        """解析龙虎榜「解读」字段（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.parse_lhb_jiedu(jiedu)
-
-    def _load_lhb_for_date(self, trade_date: str) -> Dict[str, Dict[str, Any]]:
-        """加载指定交易日的龙虎榜数据（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.load_lhb_for_date(trade_date, log_fn=self._log)
-
     def _load_industry_board_strength(self) -> Dict[str, float]:
         """加载东财行业板块涨跌幅（thin delegate -> scoring/first_board.py）。"""
         return _scoring_first_board.load_industry_board_strength(log_fn=self._log)

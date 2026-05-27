@@ -291,7 +291,7 @@ def score_continuation_by_compare(
         if theme_reason:
             reasons.append(theme_reason)
 
-    # 资金面：龙虎榜（cont 类需要 boards 用于高位散户接力的额外惩罚）
+    # 板块联动（行业涨跌幅加分）
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(
         rec.get("code", ""), compare_context,
         industry=rec.get("industry", ""), boards=boards,

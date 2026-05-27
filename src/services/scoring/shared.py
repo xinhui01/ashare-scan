@@ -4,7 +4,7 @@
 - parse_full_pool: 把涨停池 DataFrame 转 records 列表
 - count_pool_industries: 涨停池行业分布
 - theme_bonus: AI 题材聚类热度加分
-- capital_flow_bonus: 龙虎榜 + 板块涨跌幅加分
+- capital_flow_bonus: 板块涨跌幅加分（行业联动）
 - vol_ratio_with_baseline: 5/20 日量比双口径计算
 
 设计：纯函数 / 静态方法，无 self.fetcher 依赖。所需上下文（compare_context 等）以参数注入。
@@ -92,80 +92,17 @@ def capital_flow_bonus(
     industry: str = "",
     boards: int = 0,
 ) -> Tuple[float, List[str]]:
-    """龙虎榜 + 板块涨跌幅加分（含 LHB 解读字段细分）。
+    """板块涨跌幅加分（强势板块联动）。
 
-    基础（按净买额）：
-    - ≥5000 万净买 → +8 / >0 → +5 / ≤-3000 万 → -5 / <0 → -2
+    历史上还包含龙虎榜净买额 + 解读细分加分，但 LHB 数据源不稳定且
+    游资席位语义参差，整体删掉了。函数名保留是为了不破坏调用方签名
+    （cont / first / fresh / wrap 评分都从这里拿"行业联动分"）。
 
-    解读细分（在基础之上叠加，最多 +8）：
-    - 主力做T / 营业部接力T接 → +4（强游资接力）
-    - 知名游资地区买入（西藏/宁波/上海/江苏/深圳/广东/浙江）→ +3
-    - 机构买入 ≥2 家 → +5；1 家 → +3
-    - 机构卖出 → -4
-    - 历史成功率 ≥45% → +2；<25% → -2
-    - 普通席位单独上榜 → -1（散户接力，弱信号）
-      · boards>=3 时升级为 -5（高位连板没有机构/游资接力 = 见顶特征）
+    boards 参数也保留以向后兼容（之前用于"高位连板惩罚"，跟着 LHB
+    一起删了）。
     """
     bonus = 0.0
     reasons: List[str] = []
-
-    lhb = (compare_context.get("lhb_map") or {}).get(code)
-    if isinstance(lhb, dict):
-        net = float(lhb.get("net_buy") or 0)
-        if net >= 5e7:
-            bonus += 8
-            reasons.append(f"龙虎榜净买{net/1e8:.2f}亿+8")
-        elif net > 0:
-            bonus += 5
-            reasons.append(f"龙虎榜净买{net/1e6:.0f}万+5")
-        elif net <= -3e7:
-            bonus -= 5
-            reasons.append(f"龙虎榜净卖{net/1e8:.2f}亿-5")
-        elif net < 0:
-            bonus -= 2
-            reasons.append(f"龙虎榜净卖{abs(net)/1e6:.0f}万-2")
-
-        # 解读字段细分加分（仅在主力买入主导时给正向加分）
-        jiedu_parsed = lhb.get("jiedu_parsed") or {}
-        if isinstance(jiedu_parsed, dict):
-            is_buy = jiedu_parsed.get("is_buy_dominant", False) or net > 0
-            inst_buy = int(jiedu_parsed.get("institution_buy") or 0)
-            inst_sell = int(jiedu_parsed.get("institution_sell") or 0)
-            main_t = bool(jiedu_parsed.get("main_t_trade"))
-            region = jiedu_parsed.get("hot_money_region")
-            ordinary = bool(jiedu_parsed.get("ordinary_seats_only"))
-            rate = jiedu_parsed.get("success_rate")
-
-            if is_buy and main_t:
-                bonus += 4
-                reasons.append("主力做T接力+4")
-            if is_buy and region:
-                bonus += 3
-                reasons.append(f"{region}游资买入+3")
-            if inst_buy >= 2:
-                bonus += 5
-                reasons.append(f"{inst_buy}家机构买入+5")
-            elif inst_buy == 1:
-                bonus += 3
-                reasons.append("1家机构买入+3")
-            if inst_sell >= 1:
-                bonus -= 4
-                reasons.append(f"{inst_sell}家机构卖出-4")
-            if isinstance(rate, (int, float)):
-                if rate >= 45:
-                    bonus += 2
-                    reasons.append(f"历史成功率{rate:.0f}%+2")
-                elif rate < 25:
-                    bonus -= 2
-                    reasons.append(f"历史成功率仅{rate:.0f}%-2")
-            if is_buy and ordinary and inst_buy == 0 and not main_t and not region:
-                # 高位连板还只有散户接力 = 机构/游资不愿进场，是典型见顶特征
-                if boards >= 3:
-                    bonus -= 5
-                    reasons.append(f"{boards}连板仅普通席位接力-5")
-                else:
-                    bonus -= 1
-                    reasons.append("普通席位接力-1")
 
     # 板块涨跌幅加分（强势板块联动）
     board_strength = compare_context.get("board_strength") or {}

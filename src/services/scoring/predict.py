@@ -236,7 +236,6 @@ def _check_prerequisites(
     historical_mode: bool,
     pool_source: str,
     concept_themes_count: int,
-    lhb_map: Dict[str, Any],
     board_strength: Dict[str, Any],
     sentiment_degraded: bool,
     zt_codes: set,
@@ -268,26 +267,20 @@ def _check_prerequisites(
             "若题材列表为空请先补足涨停池历史 + 刷新概念库"
         )
 
-    # 3. 龙虎榜（仅实时模式必备；历史模式 akshare 无对应日期接口，跳过）
-    if not historical_mode and not lhb_map:
-        missing.append(
-            "❌ 龙虎榜数据缺失 → 请检查 akshare 龙虎榜接口可用性"
-        )
-
-    # 4. 板块强度（仅实时模式必备；历史模式无历史接口）
+    # 3. 板块强度（仅实时模式必备；历史模式从合成 spot 兜底）
     if not historical_mode and not board_strength:
         missing.append(
             "❌ 板块强度（行业涨跌榜）数据缺失 → 请检查东财板块接口"
         )
 
-    # 5. 市场情绪不得降级
+    # 4. 市场情绪不得降级
     if sentiment_degraded:
         missing.append(
             "❌ 市场情绪数据降级（跌停池 / 上证指数未完整拉到）→ "
             "请检查网络 / akshare 接口，或点「刷新（强制重拉外部数据）」重试"
         )
 
-    # 6. 所有涨停股个股历史 K 线 ≥ 10 行（cont scorer 必备）
+    # 5. 所有涨停股个股历史 K 线 ≥ 10 行（cont scorer 必备）
     # 新股豁免：若 K 线不足 10 行但最早一根 K 线在最近 30 个自然日内，视为新股
     # （cont scorer 已自带 len(history) >= 10 守卫，新股进流程会自动降级评分而不会崩）
     missing_kline: List[str] = []
@@ -366,10 +359,9 @@ def predict_limit_up_candidates(
         summary: 文字摘要
 
     `historical_mode=True`：回测模式。spot_df 从 history 表合成（"as of 收盘"）
-    而非实时快照；龙虎榜走 akshare stock_lhb_detail_em(start/end=trade_date)，
-    板块强度从合成 spot 按行业聚合涨跌幅。涨停池仍用 get_limit_up_pool
-    （其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放预测"的批量回测
-    场景下使用。
+    而非实时快照；板块强度从合成 spot 按行业聚合涨跌幅。涨停池仍用
+    get_limit_up_pool（其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放
+    预测"的批量回测场景下使用。
 
     迁自 StockFilter.predict_limit_up_candidates；行为零变化。
     """
@@ -381,8 +373,8 @@ def predict_limit_up_candidates(
     from stock_data import DaemonThreadPoolExecutor
 
     # ===== auto-promote historical_mode =====
-    # 若 trade_date 早于今日，强制切到历史模式。原因：实时 spot / 板块强度 /
-    # 龙虎榜等接口都不带 date 参数，永远返回"当前时刻"，跨天调用会拉到错误
+    # 若 trade_date 早于今日，强制切到历史模式。原因：实时 spot / 板块强度
+    # 等接口都不带 date 参数，永远返回"当前时刻"，跨天调用会拉到错误
     # 日期的盘中数据，导致两台机器（或同一台机器不同时间）跑同一历史日期
     # 结果不一致。auto-promote 后历史 spot 从本地 history 表合成，结果稳定。
     if not historical_mode and trade_date:
@@ -394,8 +386,8 @@ def predict_limit_up_candidates(
             if log_fn:
                 log_fn(
                     f"涨停预测：trade_date={trade_date} ≠ 今日({today_key})，"
-                    f"自动切到历史模式（spot 从本地 history 合成，板块/龙虎榜等"
-                    f"实时指标置空，保证两台机器结果一致）"
+                    f"自动切到历史模式（spot 从本地 history 合成，板块强度走"
+                    f"合成 spot 兜底，保证两台机器结果一致）"
                 )
     if progress_callback:
         progress_callback(0, 1, "统计最近涨停对比环境...")
@@ -409,7 +401,6 @@ def predict_limit_up_candidates(
         "spot": {"rows": 0, "industry_missing": 0, "source": "none"},
         "limit_up_pool": {"rows": 0, "source": "none"},
         "themes": {"loaded": False, "themes": 0, "covered_codes": 0},
-        "lhb": {"loaded": False, "rows": 0},
         "board_strength": {"loaded": False, "rows": 0},
         "sentiment": {"loaded": False, "score": None, "degraded": False},
         "warnings": [],
@@ -667,32 +658,13 @@ def predict_limit_up_candidates(
                 "（最近 10 日 limit_up_pool 数据可能不足）"
             )
 
-    # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
-    # 龙虎榜 fallback 链：东财 (stock_lhb_detail_em) → 新浪 (stock_lhb_detail_daily_sina)
-    #   - 新浪只给"上榜 + 指标"，无净买额 / 解读，下游评分会少几个维度
+    # 阶段2.6：加载板块强度（失败不影响预测）
     # 板块强度 fallback 链：
     #   - 历史模式：东财历史日 K → 同花顺历史日 K → 合成 spot 按行业聚合
     #   - 实时模式：东财行业列表 → 同花顺当日日 K → 合成 spot 按行业聚合
     #   THS 命名跟东财不一致，下游 lookup miss 一部分，但聊胜于无
     if log_fn:
-        log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
-
-    try:
-        lhb_map = _first_board.load_lhb_for_date(trade_date, log_fn=log_fn)
-    except Exception as exc:
-        logger.debug("龙虎榜（东财）加载异常: %s", exc)
-        lhb_map = {}
-    if not lhb_map:
-        try:
-            lhb_map = _first_board.load_lhb_for_date_sina(trade_date, log_fn=log_fn)
-            if lhb_map and log_fn:
-                log_fn(
-                    f"涨停预测：东财龙虎榜空 → 新浪 LHB {len(lhb_map)} 只"
-                    f"（无净买额字段，基础净买分将不参与）"
-                )
-        except Exception as exc:
-            logger.debug("龙虎榜（新浪）加载异常: %s", exc)
-            data_quality["warnings"].append(f"龙虎榜拉取失败（东财+新浪均挂）: {exc}")
+        log_fn("涨停预测：正在加载板块强度...")
 
     if historical_mode:
         try:
@@ -758,19 +730,14 @@ def predict_limit_up_candidates(
                     f"合成 spot 兜底聚合 {len(board_strength)} 个板块"
                 )
 
-    data_quality["lhb"]["loaded"] = bool(lhb_map)
-    data_quality["lhb"]["rows"] = len(lhb_map)
     data_quality["board_strength"]["loaded"] = bool(board_strength)
     data_quality["board_strength"]["rows"] = len(board_strength)
 
-    compare_context["lhb_map"] = lhb_map
     compare_context["board_strength"] = board_strength
     if log_fn:
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
         board_summary = "、".join(f"{k}({v:.1f}%)" for k, v in top_boards)
-        log_fn(
-            f"涨停预测：龙虎榜 {len(lhb_map)} 只 / 板块强弱榜 TOP5 {board_summary}"
-        )
+        log_fn(f"涨停预测：板块强弱榜 TOP5 {board_summary}")
 
     # 市场情绪评分（供二波接力等评分调节，冰点情绪下降权）
     try:
@@ -810,7 +777,6 @@ def predict_limit_up_candidates(
         historical_mode=historical_mode,
         pool_source=data_quality["limit_up_pool"].get("source", "unknown"),
         concept_themes_count=int(data_quality["themes"].get("themes") or 0),
-        lhb_map=lhb_map,
         board_strength=board_strength,
         sentiment_degraded=bool(data_quality["sentiment"].get("degraded")),
         zt_codes=zt_codes,
@@ -1016,14 +982,6 @@ def predict_limit_up_candidates(
         summary_lines.append(
             f"AI 题材聚类：{'、'.join(f'{k}({v}只)' for k, v in top_themes)}"
         )
-    if lhb_map:
-        net_buys = [(c, v.get("net_buy", 0)) for c, v in lhb_map.items() if v.get("net_buy", 0) > 0]
-        net_buys.sort(key=lambda x: -x[1])
-        if net_buys:
-            top_lhb = net_buys[:3]
-            summary_lines.append(
-                f"龙虎榜净买 TOP3：{'、'.join(f'{c}({v/1e8:.2f}亿)' for c, v in top_lhb)}"
-            )
     if board_strength:
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
         summary_lines.append(
