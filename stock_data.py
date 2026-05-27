@@ -1293,12 +1293,14 @@ class StockDataFetcher:
             self._limit_up_reason_cache[cache_key] = {}
             return {}
 
+        # 严格只接受 4 个带日期参数的 URL；之前还有一个无 date 参数的"兜底"
+        # 兜底返回的是复盘网首页（今日数据），但我们的日期校验只在 params 非空
+        # 时才生效，导致历史日期的缓存被今日数据污染 → 已移除
         url_candidates = [
             ("https://www.fupanwang.com/fupanla/", {"date": display_date}),
             ("https://www.fupanwang.com/fupanla/", {"date": date_key}),
             ("https://www.fupanwang.com/fupanla/", {"day": display_date}),
             ("https://www.fupanwang.com/fupanla/", {"day": date_key}),
-            ("https://www.fupanwang.com/fupanla/", {}),
         ]
 
         last_error: Optional[Exception] = None
@@ -1309,7 +1311,8 @@ class StockDataFetcher:
                 parsed = self._parse_limit_up_reason_page(html_text)
                 if not parsed:
                     continue
-                if params and display_date not in html_text and date_key not in html_text:
+                # 强制要求响应里出现请求的日期，防止"复盘网静默返回今日数据"
+                if display_date not in html_text and date_key not in html_text:
                     continue
                 result = parsed
                 break
@@ -1380,6 +1383,16 @@ class StockDataFetcher:
         trade_date: str,
         source: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        """给涨停记录补 reason / detail / strong_tag 字段。
+
+        reason fallback 链：
+        1. 复盘网（fupanwang.com）当日真实涨停原因 → 最准
+        2. 概念兜底（stock_concept_tags 表 → 该股 TOP-N 概念）→ 盘中复盘网未更新时用
+        3. 空字符串
+
+        ``limit_up_reason_source`` 字段标记数据来自哪条链，便于 GUI 区分展示
+        ("fupanwang" / "concepts_fallback" / "")。
+        """
         if not records:
             return records
         reason_map = self._load_limit_up_reason_map(trade_date, source=source)
@@ -1388,8 +1401,29 @@ class StockDataFetcher:
             name = str(rec.get("name") or "")
             normalized_name = self._normalize_stock_name(name)
             payload = reason_map.get(normalized_name, {})
+            primary_reason = str(payload.get("reason") or "").strip()
+
             if "limit_up_reason" not in rec:
-                rec["limit_up_reason"] = str(payload.get("reason") or "").strip()
+                if primary_reason:
+                    rec["limit_up_reason"] = primary_reason
+                    rec["limit_up_reason_source"] = "fupanwang"
+                elif code:
+                    # 复盘网无数据（多为盘中场景，复盘网通常盘后 16:00+ 才更新）
+                    # 兜底用概念标签拼成 reason，UI 上加 [..] 区分非真实原因
+                    try:
+                        import stock_store as _ss
+                        concepts = _ss.lookup_concepts_by_code(code, limit=5) or []
+                    except Exception:
+                        concepts = []
+                    if concepts:
+                        rec["limit_up_reason"] = f"[{' / '.join(concepts)}]"
+                        rec["limit_up_reason_source"] = "concepts_fallback"
+                    else:
+                        rec["limit_up_reason"] = ""
+                        rec["limit_up_reason_source"] = ""
+                else:
+                    rec["limit_up_reason"] = ""
+                    rec["limit_up_reason_source"] = ""
             if "limit_up_reason_detail" not in rec:
                 rec["limit_up_reason_detail"] = str(payload.get("detail") or "").strip()
             if "strong_tag" not in rec:

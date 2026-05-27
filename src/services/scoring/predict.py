@@ -146,6 +146,47 @@ def build_compare_market_context(
     }
 
 
+def _compute_timing_hint(trade_date: str, historical_mode: bool) -> str:
+    """预测时机提示：盘中 / 盘后 / 历史模式 reason 数据完整度差异。
+
+    复盘网（涨停 reason 主源）当天数据通常盘后 16:00+ 才发布完整。盘中跑预测
+    时 reason 字段会走概念兜底（[xxx / yyy]），不是真实涨停原因。提示用户
+    "什么时候跑预测最准"。
+    """
+    try:
+        now = datetime.now()
+        today_key = now.strftime("%Y%m%d")
+    except Exception:
+        return ""
+    td = str(trade_date or "").strip()
+    if not td:
+        return ""
+
+    if historical_mode or td < today_key:
+        return (
+            "历史模式：复盘网应已有完整 reason 数据；行情走本地缓存合成，结果稳定。"
+        )
+
+    if td == today_key:
+        hour = now.hour
+        if hour < 15:
+            return (
+                f"盘中预测（{now.strftime('%H:%M')}）：复盘网 reason 数据通常 "
+                f"16:00 后才更新完整，当前 reason 字段将走概念标签兜底（不是真实涨停原因）。"
+                f"建议盘后 16:30+ 重跑一次获取真实 reason。"
+            )
+        if hour < 16:
+            return (
+                f"刚收盘（{now.strftime('%H:%M')}）：复盘网正在更新中，部分 reason "
+                f"可能仍为空 / 概念兜底。16:30 后重跑可拿到完整数据。"
+            )
+        return (
+            f"盘后预测（{now.strftime('%H:%M')}）：复盘网 reason 数据应已稳定，预测精度最佳。"
+        )
+
+    return f"未来日期（{td}）：暂无数据，请检查 trade_date 设置。"
+
+
 def _derive_board_strength_from_spot(spot_df: Optional[pd.DataFrame]) -> Dict[str, float]:
     """历史模式无 akshare 行业实时接口，从合成 spot 按 "所属行业" 聚合平均涨跌幅。
 
@@ -372,7 +413,10 @@ def predict_limit_up_candidates(
         "board_strength": {"loaded": False, "rows": 0},
         "sentiment": {"loaded": False, "score": None, "degraded": False},
         "warnings": [],
+        "timing_hint": _compute_timing_hint(trade_date, historical_mode),
     }
+    if data_quality["timing_hint"] and log_fn:
+        log_fn(f"涨停预测：{data_quality['timing_hint']}")
 
     profile: Dict[str, Any] = {}
     feature_samples: List[Dict[str, Any]] = []

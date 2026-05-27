@@ -2047,6 +2047,9 @@ class PredictTab:
             if sent.get("degraded"):
                 sent_disp += "  ⚠降级"
             txt.insert(tk.END, f"  市场情绪: {sent_disp}\n")
+            timing = dq.get("timing_hint") or ""
+            if timing:
+                txt.insert(tk.END, f"\n  ⏰ 时机: {timing}\n")
             warnings = dq.get("warnings") or []
             if warnings:
                 txt.insert(tk.END, f"\n  ⚠ 注意 ({len(warnings)} 条):\n")
