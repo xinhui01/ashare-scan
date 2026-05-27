@@ -47,25 +47,36 @@ class _AsOfHistoryFetcher:
         mirror_pool: Optional[List[str]] = None,
         request_plan: Optional[Any] = None,
     ):
-        try:
-            df = self.base_fetcher.get_history_data(
-                stock_code,
-                days=max(int(days or 0), 120),
-                force_refresh=force_refresh,
-                preferred_mirror=preferred_mirror,
-                mirror_pool=mirror_pool,
-                request_plan=request_plan,
-                as_of_trade_date=self.as_of_trade_date,
-            )
-        except TypeError:
-            df = self.base_fetcher.get_history_data(
-                stock_code,
-                days=max(int(days or 0), 120),
-                force_refresh=force_refresh,
-                preferred_mirror=preferred_mirror,
-                mirror_pool=mirror_pool,
-                request_plan=request_plan,
-            )
+        requested_days = int(days or 0)
+        effective_days = max(requested_days, 120)
+
+        def _fetch(use_days: int):
+            try:
+                return self.base_fetcher.get_history_data(
+                    stock_code,
+                    days=use_days,
+                    force_refresh=force_refresh,
+                    preferred_mirror=preferred_mirror,
+                    mirror_pool=mirror_pool,
+                    request_plan=request_plan,
+                    as_of_trade_date=self.as_of_trade_date,
+                )
+            except TypeError:
+                return self.base_fetcher.get_history_data(
+                    stock_code,
+                    days=use_days,
+                    force_refresh=force_refresh,
+                    preferred_mirror=preferred_mirror,
+                    mirror_pool=mirror_pool,
+                    request_plan=request_plan,
+                )
+
+        df = _fetch(effective_days)
+        # store_facade.load_history 在 cache 行数 < min_rows 时整体返回 None，
+        # 新股 / 短历史票会因此被误判为"零 K 线"。这里用调用方实际请求的 days
+        # 再试一次，让短历史票也能命中缓存。
+        if (df is None or df.empty) and requested_days and requested_days < effective_days:
+            df = _fetch(requested_days)
         if df is None or df.empty or "date" not in df.columns:
             return df
 
@@ -135,6 +146,29 @@ def build_compare_market_context(
     }
 
 
+def _is_new_stock_history(history: pd.DataFrame, today: datetime) -> bool:
+    """K 线行数不足 10 但最早 K 线日期在最近 30 个自然日内 → 视为新股。
+
+    用 history 自己最早日期判定，不依赖外部上市日期接口，避免每只票多一次网络。
+    """
+    if history is None or history.empty or "date" not in history.columns:
+        return False
+    try:
+        earliest = str(history["date"].astype(str).iloc[0]).strip()
+    except Exception:
+        return False
+    if not earliest:
+        return False
+    norm = earliest.replace("/", "-").replace(".", "-")
+    if len(norm) == 8 and norm.isdigit():
+        norm = f"{norm[:4]}-{norm[4:6]}-{norm[6:8]}"
+    try:
+        earliest_dt = datetime.strptime(norm[:10], "%Y-%m-%d")
+    except Exception:
+        return False
+    return (today - earliest_dt).days <= 30
+
+
 def _check_prerequisites(
     *,
     historical_mode: bool,
@@ -146,6 +180,7 @@ def _check_prerequisites(
     zt_codes: set,
     fetcher,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
 ) -> List[str]:
     """硬校验所有预测必备数据是否就位。返回缺失项列表（空列表 = 通过）。
 
@@ -191,7 +226,10 @@ def _check_prerequisites(
         )
 
     # 6. 所有涨停股个股历史 K 线 ≥ 10 行（cont scorer 必备）
+    # 新股豁免：若 K 线不足 10 行但最早一根 K 线在最近 30 个自然日内，视为新股
+    # （cont scorer 已自带 len(history) >= 10 守卫，新股进流程会自动降级评分而不会崩）
     missing_kline: List[str] = []
+    new_stock_skipped: List[str] = []
     if zt_codes:
         try:
             request_plan = (
@@ -203,15 +241,26 @@ def _check_prerequisites(
             )
         except Exception:
             request_plan = None
+        today = datetime.now()
         for code in sorted(zt_codes):
+            # 关键：这里只校验 ≥ 10 行；days 要直接传 10，否则 store_facade.load_history
+            # 在 cache_only 模式下会因 min_rows 不达标而整体返回 None，把 60 行历史的票
+            # 也误判成"K 线缺失"。
             try:
                 history = fetcher.get_history_data(
-                    code, days=120, force_refresh=False,
+                    code, days=10, force_refresh=False,
                     request_plan=request_plan,
                 )
             except Exception:
                 history = None
-            if history is None or history.empty or len(history) < 10:
+            if history is None or history.empty:
+                missing_kline.append(code)
+                continue
+            if len(history) >= 10:
+                continue
+            if _is_new_stock_history(history, today):
+                new_stock_skipped.append(code)
+            else:
                 missing_kline.append(code)
     if missing_kline:
         preview = "、".join(missing_kline[:10])
@@ -220,6 +269,10 @@ def _check_prerequisites(
             f"❌ 个股历史 K 线不足 10 行: {preview}{tail} → "
             f"请在「K 线缓存」tab 用「批量补历史」更新这些票"
         )
+    if new_stock_skipped and log_fn:
+        preview = "、".join(new_stock_skipped[:10])
+        tail = f" 等 {len(new_stock_skipped)} 只" if len(new_stock_skipped) > 10 else ""
+        log_fn(f"涨停预测：识别到新股（K 线 < 10 行但最早 K 线在 30 日内），不阻断预测：{preview}{tail}")
 
     return missing
 
@@ -637,6 +690,7 @@ def predict_limit_up_candidates(
         zt_codes=zt_codes,
         fetcher=scoring_fetcher,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
+        log_fn=log_fn,
     )
     if prereq_missing:
         data_quality["blocked"] = True
