@@ -4,7 +4,7 @@
 - parse_full_pool: 把涨停池 DataFrame 转 records 列表
 - count_pool_industries: 涨停池行业分布
 - theme_bonus: AI 题材聚类热度加分
-- capital_flow_bonus: 龙虎榜 + 北向资金 + 板块涨跌幅加分
+- capital_flow_bonus: 龙虎榜 + 板块涨跌幅加分
 - vol_ratio_with_baseline: 5/20 日量比双口径计算
 
 设计：纯函数 / 静态方法，无 self.fetcher 依赖。所需上下文（compare_context 等）以参数注入。
@@ -92,7 +92,7 @@ def capital_flow_bonus(
     industry: str = "",
     boards: int = 0,
 ) -> Tuple[float, List[str]]:
-    """龙虎榜 + 北向资金 + 板块涨跌幅加分（含 LHB 解读字段细分）。
+    """龙虎榜 + 板块涨跌幅加分（含 LHB 解读字段细分）。
 
     基础（按净买额）：
     - ≥5000 万净买 → +8 / >0 → +5 / ≤-3000 万 → -5 / <0 → -2
@@ -105,10 +105,6 @@ def capital_flow_bonus(
     - 历史成功率 ≥45% → +2；<25% → -2
     - 普通席位单独上榜 → -1（散户接力，弱信号）
       · boards>=3 时升级为 -5（高位连板没有机构/游资接力 = 见顶特征）
-
-    北向 3 日加仓：
-    - ≥5000 万 → +5；≥1000 万 → +3；≥200 万 → +1
-    - ≤-3000 万 → -3；≤-500 万 → -1
     """
     bonus = 0.0
     reasons: List[str] = []
@@ -170,25 +166,6 @@ def capital_flow_bonus(
                 else:
                     bonus -= 1
                     reasons.append("普通席位接力-1")
-
-    nb_change = (compare_context.get("northbound_map") or {}).get(code)
-    if isinstance(nb_change, (int, float)):
-        # 单位：万元（akshare "3日增持估计-市值" 接口）
-        if nb_change >= 5000:
-            bonus += 5
-            reasons.append(f"北向加仓{nb_change/1e4:.1f}亿+5")
-        elif nb_change >= 1000:
-            bonus += 3
-            reasons.append(f"北向加仓{nb_change:.0f}万+3")
-        elif nb_change >= 200:
-            bonus += 1
-            reasons.append(f"北向小幅加仓{nb_change:.0f}万+1")
-        elif nb_change <= -3000:
-            bonus -= 3
-            reasons.append(f"北向减仓{abs(nb_change)/1e4:.1f}亿-3")
-        elif nb_change <= -500:
-            bonus -= 1
-            reasons.append(f"北向小幅减仓{abs(nb_change):.0f}万-1")
 
     # 板块涨跌幅加分（强势板块联动）
     board_strength = compare_context.get("board_strength") or {}

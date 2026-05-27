@@ -248,6 +248,11 @@ class StockMonitorApp:
         self.update_cache_btn = ttk.Button(row2, text="更新历史缓存", command=self.start_history_cache_update)
         self.update_cache_btn.pack(side=tk.LEFT, padx=5)
 
+        self.backfill_industry_btn = ttk.Button(
+            row2, text="补全行业信息", command=self.start_industry_backfill,
+        )
+        self.backfill_industry_btn.pack(side=tk.LEFT, padx=5)
+
         self.stop_btn = ttk.Button(row2, text="停止", command=lambda: self.result.stop_scan(), state=tk.DISABLED)
         self.stop_btn.pack(side=tk.LEFT, padx=5)
 
@@ -1033,6 +1038,50 @@ class StockMonitorApp:
             target=self.update_history_cache, args=(request, token), daemon=True
         )
         self._cache_thread.start()
+
+    def start_industry_backfill(self):
+        """从东财一级行业反向遍历成分股，回填 universe.industry 字段。"""
+        if getattr(self, "_industry_backfill_running", False):
+            return
+        self._industry_backfill_running = True
+        self.backfill_industry_btn.config(state=tk.DISABLED)
+        self._open_run_log()
+        self._log("开始补全 universe.industry（从东财一级行业反向遍历成分股）...")
+        self.status_var.set("补全行业信息：拉取行业列表...")
+
+        def _run():
+            try:
+                from src.services.scoring import first_board as _fb
+
+                def _progress(cur, total, msg):
+                    self._post_to_ui(
+                        lambda c=cur, t=total, m=msg: self.status_var.set(
+                            f"补全行业 {c}/{t} · {m}"
+                        )
+                    )
+
+                result = _fb.backfill_universe_industries(
+                    log_fn=self._log_async, progress_callback=_progress,
+                )
+                msg = (
+                    f"补全行业完成：覆盖 {result.get('industries', 0)} 个东财行业，"
+                    f"映射 {result.get('mapped_codes', 0)} 只票，"
+                    f"DB 写入 {result.get('updated', 0)} 行"
+                )
+                if result.get("errors"):
+                    msg += f"，{len(result['errors'])} 个行业拉取失败"
+                self._log_async(msg)
+                self._post_to_ui(lambda m=msg: self.status_var.set(m))
+            except Exception as exc:
+                self._log_async(f"补全行业失败：{exc}")
+                self._post_to_ui(lambda e=exc: self.status_var.set(f"补全行业失败：{e}"))
+            finally:
+                self._industry_backfill_running = False
+                self._post_to_ui(
+                    lambda: self.backfill_industry_btn.config(state=tk.NORMAL)
+                )
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def update_history_cache(self, request: ScanRequest, cancel_token: Optional[CancelToken] = None):
         import time as _time

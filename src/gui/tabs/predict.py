@@ -263,12 +263,6 @@ class PredictTab:
             command=self._on_filter_changed,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
-        self.filter_northbound_only = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            filter_bar, text="仅北向加仓", variable=self.filter_northbound_only,
-            command=self._on_filter_changed,
-        ).pack(side=tk.LEFT, padx=(0, 8))
-
         self.filter_theme_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             filter_bar, text="仅命中题材", variable=self.filter_theme_only,
@@ -2418,7 +2412,6 @@ class PredictTab:
         self.filter_keyword.set("")
         self.filter_industry.set("全部")
         self.filter_lhb_only.set(False)
-        self.filter_northbound_only.set(False)
         self.filter_theme_only.set(False)
         self._render_trees()
 
@@ -2489,11 +2482,6 @@ class PredictTab:
         if self.filter_lhb_only.get():
             lhb = (ctx.get("lhb_map") or {}).get(code)
             if not lhb or float((lhb or {}).get("net_buy") or 0) <= 0:
-                return False
-
-        if self.filter_northbound_only.get():
-            nb = (ctx.get("northbound_map") or {}).get(code, 0)
-            if not isinstance(nb, (int, float)) or nb < 200:
                 return False
 
         if self.filter_theme_only.get():

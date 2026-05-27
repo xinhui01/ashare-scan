@@ -376,7 +376,7 @@ def score_broken_board_wrap(
         if theme_reason:
             reasons.append(theme_reason)
 
-    # ---- 资金面：龙虎榜 + 北向 3 日加仓 ----
+    # ---- 资金面：龙虎榜 ----
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(code, compare_context)
     if flow_bonus != 0:
         score += flow_bonus

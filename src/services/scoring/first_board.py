@@ -1,12 +1,13 @@
-"""首板候选（first_board）评分 + lhb / spot / strong / pullback / northbound helpers。
+"""首板候选（first_board）评分 + lhb / spot / strong / pullback helpers。
 
-10 个模块级函数（参数注入模式）：
+模块级函数（参数注入模式）：
 - scan_first_board_candidates_cached: 从今日强势股 + MA5 回踩股池扫候选并按 profile 评分
 - score_first_board_by_profile: 用涨停前兆画像对强势股打分
 - parse_lhb_jiedu: 解析龙虎榜「解读」字段（静态纯函数）
 - load_lhb_for_date: 加载指定交易日的龙虎榜数据（带缓存）
-- load_industry_board_strength: 加载东财行业板块涨跌幅
-- load_northbound_accumulation: 加载北向资金 3 日加仓榜
+- load_industry_board_strength: 加载东财行业板块涨跌幅（实时）
+- load_industry_board_strength_for_date: 加载历史日各行业涨跌幅（按日缓存）
+- backfill_universe_industries: 一次性回填 universe.industry 字段（按东财行业反向遍历成分股）
 - fetch_spot_snapshot: 获取全市场实时行情快照（东财→新浪 fallback）
 - parse_spot_record: 从实时行情行解析基础记录（静态纯函数）
 - filter_strong_stocks: 从行情快照筛选 +3%~+9.95% 强势股
@@ -226,18 +227,139 @@ def load_industry_board_strength(
     return result
 
 
-def load_northbound_accumulation(
+def load_industry_board_strength_for_date(
+    trade_date: str,
     *,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, float]:
-    """北向资金 3 日加仓榜——数据源已停更。
+    """历史日各东财行业板块涨跌幅 (% mean across industries).
 
-    港交所 2024-08-17 起把"北向资金每日成交/持股明细"改为按季度披露，
-    东财 `RPT_MUTUAL_STOCK_NORTHSTA` 表自此不再产出新数据，所有公开免费
-    源（akshare / 东财 datacenter / 同花顺 / 新浪）都无法获取日级数据。
-    保留函数签名仅为向后兼容上游 thin delegate，永远返回空 dict。
+    `ak.stock_board_industry_hist_em(symbol=行业名, start_date=date, end_date=date)`
+    每行业一次调用。结果按 trade_date 缓存到 app_config。
+
+    网络挂 / 数据空时返回空 dict，调用方应当兜底（合成 spot 聚合）。
     """
-    return {}
+    from stock_store import load_app_config, save_app_config
+    td = str(trade_date or "").strip()
+    if not td:
+        return {}
+    cache_key = f"stock_filter_board_strength_history_{td}"
+    cached = load_app_config(cache_key, default=None)
+    if isinstance(cached, dict) and cached:
+        return {str(k): float(v) for k, v in cached.items()}
+
+    try:
+        import akshare as ak
+        from stock_data import _retry_ak_call
+        names_df = _retry_ak_call(ak.stock_board_industry_name_em)
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"涨停预测[历史]：拉东财行业列表失败 {exc}")
+        return {}
+    if names_df is None or names_df.empty or "板块名称" not in names_df.columns:
+        return {}
+
+    result: Dict[str, float] = {}
+    industry_names = [str(n).strip() for n in names_df["板块名称"].tolist() if str(n).strip()]
+    for idx, name in enumerate(industry_names):
+        try:
+            import akshare as ak
+            from stock_data import _retry_ak_call
+            df = _retry_ak_call(
+                ak.stock_board_industry_hist_em,
+                symbol=name,
+                start_date=td,
+                end_date=td,
+                period="日k",
+                adjust="",
+            )
+        except Exception:
+            continue
+        if df is None or df.empty or "涨跌幅" not in df.columns:
+            continue
+        try:
+            chg = float(df.iloc[0]["涨跌幅"])
+        except (TypeError, ValueError):
+            continue
+        result[name] = round(chg, 2)
+        if log_fn and (idx + 1) % 20 == 0:
+            log_fn(f"涨停预测[历史]：行业板块强度进度 {idx + 1}/{len(industry_names)}")
+
+    if result:
+        try:
+            save_app_config(cache_key, result)
+        except Exception:
+            pass
+    return result
+
+
+def backfill_universe_industries(
+    *,
+    log_fn: Optional[Callable[[str], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """一次性回填 universe.industry：按东财一级行业反向遍历成分股，建 code→industry 映射，
+    批量 UPSERT 到 universe 表。
+
+    返回 dict: {industries: int, updated: int, errors: List[str]}
+    """
+    from stock_store import update_universe_industries
+    import akshare as ak
+    from stock_data import _retry_ak_call
+
+    errors: List[str] = []
+    try:
+        names_df = _retry_ak_call(ak.stock_board_industry_name_em)
+    except Exception as exc:
+        msg = f"拉东财行业列表失败: {exc}"
+        if log_fn:
+            log_fn(f"补全行业：{msg}")
+        return {"industries": 0, "updated": 0, "errors": [msg]}
+
+    if names_df is None or names_df.empty or "板块名称" not in names_df.columns:
+        return {"industries": 0, "updated": 0, "errors": ["东财行业列表为空"]}
+
+    industries = [str(n).strip() for n in names_df["板块名称"].tolist() if str(n).strip()]
+    if log_fn:
+        log_fn(f"补全行业：东财一级行业共 {len(industries)} 个，开始拉成分股...")
+
+    code_to_industry: Dict[str, str] = {}
+    for idx, name in enumerate(industries):
+        if progress_callback:
+            progress_callback(idx, len(industries), f"拉取 {name} 成分股")
+        try:
+            cons = _retry_ak_call(ak.stock_board_industry_cons_em, symbol=name)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        if cons is None or cons.empty:
+            continue
+        # 字段名兼容：实际返回 "代码"；fallback 找 "code"
+        code_col = "代码" if "代码" in cons.columns else ("code" if "code" in cons.columns else None)
+        if code_col is None:
+            errors.append(f"{name}: 找不到代码列")
+            continue
+        for code in cons[code_col].astype(str).tolist():
+            c = code.strip().zfill(6)
+            if len(c) == 6 and c.isdigit() and c not in code_to_industry:
+                code_to_industry[c] = name
+
+    if progress_callback:
+        progress_callback(len(industries), len(industries), "写入数据库")
+
+    updated = update_universe_industries(code_to_industry)
+    if log_fn:
+        log_fn(
+            f"补全行业：完成，覆盖 {len(industries)} 个行业，"
+            f"映射 {len(code_to_industry)} 只票，DB 写入 {updated} 行"
+            + (f"，{len(errors)} 个行业拉取失败" if errors else "")
+        )
+    return {
+        "industries": len(industries),
+        "mapped_codes": len(code_to_industry),
+        "updated": updated,
+        "errors": errors,
+    }
 
 
 def fetch_spot_snapshot(

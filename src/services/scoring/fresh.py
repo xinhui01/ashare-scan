@@ -280,7 +280,7 @@ def score_fresh_first_board(
         if theme_reason:
             reasons.append(theme_reason)
 
-    # 6c. 资金面：龙虎榜 + 北向 3 日加仓
+    # 6c. 资金面：龙虎榜
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(code, compare_context)
     if flow_bonus != 0:
         score += flow_bonus

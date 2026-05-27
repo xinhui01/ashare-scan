@@ -131,6 +131,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             exchange TEXT NOT NULL DEFAULT '',
             board TEXT NOT NULL DEFAULT '',
             concepts TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
         );
 
@@ -301,6 +302,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     }
     if "concepts" not in existing_columns:
         conn.execute("ALTER TABLE universe ADD COLUMN concepts TEXT NOT NULL DEFAULT ''")
+    if "industry" not in existing_columns:
+        conn.execute("ALTER TABLE universe ADD COLUMN industry TEXT NOT NULL DEFAULT ''")
 
     meta_columns = {
         row[1] for row in conn.execute("PRAGMA table_info(history_meta)").fetchall()
@@ -414,7 +417,7 @@ def load_universe() -> Optional[pd.DataFrame]:
     def _read():
         with _connect() as conn:
             return pd.read_sql_query(
-                "SELECT code, name, exchange, board, concepts FROM universe ORDER BY code",
+                "SELECT code, name, exchange, board, concepts, industry FROM universe ORDER BY code",
                 conn,
                 dtype={"code": str},
             )
@@ -424,6 +427,44 @@ def load_universe() -> Optional[pd.DataFrame]:
         return None
     df["code"] = df["code"].astype(str).str.strip().str.zfill(6)
     return df
+
+
+def update_universe_industries(code_to_industry: Dict[str, str]) -> int:
+    """批量回填 universe.industry 字段（按 code UPSERT）。
+
+    返回实际更新的行数。空映射 / 全是空行业 直接跳过。
+    code 中没在 universe 表里的会被 INSERT 进去（带空 name/exchange/board/concepts），
+    保证补行业按钮能为后期加入的票也建一行。
+    """
+    if not code_to_industry:
+        return 0
+    rows = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for code, ind in code_to_industry.items():
+        c = str(code or "").strip().zfill(6)
+        i = str(ind or "").strip()
+        if not c or len(c) != 6 or not i:
+            continue
+        rows.append((c, i, now_str))
+    if not rows:
+        return 0
+
+    def _write():
+        with _connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO universe(code, name, exchange, board, concepts, industry, updated_at)
+                VALUES (?, '', '', '', '', ?, ?)
+                ON CONFLICT(code) DO UPDATE SET
+                    industry=excluded.industry,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            return conn.total_changes
+
+    with _DB_WRITE_LOCK:
+        return _retry_locked(_write)
 
 
 def save_history(stock_code: str, df: pd.DataFrame) -> None:
@@ -630,7 +671,7 @@ def load_spot_snapshot_at(trade_date: str) -> Optional[pd.DataFrame]:
                h.amount AS "成交额",
                h.volume AS "成交量",
                h.turnover_rate AS "换手率",
-               COALESCE(m.industry, '') AS "所属行业"
+               COALESCE(NULLIF(u.industry, ''), m.industry, '') AS "所属行业"
         FROM history h
         LEFT JOIN universe u ON h.code = u.code
         LEFT JOIN limit_up_stock_meta m ON h.code = m.code

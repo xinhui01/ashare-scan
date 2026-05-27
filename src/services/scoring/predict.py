@@ -146,6 +146,27 @@ def build_compare_market_context(
     }
 
 
+def _derive_board_strength_from_spot(spot_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    """历史模式无 akshare 行业实时接口，从合成 spot 按 "所属行业" 聚合平均涨跌幅。
+
+    覆盖范围受 limit_up_stock_meta 行业字段限制（只覆盖曾涨停过的票），
+    无行业字段的票自动跳过；返回 dict: 行业名 → 平均涨跌幅 %。
+    """
+    if spot_df is None or not isinstance(spot_df, pd.DataFrame) or spot_df.empty:
+        return {}
+    if "所属行业" not in spot_df.columns or "涨跌幅" not in spot_df.columns:
+        return {}
+    df = spot_df[["所属行业", "涨跌幅"]].copy()
+    df["所属行业"] = df["所属行业"].astype(str).str.strip()
+    df = df[df["所属行业"] != ""]
+    df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
+    df = df.dropna(subset=["涨跌幅"])
+    if df.empty:
+        return {}
+    agg = df.groupby("所属行业")["涨跌幅"].mean()
+    return {str(k): float(round(v, 2)) for k, v in agg.items()}
+
+
 def _is_new_stock_history(history: pd.DataFrame, today: datetime) -> bool:
     """K 线行数不足 10 但最早 K 线日期在最近 30 个自然日内 → 视为新股。
 
@@ -304,9 +325,10 @@ def predict_limit_up_candidates(
         summary: 文字摘要
 
     `historical_mode=True`：回测模式。spot_df 从 history 表合成（"as of 收盘"）
-    而非实时快照；龙虎榜 / 北向 / 板块强度等实时指标全部置空。涨停池仍用
-    get_limit_up_pool（其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放
-    预测"的批量回测场景下使用。
+    而非实时快照；龙虎榜走 akshare stock_lhb_detail_em(start/end=trade_date)，
+    板块强度从合成 spot 按行业聚合涨跌幅。涨停池仍用 get_limit_up_pool
+    （其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放预测"的批量回测
+    场景下使用。
 
     迁自 StockFilter.predict_limit_up_candidates；行为零变化。
     """
@@ -602,28 +624,39 @@ def predict_limit_up_candidates(
             )
 
     # 阶段2.6：加载龙虎榜 + 板块强度（失败不影响预测）
-    # 北向逐日明细自 2024-08-17 起停止披露，永久置空。
-    # 历史模式：实时指标对历史日期没意义，全部置空
-    northbound_map: Dict[str, float] = {}
-    if historical_mode:
-        if log_fn:
-            log_fn("涨停预测[历史模式]：跳过龙虎榜 / 板块强度（实时指标）")
+    # - 龙虎榜：akshare stock_lhb_detail_em 支持 start_date/end_date，历史 / 实时同一条路径
+    # - 板块强度：实时模式拉东财行业涨跌；历史模式从合成 spot 按行业聚合涨跌幅
+    if log_fn:
+        log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
+    try:
+        lhb_map = _first_board.load_lhb_for_date(trade_date, log_fn=log_fn)
+    except Exception as exc:
+        logger.debug("龙虎榜加载异常: %s", exc)
         lhb_map = {}
-        board_strength = {}
-        data_quality["warnings"].append(
-            "历史模式：龙虎榜 / 板块强度 / 北向资金等实时指标未启用"
-            "（akshare 这几个接口无历史日期参数）"
-        )
-    else:
-        if log_fn:
-            log_fn("涨停预测：正在加载龙虎榜 / 板块强度...")
-        try:
-            lhb_map = _first_board.load_lhb_for_date(trade_date, log_fn=log_fn)
-        except Exception as exc:
-            logger.debug("龙虎榜加载异常: %s", exc)
-            lhb_map = {}
-            data_quality["warnings"].append(f"龙虎榜拉取失败: {exc}")
+        data_quality["warnings"].append(f"龙虎榜拉取失败: {exc}")
 
+    if historical_mode:
+        # A3 优先：东财历史行业 K 线 → 各行业当日涨跌幅，跟实时模式同源
+        # 兜底：从合成 spot 按行业聚合（仅在 A3 网络挂 / 数据空时启用，方向准但口径差）
+        try:
+            board_strength = _first_board.load_industry_board_strength_for_date(
+                trade_date, log_fn=log_fn,
+            )
+        except Exception as exc:
+            logger.debug("历史行业板块强度拉取异常: %s", exc)
+            board_strength = {}
+        if not board_strength:
+            board_strength = _derive_board_strength_from_spot(spot_df)
+            if log_fn:
+                log_fn(
+                    f"涨停预测[历史模式]：东财历史行业接口空 → "
+                    f"合成 spot 兜底聚合 {len(board_strength)} 个板块"
+                )
+        elif log_fn:
+            log_fn(
+                f"涨停预测[历史模式]：东财历史行业接口 {len(board_strength)} 个板块"
+            )
+    else:
         try:
             board_strength = _first_board.load_industry_board_strength(log_fn=log_fn)
         except Exception as exc:
@@ -637,7 +670,6 @@ def predict_limit_up_candidates(
     data_quality["board_strength"]["rows"] = len(board_strength)
 
     compare_context["lhb_map"] = lhb_map
-    compare_context["northbound_map"] = northbound_map
     compare_context["board_strength"] = board_strength
     if log_fn:
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]

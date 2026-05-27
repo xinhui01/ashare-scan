@@ -1082,10 +1082,6 @@ class StockFilter:
         """加载东财行业板块涨跌幅（thin delegate -> scoring/first_board.py）。"""
         return _scoring_first_board.load_industry_board_strength(log_fn=self._log)
 
-    def _load_northbound_accumulation(self) -> Dict[str, float]:
-        """加载北向资金 3 日加仓榜（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.load_northbound_accumulation(log_fn=self._log)
-
     def _fetch_spot_snapshot(self) -> Optional[pd.DataFrame]:
         """获取全市场实时行情快照（thin delegate -> scoring/first_board.py）。"""
         return _scoring_first_board.fetch_spot_snapshot(log_fn=self._log)
