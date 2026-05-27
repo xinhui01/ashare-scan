@@ -359,12 +359,6 @@ from src.sources import netease as _src_netease
 _fetch_netease_hist_frame = _src_netease.fetch_hist_frame
 
 
-# ---- 百度股市通历史日线 ----
-# 实现已迁移到 src/sources/baidu.py；下面是公共函数别名。
-from src.sources import baidu as _src_baidu
-_fetch_baidu_hist_frame = _src_baidu.fetch_hist_frame
-
-
 # ---- 搜狐财经历史日线 ----
 # 实现已迁移到 src/sources/sohu.py；下面是公共函数别名。
 from src.sources import sohu as _src_sohu
@@ -649,7 +643,7 @@ class StockDataFetcher:
                         reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
                     ))
 
-        # 新浪/网易/百度/搜狐/同花顺/华尔街见闻：作为补充分流通道（跳过正在冷却的源）
+        # 新浪/网易/搜狐/同花顺/华尔街见闻：作为补充分流通道（跳过正在冷却的源）
         if normalized in ("auto", "sina"):
             if not _global_host_on_cooldown("finance.sina.com.cn"):
                 plans.append(HistoryRequestPlan(
@@ -665,14 +659,6 @@ class StockDataFetcher:
                     provider_sequence=("netease",),
                     mirror_urls=(),
                     reason="multi-source-netease",
-                ))
-        if normalized in ("auto", "baidu"):
-            if not _global_host_on_cooldown("gushitong.baidu.com"):
-                plans.append(HistoryRequestPlan(
-                    mode="network",
-                    provider_sequence=("baidu",),
-                    mirror_urls=(),
-                    reason="multi-source-baidu",
                 ))
         if normalized in ("auto", "sohu"):
             if not _global_host_on_cooldown("q.stock.sohu.com"):
@@ -783,7 +769,7 @@ class StockDataFetcher:
             # 检查分配的源是否已冷却，是则直接用 fallback
             _host_map = {
                 "sina": "finance.sina.com.cn", "netease": "quotes.money.163.com",
-                "baidu": "gushitong.baidu.com", "sohu": "q.stock.sohu.com",
+                "sohu": "q.stock.sohu.com",
                 "ths": "d.10jqka.com.cn", "wscn": "api-ddc-wscn.awtmt.com",
             }
             assigned_all_cooled = all(
@@ -878,13 +864,6 @@ class StockDataFetcher:
                 mirror_urls=(),
                 reason="history-provider=netease",
             )
-        if normalized == "baidu":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("baidu",),
-                mirror_urls=(),
-                reason="history-provider=baidu",
-            )
         if normalized == "sohu":
             return HistoryRequestPlan(
                 mode="network",
@@ -929,7 +908,7 @@ class StockDataFetcher:
                 reason=reason,
             )
 
-        _non_em_providers = ("sina", "ths", "netease", "baidu", "sohu", "wscn")
+        _non_em_providers = ("sina", "ths", "netease", "sohu", "wscn")
         if _eastmoney_circuit_breaker_open():
             # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
             return HistoryRequestPlan(
@@ -1812,7 +1791,6 @@ class StockDataFetcher:
             _PROVIDER_HOST = {
                 "sina": "finance.sina.com.cn",
                 "netease": "quotes.money.163.com",
-                "baidu": "gushitong.baidu.com",
                 "sohu": "q.stock.sohu.com",
                 "ths": "d.10jqka.com.cn",
                 "wscn": "api-ddc-wscn.awtmt.com",
@@ -1881,16 +1859,6 @@ class StockDataFetcher:
                         last_error = e
                         if self._log:
                             self._log(f"历史 {stock_code} 使用网易源失败: {e}")
-                        continue
-                elif provider == "baidu":
-                    try:
-                        if self._log:
-                            self._log(f"历史 {stock_code} 正在使用百度源补位。")
-                        df = _fetch_baidu_hist_frame(stock_code, start_date, end_date)
-                    except Exception as e:
-                        last_error = e
-                        if self._log:
-                            self._log(f"历史 {stock_code} 使用百度源失败: {e}")
                         continue
                 elif provider == "sohu":
                     try:

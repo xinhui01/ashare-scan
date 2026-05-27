@@ -1,6 +1,7 @@
 """搜狐财经历史 K 线源。
 
-接口：``https://q.stock.sohu.com/hisHq``，JSONP 格式。
+接口：``https://q.stock.sohu.com/hisHq``。
+当前接口直接返回 JSON；传入旧版 ``rt`` 参数会触发错误响应。
 """
 from __future__ import annotations
 
@@ -46,7 +47,7 @@ def stock_code(code: str) -> str:
 
 
 def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.DataFrame":
-    """搜狐财经历史日线：JSONP 格式。"""
+    """搜狐财经历史日线。"""
     import requests
 
     if on_cooldown("q.stock.sohu.com"):
@@ -65,7 +66,6 @@ def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.
         "order": "D",
         "period": "d",
         "callback": f"historySearchHandler",
-        "rt": f"jsonp{random.randint(1000, 9999)}",
     }
 
     last_error = None
