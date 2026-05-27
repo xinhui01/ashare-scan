@@ -448,15 +448,118 @@ def load_industry_board_strength_for_date_ths(
     return result
 
 
+def _new_ths_session():
+    """创建带 trust_env=False 的 requests Session，跨多次行业 scrape 复用。"""
+    import requests
+    sess = requests.Session()
+    sess.trust_env = False
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    })
+    return sess
+
+
+def _ths_industry_constituents(
+    industry_code: str,
+    *,
+    session=None,
+    log_fn: Optional[Callable[[str], None]] = None,
+    max_pages: int = 20,
+    rate_limit_sec: float = 0.6,
+) -> List[str]:
+    """scrape 同花顺行业 detail 页面拿成分股 6 位代码。
+
+    分页规则：
+    - page=1 走主 URL ``http://q.10jqka.com.cn/thshy/detail/code/{ind_code}/``
+      （建 session、拿 cookie；否则 ajax 接口直接 401）
+    - page=2+ 走 ajax URL，必须带 ``X-Requested-With: XMLHttpRequest`` 头
+    遇到空表 / 非 200 / 整页都是已见过的代码 三种情况终止。
+
+    ``session=None`` 时每次新建（适合单次测试）；批量 scrape 时上层应该
+    传一个复用的 session 避免 THS 把每个新连接当独立来源做风控。
+    """
+    import time as _time
+    from bs4 import BeautifulSoup
+
+    main_url = f"http://q.10jqka.com.cn/thshy/detail/code/{industry_code}/"
+    sess = session if session is not None else _new_ths_session()
+
+    def _extract_codes(html_text: str) -> List[str]:
+        soup = BeautifulSoup(html_text, "lxml")
+        out: List[str] = []
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 3:
+                continue
+            code_text = tds[1].get_text(strip=True)
+            if len(code_text) == 6 and code_text.isdigit():
+                out.append(code_text)
+        return out
+
+    codes: List[str] = []
+    seen: set = set()
+
+    for page in range(1, max_pages + 1):
+        if page == 1:
+            url = main_url
+            # 主页面请求清掉 X-Requested-With 避免误伤
+            sess.headers.pop("X-Requested-With", None)
+        else:
+            url = (
+                f"http://q.10jqka.com.cn/thshy/detail/field/199112/order/desc/"
+                f"page/{page}/ajax/1/code/{industry_code}"
+            )
+            sess.headers["Referer"] = main_url
+            sess.headers["X-Requested-With"] = "XMLHttpRequest"
+
+        try:
+            r = sess.get(url, timeout=10)
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"补全行业：THS {industry_code} page {page} 请求失败 {exc}")
+            break
+        if r.status_code != 200:
+            if log_fn:
+                log_fn(
+                    f"补全行业：THS {industry_code} page {page} HTTP {r.status_code}，"
+                    f"可能限速，停止该行业的分页"
+                )
+            break
+
+        page_codes = _extract_codes(r.text)
+        if not page_codes:
+            break
+        new_codes = [c for c in page_codes if c not in seen]
+        if not new_codes:
+            break
+        for c in new_codes:
+            seen.add(c)
+            codes.append(c)
+        _time.sleep(rate_limit_sec)
+
+    return codes
+
+
 def backfill_universe_industries(
     *,
     log_fn: Optional[Callable[[str], None]] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
-    """一次性回填 universe.industry：按东财一级行业反向遍历成分股，建 code→industry 映射，
-    批量 UPSERT 到 universe 表。
+    """一次性回填 universe.industry。
 
-    返回 dict: {industries: int, updated: int, errors: List[str]}
+    改用同花顺一级行业（90 个）+ scrape 各行业 detail 页面分页拿成分股。
+    之前用东财 ``stock_board_industry_cons_em`` 走 push2 已死，无法替代。
+
+    NB: universe.industry 写入的是 THS 命名（"半导体" 而非"半导体及元件"），
+    跟 limit_up_stock_meta.industry（EM 命名）不一致。``load_spot_snapshot_at``
+    用 ``COALESCE(NULLIF(u.industry,''), m.industry, '')``，u.industry 优先，
+    最终 spot 的"所属行业"列以 THS 命名为主 → 板块强度 fallback 走 THS 时
+    命中率最高，走合成 spot 兜底时也是 THS 命名（自洽）。
+
+    返回 dict: {industries, mapped_codes, updated, errors}
     """
     from stock_store import update_universe_industries
     import akshare as ak
@@ -464,40 +567,57 @@ def backfill_universe_industries(
 
     errors: List[str] = []
     try:
-        names_df = _retry_ak_call(ak.stock_board_industry_name_em)
+        names_df = _retry_ak_call(ak.stock_board_industry_name_ths)
     except Exception as exc:
-        msg = f"拉东财行业列表失败: {exc}"
+        msg = f"拉同花顺行业列表失败: {exc}"
         if log_fn:
             log_fn(f"补全行业：{msg}")
-        return {"industries": 0, "updated": 0, "errors": [msg]}
+        return {"industries": 0, "mapped_codes": 0, "updated": 0, "errors": [msg]}
 
-    if names_df is None or names_df.empty or "板块名称" not in names_df.columns:
-        return {"industries": 0, "updated": 0, "errors": ["东财行业列表为空"]}
+    if names_df is None or names_df.empty or "code" not in names_df.columns:
+        return {
+            "industries": 0,
+            "mapped_codes": 0,
+            "updated": 0,
+            "errors": ["同花顺行业列表为空"],
+        }
 
-    industries = [str(n).strip() for n in names_df["板块名称"].tolist() if str(n).strip()]
+    industries = [
+        (str(row["name"]).strip(), str(row["code"]).strip())
+        for _, row in names_df.iterrows()
+        if str(row.get("name", "")).strip() and str(row.get("code", "")).strip()
+    ]
     if log_fn:
-        log_fn(f"补全行业：东财一级行业共 {len(industries)} 个，开始拉成分股...")
+        log_fn(
+            f"补全行业：同花顺一级行业共 {len(industries)} 个，"
+            f"开始 scrape 各行业 detail 页（~每页 0.15s 限速，预计 5-8 分钟）..."
+        )
 
     code_to_industry: Dict[str, str] = {}
-    for idx, name in enumerate(industries):
+    # 一个 session 跨所有行业复用：保留 cookie + keep-alive，
+    # 不至于 THS 把每个新连接当独立来源做风控
+    shared_session = _new_ths_session()
+    for idx, (name, ind_code) in enumerate(industries):
         if progress_callback:
-            progress_callback(idx, len(industries), f"拉取 {name} 成分股")
+            progress_callback(idx, len(industries), f"拉取 {name}")
         try:
-            cons = _retry_ak_call(ak.stock_board_industry_cons_em, symbol=name)
+            stock_codes = _ths_industry_constituents(
+                ind_code, session=shared_session, log_fn=log_fn,
+            )
         except Exception as exc:
             errors.append(f"{name}: {exc}")
             continue
-        if cons is None or cons.empty:
+        if not stock_codes:
+            errors.append(f"{name}: 无成分股")
             continue
-        # 字段名兼容：实际返回 "代码"；fallback 找 "code"
-        code_col = "代码" if "代码" in cons.columns else ("code" if "code" in cons.columns else None)
-        if code_col is None:
-            errors.append(f"{name}: 找不到代码列")
-            continue
-        for code in cons[code_col].astype(str).tolist():
-            c = code.strip().zfill(6)
-            if len(c) == 6 and c.isdigit() and c not in code_to_industry:
-                code_to_industry[c] = name
+        for c in stock_codes:
+            # 首次见到的代码保留，重复（出现在多个行业）保留首个
+            code_to_industry.setdefault(c, name)
+        if log_fn and (idx + 1) % 10 == 0:
+            log_fn(
+                f"补全行业：进度 {idx + 1}/{len(industries)}，"
+                f"已累计映射 {len(code_to_industry)} 只票"
+            )
 
     if progress_callback:
         progress_callback(len(industries), len(industries), "写入数据库")
@@ -505,9 +625,9 @@ def backfill_universe_industries(
     updated = update_universe_industries(code_to_industry)
     if log_fn:
         log_fn(
-            f"补全行业：完成，覆盖 {len(industries)} 个行业，"
+            f"补全行业：完成，覆盖 {len(industries)} 个 THS 行业，"
             f"映射 {len(code_to_industry)} 只票，DB 写入 {updated} 行"
-            + (f"，{len(errors)} 个行业拉取失败" if errors else "")
+            + (f"，{len(errors)} 个行业有问题" if errors else "")
         )
     return {
         "industries": len(industries),
