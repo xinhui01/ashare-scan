@@ -24,7 +24,11 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring.helpers import _count_historical_any_limit_up
-from src.sources.limit_up_pool_service import normalize_sina_spot_df
+from src.sources.limit_up_pool_service import (
+    fetch_tencent_spot_df,
+    normalize_sina_spot_df,
+    _enrich_spot_industry_from_universe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -584,12 +588,23 @@ def fetch_spot_snapshot(
     try:
         if log_fn:
             log_fn("涨停预测：正在获取全市场实时行情快照（新浪，约30s）...")
-        df = normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
+        df = _enrich_spot_industry_from_universe(
+            normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
+        )
         if df is not None and not df.empty:
             return df
     except Exception as e2:
         if log_fn:
-            log_fn(f"涨停预测：新浪实时行情也失败: {e2}")
+            log_fn(f"涨停预测：新浪实时行情失败: {e2}，尝试腾讯兜底...")
+    try:
+        if log_fn:
+            log_fn("涨停预测：正在获取全市场实时行情快照（腾讯）...")
+        df = fetch_tencent_spot_df()
+        if df is not None and not df.empty:
+            return df
+    except Exception as e3:
+        if log_fn:
+            log_fn(f"涨停预测：腾讯实时行情也失败: {e3}")
     return None
 
 

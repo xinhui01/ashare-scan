@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from src.utils import parsing as _utils_parsing
 
@@ -38,6 +39,106 @@ def normalize_sina_spot_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]
         .str.strip().str.zfill(6)
     )
     return out
+
+
+def _enrich_spot_industry_from_universe(df: pd.DataFrame) -> pd.DataFrame:
+    """尽量用本地 universe 表回填行业，减少 fallback 源缺列时的影响。"""
+    if df is None or df.empty or "代码" not in df.columns:
+        return df
+    out = df.copy()
+    target_col = "所属行业"
+    if target_col not in out.columns:
+        out[target_col] = ""
+    try:
+        from stock_store import load_universe
+
+        universe = load_universe()
+    except Exception:
+        universe = None
+    if universe is None or universe.empty or "code" not in universe.columns:
+        return out
+    code_to_industry = {
+        str(row["code"]).strip().zfill(6): str(row.get("industry") or "").strip()
+        for _, row in universe.iterrows()
+        if str(row.get("industry") or "").strip()
+    }
+    if not code_to_industry:
+        return out
+    missing_mask = out[target_col].fillna("").astype(str).str.strip() == ""
+    if missing_mask.any():
+        out.loc[missing_mask, target_col] = (
+            out.loc[missing_mask, "代码"]
+            .astype(str)
+            .str.strip()
+            .str.zfill(6)
+            .map(code_to_industry)
+            .fillna("")
+        )
+    return out
+
+
+def normalize_tencent_spot_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """把腾讯全市场列表规范成现有 spot 消费方可直接使用的列。"""
+    if df is None or df.empty or "code" not in df.columns:
+        return None
+    blank_text = pd.Series([""] * len(df), index=df.index, dtype="object")
+    out = pd.DataFrame(
+        {
+            "代码": df["code"].astype(str).str.replace(r"^(sh|sz|bj)", "", regex=True).str.strip().str.zfill(6),
+            "名称": df.get("name", blank_text).astype(str).str.strip(),
+            "最新价": pd.to_numeric(df.get("zxj"), errors="coerce"),
+            "涨跌额": pd.to_numeric(df.get("zd"), errors="coerce"),
+            "涨跌幅": pd.to_numeric(df.get("zdf"), errors="coerce"),
+            "成交量": pd.to_numeric(df.get("volume"), errors="coerce") * 100,
+            "成交额": pd.to_numeric(df.get("turnover"), errors="coerce") * 10000,
+            "换手率": pd.to_numeric(df.get("hsl"), errors="coerce"),
+            "所属行业": "",
+        }
+    )
+    return _enrich_spot_industry_from_universe(out)
+
+
+def fetch_tencent_spot_df() -> Optional[pd.DataFrame]:
+    """腾讯全市场排行接口，分页拉全量 A 股，作为新浪失效后的兜底。"""
+    url = "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://stockapp.finance.qq.com/mstats/",
+            "Accept": "application/json, text/plain, */*",
+        }
+    )
+    page_size = 200
+    offset = 0
+    total = None
+    frames: List[pd.DataFrame] = []
+    while total is None or offset < int(total):
+        params = {
+            "_appver": "11.17.0",
+            "board_code": "aStock",
+            "sort_type": "price",
+            "direct": "down",
+            "offset": str(offset),
+            "count": str(page_size),
+        }
+        resp = session.get(url, params=params, timeout=12)
+        resp.raise_for_status()
+        payload = resp.json()
+        data = payload.get("data") or {}
+        rows = data.get("rank_list") or []
+        if not rows:
+            break
+        frames.append(pd.DataFrame(rows))
+        total = int(data.get("total") or 0)
+        offset += page_size
+    if not frames:
+        return None
+    return normalize_tencent_spot_df(pd.concat(frames, ignore_index=True))
 
 
 # ============== 模块级 intraday 派生 helper ==============
@@ -132,12 +233,23 @@ def fetch_spot_with_fallback(
     try:
         if log_fn:
             log_fn("全市场 spot 快照：新浪兜底（约 30s）...")
-        df = normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
+        df = _enrich_spot_industry_from_universe(
+            normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
+        )
         if df is not None and not df.empty:
             return df
     except Exception as exc:
         if log_fn:
-            log_fn(f"全市场 spot 新浪兜底也失败: {exc}")
+            log_fn(f"全市场 spot 新浪兜底失败: {exc}，尝试腾讯兜底")
+    try:
+        if log_fn:
+            log_fn("全市场 spot 快照：腾讯兜底...")
+        df = fetch_tencent_spot_df()
+        if df is not None and not df.empty:
+            return df
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"全市场 spot 腾讯兜底也失败: {exc}")
     return None
 
 
