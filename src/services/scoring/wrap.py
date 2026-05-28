@@ -75,7 +75,7 @@ def scan_broken_board_wrap_candidates_cached(
             build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         )
         # 反包分支优先追求命中率，默认只保留高置信候选。
-        if score_info is not None and score_info["score"] >= 75:
+        if score_info is not None and score_info["score"] >= 70:
             candidates.append(score_info)
         if progress_callback:
             progress_callback(idx + 1, total, f"反包筛选 {rec['code']} {rec.get('name', '')}")

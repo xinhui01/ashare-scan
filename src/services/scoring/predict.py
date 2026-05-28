@@ -966,7 +966,7 @@ def predict_limit_up_candidates(
         f"保留涨停候选：{len(continuation_candidates)} 只（得分>=40）",
         f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
         f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=45）",
-        f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=75）",
+        f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=70）",
     ]
     latest_cont_rate = compare_context.get("latest_continuation_rate")
     avg_cont_rate = compare_context.get("avg_continuation_rate")
