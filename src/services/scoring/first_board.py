@@ -580,7 +580,8 @@ def fetch_spot_snapshot(
         try:
             if log_fn:
                 log_fn("涨停预测：正在获取全市场实时行情快照（东财）...")
-            return _retry_ak_call(ak.stock_zh_a_spot_em)
+            df = _retry_ak_call(ak.stock_zh_a_spot_em)
+            return _enrich_spot_industry_from_universe(df)
         except Exception as e:
             if log_fn:
                 log_fn(f"涨停预测：东财实时行情失败: {e}，尝试新浪备选...")

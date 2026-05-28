@@ -4,6 +4,7 @@ import pandas as pd
 
 from scan_models import FilterSettings
 from stock_filter import StockFilter
+from src.services.scoring import first_board as _first_board
 from src.services.scoring.predict import _AsOfHistoryFetcher
 
 
@@ -359,6 +360,28 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
         fetcher.get_history_data("002421", days=120)
 
         self.assertEqual(calls, ["20260521"])
+
+
+def test_fetch_spot_snapshot_enriches_em_industry_from_universe(monkeypatch):
+    raw = pd.DataFrame([
+        {"代码": "000001", "名称": "平安银行", "所属行业": ""},
+        {"代码": "000002", "名称": "万科A", "所属行业": "房地产"},
+    ])
+
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+    monkeypatch.setattr("stock_data._retry_ak_call", lambda fn: raw.copy())
+
+    def _fill(df):
+        out = df.copy()
+        out.loc[out["代码"] == "000001", "所属行业"] = "银行"
+        return out
+
+    monkeypatch.setattr(_first_board, "_enrich_spot_industry_from_universe", _fill)
+
+    df = _first_board.fetch_spot_snapshot()
+
+    assert df is not None
+    assert list(df["所属行业"]) == ["银行", "房地产"]
 
 
 if __name__ == "__main__":
