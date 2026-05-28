@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -169,8 +170,25 @@ def _signal_down_limit(n_dt: int) -> Tuple[int, str]:
 
 # ============== 数据加载 ==============
 
+def _industry_aggregates(df) -> Dict[str, Any]:
+    """从涨停池 df 提取行业分布相关聚合（HHI = 板块集中度）。"""
+    if df is None or df.empty or "所属行业" not in df.columns:
+        return {"top_industries": [], "industry_count": 0, "hhi": 0.0}
+    industries = df["所属行业"].astype(str).tolist()
+    total = len(industries)
+    if total == 0:
+        return {"top_industries": [], "industry_count": 0, "hhi": 0.0}
+    cnt = Counter(industries)
+    hhi = sum((n / total) ** 2 for n in cnt.values())
+    return {
+        "top_industries": cnt.most_common(5),
+        "industry_count": len(cnt),
+        "hhi": round(hhi, 4),
+    }
+
+
 def _load_pool_aggregates(date_key: str) -> Optional[Dict[str, Any]]:
-    """从 limit_up_pool 聚合涨停数 / 炸板 / 最高板 / 4+板等。"""
+    """从 limit_up_pool 聚合涨停数 / 炸板 / 最高板 / 4+板 / 行业分布等。"""
     df = stock_store.load_limit_up_pool(date_key)
     if df is None or df.empty:
         return None
@@ -181,13 +199,25 @@ def _load_pool_aggregates(date_key: str) -> Optional[Dict[str, Any]]:
         if "代码" in df.columns
         else []
     )
+    ind_agg = _industry_aggregates(df)
+
+    first_board_industries: List[str] = []
+    if boards is not None and "所属行业" in df.columns:
+        mask = boards == 1
+        first_board_industries = df.loc[mask, "所属行业"].astype(str).tolist()
+
     return {
         "lu_count": len(df),
         "broken_count": int((breaks > 0).sum()) if breaks is not None else 0,
         "broken_total_times": int(breaks.sum()) if breaks is not None else 0,
         "max_boards": int(boards.max()) if boards is not None and len(boards) else 0,
         "high_board_count_4plus": int((boards >= 4).sum()) if boards is not None else 0,
+        "first_board_count": int((boards == 1).sum()) if boards is not None else 0,
+        "first_board_industries": first_board_industries,
         "codes": codes,
+        "top_industries": ind_agg["top_industries"],
+        "industry_count": ind_agg["industry_count"],
+        "hhi": ind_agg["hhi"],
     }
 
 
@@ -419,6 +449,198 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
     return out
 
 
+# ============== 题材轮动 + 市场状态分类 ==============
+
+def _compute_rotation_metrics(
+    today_agg: Optional[Dict[str, Any]],
+    yest_agg: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """计算题材轮动指标（不进 score，仅用于状态分类）。
+
+    rotation_score 范围 ~[-50, +70]：正 = 偏轮动（主线断档/新方向涌现），
+    负 = 偏延续（主线维持）。
+    """
+    default = {
+        "main_line": None,
+        "main_line_status": "unknown",  # continued / weakened / broken / unknown
+        "industry_overlap_rate": 0.0,
+        "hhi_today": (today_agg or {}).get("hhi", 0.0),
+        "hhi_yesterday": (yest_agg or {}).get("hhi", 0.0),
+        "rotation_score": 0,
+        "today_top_industries": (today_agg or {}).get("top_industries", [])[:5],
+        "yesterday_top_industries": (yest_agg or {}).get("top_industries", [])[:5],
+        "new_industries": [],
+    }
+    if not today_agg or not yest_agg:
+        return default
+
+    today_top_list = [n for n, _ in today_agg.get("top_industries", [])]
+    yest_top_list = [n for n, _ in yest_agg.get("top_industries", [])]
+    main_line = yest_top_list[0] if yest_top_list else None
+    today_top3 = today_top_list[:3]
+
+    if main_line is None:
+        status = "unknown"
+    elif main_line in today_top3:
+        status = "continued"
+    elif main_line in today_top_list:
+        status = "weakened"
+    else:
+        status = "broken"
+
+    today_set = set(today_top_list)
+    yest_set = set(yest_top_list)
+    overlap = (
+        len(today_set & yest_set) / max(1, len(today_set))
+        if today_set else 0.0
+    )
+    new_industries = sorted(today_set - yest_set)
+
+    score = 0
+    score += {"broken": 40, "weakened": 20, "continued": -20, "unknown": 0}[status]
+    if overlap < 0.3:
+        score += 30
+    elif overlap < 0.5:
+        score += 10
+    else:
+        score -= 10
+    # HHI 大幅下降 = 板块从集中变分散 = 更轮动
+    hhi_t = today_agg.get("hhi", 0.0)
+    hhi_y = yest_agg.get("hhi", 0.0)
+    if hhi_y > 0:
+        if hhi_t < hhi_y * 0.7:
+            score += 10
+        elif hhi_t > hhi_y * 1.3:
+            score -= 10
+
+    return {
+        "main_line": main_line,
+        "main_line_status": status,
+        "industry_overlap_rate": round(overlap, 3),
+        "hhi_today": hhi_t,
+        "hhi_yesterday": hhi_y,
+        "rotation_score": score,
+        "today_top_industries": today_agg.get("top_industries", [])[:5],
+        "yesterday_top_industries": yest_agg.get("top_industries", [])[:5],
+        "new_industries": new_industries,
+    }
+
+
+# 状态 → 推荐打法的核心规则表。
+# pools 对应 scoring 模块的池子键: cont(连板) / first(首板) / fresh(新晋) / wrap(反包) / first_board(打首板)
+_STATE_STRATEGIES = {
+    "接力日": {
+        "color": "#2e7d32",
+        "strategy": {
+            "label": "连板接力 + 高度龙头",
+            "pools": ["cont", "first"],
+            "position_cap": 0.8,
+            "notes": "重点 2-4 板加速 + 龙头补涨；首板优先选主线方向；避开人气退潮的孤独高位。",
+        },
+    },
+    "轮动日": {
+        "color": "#1565c0",
+        "strategy": {
+            "label": "首板新题材 / 避开老主线",
+            "pools": ["fresh", "first_board"],
+            "position_cap": 0.6,
+            "notes": "重点：今日新冒头行业（昨日 top3 外）的首板；老主线龙头的二次接力胜率低。",
+        },
+    },
+    "退潮日": {
+        "color": "#d84315",
+        "strategy": {
+            "label": "反包/低吸为主，轻仓",
+            "pools": ["wrap", "fresh"],
+            "position_cap": 0.3,
+            "notes": "不打高位接力；优先昨日炸板/前期强势股回踩反包；新首板谨慎，控制单股仓位。",
+        },
+    },
+    "冰点日": {
+        "color": "#b71c1c",
+        "strategy": {
+            "label": "空仓观望 / 极少试探超跌反包",
+            "pools": ["wrap"],
+            "position_cap": 0.1,
+            "notes": "原则空仓；仅可少量试探跌停股反包，单只 ≤2%。等情绪修复出明确赚钱效应再加仓。",
+        },
+    },
+    "过渡日": {
+        "color": "#f9a825",
+        "strategy": {
+            "label": "首板为主，谨慎接力",
+            "pools": ["first", "fresh"],
+            "position_cap": 0.5,
+            "notes": "状态模糊，控仓为先；优先首板低位股，少量参与 2 板接力测试方向。",
+        },
+    },
+}
+
+
+def _classify_market_state(
+    *,
+    score: int,
+    today_agg: Dict[str, Any],
+    rotation: Dict[str, Any],
+    yest_lu: int,
+    today_continued: int,
+) -> Dict[str, Any]:
+    """基于综合分 + 高度结构 + 轮动指标判定当日市场状态。"""
+    lu = int(today_agg.get("lu_count", 0))
+    max_b = int(today_agg.get("max_boards", 0))
+    n4 = int(today_agg.get("high_board_count_4plus", 0))
+    cont_rate = (today_continued / yest_lu) if yest_lu else 0.0
+    rot = int(rotation.get("rotation_score", 0))
+    main_status = rotation.get("main_line_status", "unknown")
+
+    # 冰点：宽度+高度同时极弱（不依赖 score，否则会误把"低评分但涨停几十只"的退潮日归冰点）
+    if lu < 15 or (lu < 25 and max_b <= 2):
+        label = "冰点日"
+        reason = f"涨停 {lu} 只 + 最高 {max_b} 板，赚钱效应崩塌"
+        confidence = 0.9
+    elif max_b <= 3 and n4 == 0 and cont_rate < 0.20:
+        label = "退潮日"
+        reason = (
+            f"最高 {max_b} 板 + 无 4+ 板 + 晋级 {cont_rate*100:.0f}%，"
+            "高度梯队断档，赚钱效应退潮"
+        )
+        confidence = 0.85
+    elif (
+        max_b >= 5 and n4 >= 2
+        and (cont_rate >= 0.20 or score >= 80)
+        and rot < 30
+    ):
+        label = "接力日"
+        reason = (
+            f"最高 {max_b} 板 + 4+ 板 {n4} 只 + 晋级 {cont_rate*100:.0f}% + "
+            f"主线 {main_status}，溢价模式"
+        )
+        confidence = 0.85
+    elif lu >= 25 and main_status in ("broken", "weakened") and rot >= 30:
+        label = "轮动日"
+        reason = (
+            f"主线 {main_status} + 轮动分 {rot:+d} + 涨停 {lu} 只，"
+            "新方向涌现"
+        )
+        confidence = 0.75
+    else:
+        label = "过渡日"
+        reason = (
+            f"未触发明确接力/轮动/退潮规则：涨停 {lu} 只 · 最高 {max_b} 板 · "
+            f"主线 {main_status} · 轮动 {rot:+d}"
+        )
+        confidence = 0.6
+
+    spec = _STATE_STRATEGIES[label]
+    return {
+        "label": label,
+        "color": spec["color"],
+        "confidence": confidence,
+        "reason": reason,
+        "strategy": spec["strategy"],
+    }
+
+
 # ============== 仓位映射 ==============
 
 def _position_advice(score: int) -> Dict[str, Any]:
@@ -589,6 +811,15 @@ def analyze_market_sentiment(
     score = max(0, min(100, score))
     advice = _position_advice(score)
 
+    rotation = _compute_rotation_metrics(today_agg, yest_agg)
+    market_state = _classify_market_state(
+        score=score,
+        today_agg=today_agg,
+        rotation=rotation,
+        yest_lu=yest_lu,
+        today_continued=today_continued,
+    )
+
     # 一句话总结
     parts: List[str] = []
     parts.append(
@@ -603,9 +834,16 @@ def analyze_market_sentiment(
         parts.append(f"上证 {external['sh_index_pct']:+.2f}%")
     if external.get("down_limit_count") is not None:
         parts.append(f"跌停 {external['down_limit_count']} 只")
-    summary = "；".join(parts) + f"。综合 {score} 分 → 建议 {advice['label']}。"
+    summary = (
+        "；".join(parts)
+        + f"。综合 {score} 分 → 建议 {advice['label']}。"
+        + f" 状态：{market_state['label']} → {market_state['strategy']['label']}。"
+    )
 
-    _l(f"市场情绪 {end}: 综合 {score}/100 → {advice['label']}")
+    _l(
+        f"市场情绪 {end}: 综合 {score}/100 → {advice['label']} | "
+        f"状态 {market_state['label']} → {market_state['strategy']['label']}"
+    )
 
     return {
         "trade_date": end,
@@ -613,6 +851,7 @@ def analyze_market_sentiment(
         "position_suggest": advice,
         "signals": signals,
         "summary": summary,
+        "market_state": market_state,
         "raw": {
             "today": today_agg,
             "yesterday_date": yest_date,
@@ -623,6 +862,7 @@ def analyze_market_sentiment(
             "prior_counts": prior_counts,
             "required_pool_dates": required_dates,
             "external": external,
+            "rotation": rotation,
         },
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }

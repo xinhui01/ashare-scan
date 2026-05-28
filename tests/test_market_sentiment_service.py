@@ -35,7 +35,10 @@ def test_default_date_still_uses_latest_cached(monkeypatch):
             "codes": ["000001"],
         },
     )
-    monkeypatch.setattr(svc, "_avg_lu_count_5d", lambda end_date: (10.0, ["20260521"]))
+    monkeypatch.setattr(
+        svc, "_avg_lu_count_5d",
+        lambda end_date: (10.0, ["20260521"], {"20260521": 10}),
+    )
     monkeypatch.setattr(svc, "_previous_pool_date", lambda end_date: "")
 
     result = svc.analyze_market_sentiment(None, fetch_external=False, log=lambda _s: None)

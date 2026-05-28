@@ -190,7 +190,11 @@ class PredictTab:
         )
         self.sentiment_score_label.pack(side=tk.LEFT, padx=(0, 6))
         self.sentiment_advice_label = ttk.Label(sent_bar, text="→ -")
-        self.sentiment_advice_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.sentiment_advice_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.sentiment_state_label = ttk.Label(
+            sent_bar, text="", font=("", 11, "bold"),
+        )
+        self.sentiment_state_label.pack(side=tk.LEFT, padx=(0, 12))
         self.sentiment_summary_label = ttk.Label(
             sent_bar, text="点击右侧「刷新」分析市场情绪", foreground="#666",
         )
@@ -1422,6 +1426,9 @@ class PredictTab:
         score = int(r.get("score", 50))
         advice = r.get("position_suggest") or {}
         color = advice.get("color", "#1f1f1f")
+        state = r.get("market_state") or {}
+        state_label = state.get("label", "")
+        state_color = state.get("color", "#1f1f1f")
         try:
             self.sentiment_score_label.config(
                 text=f"情绪 {r.get('trade_date', '-')} : {score}/100",
@@ -1430,6 +1437,14 @@ class PredictTab:
             self.sentiment_advice_label.config(
                 text=f"→ {advice.get('label', '-')}", foreground=color,
             )
+            if state_label:
+                conf = state.get("confidence") or 0
+                self.sentiment_state_label.config(
+                    text=f"📊 {state_label}({conf*100:.0f}%)",
+                    foreground=state_color,
+                )
+            else:
+                self.sentiment_state_label.config(text="")
             # 显示 5 个最重要指标的缩略
             sigs = r.get("signals") or []
             key_names = ("涨停数", "晋级率", "最高连板", "大盘", "跌停数")
@@ -1479,6 +1494,90 @@ class PredictTab:
             body, text=r.get("summary", ""), wraplength=720,
             foreground="#333",
         ).pack(anchor=tk.W, pady=(0, 8))
+
+        # ===== 市场状态（状态分类 + 推荐打法）=====
+        state = r.get("market_state") or {}
+        if state:
+            state_box = ttk.LabelFrame(body, text="市场状态", padding=8)
+            state_box.pack(fill=tk.X, pady=(0, 8))
+            state_color = state.get("color", "#1f1f1f")
+            head_line = ttk.Frame(state_box)
+            head_line.pack(fill=tk.X)
+            ttk.Label(
+                head_line,
+                text=f"{state.get('label', '?')}",
+                font=("", 14, "bold"),
+                foreground=state_color,
+            ).pack(side=tk.LEFT)
+            ttk.Label(
+                head_line,
+                text=f"  置信 {(state.get('confidence') or 0)*100:.0f}%",
+                foreground="#666",
+            ).pack(side=tk.LEFT, padx=(4, 0))
+
+            ttk.Label(
+                state_box, text=f"判定理由: {state.get('reason', '-')}",
+                foreground="#444", wraplength=700, justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(4, 0))
+
+            strat = state.get("strategy") or {}
+            if strat:
+                ttk.Label(
+                    state_box,
+                    text=f"推荐打法: {strat.get('label', '-')}  "
+                         f"· 仓位上限 {(strat.get('position_cap') or 0)*100:.0f}%",
+                    font=("", 11, "bold"),
+                    foreground=state_color,
+                ).pack(anchor=tk.W, pady=(4, 0))
+                ttk.Label(
+                    state_box, text=f"操作要点: {strat.get('notes', '-')}",
+                    foreground="#444", wraplength=700, justify=tk.LEFT,
+                ).pack(anchor=tk.W, pady=(2, 0))
+                ttk.Label(
+                    state_box,
+                    text="⚠ 33 天小样本回测显示该推荐尚需更长样本验证（接力日 T+1 实测亏损，反包炸过板全状态稳定为正）",
+                    foreground="#b71c1c", wraplength=700, justify=tk.LEFT,
+                ).pack(anchor=tk.W, pady=(4, 0))
+
+            # 轮动指标明细
+            rot = (r.get("raw") or {}).get("rotation") or {}
+            if rot:
+                rot_lines: List[str] = []
+                rot_lines.append(
+                    f"主线: {rot.get('main_line', '-')}  "
+                    f"({rot.get('main_line_status', '-')})  "
+                    f"· 行业重叠率 {(rot.get('industry_overlap_rate', 0))*100:.0f}%  "
+                    f"· 轮动分 {rot.get('rotation_score', 0):+d}"
+                )
+                top_today = rot.get("today_top_industries") or []
+                top_yest = rot.get("yesterday_top_industries") or []
+                if top_today:
+                    rot_lines.append(
+                        "今日 top 行业: " + ", ".join(
+                            f"{n}({c})" for n, c in top_today[:5]
+                        )
+                    )
+                if top_yest:
+                    rot_lines.append(
+                        "昨日 top 行业: " + ", ".join(
+                            f"{n}({c})" for n, c in top_yest[:5]
+                        )
+                    )
+                new_inds = rot.get("new_industries") or []
+                if new_inds:
+                    shown = ", ".join(new_inds[:10])
+                    tail = f" … 共 {len(new_inds)} 个" if len(new_inds) > 10 else ""
+                    rot_lines.append(f"新冒头行业 (昨日 top5 外): {shown}{tail}")
+                rot_lines.append(
+                    f"板块集中度 HHI: 今日 {rot.get('hhi_today', 0):.3f}  · "
+                    f"昨日 {rot.get('hhi_yesterday', 0):.3f}  "
+                    "(>0.10 高度集中, <0.05 高度分散)"
+                )
+                for line in rot_lines:
+                    ttk.Label(
+                        state_box, text=line, foreground="#555",
+                        wraplength=700, justify=tk.LEFT,
+                    ).pack(anchor=tk.W, pady=1)
 
         # 信号明细表
         cols = ("name", "value", "delta", "note")
