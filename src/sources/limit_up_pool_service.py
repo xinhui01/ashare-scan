@@ -238,7 +238,7 @@ def derive_limit_up_pool_from_spot(
         seal_time = ""
         breaks_count = 0
         try:
-            limit_up_price = _safe_float(row.get("最新价"), 0.0) or 0.0
+            limit_up_price = _safe_float(row.get("最新价")) or 0.0
             if limit_up_price > 0:
                 intraday_df = fetcher.get_intraday_data(
                     code,
