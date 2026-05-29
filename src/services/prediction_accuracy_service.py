@@ -215,12 +215,22 @@ def _evaluate_candidate(
 
     t_close = float(t_row["close"].iloc[0]) if not t_row.empty and pd.notna(t_row["close"].iloc[0]) else None
 
+    # T+2 集合竞价价 = verify_date 之后第一个交易日的 open
+    # 用于"T+1 开盘买入 → T+2 集合竞价卖出"的隔夜持有口径
+    later_rows = df[df["date"] > verify_date_dash].head(1)
+    t2_open: Optional[float] = None
+    if not later_rows.empty and "open" in later_rows.columns:
+        v = later_rows["open"].iloc[0]
+        if v is not None and pd.notna(v):
+            t2_open = float(v)
+
     if t1_row.empty:
         # T+1 K 线缺失：视为停牌或暂未到日期
         return {
             "t_close": t_close,
             "t1_open": None, "t1_high": None, "t1_low": None,
             "t1_close": None, "t1_pct": None, "t1_open_close_pct": None,
+            "t2_open": t2_open, "t1_open_t2_open_pct": None,
             "t1_limit_up": False, "t1_one_word": False, "t1_suspended": True,
             "hit_strict": False, "hit_loose": False, "hit_buyable": False,
         }
@@ -240,6 +250,12 @@ def _evaluate_candidate(
         t1_open_close_pct: Optional[float] = (t1_close - t1_open) / t1_open * 100.0
     else:
         t1_open_close_pct = None
+
+    # T+1 开盘买入 → T+2 集合竞价卖出（隔夜持有口径）
+    if t1_open is not None and t1_open > 0 and t2_open is not None:
+        t1_open_t2_open_pct: Optional[float] = (t2_open - t1_open) / t1_open * 100.0
+    else:
+        t1_open_t2_open_pct = None
 
     threshold = _limit_up_threshold(code, name)
     is_lu = (t1_pct is not None and t1_pct >= threshold)
@@ -262,6 +278,8 @@ def _evaluate_candidate(
         "t1_close": t1_close,
         "t1_pct": t1_pct,
         "t1_open_close_pct": t1_open_close_pct,
+        "t2_open": t2_open,
+        "t1_open_t2_open_pct": t1_open_t2_open_pct,
         "t1_limit_up": is_lu,
         "t1_one_word": one_word,
         "t1_suspended": False,
@@ -403,6 +421,7 @@ def evaluate(trade_date: str, *, refresh_stale: bool = False) -> Dict[str, Any]:
                         "t_close": None, "t1_open": None, "t1_high": None,
                         "t1_low": None, "t1_close": None, "t1_pct": None,
                         "t1_open_close_pct": None,
+                        "t2_open": None, "t1_open_t2_open_pct": None,
                         "t1_limit_up": False, "t1_one_word": False,
                         "t1_suspended": True,
                         "hit_strict": False, "hit_loose": False, "hit_buyable": False,

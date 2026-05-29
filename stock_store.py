@@ -280,6 +280,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             t1_close REAL,
             t1_pct REAL,
             t1_open_close_pct REAL,
+            t2_open REAL,
+            t1_open_t2_open_pct REAL,
             t1_limit_up INTEGER NOT NULL DEFAULT 0,
             t1_one_word INTEGER NOT NULL DEFAULT 0,
             t1_suspended INTEGER NOT NULL DEFAULT 0,
@@ -324,6 +326,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE limit_up_prediction_accuracy ADD COLUMN reasons TEXT NOT NULL DEFAULT ''"
         )
+    if "t2_open" not in accuracy_columns:
+        conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t2_open REAL")
+    if "t1_open_t2_open_pct" not in accuracy_columns:
+        conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t1_open_t2_open_pct REAL")
 
 
 def db_path() -> Path:
@@ -1197,6 +1203,7 @@ _PREDICTION_ACCURACY_FIELDS = (
     "name", "industry", "predicted_score", "predicted_type",
     "t_close", "t1_open", "t1_high", "t1_low", "t1_close", "t1_pct",
     "t1_open_close_pct",
+    "t2_open", "t1_open_t2_open_pct",
     "t1_limit_up", "t1_one_word", "t1_suspended",
     "hit_strict", "hit_loose", "hit_buyable", "reasons", "evaluated_at",
 )
@@ -1232,6 +1239,8 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
             _to_float(rec.get("t1_close")),
             _to_float(rec.get("t1_pct")),
             _to_float(rec.get("t1_open_close_pct")),
+            _to_float(rec.get("t2_open")),
+            _to_float(rec.get("t1_open_t2_open_pct")),
             int(bool(rec.get("t1_limit_up"))),
             int(bool(rec.get("t1_one_word"))),
             int(bool(rec.get("t1_suspended"))),
@@ -1254,10 +1263,11 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     name, industry, predicted_score, predicted_type,
                     t_close, t1_open, t1_high, t1_low, t1_close, t1_pct,
                     t1_open_close_pct,
+                    t2_open, t1_open_t2_open_pct,
                     t1_limit_up, t1_one_word, t1_suspended,
                     hit_strict, hit_loose, hit_buyable, reasons, evaluated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date, code, category) DO UPDATE SET
                     verify_date=excluded.verify_date,
                     name=excluded.name,
@@ -1274,6 +1284,8 @@ def save_prediction_accuracy_records(records: List[Dict[str, Any]]) -> int:
                     t1_close=excluded.t1_close,
                     t1_pct=excluded.t1_pct,
                     t1_open_close_pct=excluded.t1_open_close_pct,
+                    t2_open=excluded.t2_open,
+                    t1_open_t2_open_pct=excluded.t1_open_t2_open_pct,
                     t1_limit_up=excluded.t1_limit_up,
                     t1_one_word=excluded.t1_one_word,
                     t1_suspended=excluded.t1_suspended,
