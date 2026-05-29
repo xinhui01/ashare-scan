@@ -5,7 +5,7 @@
 - build_compare_market_context: 从最近几组涨停对比中提炼市场环境
 
 依赖：StockDataFetcher（fetcher 参数）+ 可选 log_fn / build_local_cache_history_plan_fn。
-内部直接调用 scoring 包内的各 scorer 模块（cont / first / fresh / wrap / first_board /
+内部直接调用 scoring 包内的各 scorer 模块（cont / first / fresh / wrap / trend / first_board /
 classifiers / shared）。
 """
 from __future__ import annotations
@@ -24,6 +24,7 @@ from src.services.scoring import first as _first
 from src.services.scoring import first_board as _first_board
 from src.services.scoring import fresh as _fresh
 from src.services.scoring import shared as _shared
+from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
 
 logger = logging.getLogger(__name__)
@@ -533,6 +534,7 @@ def predict_limit_up_candidates(
             "first_board_candidates": [],
             "fresh_first_board_candidates": [],
             "broken_board_wrap_candidates": [],
+            "trend_limit_up_candidates": [],
             "hot_industries": {},
             "summary": summary,
             "data_quality": data_quality,
@@ -804,6 +806,7 @@ def predict_limit_up_candidates(
             "first_board_candidates": [],
             "fresh_first_board_candidates": [],
             "broken_board_wrap_candidates": [],
+            "trend_limit_up_candidates": [],
             "hot_industries": {},
             "compare_context": compare_context,
             "summary": summary,
@@ -958,6 +961,19 @@ def predict_limit_up_candidates(
         filter_wrap_candidate_stocks_fn=_first_board.filter_wrap_candidate_stocks,
     )
 
+    # 阶段8：趋势涨停候选（多头排列、稳健上行）
+    if log_fn:
+        log_fn("涨停预测：阶段8 - 识别趋势涨停候选...")
+    trend_limit_up_candidates = _trend.scan_trend_limit_up_candidates_cached(
+        spot_df, zt_codes, hot_industries, compare_context, progress_callback,
+        fetcher=scoring_fetcher,
+        log_fn=log_fn,
+        limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
+        build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
+        filter_strong_stocks_fn=_first_board.filter_strong_stocks,
+        filter_ma5_pullback_stocks_fn=_first_board.filter_ma5_pullback_stocks,
+    )
+
     # 摘要
     summary_lines = [
         f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
@@ -967,6 +983,7 @@ def predict_limit_up_candidates(
         f"二波接力候选：{len(first_board_candidates)} 只（得分>=50）",
         f"首板涨停候选：{len(fresh_first_board_candidates)} 只（5日未涨停，得分>=45）",
         f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=70）",
+        f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=65）",
     ]
     latest_cont_rate = compare_context.get("latest_continuation_rate")
     avg_cont_rate = compare_context.get("avg_continuation_rate")
@@ -996,6 +1013,7 @@ def predict_limit_up_candidates(
         "first_board_candidates": first_board_candidates,
         "fresh_first_board_candidates": fresh_first_board_candidates,
         "broken_board_wrap_candidates": broken_board_wrap_candidates,
+        "trend_limit_up_candidates": trend_limit_up_candidates,
         "hot_industries": hot_industries,
         "compare_context": compare_context,
         "summary": "\n".join(summary_lines),
