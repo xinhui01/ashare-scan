@@ -24,6 +24,14 @@ import requests
 from src.utils import parsing as _utils_parsing
 
 _safe_float = _utils_parsing.safe_float
+_BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
+
+
+def _clean_industry_value(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.lower() in _BLANK_INDUSTRY_VALUES:
+        return ""
+    return text
 
 
 def normalize_sina_spot_df(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -50,22 +58,24 @@ def _enrich_spot_industry_from_universe(df: pd.DataFrame) -> pd.DataFrame:
     if target_col not in out.columns:
         out[target_col] = ""
     try:
-        from stock_store import load_universe
+        from stock_store import load_industry_map, load_universe
 
         universe = load_universe()
     except Exception:
         universe = None
+        load_industry_map = None
     if universe is None or universe.empty or "code" not in universe.columns:
-        return out
-    code_to_industry = {
-        str(row["code"]).strip().zfill(6): str(row.get("industry") or "").strip()
-        for _, row in universe.iterrows()
-        if str(row.get("industry") or "").strip()
-    }
-    if not code_to_industry:
-        return out
-    missing_mask = out[target_col].fillna("").astype(str).str.strip() == ""
-    if missing_mask.any():
+        code_to_industry = {}
+    else:
+        code_to_industry = {
+            str(row["code"]).strip().zfill(6): ind
+            for _, row in universe.iterrows()
+            for ind in [_clean_industry_value(row.get("industry"))]
+            if ind
+        }
+
+    missing_mask = out[target_col].map(_clean_industry_value) == ""
+    if missing_mask.any() and code_to_industry:
         out.loc[missing_mask, target_col] = (
             out.loc[missing_mask, "代码"]
             .astype(str)
@@ -74,6 +84,29 @@ def _enrich_spot_industry_from_universe(df: pd.DataFrame) -> pd.DataFrame:
             .map(code_to_industry)
             .fillna("")
         )
+
+    missing_mask = out[target_col].map(_clean_industry_value) == ""
+    if missing_mask.any() and callable(load_industry_map):
+        try:
+            codes = (
+                out.loc[missing_mask, "代码"]
+                .astype(str)
+                .str.strip()
+                .str.zfill(6)
+                .tolist()
+            )
+            meta_map = load_industry_map(codes)
+        except Exception:
+            meta_map = {}
+        if meta_map:
+            out.loc[missing_mask, target_col] = (
+                out.loc[missing_mask, "代码"]
+                .astype(str)
+                .str.strip()
+                .str.zfill(6)
+                .map(meta_map)
+                .fillna("")
+            )
     return out
 
 

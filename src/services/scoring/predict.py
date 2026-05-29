@@ -28,6 +28,14 @@ from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
 
 logger = logging.getLogger(__name__)
+_BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
+
+
+def _count_missing_industries(df: Optional[pd.DataFrame]) -> int:
+    if df is None or "所属行业" not in df.columns:
+        return 0
+    industries = df["所属行业"].fillna("").astype(str).str.strip()
+    return int(industries.str.lower().isin(_BLANK_INDUSTRY_VALUES).sum())
 
 
 @dataclass
@@ -232,6 +240,36 @@ def _is_new_stock_history(history: pd.DataFrame, today: datetime) -> bool:
     return (today - earliest_dt).days <= 30
 
 
+def _load_cached_history_for_prereq(code: str, limit: int = 10) -> Optional[pd.DataFrame]:
+    """Read raw SQLite history for prerequisite checks.
+
+    StockDataFetcher intentionally returns None when cached rows are fewer than
+    requested. The prereq check still needs those short rows to identify newly
+    listed stocks and avoid blocking prediction incorrectly.
+    """
+    try:
+        from stock_store import load_history
+
+        return load_history(code, limit=limit)
+    except Exception:
+        return None
+
+
+def _trim_history_as_of(history: Optional[pd.DataFrame], fetcher: Any) -> Optional[pd.DataFrame]:
+    if history is None or history.empty or "date" not in history.columns:
+        return history
+    as_of = str(getattr(fetcher, "as_of_trade_date", "") or "").strip()
+    if len(as_of) == 8 and as_of.isdigit():
+        as_of = f"{as_of[:4]}-{as_of[4:6]}-{as_of[6:8]}"
+    if not as_of:
+        return history
+    date_col = (
+        history["date"].astype(str).str.replace("/", "-", regex=False).str.replace(".", "-", regex=False)
+    )
+    trimmed = history.loc[date_col <= as_of].copy()
+    return trimmed.reset_index(drop=True)
+
+
 def _check_prerequisites(
     *,
     historical_mode: bool,
@@ -310,8 +348,10 @@ def _check_prerequisites(
             except Exception:
                 history = None
             if history is None or history.empty:
-                missing_kline.append(code)
-                continue
+                history = _trim_history_as_of(_load_cached_history_for_prereq(code, 10), fetcher)
+                if history is None or history.empty:
+                    missing_kline.append(code)
+                    continue
             if len(history) >= 10:
                 continue
             if _is_new_stock_history(history, today):
@@ -442,9 +482,7 @@ def predict_limit_up_candidates(
             cnt = 0 if spot_df is None else len(spot_df)
             data_quality["spot"]["source"] = "local_history"
             data_quality["spot"]["rows"] = int(cnt)
-            if spot_df is not None and "所属行业" in spot_df.columns:
-                missing = int((spot_df["所属行业"].fillna("") == "").sum())
-                data_quality["spot"]["industry_missing"] = missing
+            data_quality["spot"]["industry_missing"] = _count_missing_industries(spot_df)
             if cnt == 0:
                 data_quality["warnings"].append(
                     f"历史 spot 为空：本地 history 表无 {trade_date} 数据，"
@@ -506,10 +544,7 @@ def predict_limit_up_candidates(
         if spot_df is not None:
             data_quality["spot"]["source"] = "realtime"
             data_quality["spot"]["rows"] = int(len(spot_df))
-            if "所属行业" in spot_df.columns:
-                data_quality["spot"]["industry_missing"] = int(
-                    (spot_df["所属行业"].fillna("") == "").sum()
-                )
+            data_quality["spot"]["industry_missing"] = _count_missing_industries(spot_df)
 
     if today_pool_df is None or today_pool_df.empty:
         non_trading = False

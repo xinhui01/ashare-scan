@@ -1,11 +1,17 @@
 import unittest
+from datetime import datetime as _datetime
+from unittest.mock import patch
 
 import pandas as pd
 
 from scan_models import FilterSettings
 from stock_filter import StockFilter
 from src.services.scoring import first_board as _first_board
-from src.services.scoring.predict import _AsOfHistoryFetcher
+from src.services.scoring.predict import (
+    _AsOfHistoryFetcher,
+    _check_prerequisites,
+    _count_missing_industries,
+)
 
 
 class _CompareFetcher:
@@ -361,6 +367,48 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
 
         self.assertEqual(calls, ["20260521"])
 
+    def test_prereq_uses_raw_cache_to_exempt_short_new_stock_history(self):
+        class _CacheOnlyFetcher:
+            def get_history_data(self, *args, **kwargs):
+                return None
+
+        class _FixedDatetime(_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 5, 29, 22, 0, 0)
+
+        raw_history = pd.DataFrame({
+            "date": [
+                "2026-05-22",
+                "2026-05-25",
+                "2026-05-26",
+                "2026-05-27",
+                "2026-05-28",
+                "2026-05-29",
+            ],
+            "close": [127.68, 99.49, 86.08, 73.25, 73.09, 80.4],
+        })
+        logs = []
+
+        with (
+            patch("src.services.scoring.predict.datetime", _FixedDatetime),
+            patch("stock_store.load_history", return_value=raw_history),
+        ):
+            missing = _check_prerequisites(
+                historical_mode=False,
+                pool_source="cache_db",
+                concept_themes_count=1,
+                board_strength={"机器人": 1.0},
+                sentiment_degraded=False,
+                zt_codes={"603435"},
+                fetcher=_CacheOnlyFetcher(),
+                build_local_cache_history_plan_fn=lambda **kwargs: object(),
+                log_fn=logs.append,
+            )
+
+        self.assertEqual(missing, [])
+        self.assertTrue(any("603435" in item for item in logs))
+
 
 def test_fetch_spot_snapshot_enriches_em_industry_from_universe(monkeypatch):
     raw = pd.DataFrame([
@@ -382,6 +430,35 @@ def test_fetch_spot_snapshot_enriches_em_industry_from_universe(monkeypatch):
 
     assert df is not None
     assert list(df["所属行业"]) == ["银行", "房地产"]
+
+
+def test_spot_industry_enriches_from_meta_when_universe_missing(monkeypatch):
+    raw = pd.DataFrame([
+        {"代码": "000001", "名称": "平安银行", "所属行业": ""},
+        {"代码": "000002", "名称": "万科A", "所属行业": "nan"},
+        {"代码": "000003", "名称": "国农科技", "所属行业": None},
+    ])
+    universe = pd.DataFrame([
+        {"code": "000001", "industry": ""},
+        {"code": "000002", "industry": "房地产"},
+        {"code": "000003", "industry": "nan"},
+    ])
+
+    monkeypatch.setattr("stock_store.load_universe", lambda: universe)
+    monkeypatch.setattr(
+        "stock_store.load_industry_map",
+        lambda codes: {"000001": "银行", "000003": "医药生物"},
+    )
+
+    df = _first_board._enrich_spot_industry_from_universe(raw)
+
+    assert list(df["所属行业"]) == ["银行", "房地产", "医药生物"]
+
+
+def test_count_missing_industries_treats_placeholder_values_as_blank():
+    df = pd.DataFrame({"所属行业": ["银行", "", None, " nan ", "-", "未知"]})
+
+    assert _count_missing_industries(df) == 5
 
 
 if __name__ == "__main__":
