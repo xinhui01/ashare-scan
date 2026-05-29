@@ -72,6 +72,27 @@ def score_continuation(
         score += 5
         reasons.append("首板+5")
 
+    # 1b. 开盘溢价惩罚 —— 2026-05-29 实盘"开盘价买入"约束：
+    # 用户实盘买不到盘中低点，按开盘价追买是真实可达口径。
+    # 27 天回测 avg_oc (按板数)：
+    #   1板 -0.31% / 2板 -0.70% / 3板 -2.33% / 4板 +0.14%(n=16噪声) / 5+板 -3.15%
+    # strict 命中率（次日涨停）随板数单调上升 14%→43%，但开盘溢价 3-6%
+    # 把涨停红利全吃掉甚至倒亏。按板数单调减分对冲基础分的"强势加分"，
+    # 让最终分数反映可达 PnL 而非纯命中率。
+    if boards >= 5:
+        score -= 15
+        reasons.append(f"{boards}板开盘溢价大-15")
+    elif boards == 4:
+        score -= 10
+        reasons.append("4板开盘溢价偏大-10")
+    elif boards == 3:
+        score -= 8
+        reasons.append("3板开盘溢价偏大-8")
+    elif boards == 2:
+        score -= 3
+        reasons.append("2板开盘溢价小-3")
+    # 1 板 avg_oc -0.31% 几乎可忽略，不减分
+
     # 2. 封板强度（炸板次数少、封板时间早）
     if break_count == 0:
         score += 15
