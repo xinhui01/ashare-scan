@@ -99,8 +99,11 @@ def score_continuation(
                 score += 5
                 reasons.append("上午封板+5")
             elif seal_minutes >= 14 * 60 + 30:
-                score -= 5
-                reasons.append("尾盘封板-5")
+                # 2026-05-29 -5 → -15：cont_1to2 ≥60 分明细几乎全带"尾盘封板"标签
+                # 仍能攒到 60+ 分，说明 -5 不足以压住。尾盘封板=资金不愿打板/可能被埋，
+                # 是连板延续最重要的负向信号。
+                score -= 15
+                reasons.append("尾盘封板-15")
         except (ValueError, IndexError):
             pass
 
@@ -339,7 +342,9 @@ def score_continuation_by_compare(
         score -= 15
         reasons.append("题材退潮阶段-15")
 
-    # 3. 情绪定盘：冰点情绪下高位连板的"死亡之吻"
+    # 3. 情绪定盘 —— 2026-05-29 把"火爆 +5"改成分档：
+    # cont_1to2 ≥60 分明细几乎每条都带"情绪火爆 94 +5"但 strict 命中率仅 6.5%（vs <60 14.5%）。
+    # 95+ 通常是市场顶部信号，把这部分翻转为减分。
     sent_score = int(compare_context.get("sentiment_score") or 50)
     if sent_score < 35:
         score -= 15
@@ -347,9 +352,15 @@ def score_continuation_by_compare(
     elif sent_score < 50:
         score -= 7
         reasons.append(f"情绪偏冷{sent_score}-7")
+    elif sent_score >= 95:
+        score -= 5
+        reasons.append(f"情绪过热{sent_score}-5")
+    elif sent_score >= 85:
+        score += 0
+        reasons.append(f"情绪火爆{sent_score}+0")
     elif sent_score >= 70:
-        score += 5
-        reasons.append(f"情绪火爆{sent_score}+5")
+        score += 3
+        reasons.append(f"情绪温热{sent_score}+3")
 
     final_score = max(0, min(100, int(round(score))))
     base["score"] = final_score

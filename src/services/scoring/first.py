@@ -333,36 +333,43 @@ def score_followthrough_candidate(
         score += relay_bonus
         reasons.append(f"距前涨停{days_since_prior_lu}日+{relay_bonus}")
 
-    # 2. 当日表现（max 22）— 数据反馈：高涨幅+收强 70+分段在 22 个样本里 0 命中，
-    #    而 56-57 分段的"潜伏+收强"反而 30%+ 命中（动能透支 vs 蓄势启动）
+    # 2. 当日表现 —— 2026-05-29 校准翻转：
+    # 旧版"潜伏+收强 +22"基于 22 条早期样本（命中 30%+），但累积 589 条 first 样本后：
+    #   - 潜伏+收强 (-1~+4% + 收强): hit 10.7% (n=122) ← 实际反指 -5.4%
+    #   - 启动+收强 (4-9.5% + 收强):  hit 17.3% (n=255) ← 实际正指 +4.1%
+    # 直接对调：启动+收强升至 +18（最强单项），潜伏+收强降到接近 0。
     if 4.0 <= change_pct < 9.5 and is_strong_close:
-        score += 12
-        reasons.append(f"启动+收强{change_pct:+.1f}%+12")
+        score += 18
+        reasons.append(f"启动+收强{change_pct:+.1f}%+18")
     elif -1.0 <= change_pct < 4.0 and is_strong_close:
-        score += 22
-        reasons.append(f"潜伏+收强{change_pct:+.1f}%+22")
+        score += 0
+        reasons.append(f"潜伏+收强{change_pct:+.1f}%+0")
     elif 4.0 <= change_pct < 9.5:
         score += 3
         reasons.append(f"启动但收弱{change_pct:+.1f}%+3")
     elif -3.0 <= change_pct < -1.0 and is_strong_close:
-        score += 13
-        reasons.append(f"小阴+收强{change_pct:+.1f}%+13")
+        score += 8
+        reasons.append(f"小阴+收强{change_pct:+.1f}%+8")
     else:
-        score += 3
-        reasons.append(f"涨幅{change_pct:+.1f}%+3")
+        score += 0
+        reasons.append(f"涨幅{change_pct:+.1f}%+0")
 
-    # 3. 距涨停可达（max 15）
+    # 3. 距涨停可达 —— 2026-05-29 收紧：
+    #   - ≤4%: hit 19.1% (n=220) ← 全文最强正指 +6.6%，保留 15
+    #   - 4-6%: hit 12.0% (n=283) ← 反指 -5.6%，归零
+    #   - 6-8%: 样本里更弱，归零
+    # 真正可达涨停才有意义，4% 以外的距离已经是"远"。
     lu_threshold = threshold_fn(code)
     room_to_lu = lu_threshold - change_pct
     if room_to_lu <= 4.0:
         score += 15
         reasons.append(f"距涨停剩{room_to_lu:.1f}%+15")
     elif room_to_lu <= 6.0:
-        score += 10
-        reasons.append(f"距涨停剩{room_to_lu:.1f}%+10")
+        score += 0
+        reasons.append(f"距涨停剩{room_to_lu:.1f}%+0")
     elif room_to_lu <= 8.0:
-        score += 5
-        reasons.append(f"距涨停剩{room_to_lu:.1f}%+5")
+        score += 0
+        reasons.append(f"距涨停剩{room_to_lu:.1f}%+0")
 
     # 4. 量价配合（max 12）— 爆量与"高涨幅"叠加时打折，防止"加速顶"被堆出高分
     if volume_ratio_today >= 3.0:
@@ -380,17 +387,20 @@ def score_followthrough_candidate(
         reasons.append(f"强势缩量整理{volume_ratio_today:.1f}x+5")
     # 1.0~1.5 不加分
 
-    # 5. 情绪共振（max 20）
+    # 5. 情绪共振 —— 2026-05-29 减半：
+    # "热门板块 +12" 实测反指 -3.7% (n=85)、"题材龙头≥20只" 反指 -3.4% (n=59)。
+    # 高情绪共振往往出现在加速顶/见顶日，跟单股技术面冲突时往往是顶部信号。
     if industry and hot_industries.get(industry, 0) >= 3:
-        score += 12
-        reasons.append(f"热门板块({hot_industries[industry]}只)+12")
-    elif industry and hot_industries.get(industry, 0) >= 2:
         score += 6
-        reasons.append(f"板块联动({hot_industries[industry]}只)+6")
+        reasons.append(f"热门板块({hot_industries[industry]}只)+6")
+    elif industry and hot_industries.get(industry, 0) >= 2:
+        score += 3
+        reasons.append(f"板块联动({hot_industries[industry]}只)+3")
 
     theme_bonus, theme_reason = _shared.theme_bonus(code, industry, compare_context)
     if theme_bonus > 0:
-        score += min(theme_bonus, 8)
+        # 题材龙头数 ≥20 只时反指，封顶 4 避免过度加权
+        score += min(theme_bonus, 4)
         if theme_reason:
             reasons.append(theme_reason)
 
@@ -399,10 +409,12 @@ def score_followthrough_candidate(
         score += flow_bonus
         reasons.extend(flow_reasons)
 
-    # 6. 形态加分（max 10）
+    # 6. 形态加分 —— 2026-05-29 调整：
+    # "突破20日新高" 实测反指 -3.8% (n=215)，归零（加速顶常见特征，不再加分）。
+    # "站稳MA10" 无显著方向性 (+1.2% diff, p>0.05)，保留 +4。
     if breakout_20d:
-        score += 6
-        reasons.append("突破20日新高+6")
+        score += 0
+        reasons.append("突破20日新高+0")
     if above_ma10:
         score += 4
         reasons.append("站稳MA10+4")
@@ -469,7 +481,9 @@ def score_followthrough_candidate(
         score -= 2
         reasons.append("前波T字板-2")
 
-    # D. 情绪定盘联动：冰点情绪下二波接力胜率显著下降
+    # D. 情绪定盘联动 —— 2026-05-29 把"火爆 +5"改成分档：
+    # 实测含"情绪火爆"标签 n=85 hit 11.8% vs 不含 hit 15.5%（diff -3.7%）。
+    # cont_1to2 ≥60 分明细几乎每条都带"情绪火爆 94"，>=95 通常是市场顶部反指。
     sent_score = int(compare_context.get("sentiment_score") or 50)
     if sent_score < 35:
         score -= 15
@@ -477,9 +491,15 @@ def score_followthrough_candidate(
     elif sent_score < 50:
         score -= 7
         reasons.append(f"情绪偏冷{sent_score}-7")
+    elif sent_score >= 95:
+        score -= 5
+        reasons.append(f"情绪过热{sent_score}-5")
+    elif sent_score >= 85:
+        score += 0
+        reasons.append(f"情绪火爆{sent_score}+0")
     elif sent_score >= 70:
-        score += 5
-        reasons.append(f"情绪火爆{sent_score}+5")
+        score += 3
+        reasons.append(f"情绪温热{sent_score}+3")
 
     # === 历史同类形态加分：近 90 日内的二波接力成功次数 ===
     occ_count, last_hit_days = _count_historical_followthrough(
