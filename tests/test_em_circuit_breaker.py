@@ -88,6 +88,34 @@ class TestEMCircuitBreaker(unittest.TestCase):
         self.assertLessEqual(cooldown_now, 200.0 + 0.01)
         self.assertGreater(cb.consecutive_trips(), 2)  # 确实触发了多轮
 
+    def test_single_failure_after_cooldown_does_not_immediately_retrip(self):
+        """冷却到期后的首次"试探"失败不应立刻重新熔断。
+
+        这是恢复语义的核心：冷却期过后东财获得一个完整的 fail_threshold
+        次试探窗口，单次抖动不再瞬间把冷却指数升级。
+        """
+        cb, clock = self._make()
+        for _ in range(3):
+            cb.record_failure()
+        self.assertTrue(cb.is_open())          # 已熔断，冷却 30s
+        clock.advance(30.1)                     # 冷却到期 → 半开
+        self.assertFalse(cb.is_open())
+        cb.record_failure()                     # 半开期一次试探失败
+        self.assertFalse(cb.is_open())          # 不应立刻重新熔断
+        self.assertEqual(cb.fail_count(), 1)    # 计数已从头开始
+
+    def test_threshold_fresh_failures_after_cooldown_retrip_and_escalate(self):
+        """但冷却后若连续失败到阈值（真·持续故障），仍应重新熔断并升级冷却。"""
+        cb, clock = self._make()
+        for _ in range(3):
+            cb.record_failure()                 # 熔断1：30s
+        clock.advance(30.1)                     # 冷却到期 → 半开
+        for _ in range(3):
+            cb.record_failure()                 # 半开期连续失败到阈值
+        self.assertTrue(cb.is_open())
+        self.assertEqual(cb.consecutive_trips(), 2)
+        self.assertAlmostEqual(cb.open_until() - clock(), 60.0, delta=0.01)
+
     def test_reset_is_alias_for_success(self):
         cb, _ = self._make()
         cb.record_failure()

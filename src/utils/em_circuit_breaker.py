@@ -68,6 +68,15 @@ class EMCircuitBreaker:
     # ---- 突变 ----
     def record_failure(self) -> None:
         with self._lock:
+            now = self._clock()
+            # 半开恢复：上一轮熔断的冷却期已过（is_open 已返回 False、请求已放行），
+            # 这是冷却后的一次"试探"失败。若沿用旧的 fail_count，会因它早已 ≥ 阈值
+            # 而单次失败即重新熔断、且冷却指数升级（30s→60s→…→600s 越锁越久）。
+            # 这里把计数清零、清掉旧的 open_until，给一个完整的 fail_threshold 次
+            # 试探窗口；只有真·持续故障（窗口内再次连续失败到阈值）才会重新熔断。
+            if self._open_until and now >= self._open_until:
+                self._fail_count = 0
+                self._open_until = 0.0
             self._fail_count += 1
             if self._fail_count >= self._fail_threshold:
                 self._consecutive_trips += 1
@@ -75,7 +84,7 @@ class EMCircuitBreaker:
                     self._initial_cooldown * (2 ** (self._consecutive_trips - 1)),
                     self._max_cooldown,
                 )
-                self._open_until = self._clock() + cooldown
+                self._open_until = now + cooldown
                 logger.warning(
                     "东方财富熔断器已开启：连续 %d 次失败，冷却 %.0fs（第 %d 次触发）",
                     self._fail_count, cooldown, self._consecutive_trips,

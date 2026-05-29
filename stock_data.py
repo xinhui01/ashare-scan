@@ -2065,9 +2065,10 @@ class StockDataFetcher:
                         self._log(f"分时行情(东财) {code} 获取失败: {e}")
             elif provider == "sina":
                 try:
-                    # 新浪接口要求 symbol 带 sh/sz 前缀（如 sh600519）
-                    sina_symbol = _market_prefixed_code(code)
-                    raw = _retry_ak_call(ak.stock_zh_a_minute, symbol=sina_symbol, period="1")
+                    # 容错封装：被限流(HTTP 456)/非 JSONP 时干净返回空表，
+                    # 不再抛 akshare 的 "list index out of range"。
+                    from src.sources.sina import fetch_intraday_1min as _fetch_sina_intraday_1min
+                    raw = _retry_ak_call(_fetch_sina_intraday_1min, code, logger=self._log)
                 except Exception as e:
                     last_error = e
                     if self._log:

@@ -11,6 +11,7 @@ from typing import Optional
 
 import pandas as pd
 
+from src.network.headers import USER_AGENT_POOL
 from src.network.host_health import (
     cooldown_remaining,
     mark_failed,
@@ -72,3 +73,67 @@ def fetch_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.Dat
     if last_error is not None:
         raise last_error
     return pd.DataFrame()
+
+
+def fetch_intraday_1min(stock_code: str, logger=None) -> "pd.DataFrame":
+    """新浪 1 分钟分时：容错解析，替代脆弱的 ``ak.stock_zh_a_minute``。
+
+    akshare 的 ``stock_zh_a_minute`` 在新浪返回非 JSONP（被限流时的 HTTP 456
+    拦截页、空响应等）时会执行 ``data_text.split("=(")[1]`` 直接抛
+    ``IndexError: list index out of range``，日志难懂且打断回退。
+
+    本函数直连同一接口，自己做"找 ``[...]`` 段 + json.loads"的宽松解析：
+    - 非 200 / 找不到 JSON 数组 → 记一条清晰日志并返回空表（让上层干净回退）；
+    - 真正的网络异常（超时/断连）照常抛出，交给外层重试。
+
+    返回列 ``day/open/high/low/close/volume``（不复权），可直接喂给
+    ``normalize_source_frame``（按列名映射，``day`` → ``time``）。
+    """
+    import json
+
+    import requests
+
+    from stock_data import _use_bypass_proxy, _use_insecure_ssl
+
+    symbol = market_prefixed_code(stock_code)
+    url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
+    params = {"symbol": symbol, "scale": "1", "ma": "no", "datalen": "1970"}
+
+    throttle()
+    req_kw = {
+        "url": url,
+        "params": params,
+        "timeout": (5, 15),
+        "headers": {
+            "User-Agent": random.choice(USER_AGENT_POOL),
+            "Referer": "https://finance.sina.com.cn/",
+        },
+    }
+    if _use_insecure_ssl():
+        req_kw["verify"] = False
+    with requests.Session() as session:
+        if _use_bypass_proxy():
+            session.trust_env = False
+        resp = session.get(**req_kw)
+
+    if resp.status_code != 200:
+        if logger:
+            logger(f"分时行情(新浪) {stock_code} 被限流/拒绝 (HTTP {resp.status_code})，跳过新浪")
+        return pd.DataFrame()
+
+    text = resp.text or ""
+    start = text.find("[")
+    end = text.rfind("]")
+    if start < 0 or end <= start:
+        if logger:
+            logger(f"分时行情(新浪) {stock_code} 返回非预期格式(无数据)，跳过新浪")
+        return pd.DataFrame()
+    try:
+        data = json.loads(text[start : end + 1])
+    except (ValueError, TypeError):
+        if logger:
+            logger(f"分时行情(新浪) {stock_code} JSON 解析失败，跳过新浪")
+        return pd.DataFrame()
+    if not data:
+        return pd.DataFrame()
+    return pd.DataFrame(data)
