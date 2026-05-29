@@ -114,13 +114,21 @@ def score_fresh_first_board(
 
     强制条件：最近 cooldown_days 个交易日内不存在涨停过。命中冷却期返回 None。
 
-    实证：基于 1112 只真实首板涨停股回测，本算法在
-      - score ≥ 50: precision ~3% (n=447)
-      - score ≥ 60: precision ~4% (n=104)
-      - score ≥ 70: precision ~9% (n=11)
-    高分段命中率合理但样本稀少。建议盯 ≥70 分的候选。
+    ⚠ 校准警示（2026-05-29，27 天 accuracy 表 425 候选 / 420 可买）：
+    旧的"涨幅 8%+ +28 / 量比爆量 +22"组合实测呈**反向校准**：
+      - 50-59 分: loose hit 10.5% (n=192)
+      - 60-69 分: loose hit  2.4% (n=41)  ← 倒挂 4x
+      - 70-79 分: loose hit  0.0% (n=4)
+    入口涨幅 8%+ 的样本 avg T+1 = -1.33%、≥+5% 占比仅 5%；
+    入口涨幅 3-4% 的样本 avg T+1 = +0.85%、≥+5% 占比 25%。
+    A 股真涨停股盘中较快封板，收盘停在 8-9.5% 的多为"想冲没冲上"的滞涨
+    / 高位放量出货，T+1 均值回归概率远大于继续上攻。
 
-    迁自 StockFilter._score_fresh_first_board；行为零变化。
+    2026-05-29 调整：
+    1) 翻转当日涨幅权重曲线 —— 3-6% 给最高分，6%+ 弱化甚至倒扣
+    2) 拉开股性活跃度 spread —— 跟实盘经验"凡涨停过的更易再次首板涨停，
+       僵尸股首板成功率低"对齐
+    样本仅 27 天，待累积更多数据后再回收 / 微调。
     """
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
 
@@ -171,20 +179,21 @@ def score_fresh_first_board(
     score = 0.0
     reasons: List[str] = []
 
-    # 1. 当日涨幅靠近涨停
+    # 1. 当日涨幅 —— 2026-05-29 翻转：3-6% 给最高分（实证最佳入口），
+    #    6-8% 弱化，8%+ 直接倒扣（高位放量滞涨 / T+1 均值回归）。
     if change_pct is not None:
         if change_pct >= 8.0:
-            score += 28
-            reasons.append(f"涨{change_pct:.1f}%逼近涨停+28")
+            score -= 8
+            reasons.append(f"涨{change_pct:.1f}%高位滞涨-8")
         elif change_pct >= 6.0:
-            score += 18
-            reasons.append(f"涨{change_pct:.1f}%放量上攻+18")
+            score += 4
+            reasons.append(f"涨{change_pct:.1f}%放量上攻+4")
         elif change_pct >= 4.0:
-            score += 10
-            reasons.append(f"涨{change_pct:.1f}%突破+10")
+            score += 16
+            reasons.append(f"涨{change_pct:.1f}%突破+16")
         elif change_pct >= 3.0:
-            score += 5
-            reasons.append(f"涨{change_pct:.1f}%温和启动+5")
+            score += 20
+            reasons.append(f"涨{change_pct:.1f}%温和启动+20")
 
     # 2. 量比放大（叠加 20 日校验，剔除"缩量调整里的假放量"）
     vol_ratio, vol_ratio_20 = _shared.vol_ratio_with_baseline(volume, t)
@@ -311,20 +320,23 @@ def score_fresh_first_board(
             score -= 5
             reasons.append(f"昨日晋级率{latest_cont_rate:.0f}%-5")
 
-    # 9. 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚
+    # 9. 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚。
+    # 2026-05-29 spread 从 [+6, -3] 拉宽到 [+12, -10]，对齐实盘经验
+    # "凡涨停过的股更易再次首板涨停，僵尸股首板成功率低"；
+    # 同时 fresh 高分段 45 条明细中过半带"僵尸股"标签 → 旧 -3 力度不够把它们压下去。
     occ_count, last_hit_days = _count_historical_any_limit_up(
         history, code, lookback_days=60, threshold_fn=threshold_fn,
     )
     if occ_count >= 5:
-        stock_bonus, label = 6, "妖股性"
+        stock_bonus, label = 12, "妖股性"
     elif occ_count >= 3:
-        stock_bonus, label = 4, "股性活跃"
+        stock_bonus, label = 8, "股性活跃"
     elif occ_count >= 1:
-        stock_bonus, label = 2, "曾涨停"
+        stock_bonus, label = 4, "曾涨停"
     else:
-        stock_bonus, label = -3, "僵尸股"
+        stock_bonus, label = -10, "僵尸股"
     if stock_bonus > 0 and last_hit_days is not None and last_hit_days <= 20:
-        stock_bonus = min(stock_bonus + 1, 6)
+        stock_bonus = min(stock_bonus + 2, 14)
         reasons.append(f"近60日{occ_count}次涨停{label}(最近{last_hit_days}日){stock_bonus:+d}")
     elif stock_bonus > 0:
         reasons.append(f"近60日{occ_count}次涨停{label}{stock_bonus:+d}")
