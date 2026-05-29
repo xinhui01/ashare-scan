@@ -1410,11 +1410,23 @@ class StockDataFetcher:
         return records
 
     @staticmethod
-    def _sanitize_limit_up_pool(df: pd.DataFrame) -> pd.DataFrame:
+    def _sanitize_limit_up_pool(
+        df: pd.DataFrame,
+        *,
+        drop_missing_seal_time: bool = True,
+    ) -> pd.DataFrame:
         """剔除接口返回的脏数据：涨跌幅 ≤ 0 / 最新价 ≤ 0 / 首封时间 全 0。
 
         akshare `stock_zt_pool_em` 偶尔会塞进异常行（如 涨跌幅=-100、最新价=0、
         首次封板时间='000000'），这些不是真实涨停股，必须在入库前过滤掉。
+
+        drop_missing_seal_time:
+            True（默认）= 东财在线池口径：真实涨停股必有封板时间，空/000000 视为脏数据剔除。
+            False = 反推/spot 派生池口径：这些来源本就拿不到封板时间（无分钟数据），
+                    空封板时间是正常的，不能据此剔除，否则整池被清空。
+
+        注：pandas 3.0 起 `astype(str)` 不再把缺失值变成 "nan" 字符串，会导致 NaN 与
+        空串行为分叉。这里用 `isna()` 显式覆盖缺失值，保证两者口径一致、跨版本稳定。
         """
         if df is None or df.empty:
             return df
@@ -1425,10 +1437,14 @@ class StockDataFetcher:
         if "最新价" in df.columns:
             price = pd.to_numeric(df["最新价"], errors="coerce")
             keep_mask &= price.fillna(-1) > 0
-        if "首次封板时间" in df.columns:
-            seal_time = df["首次封板时间"].astype(str).str.strip()
-            # "000000" 或全空都是无效封板时间
-            keep_mask &= ~(seal_time.isin(["", "000000", "0", "0000", "nan", "NaN", "None"]))
+        if drop_missing_seal_time and "首次封板时间" in df.columns:
+            seal_raw = df["首次封板时间"]
+            seal_str = seal_raw.astype(str).str.strip()
+            # 缺失值（NaN/NaT/pd.NA）+ 无效占位串，都算无封板时间
+            is_missing = seal_raw.isna() | seal_str.isin(
+                ["", "000000", "0", "0000", "nan", "NaN", "None", "<NA>", "NaT"]
+            )
+            keep_mask &= ~is_missing
         return df[keep_mask].reset_index(drop=True)
 
     def _fetch_spot_with_fallback(self) -> Optional[pd.DataFrame]:

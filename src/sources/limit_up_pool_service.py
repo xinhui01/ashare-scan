@@ -421,12 +421,17 @@ def get_limit_up_pool(
     from stock_store import load_limit_up_pool, save_limit_up_pool
     db_cached = load_limit_up_pool(date_key)
     if db_cached is not None and not db_cached.empty:
-        db_cached = fetcher._sanitize_limit_up_pool(db_cached)
-        fetcher._limit_up_pool_cache[date_key] = db_cached
-        fetcher._last_pool_source[date_key] = "cache_db"
+        # 缓存可能是反推/spot 派生池（无封板时间是正常的），故不按封板时间剔除
+        db_cached = fetcher._sanitize_limit_up_pool(db_cached, drop_missing_seal_time=False)
+        if db_cached is not None and not db_cached.empty:
+            fetcher._limit_up_pool_cache[date_key] = db_cached
+            fetcher._last_pool_source[date_key] = "cache_db"
+            if log_fn:
+                log_fn(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
+            return db_cached
+        # 缓存清洗后变空：不缓存空值，继续往下走东财 / spot 兜底（含腾讯）
         if log_fn:
-            log_fn(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
-        return db_cached
+            log_fn(f"涨停池 {date_key} 本地缓存清洗后为空，继续尝试在线源")
 
     # 3. 东财涨停池接口（正常路径）
     em_ok = not _eastmoney_circuit_breaker_open()
@@ -463,7 +468,8 @@ def get_limit_up_pool(
     try:
         derived = fetcher._derive_limit_up_pool_from_spot(date_key, prev_pool_df=prev_pool)
         if derived is not None and not derived.empty:
-            derived = fetcher._sanitize_limit_up_pool(derived)
+            # spot 派生池可能拿不到封板时间（东财熔断时无分钟数据），不据此剔除
+            derived = fetcher._sanitize_limit_up_pool(derived, drop_missing_seal_time=False)
             if derived is not None and not derived.empty:
                 fetcher._limit_up_pool_cache[date_key] = derived
                 save_limit_up_pool(date_key, derived)

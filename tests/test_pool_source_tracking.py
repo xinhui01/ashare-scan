@@ -35,7 +35,7 @@ class TestPoolSourceTracking:
         monkeypatch.setattr(
             f,
             "_sanitize_limit_up_pool",
-            lambda df: df,
+            lambda df, **kwargs: df,
         )
         monkeypatch.setattr(
             "stock_store.load_limit_up_pool",
@@ -51,7 +51,7 @@ class TestPoolSourceTracking:
         monkeypatch.setattr(
             f,
             "_sanitize_limit_up_pool",
-            lambda df: df,
+            lambda df, **kwargs: df,
         )
         monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
         monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
@@ -69,7 +69,7 @@ class TestPoolSourceTracking:
         monkeypatch.setattr(
             f,
             "_sanitize_limit_up_pool",
-            lambda df: df,
+            lambda df, **kwargs: df,
         )
         monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)  # 熔断
         monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
@@ -89,7 +89,7 @@ class TestPoolSourceTracking:
         monkeypatch.setattr(
             f,
             "_sanitize_limit_up_pool",
-            lambda df: df,
+            lambda df, **kwargs: df,
         )
         monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
         monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
@@ -107,5 +107,10 @@ class TestPoolSourceTracking:
         monkeypatch.setattr(
             "stock_data._retry_ak_call",
             lambda _fn, *args, **kwargs: pd.DataFrame([{"foo": "bar"}]),
+        )
+        # 腾讯兜底走 requests 直连（不经 _retry_ak_call），需单独 mock 否则会真连网络
+        monkeypatch.setattr(
+            "src.sources.limit_up_pool_service.fetch_tencent_spot_df",
+            lambda: None,
         )
         assert f._fetch_spot_with_fallback() is None

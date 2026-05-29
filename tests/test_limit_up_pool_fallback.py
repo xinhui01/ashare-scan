@@ -165,6 +165,101 @@ class TestLimitUpPoolEmptyRetry:
         assert not fetcher._limit_up_pool_cache["20260520"].empty
 
 
+class TestSanitizeSealTime:
+    """sanitize 的封板时间过滤只对'真·东财在线池'生效；反推/spot 派生池豁免。
+
+    pandas 3.0 起 astype(str) 不再把 NaN 变成 "nan"，导致 NaN 与空串行为分叉。
+    这里同时验证：drop_missing_seal_time=True 时 NaN 与空串都被剔除（一致）。
+    """
+
+    def _df(self, seal_values):
+        return pd.DataFrame([
+            {"代码": "600000", "涨跌幅": 10.0, "最新价": 9.2, "首次封板时间": s}
+            for s in seal_values
+        ])
+
+    def test_missing_seal_time_kept_when_flag_false(self):
+        # 反推池：首次封板时间 = NaN / 空串 / None，均应保留
+        df = self._df([pd.NA, "", None])
+        out = StockDataFetcher._sanitize_limit_up_pool(df, drop_missing_seal_time=False)
+        assert len(out) == 3
+
+    def test_missing_seal_time_dropped_when_flag_true(self):
+        # 东财在线池：空封板时间是脏数据，NaN 与空串都要剔除（pandas 版本无关）
+        df = self._df([pd.NA, "", None, "000000"])
+        out = StockDataFetcher._sanitize_limit_up_pool(df, drop_missing_seal_time=True)
+        assert out.empty
+
+    def test_default_keeps_dropping_garbage(self):
+        # 默认（True）保持原行为：有效封板时间留，'000000' 剔除
+        df = self._df(["09:35:00", "000000"])
+        out = StockDataFetcher._sanitize_limit_up_pool(df)
+        assert len(out) == 1
+        assert out.iloc[0]["首次封板时间"] == "09:35:00"
+
+    def test_price_and_chg_garbage_always_dropped(self):
+        # 涨跌幅/最新价 脏数据无论 flag 都剔除
+        df = pd.DataFrame([
+            {"代码": "600000", "涨跌幅": -100.0, "最新价": 0.0, "首次封板时间": "09:35:00"},
+        ])
+        assert StockDataFetcher._sanitize_limit_up_pool(df, drop_missing_seal_time=False).empty
+
+
+class TestCacheSanitizeFallthrough:
+    """步骤2 SQLite 缓存：先清洗后判空。"""
+
+    def _build_fetcher(self):
+        instance = StockDataFetcher.__new__(StockDataFetcher)
+        instance._log = lambda msg: None
+        instance._limit_up_pool_cache = {}
+        instance._prev_limit_up_pool_cache = {}
+        instance._last_pool_source = {}
+        instance._last_prev_pool_source = {}
+        return instance
+
+    def test_reverse_derived_cache_with_nan_seal_time_survives(self, monkeypatch):
+        # 复现 bug：反推池（NaN 封板时间）从缓存读出后不应被清成空
+        fetcher = self._build_fetcher()
+        cached = pd.DataFrame([
+            {"代码": "600726", "名称": "华电能源", "涨跌幅": 10.04,
+             "最新价": 9.21, "首次封板时间": pd.NA, "连板数": 4},
+        ])
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20260528")
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *a, **k: cached.copy())
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *a, **k: None)
+
+        df = fetcher.get_limit_up_pool("20260528")
+
+        assert not df.empty
+        assert len(df) == 1
+        assert fetcher.get_pool_source("20260528") == "cache_db"
+
+    def test_all_dirty_cache_falls_through_to_network(self, monkeypatch):
+        # 缓存全脏（涨跌幅<=0）清洗后变空 → 不缓存空、继续走在线源
+        fetcher = self._build_fetcher()
+        dirty = pd.DataFrame([
+            {"代码": "600000", "名称": "脏", "涨跌幅": -100.0, "最新价": 0.0,
+             "首次封板时间": "000000", "连板数": 1},
+        ])
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20260520")
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *a, **k: dirty.copy())
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *a, **k: None)
+        monkeypatch.setattr(
+            "stock_data._retry_ak_call",
+            lambda _fn, date=None: pd.DataFrame([
+                {"代码": "600001", "名称": "网络股", "涨跌幅": 10.0,
+                 "最新价": 5.0, "首次封板时间": "09:31:00", "连板数": 1},
+            ]),
+        )
+
+        df = fetcher.get_limit_up_pool("20260520")
+
+        assert not df.empty
+        assert df.iloc[0]["代码"] == "600001"
+        assert fetcher.get_pool_source("20260520") == "eastmoney"
+
+
 def test_gui_refresh_clears_limit_up_pool_cache_and_triggers_retry():
     from src.gui.app import StockMonitorApp
     from src.gui.tabs.predict import PredictTab
