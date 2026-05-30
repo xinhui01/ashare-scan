@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring import shared as _shared
+from src.services.scoring import fresh_calibration as _fresh_calibration
 from src.services.scoring.helpers import _count_historical_any_limit_up
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,25 @@ def scan_fresh_first_board_candidates_cached(
         if progress_callback:
             progress_callback(idx + 1, total, f"首板筛选 {rec['code']} {rec.get('name', '')}")
 
-    candidates.sort(key=lambda x: -x["score"])
+    calibration_rules = compare_context.get("fresh_calibration_rules") or {}
+    if isinstance(calibration_rules, dict) and calibration_rules:
+        candidates = [
+            _fresh_calibration.calibrate_fresh_candidate(
+                item, calibration_rules, min_samples=20,
+            )
+            for item in candidates
+        ]
+        candidates.sort(
+            key=lambda x: (
+                str(x.get("confidence") or "") == "涨停高置信",
+                float(x.get("calibrated_hit_rate") or 0.0),
+                int(x.get("calibrated_score") or x.get("score") or 0),
+                int(x.get("score") or 0),
+            ),
+            reverse=True,
+        )
+    else:
+        candidates.sort(key=lambda x: -x["score"])
     return candidates[:50]
 
 

@@ -737,6 +737,19 @@ SCORE_BUCKETS: List[Tuple[str, int, int]] = [
     ("80-100", 80, 100),
 ]
 
+_CURRENT_FRESH_SCORE_MARKERS: Tuple[str, ...] = (
+    "高位滞涨-8",
+    "放量上攻+4",
+    "突破+16",
+    "温和启动+20",
+)
+
+
+def _is_current_fresh_score_row(row: Dict[str, Any]) -> bool:
+    """Whether a fresh-row score was produced by the current scorer weights."""
+    reasons = str(row.get("reasons") or "")
+    return any(marker in reasons for marker in _CURRENT_FRESH_SCORE_MARKERS)
+
 
 def _load_recent_rows(
     category: Optional[str],
@@ -754,6 +767,8 @@ def _load_recent_rows(
             cat = str(r.get("category") or "")
             if category:
                 if cat != category:
+                    continue
+                if cat == "fresh" and not _is_current_fresh_score_row(r):
                     continue
             else:
                 # 全类别聚合时跳过 cont 子类别，避免和 cont 主类别重复计数

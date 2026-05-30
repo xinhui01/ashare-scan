@@ -97,13 +97,16 @@ from stock_store import (
     clear_scan_snapshots,
     clear_universe as clear_universe_store,
     history_coverage_summary as load_history_coverage_summary,
+    load_all_history_meta_map as load_all_history_meta_map_store,
     load_fund_flow as load_fund_flow_store,
     load_history as load_history_store,
     load_history_meta as load_history_meta_store,
     load_universe as load_universe_store,
     save_fund_flow as save_fund_flow_store,
     save_history as save_history_store,
+    save_history_meta_batch as save_history_meta_batch_store,
     save_history_meta as save_history_meta_store,
+    save_history_rows_batch as save_history_rows_batch_store,
     save_universe as save_universe_store,
 )
 from data_source_models import DATA_SOURCE_OPTIONS, DataProviderPlan, HistoryRequestPlan
@@ -114,10 +117,20 @@ T = TypeVar("T")
 # 此处重新导出，保持 `from stock_data import DaemonThreadPoolExecutor` 零修改。
 from src.utils.daemon_executor import DaemonThreadPoolExecutor
 from src.config import env_int, env_float
+from src.utils.snapshot_history import snapshot_rows_to_history_rows
+from src.utils.trade_calendar import resolve_sync_target_trade_date
 
 
 def _history_request_concurrency() -> int:
     return env_int("ASHARE_SCAN_HISTORY_CONCURRENCY", default=2, lo=1, hi=10)
+
+
+def _history_per_source_concurrency() -> int:
+    return env_int("ASHARE_SCAN_HISTORY_PER_SOURCE_CONCURRENCY", default=1, lo=1, hi=4)
+
+
+def _history_total_concurrency_cap() -> int:
+    return env_int("ASHARE_SCAN_HISTORY_TOTAL_CONCURRENCY", default=12, lo=1, hi=32)
 
 
 def _history_min_request_interval_sec() -> float:
@@ -282,8 +295,8 @@ def _retry_ak_call(fn: Callable[..., T], *args, max_attempts: int = 2, base_dela
 
 
 def _history_retry_ak_call(fn: Callable[..., T], *args, **kwargs) -> T:
-    # 历史 K 线接口对并发和出口网络都更敏感，先串行闸门。
-    # 具体的镜像轮换和短重试交给函数内部处理，避免外层再叠超长等待。
+    # 东方财富历史接口对并发和出口网络最敏感，保留东财专用闸门。
+    # 其它历史源在各自模块内有独立节流阀，不能再共用这个全局闸门。
     with _HISTORY_REQUEST_SEMAPHORE:
         return fn(*args, **kwargs)
 
@@ -376,6 +389,19 @@ _fetch_ths_fund_flow_frame = _src_ths.fetch_fund_flow_frame
 # 实现已迁移到 src/sources/wscn.py；下面是公共函数别名。
 from src.sources import wscn as _src_wscn
 _fetch_wscn_hist_frame = _src_wscn.fetch_hist_frame
+
+
+# ---- BaoStock 历史日线 ----
+# 不需要 token；字段完整后进入统一 history schema。
+from src.sources import baostock as _src_baostock
+_fetch_baostock_hist_frame = _src_baostock.fetch_hist_frame
+
+
+# ---- 通达信 (TDX / xmtdx) 历史日线 ----
+# 可选依赖；auto 模式只有本机安装后端时才加入分流通道。
+from src.sources import tdx as _src_tdx
+_fetch_tdx_hist_frame = _src_tdx.fetch_hist_frame
+_tdx_source_available = _src_tdx.is_available
 
 
 # 历史抓取主函数 + probe：实现已迁移到 src/sources/eastmoney/history.py
@@ -495,6 +521,34 @@ def _history_partial_fields(df: Optional[pd.DataFrame]) -> str:
     if "amount" not in df.columns or pd.to_numeric(df["amount"], errors="coerce").notna().sum() == 0:
         missing.append("amount")
     return ",".join(missing)
+
+
+def _normalize_history_trade_date(value: Any) -> str:
+    raw = str(value or "").strip().replace("/", "-").replace(".", "-")
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw
+
+
+def _combine_partial_fields(*values: Any) -> str:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        for part in str(value or "").replace("，", ",").split(","):
+            field = part.strip()
+            if field and field not in seen:
+                seen.add(field)
+                out.append(field)
+    return ",".join(out)
+
+
+def _history_plan_channel_key(plan: HistoryRequestPlan) -> str:
+    providers = tuple(str(p or "").strip().lower() for p in plan.provider_sequence if str(p or "").strip())
+    if len(providers) == 1:
+        return providers[0]
+    if providers:
+        return "fallback:" + "+".join(providers)
+    return str(plan.reason or "unknown")
 
 
 def _intraday_market_closed_now() -> bool:
@@ -684,12 +738,178 @@ class StockDataFetcher:
                     mirror_urls=(),
                     reason="multi-source-wscn",
                 ))
+        if normalized in ("auto", "baostock"):
+            if not _global_host_on_cooldown("baostock.com"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("baostock",),
+                    mirror_urls=(),
+                    reason="multi-source-baostock",
+                ))
+        if normalized in ("auto", "tdx"):
+            if (normalized == "tdx" or _tdx_source_available()) and not _global_host_on_cooldown("tdx"):
+                plans.append(HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=("tdx",),
+                    mirror_urls=(),
+                    reason="multi-source-tdx",
+                ))
 
         # 兜底：至少保证一个 auto plan
         if not plans:
             plans.append(self.build_history_request_plan(source=source, force_refresh=False))
 
         return plans
+
+    def _fetch_history_cache_spot_snapshot(self) -> Optional[pd.DataFrame]:
+        from src.services.scoring.first_board import fetch_spot_snapshot
+
+        return fetch_spot_snapshot(log_fn=self._log)
+
+    def _fast_append_spot_snapshot_to_history_cache(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        should_stop: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        """用一次全市场快照批量补最近已收盘交易日的 history 行。"""
+        stats: Dict[str, Any] = {
+            "enabled": True,
+            "appended": 0,
+            "failed": 0,
+            "converted": 0,
+            "skipped_reason": "",
+        }
+        if should_stop and should_stop():
+            stats["skipped_reason"] = "stopped"
+            return stats
+
+        try:
+            target = resolve_sync_target_trade_date()
+        except Exception as exc:
+            stats["skipped_reason"] = f"target-error:{exc}"
+            if self._log:
+                self._log(f"快照补K：交易日判定失败，跳过快照补K: {exc}")
+            return stats
+
+        if not target.allows_history_write():
+            stats["skipped_reason"] = f"phase={target.phase}"
+            if self._log:
+                self._log(
+                    f"快照补K：当前处于 {target.phase}，不把盘中快照写入历史K线。"
+                )
+            return stats
+
+        target_codes = {
+            str(item.get("code", "") or "").strip().zfill(6)
+            for item in rows
+            if str(item.get("code", "") or "").strip()
+        }
+        if not target_codes:
+            stats["skipped_reason"] = "empty-universe"
+            return stats
+
+        try:
+            spot_df = self._fetch_history_cache_spot_snapshot()
+        except Exception as exc:
+            stats["skipped_reason"] = f"spot-error:{exc}"
+            if self._log:
+                self._log(f"快照补K：全市场快照获取失败，跳过快照补K: {exc}")
+            return stats
+        if spot_df is None or spot_df.empty:
+            stats["skipped_reason"] = "empty-spot"
+            if self._log:
+                self._log("快照补K：全市场快照为空，跳过快照补K。")
+            return stats
+
+        converted = snapshot_rows_to_history_rows(
+            spot_df.to_dict("records"),
+            target.target_date,
+            target.phase,
+        )
+        stats["converted"] = len(converted)
+        if not converted:
+            stats["skipped_reason"] = "no-converted-rows"
+            return stats
+
+        meta_map = load_all_history_meta_map_store()
+        rows_by_code: Dict[str, pd.DataFrame] = {}
+        metas_by_code: Dict[str, Dict[str, Any]] = {}
+        target_date = _normalize_history_trade_date(target.target_date)
+        for row in converted:
+            code = str(row.get("code", "") or "").strip().zfill(6)
+            if code not in target_codes:
+                continue
+            meta = meta_map.get(code) or {}
+            latest = _normalize_history_trade_date(meta.get("latest_trade_date"))
+            if latest and latest > target_date:
+                continue
+
+            frame_row = dict(row)
+            frame_row.pop("code", None)
+            row_partial = str(frame_row.pop("partial_fields", "") or "")
+            frame_row.pop("needs_repair", None)
+            if frame_row.get("amount") is None:
+                row_partial = _combine_partial_fields(row_partial, "amount")
+
+            rows_by_code[code] = pd.DataFrame([frame_row])
+
+            existing_partial = str(meta.get("partial_fields") or "").strip()
+            existing_source = str(meta.get("source") or "").strip()
+            existing_needs_repair = _history_meta_requires_repair(meta)
+            if existing_needs_repair and not existing_partial and existing_source.lower() == "tencent":
+                existing_partial = "amount"
+            partial_fields = _combine_partial_fields(
+                existing_partial if existing_needs_repair else "",
+                row_partial,
+            )
+            try:
+                current_count = int(meta.get("row_count", 0) or 0)
+            except (TypeError, ValueError):
+                current_count = 0
+            count_delta = 1 if not latest or latest < target_date else 0
+            row_count = max(1, current_count + count_delta)
+            metas_by_code[code] = {
+                "code": code,
+                "latest_trade_date": target_date,
+                "row_count": row_count,
+                "source": "spot-snapshot",
+                "partial_fields": partial_fields,
+                "needs_repair": 1 if partial_fields else 0,
+            }
+
+        if not rows_by_code:
+            stats["skipped_reason"] = "no-target-rows"
+            return stats
+
+        success_codes, failed_codes = save_history_rows_batch_store(rows_by_code)
+        metas = [metas_by_code[code] for code in success_codes if code in metas_by_code]
+        meta_success, meta_failed = save_history_meta_batch_store(metas)
+        stats["appended"] = len(meta_success)
+        stats["failed"] = len(set(failed_codes) | set(meta_failed))
+        if self._log:
+            self._log(
+                f"快照补K：目标日 {target_date}，写入 {stats['appended']} 只，"
+                f"失败 {stats['failed']} 只。"
+            )
+        return stats
+
+    def _resolve_history_update_worker_count(
+        self,
+        requested_workers: Optional[int],
+        plans: List[HistoryRequestPlan],
+    ) -> Tuple[int, int, int]:
+        per_source_limit = _history_per_source_concurrency()
+        channel_count = max(1, len({_history_plan_channel_key(plan) for plan in plans}))
+        natural_workers = max(1, channel_count * per_source_limit)
+        try:
+            requested = int(requested_workers or 0)
+        except (TypeError, ValueError):
+            requested = 0
+        if requested <= 0:
+            requested = self.history_request_concurrency_limit()
+        worker_count = min(max(requested, natural_workers), _history_total_concurrency_cap())
+        return max(1, worker_count), per_source_limit, channel_count
 
     def update_history_cache(
         self,
@@ -701,6 +921,7 @@ class StockDataFetcher:
         should_stop: Optional[Callable[[], bool]] = None,
         refresh_universe: bool = False,
         allowed_boards: Optional[List[str]] = None,
+        fast_daily_append: bool = True,
     ) -> Dict[str, Any]:
         universe = self.get_all_stocks(force_refresh=refresh_universe)
         if universe is None or universe.empty:
@@ -716,48 +937,105 @@ class StockDataFetcher:
         if total <= 0:
             return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
 
+        snapshot_stats: Dict[str, Any] = {
+            "enabled": bool(fast_daily_append),
+            "appended": 0,
+            "failed": 0,
+            "converted": 0,
+            "skipped_reason": "disabled" if not fast_daily_append else "",
+        }
+        if fast_daily_append:
+            snapshot_stats = self._fast_append_spot_snapshot_to_history_cache(
+                rows,
+                should_stop=should_stop,
+            )
+
+        pre_skipped = 0
+        pending_rows: List[Dict[str, Any]] = []
+        for item in rows:
+            code = str(item.get("code", "")).strip().zfill(6)
+            if should_stop and should_stop():
+                pre_skipped += 1
+                continue
+            if _is_history_cache_fresh(code, max(1, days), self._log):
+                pre_skipped += 1
+            else:
+                pending_rows.append(item)
+
+        if not pending_rows:
+            return {
+                "total": total,
+                "updated": 0,
+                "failed": 0,
+                "skipped": pre_skipped,
+                "plan": "snapshot-only/no-pending-history",
+                "workers": 0,
+                "per_source_concurrency": _history_per_source_concurrency(),
+                "source_channels": 0,
+                "snapshot_appended": int(snapshot_stats.get("appended", 0) or 0),
+                "snapshot_failed": int(snapshot_stats.get("failed", 0) or 0),
+                "snapshot_skipped_reason": str(snapshot_stats.get("skipped_reason", "") or ""),
+            }
+
         # ---- 多源并行分流策略 ----
         source_str = source or self._default_history_source
         multi_plans = self._build_multi_source_plans(source_str)
         plan_count = len(multi_plans)
+        worker_count, per_source_limit, channel_count = self._resolve_history_update_worker_count(
+            workers,
+            multi_plans,
+        )
+        channel_limits = {
+            key: threading.BoundedSemaphore(per_source_limit)
+            for key in {_history_plan_channel_key(plan) for plan in multi_plans}
+        }
 
         if self._log:
             plan_names = [p.reason for p in multi_plans]
-            self._log(f"多源分流策略：{plan_count} 个通道 → {', '.join(plan_names)}")
+            self._log(
+                f"多源分流策略：{plan_count} 个计划/{channel_count} 个源通道，"
+                f"每源并发≤{per_source_limit}，执行线程={worker_count} → {', '.join(plan_names)}"
+            )
 
         # 打乱股票顺序，避免同板块集中请求
+        rows = pending_rows
         _random.shuffle(rows)
-
-        worker_count = max(
-            1,
-            min(int(workers or self.history_request_concurrency_limit()), self.history_request_concurrency_limit()),
-        )
-        if plan_count > 1:
-            worker_count = max(worker_count, min(plan_count + 1, 10))
 
         updated = 0
         failed = 0
-        skipped = 0
+        skipped = pre_skipped
 
-        # 构建一个包含全部备用源的 fallback plan，用于单源失败后重试
-        _all_fallback_providers = [
-            p for plan in multi_plans for p in plan.provider_sequence
-        ]
-        # 去重保序
-        _seen_providers: set[str] = set()
-        _unique_fallback: list[str] = []
-        for p in _all_fallback_providers:
-            if p not in _seen_providers:
-                _seen_providers.add(p)
-                _unique_fallback.append(p)
-        _fallback_plan = HistoryRequestPlan(
-            mode="network",
-            provider_sequence=tuple(_unique_fallback),
-            mirror_urls=(),
-            reason="multi-source-fallback",
-        ) if len(_unique_fallback) > 1 else None
+        plans_by_channel: Dict[str, HistoryRequestPlan] = {}
+        for plan in multi_plans:
+            plans_by_channel.setdefault(_history_plan_channel_key(plan), plan)
+        fallback_plans = list(plans_by_channel.values())
 
-        def _work(item: Dict[str, Any], assigned_plan: HistoryRequestPlan) -> tuple[str, str, bool, bool]:
+        def _call_history_with_plan(code: str, plan: HistoryRequestPlan) -> Optional[pd.DataFrame]:
+            channel_key = _history_plan_channel_key(plan)
+            semaphore = channel_limits.setdefault(
+                channel_key,
+                threading.BoundedSemaphore(per_source_limit),
+            )
+            with semaphore:
+                return self.get_history_data(
+                    code, days=days, force_refresh=True, request_plan=plan,
+                )
+
+        def _pick_fallback_plan(assigned_plan: HistoryRequestPlan, item_index: int) -> Optional[HistoryRequestPlan]:
+            assigned_key = _history_plan_channel_key(assigned_plan)
+            candidates = [
+                plan for plan in fallback_plans
+                if _history_plan_channel_key(plan) != assigned_key
+            ]
+            if not candidates:
+                return None
+            return candidates[item_index % len(candidates)]
+
+        def _work(
+            item_index: int,
+            item: Dict[str, Any],
+            assigned_plan: HistoryRequestPlan,
+        ) -> tuple[str, str, bool, bool]:
             """返回 (code, name, success, skipped)"""
             code = str(item.get("code", "")).strip().zfill(6)
             name = str(item.get("name", "") or "")
@@ -771,6 +1049,8 @@ class StockDataFetcher:
                 "sina": "finance.sina.com.cn", "netease": "quotes.money.163.com",
                 "sohu": "q.stock.sohu.com",
                 "ths": "d.10jqka.com.cn", "wscn": "api-ddc-wscn.awtmt.com",
+                "baostock": "baostock.com",
+                "tdx": "tdx",
             }
             assigned_all_cooled = all(
                 _global_host_on_cooldown(_host_map[p])
@@ -778,30 +1058,27 @@ class StockDataFetcher:
                 if p in _host_map
             ) if assigned_plan.provider_sequence else False
 
-            use_plan = _fallback_plan if (assigned_all_cooled and _fallback_plan) else assigned_plan
-            df = self.get_history_data(
-                code, days=days, force_refresh=True, request_plan=use_plan,
-            )
+            fallback_plan = _pick_fallback_plan(assigned_plan, item_index)
+            use_plan = fallback_plan if (assigned_all_cooled and fallback_plan) else assigned_plan
+            df = _call_history_with_plan(code, use_plan)
             if df is not None and not df.empty:
                 return code, name, True, False
-            # 如果用的是 assigned plan 失败了，再用 fallback 重试
-            if use_plan is assigned_plan and _fallback_plan is not None:
-                df = self.get_history_data(
-                    code, days=days, force_refresh=True, request_plan=_fallback_plan,
-                )
+            # 如果分配源失败，只轮转到一个其它健康源，避免失败任务同时涌向同一备用源。
+            if use_plan is assigned_plan and fallback_plan is not None:
+                df = _call_history_with_plan(code, fallback_plan)
             return code, name, bool(df is not None and not df.empty), False
 
         with DaemonThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="hist-cache") as executor:
             futures = [
-                executor.submit(_work, item, multi_plans[idx % plan_count])
+                executor.submit(_work, idx, item, multi_plans[idx % plan_count])
                 for idx, item in enumerate(rows)
             ]
-            completed = 0
+            completed = pre_skipped
             for fut in as_completed(futures):
                 completed += 1
                 code, name, ok, was_skipped = fut.result()
                 if should_stop and should_stop():
-                    skipped = max(0, total - completed)
+                    skipped += max(0, total - completed)
                     break
                 if was_skipped:
                     skipped += 1
@@ -818,6 +1095,12 @@ class StockDataFetcher:
             "failed": failed,
             "skipped": skipped,
             "plan": f"multi-source/{plan_count}channels",
+            "workers": worker_count,
+            "per_source_concurrency": per_source_limit,
+            "source_channels": channel_count,
+            "snapshot_appended": int(snapshot_stats.get("appended", 0) or 0),
+            "snapshot_failed": int(snapshot_stats.get("failed", 0) or 0),
+            "snapshot_skipped_reason": str(snapshot_stats.get("skipped_reason", "") or ""),
         }
 
     def build_intraday_request_plan(self, source: str = "auto") -> DataProviderPlan:
@@ -885,6 +1168,20 @@ class StockDataFetcher:
                 mirror_urls=(),
                 reason="history-provider=wscn",
             )
+        if normalized == "baostock":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("baostock",),
+                mirror_urls=(),
+                reason="history-provider=baostock",
+            )
+        if normalized == "tdx":
+            return HistoryRequestPlan(
+                mode="network",
+                provider_sequence=("tdx",),
+                mirror_urls=(),
+                reason="history-provider=tdx",
+            )
 
         mirrors = tuple(self.get_available_history_mirrors(force_refresh=force_refresh))
         if normalized == "eastmoney":
@@ -908,19 +1205,22 @@ class StockDataFetcher:
                 reason=reason,
             )
 
-        _non_em_providers = ("sina", "ths", "netease", "sohu", "wscn")
+        _non_em_providers = ["sina", "ths", "netease", "sohu", "wscn", "baostock"]
+        if _tdx_source_available() and not _global_host_on_cooldown("tdx"):
+            _non_em_providers.append("tdx")
+        non_em_providers = tuple(_non_em_providers)
         if _eastmoney_circuit_breaker_open():
             # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=_non_em_providers,
+                provider_sequence=non_em_providers,
                 mirror_urls=(),
                 reason="history-provider=auto(eastmoney-circuit-open)",
             )
         if mirrors:
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=("eastmoney",) + _non_em_providers,
+                provider_sequence=("eastmoney",) + non_em_providers,
                 mirror_urls=mirrors,
                 reason="history-provider=auto",
             )
@@ -932,7 +1232,7 @@ class StockDataFetcher:
             reason = "history-mirrors-unavailable"
         return HistoryRequestPlan(
             mode="network",
-            provider_sequence=_non_em_providers,
+            provider_sequence=non_em_providers,
             mirror_urls=(),
             reason=reason,
         )
@@ -1810,6 +2110,8 @@ class StockDataFetcher:
                 "sohu": "q.stock.sohu.com",
                 "ths": "d.10jqka.com.cn",
                 "wscn": "api-ddc-wscn.awtmt.com",
+                "baostock": "baostock.com",
+                "tdx": "tdx",
             }
 
             last_error: Optional[BaseException] = None
@@ -1855,12 +2157,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用新浪源补位。")
-                        df = _history_retry_ak_call(
-                            _fetch_sina_hist_frame,
-                            stock_code,
-                            start_date,
-                            end_date,
-                        )
+                        df = _fetch_sina_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -1905,6 +2202,26 @@ class StockDataFetcher:
                         last_error = e
                         if self._log:
                             self._log(f"历史 {stock_code} 使用华尔街见闻源失败: {e}")
+                        continue
+                elif provider == "baostock":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用 BaoStock 源补位。")
+                        df = _fetch_baostock_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用 BaoStock 源失败: {e}")
+                        continue
+                elif provider == "tdx":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用通达信源补位。")
+                        df = _fetch_tdx_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用通达信源失败: {e}")
                         continue
                 else:
                     last_error = RuntimeError(f"unsupported-history-provider: {provider}")

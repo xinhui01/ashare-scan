@@ -163,5 +163,46 @@ class TestRowIsHit(unittest.TestCase):
         self.assertFalse(svc._row_is_hit(row))
 
 
+class TestFreshScoreBucketVersioning(unittest.TestCase):
+    def test_fresh_score_buckets_ignore_legacy_scoring_rows(self):
+        legacy_row = {
+            "trade_date": "20260528",
+            "category": "fresh",
+            "predicted_score": 76,
+            "hit_buyable": 1,
+            "hit_loose": 0,
+            "hit_strict": 0,
+            "t1_open_close_pct": -1.0,
+            "t1_pct": -1.0,
+            "reasons": "涨9.1%逼近涨停+28 / 量比2.9x爆量+22",
+        }
+        current_row = {
+            "trade_date": "20260530",
+            "category": "fresh",
+            "predicted_score": 52,
+            "hit_buyable": 1,
+            "hit_loose": 1,
+            "hit_strict": 0,
+            "t1_open_close_pct": 5.5,
+            "t1_pct": 6.0,
+            "reasons": "涨4.5%突破+16 / 量比1.8x放量+14",
+        }
+
+        with (
+            patch.object(svc.stock_store, "list_prediction_accuracy_dates", return_value=["20260530", "20260528"]),
+            patch.object(
+                svc.stock_store,
+                "load_prediction_accuracy_by_date",
+                side_effect=lambda td: [current_row] if td == "20260530" else [legacy_row],
+            ),
+        ):
+            buckets = svc.query_score_bucket_stats(category="fresh", lookback_dates=20)
+
+        by_label = {b["label"]: b for b in buckets}
+        self.assertEqual(by_label["50-59"]["buyable"], 1)
+        self.assertEqual(by_label["50-59"]["hit"], 1)
+        self.assertEqual(by_label["70-79"]["buyable"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

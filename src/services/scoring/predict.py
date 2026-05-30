@@ -23,6 +23,7 @@ from src.services.scoring import cont as _cont
 from src.services.scoring import first as _first
 from src.services.scoring import first_board as _first_board
 from src.services.scoring import fresh as _fresh
+from src.services.scoring import fresh_calibration as _fresh_calibration
 from src.services.scoring import shared as _shared
 from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
@@ -975,6 +976,26 @@ def predict_limit_up_candidates(
     # 阶段6：首板涨停候选（最近 N 日未涨停、今日量价启动）
     if log_fn:
         log_fn("涨停预测：阶段6 - 识别首板涨停候选...")
+    try:
+        fresh_rules = _fresh_calibration.load_fresh_calibration_rules(
+            lookback_dates=20, min_samples=20, success_field="hit_strict",
+        )
+    except Exception as exc:
+        logger.debug("首板涨停校准规则加载失败: %s", exc)
+        fresh_rules = {}
+    compare_context["fresh_calibration_rules"] = fresh_rules
+    if log_fn:
+        eligible_rules = [
+            item for item in fresh_rules.values()
+            if float(item.get("rate") or 0.0) >= 10.0
+        ]
+        if eligible_rules:
+            log_fn(
+                f"涨停预测：首板 V2 严格涨停校准规则 {len(fresh_rules)} 条，"
+                f"其中 10%+ 涨停高置信规则 {len(eligible_rules)} 条"
+            )
+        else:
+            log_fn("涨停预测：首板 V2 严格涨停校准规则样本不足，回退原始分数排序")
     fresh_first_board_candidates = _fresh.scan_fresh_first_board_candidates_cached(
         spot_df, zt_codes, hot_industries, compare_context, progress_callback,
         fetcher=scoring_fetcher,

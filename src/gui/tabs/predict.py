@@ -909,7 +909,9 @@ class PredictTab:
             "seal_time": record.get("first_board_time"),
             "breaks": record.get("break_count"),
             "turnover": record.get("turnover"),
-            "score": record.get("score"),
+            "score": record.get("calibrated_score", record.get("score")),
+            "calibrated_score": record.get("calibrated_score"),
+            "calibrated_hit_rate": record.get("calibrated_hit_rate"),
             "reasons": record.get("reasons"),
             "burst_date": record.get("burst_date"),
             "burst_ratio": record.get("volume_ratio"),
@@ -950,7 +952,7 @@ class PredictTab:
         elif table_kind == "fresh":
             column = self.fresh_sort_column
             reverse = self.fresh_sort_reverse
-            secondary = ["score", "volume_ratio", "change_pct", "turnover"]
+            secondary = ["score", "calibrated_hit_rate", "volume_ratio", "change_pct", "turnover"]
         elif table_kind == "wrap":
             column = self.wrap_sort_column
             reverse = self.wrap_sort_reverse
@@ -2673,7 +2675,21 @@ class PredictTab:
         self.fresh_tree.delete(*self.fresh_tree.get_children())
         for rec in fresh_list:
             res_text, hit_tag = _result_cell("fresh", rec.get("code", ""))
-            tag = self._row_tag("fresh", hit_tag, rec.get("score", 0))
+            tag = self._row_tag(
+                "fresh", hit_tag, rec.get("calibrated_score", rec.get("score", 0)),
+            )
+            score_text = str(rec.get("score", 0))
+            if rec.get("calibrated_score") is not None:
+                score_text = f"{int(rec.get('calibrated_score') or 0)}/{int(rec.get('score') or 0)}"
+            reasons_text = rec.get("reasons", "")
+            if rec.get("calibrated_hit_rate") is not None:
+                reasons_text = (
+                    f"{rec.get('confidence', '观察')}"
+                    f"{float(rec.get('calibrated_hit_rate') or 0):.1f}%"
+                    f"({int(rec.get('calibrated_sample_size') or 0)}样本:"
+                    f"{rec.get('calibrated_rule', '-')}) / "
+                    f"{reasons_text}"
+                )
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -2685,9 +2701,9 @@ class PredictTab:
                 f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
                 f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
                 f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
-                str(rec.get("score", 0)),
+                score_text,
                 res_text,
-                rec.get("reasons", ""),
+                reasons_text,
             )
             self.fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
 

@@ -1316,6 +1316,8 @@ class StockMonitorApp:
             summary_msg = (
                 f"历史缓存更新完成：总计 {result.get('total', 0)}，"
                 f"成功 {cache_updated}，跳过(已新鲜) {cache_skipped}，失败 {cache_failed}，"
+                f"快照补K {result.get('snapshot_appended', 0)}，"
+                f"源通道 {result.get('source_channels', 0)}，"
                 f"耗时 {time_text}。"
             )
             self._post_to_ui(lambda m=summary_msg: self._log(m))
