@@ -1226,12 +1226,16 @@ class PredictTab:
             pass
 
         counts = result.get("status_counts") or {}
-        summary = (
-            f"竞价确认完成: 可买 {counts.get('可买', 0)} / "
-            f"观察 {counts.get('观察', 0)} / "
-            f"放弃 {counts.get('放弃', 0)} / "
-            f"风险过高 {counts.get('风险过高', 0)}"
-        )
+        skipped_reason = str(result.get("skipped_reason") or "").strip()
+        if skipped_reason:
+            summary = f"竞价确认跳过: {skipped_reason}（未请求实时接口）"
+        else:
+            summary = (
+                f"竞价确认完成: 可买 {counts.get('可买', 0)} / "
+                f"观察 {counts.get('观察', 0)} / "
+                f"放弃 {counts.get('放弃', 0)} / "
+                f"风险过高 {counts.get('风险过高', 0)}"
+            )
         self.status_label.config(text=summary)
         self.app.status_var.set(summary)
         self._append_opening_confirmation_summary(result)
@@ -1271,7 +1275,7 @@ class PredictTab:
             f"  生成时间: {result.get('generated_at', '-')}\n"
             f"  汇总: 可买 {counts.get('可买', 0)} / 观察 {counts.get('观察', 0)} / "
             f"放弃 {counts.get('放弃', 0)} / 风险过高 {counts.get('风险过高', 0)}\n"
-            f"  分时确认: {'已包含9:30开盘' if result.get('fetched_intraday') else '仅竞价'}\n",
+            f"  分时确认: {self._opening_confirmation_mode_text(result)}\n",
         )
         if buy_rows:
             self.summary_text.insert(tk.END, "\n  可买优先:\n")
@@ -1286,6 +1290,16 @@ class PredictTab:
             for rec in risk_rows[:8]:
                 self.summary_text.insert(tk.END, _line(rec) + "\n")
         self.summary_text.config(state=tk.DISABLED)
+
+    def _opening_confirmation_mode_text(self, result: Dict[str, Any]) -> str:
+        skipped_reason = str((result or {}).get("skipped_reason") or "").strip()
+        if skipped_reason:
+            return f"未请求实时接口（{skipped_reason}）"
+        if result.get("fetched_intraday"):
+            return "已包含9:30开盘"
+        if result.get("fetched_auction"):
+            return "仅竞价"
+        return "未请求实时接口"
 
 
     # ============== 概念炒作 业务方法 ==============
@@ -2750,6 +2764,10 @@ class PredictTab:
         gap = confirmation.get("auction_gap_pct")
         if isinstance(gap, (int, float)):
             parts.append(f"竞{gap:+.1f}%")
+            source = str(confirmation.get("auction_source") or "").strip()
+            source_label = {"eastmoney": "东财", "sina": "新浪"}.get(source, source)
+            if source_label:
+                parts.append(source_label)
         open_gap = confirmation.get("open_gap_pct")
         if isinstance(open_gap, (int, float)):
             parts.append(f"开{open_gap:+.1f}%")

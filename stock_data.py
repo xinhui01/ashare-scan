@@ -364,6 +364,8 @@ _normalize_history_frame = _sources_common.normalize_history_frame
 # 实现已迁移到 src/sources/sina.py；下面是公共函数别名。
 from src.sources import sina as _src_sina
 _fetch_sina_hist_frame = _src_sina.fetch_hist_frame
+_fetch_sina_intraday_1min = _src_sina.fetch_intraday_1min
+from src.sources.auction_snapshot import snapshot_from_intraday_frame as _snapshot_from_intraday_frame
 
 
 # ---- 网易财经历史日线 ----
@@ -2475,15 +2477,39 @@ class StockDataFetcher:
         return _return(payload)
 
     def get_auction_snapshot(self, stock_code: str) -> Optional[Dict[str, Any]]:
-        """获取当日 09:25 集合竞价撮合快照。"""
+        """获取当日 09:25 集合竞价撮合快照，东财失败时尝试新浪分时兜底。"""
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return None
-        return _retry_ak_call(
-            _fetch_eastmoney_auction_snapshot,
-            code,
-            logger=self._log,
-        )
+        try:
+            snapshot = _retry_ak_call(
+                _fetch_eastmoney_auction_snapshot,
+                code,
+                logger=self._log,
+            )
+            if snapshot:
+                out = dict(snapshot)
+                out.setdefault("source", "eastmoney")
+                return out
+        except Exception as exc:
+            if self._log:
+                self._log(f"竞价数据东财源失败 {code}: {exc}")
+
+        try:
+            raw = _retry_ak_call(
+                _fetch_sina_intraday_1min,
+                code,
+                logger=self._log,
+            )
+            snapshot = _snapshot_from_intraday_frame(raw, stock_code=code, source="sina")
+            if snapshot:
+                if self._log:
+                    self._log(f"竞价数据 {code} 使用新浪09:25分时兜底。")
+                return snapshot
+        except Exception as exc:
+            if self._log:
+                self._log(f"竞价数据新浪兜底失败 {code}: {exc}")
+        return None
 
     def prewarm_intraday_for_codes(
         self,

@@ -30,6 +30,7 @@ def test_confirms_buy_when_auction_gap_and_amount_are_healthy():
                 "price": 10.30,
                 "amount": 30_000_000,
                 "trade_date": "2026-06-01",
+                "source": "sina",
             }
         }
     )
@@ -53,6 +54,7 @@ def test_confirms_buy_when_auction_gap_and_amount_are_healthy():
     confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
     assert confirmation["status"] == "可买"
     assert round(confirmation["auction_gap_pct"], 2) == 3.0
+    assert confirmation["auction_source"] == "sina"
     assert result["status_counts"]["可买"] == 1
 
 
@@ -97,6 +99,53 @@ def test_missing_auction_data_stays_observation():
     confirmation = candidate_lists["first"][0]["opening_confirmation"]
     assert confirmation["status"] == "观察"
     assert "缺竞价" in confirmation["reason"]
+
+
+def test_skips_network_outside_opening_confirmation_window():
+    fetcher = FakeFetcher(
+        auctions={"600000": {"price": 10.30, "amount": 30_000_000}},
+        intraday={"600000": pd.DataFrame([{"time": pd.Timestamp("2026-05-29 09:30:00"), "open": 10.1}])},
+    )
+    candidate_lists = {
+        "fresh": [{"code": "600000", "close": 10.0, "score": 76}]
+    }
+
+    result = confirm_candidate_lists(
+        candidate_lists,
+        fetcher=fetcher,
+        now=datetime(2026, 5, 31, 22, 58),
+    )
+
+    assert fetcher.auction_calls == []
+    assert fetcher.intraday_calls == []
+    confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
+    assert confirmation["status"] == "观察"
+    assert "非交易日" in confirmation["reason"]
+    assert result["skipped_reason"] == "非交易日"
+    assert result["fetched_auction"] is False
+    assert result["fetched_intraday"] is False
+
+
+def test_skips_network_before_auction_match_time():
+    fetcher = FakeFetcher(
+        auctions={"600000": {"price": 10.30, "amount": 30_000_000}}
+    )
+    candidate_lists = {
+        "fresh": [{"code": "600000", "close": 10.0, "score": 76}]
+    }
+
+    result = confirm_candidate_lists(
+        candidate_lists,
+        fetcher=fetcher,
+        now=datetime(2026, 6, 1, 9, 24),
+    )
+
+    assert fetcher.auction_calls == []
+    assert fetcher.intraday_calls == []
+    confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
+    assert confirmation["status"] == "观察"
+    assert "尚未到09:25" in confirmation["reason"]
+    assert result["skipped_reason"] == "尚未到09:25"
 
 
 def test_reuses_one_auction_fetch_for_duplicate_code_across_categories():

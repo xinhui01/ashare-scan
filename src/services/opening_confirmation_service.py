@@ -68,6 +68,20 @@ def _first_open_price(payload: Any) -> Optional[float]:
     return _safe_float(row.get("open")) or _safe_float(row.get("close"))
 
 
+def _opening_confirmation_fetch_mode(now: Optional[datetime]) -> Tuple[bool, bool, str]:
+    """Return (fetch_auction, fetch_intraday, skipped_reason)."""
+    current = now or datetime.now()
+    if current.weekday() >= 5:
+        return False, False, "非交易日"
+
+    hhmm = (current.hour, current.minute)
+    if hhmm < (9, 25):
+        return False, False, "尚未到09:25"
+    if hhmm > (10, 0):
+        return False, False, "已过10:00开盘确认窗口"
+    return True, hhmm >= (9, 30), ""
+
+
 def _category_gap_window(category: str, rec: Dict[str, Any], limit_pct: float) -> Tuple[float, float, float]:
     """Return (min_buy_gap, max_buy_gap, high_risk_gap)."""
     if category == "fresh":
@@ -99,6 +113,7 @@ def evaluate_candidate_opening(
 
     auction_price = _safe_float((auction or {}).get("price")) if auction else None
     auction_amount = _safe_float((auction or {}).get("amount")) if auction else None
+    auction_source = str((auction or {}).get("source") or "").strip()
     auction_gap = None
     if prev_close and prev_close > 0 and auction_price:
         auction_gap = (auction_price / prev_close - 1.0) * 100.0
@@ -117,6 +132,7 @@ def evaluate_candidate_opening(
             "auction_price": auction_price,
             "auction_gap_pct": None,
             "auction_amount": auction_amount,
+            "auction_source": auction_source,
             "open_price": open_price,
             "open_gap_pct": open_gap,
             "score": int(round(score)),
@@ -154,6 +170,8 @@ def evaluate_candidate_opening(
         elif auction_amount < 5_000_000 and status == "可买":
             status = "观察"
             reasons.append("竞价额不足")
+    elif auction_source == "sina":
+        reasons.append("竞价额缺失")
 
     if open_gap is not None:
         if status == "可买" and open_gap <= min(auction_gap - 1.5, -1.0):
@@ -172,6 +190,7 @@ def evaluate_candidate_opening(
         "auction_price": auction_price,
         "auction_gap_pct": auction_gap,
         "auction_amount": auction_amount,
+        "auction_source": auction_source,
         "open_price": open_price,
         "open_gap_pct": open_gap,
         "score": int(round(score)),
@@ -179,9 +198,21 @@ def evaluate_candidate_opening(
     }
 
 
-def _should_fetch_intraday(now: Optional[datetime]) -> bool:
-    current = now or datetime.now()
-    return (current.hour, current.minute) >= (9, 30)
+def _skipped_confirmation(rec: Dict[str, Any], *, category: str, reason: str) -> Dict[str, Any]:
+    score = _safe_float(rec.get("calibrated_score")) or _safe_float(rec.get("score")) or 0.0
+    return {
+        "status": "观察",
+        "label": "观察",
+        "category": _CATEGORY_LABELS.get(category, category),
+        "auction_price": None,
+        "auction_gap_pct": None,
+        "auction_amount": None,
+        "auction_source": "",
+        "open_price": None,
+        "open_gap_pct": None,
+        "score": int(round(score)),
+        "reason": reason,
+    }
 
 
 def confirm_candidate_lists(
@@ -209,8 +240,32 @@ def confirm_candidate_lists(
             "generated_at": (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
         }
 
-    fetch_intraday = _should_fetch_intraday(now)
+    fetch_auction, fetch_intraday, skipped_reason = _opening_confirmation_fetch_mode(now)
     snapshots: Dict[str, Tuple[Optional[Dict[str, Any]], Optional[float]]] = {}
+
+    if not fetch_auction:
+        status_counts: Dict[str, int] = {}
+        for _code, entries in grouped.items():
+            for category, rec in entries:
+                confirmation = _skipped_confirmation(
+                    rec,
+                    category=category,
+                    reason=f"{skipped_reason}，未请求竞价接口",
+                )
+                rec["opening_confirmation"] = confirmation
+                status = confirmation.get("status", "观察")
+                status_counts[status] = status_counts.get(status, 0) + 1
+        if log_fn:
+            log_fn(f"竞价确认跳过：{skipped_reason}，未请求实时接口")
+        return {
+            "total": total,
+            "confirmed": sum(status_counts.values()),
+            "status_counts": status_counts,
+            "generated_at": (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+            "fetched_auction": False,
+            "fetched_intraday": False,
+            "skipped_reason": skipped_reason,
+        }
 
     def _fetch(code: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[float]]:
         auction = None
@@ -267,5 +322,7 @@ def confirm_candidate_lists(
         "confirmed": sum(status_counts.values()),
         "status_counts": status_counts,
         "generated_at": (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"),
+        "fetched_auction": fetch_auction,
         "fetched_intraday": fetch_intraday,
+        "skipped_reason": "",
     }
