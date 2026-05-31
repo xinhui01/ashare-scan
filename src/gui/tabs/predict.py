@@ -37,6 +37,7 @@ from src.gui.tree_enhancer import attach_enhancers_recursively as _attach_tree_e
 from src.services import (
     concept_hype_service,
     market_sentiment_service,
+    opening_confirmation_service,
     prediction_accuracy_service,
 )
 from src.utils.cancel_token import CancelToken
@@ -98,6 +99,8 @@ class PredictTab:
         self.thread: Optional[threading.Thread] = None
         self.result: Optional[Dict[str, Any]] = None
         self.results_map: Dict = {}
+        self.opening_confirm_thread: Optional[threading.Thread] = None
+        self.opening_confirm_result: Optional[Dict[str, Any]] = None
         self.prewarm_thread: Optional[threading.Thread] = None
         self.prewarm_token: Optional[CancelToken] = None
         self.concept_index_thread: Optional[threading.Thread] = None
@@ -133,6 +136,9 @@ class PredictTab:
         action_bar = ttk.Frame(predict_frame)
         action_bar.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(action_bar, text="开始预测", command=self.start).pack(side=tk.LEFT)
+        ttk.Button(
+            action_bar, text="竞价确认", command=self.confirm_opening_buy_points,
+        ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             action_bar, text="命中对比", command=self.open_compare_window,
         ).pack(side=tk.LEFT, padx=(6, 0))
@@ -382,7 +388,7 @@ class PredictTab:
             # 这样 _apply_accuracy 现有 sub_key 分支的 fallback 仍能工作
             self.stat_labels[sub_key] = recent_lbl
         cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
-                     "seal_time", "breaks", "turnover", "score", "result", "reasons")
+                     "seal_time", "breaks", "turnover", "score", "confirm", "auction", "result", "reasons")
         self.cont_tree = ttk.Treeview(
             cont_tab, columns=cont_cols, show="headings", height=22, style="Predict.Treeview",
         )
@@ -391,6 +397,7 @@ class PredictTab:
             "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70), "close": ("收盘价", 70),
             "seal_time": ("首封时间", 80), "breaks": ("炸板", 50),
             "turnover": ("换手%", 65), "score": ("预测分", 65),
+            "confirm": ("确认", 70), "auction": ("竞价/开盘", 115),
             "result": ("结果", 90),
             "reasons": ("预测依据", 300),
         }.items():
@@ -426,7 +433,7 @@ class PredictTab:
         self.best_bucket_labels["first"] = first_best
         first_cols = ("code", "name", "industry", "change_pct", "close",
                       "burst_date", "burst_ratio", "dist_ma5", "days_since_burst",
-                      "score", "result", "reasons")
+                      "score", "confirm", "auction", "result", "reasons")
         self.first_tree = ttk.Treeview(
             first_tab, columns=first_cols, show="headings", height=22, style="Predict.Treeview",
         )
@@ -435,7 +442,8 @@ class PredictTab:
             "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
             "burst_date": ("爆量日", 90), "burst_ratio": ("爆量倍数", 70),
             "dist_ma5": ("距MA5%", 65), "days_since_burst": ("距爆量日", 65),
-            "score": ("预测分", 65), "result": ("结果", 90),
+            "score": ("预测分", 65), "confirm": ("确认", 70),
+            "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 300),
         }.items():
             self.first_tree.heading(
@@ -469,7 +477,7 @@ class PredictTab:
         self.best_bucket_labels["fresh"] = fresh_best
         fresh_cols = ("code", "name", "industry", "change_pct", "close",
                       "volume_ratio", "dist_ma5", "trend_5d", "position_60d",
-                      "turnover", "score", "result", "reasons")
+                      "turnover", "score", "confirm", "auction", "result", "reasons")
         self.fresh_tree = ttk.Treeview(
             fresh_tab, columns=fresh_cols, show="headings", height=22, style="Predict.Treeview",
         )
@@ -479,7 +487,8 @@ class PredictTab:
             "volume_ratio": ("量比", 60), "dist_ma5": ("距MA5%", 65),
             "trend_5d": ("5日涨幅%", 70), "position_60d": ("60日位置%", 75),
             "turnover": ("换手%", 65),
-            "score": ("预测分", 65), "result": ("结果", 90),
+            "score": ("预测分", 65), "confirm": ("确认", 70),
+            "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 300),
         }.items():
             self.fresh_tree.heading(
@@ -513,7 +522,7 @@ class PredictTab:
         self.best_bucket_labels["wrap"] = wrap_best
         wrap_cols = ("code", "name", "industry", "pattern_kind", "change_pct", "close",
                      "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
-                     "worst_drop", "volume_ratio", "score", "result", "reasons")
+                     "worst_drop", "volume_ratio", "score", "confirm", "auction", "result", "reasons")
         self.wrap_tree = ttk.Treeview(
             wrap_tab, columns=wrap_cols, show="headings", height=22, style="Predict.Treeview",
         )
@@ -524,7 +533,8 @@ class PredictTab:
             "prior_lu_date": ("前涨停日", 90), "prior_lu_close": ("前涨停价", 75),
             "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
             "worst_drop": ("最深阴线%", 80), "volume_ratio": ("量比", 60),
-            "score": ("预测分", 65), "result": ("结果", 90),
+            "score": ("预测分", 65), "confirm": ("确认", 70),
+            "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 300),
         }.items():
             self.wrap_tree.heading(
@@ -899,6 +909,9 @@ class PredictTab:
 
     @staticmethod
     def _sort_value(record: Dict[str, Any], column: str):
+        opening_confirmation = record.get("opening_confirmation") or {}
+        confirm_status = str(opening_confirmation.get("status") or "")
+        confirm_rank = {"可买": 4, "观察": 3, "放弃": 2, "风险过高": 1}.get(confirm_status, 0)
         value_map = {
             "code": record.get("code"),
             "name": record.get("name"),
@@ -929,6 +942,8 @@ class PredictTab:
             "ma20_slope": record.get("ma20_slope_pct"),
             "trend_10d": record.get("trend_10d"),
             "result": record.get("_t1_pct"),
+            "confirm": confirm_rank,
+            "auction": opening_confirmation.get("auction_gap_pct"),
         }
         value = value_map.get(column)
         if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
@@ -1042,26 +1057,26 @@ class PredictTab:
                 self.cont_sort_reverse = not self.cont_sort_reverse
             else:
                 self.cont_sort_column = column
-                self.cont_sort_reverse = column in {"score", "boards", "change_pct", "close", "turnover", "breaks"}
+                self.cont_sort_reverse = column in {"score", "boards", "change_pct", "close", "turnover", "breaks", "confirm", "auction"}
         elif table_kind == "fresh":
             if column == self.fresh_sort_column:
                 self.fresh_sort_reverse = not self.fresh_sort_reverse
             else:
                 self.fresh_sort_column = column
-                self.fresh_sort_reverse = column in {"score", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover"}
+                self.fresh_sort_reverse = column in {"score", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover", "confirm", "auction"}
         elif table_kind == "wrap":
             if column == self.wrap_sort_column:
                 self.wrap_sort_reverse = not self.wrap_sort_reverse
             else:
                 self.wrap_sort_column = column
                 # 反包缺口越小越好，因此 wrap_gap / days_since_lu 默认升序
-                self.wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close"}
+                self.wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close", "confirm", "auction"}
         else:
             if column == self.first_sort_column:
                 self.first_sort_reverse = not self.first_sort_reverse
             else:
                 self.first_sort_column = column
-                self.first_sort_reverse = column in {"score", "burst_ratio", "change_pct", "close", "dist_ma5", "days_since_burst"}
+                self.first_sort_reverse = column in {"score", "burst_ratio", "change_pct", "close", "dist_ma5", "days_since_burst", "confirm", "auction"}
 
         if self.result:
             self._apply_result(self.result)
@@ -1142,6 +1157,135 @@ class PredictTab:
         self.summary_text.config(state=tk.DISABLED)
         self.status_label.config(text="")
         self.app.status_var.set("涨停预测失败")
+
+    def confirm_opening_buy_points(self) -> None:
+        """对当前预测候选做 9:25 后竞价/开盘买点确认。"""
+        if self.opening_confirm_thread is not None and self.opening_confirm_thread.is_alive():
+            return
+        if self.thread is not None and self.thread.is_alive():
+            messagebox.showinfo("竞价确认", "预测还在运行，等预测完成后再确认。", parent=self.app.root)
+            return
+        if not self.lists:
+            payload = load_last_limit_up_prediction()
+            if payload:
+                self._apply_result(payload)
+            if not self.lists:
+                messagebox.showinfo("竞价确认", "暂无预测候选，请先开始预测或加载历史记录。", parent=self.app.root)
+                return
+
+        total = sum(len(items or []) for items in (self.lists or {}).values())
+        if total <= 0:
+            messagebox.showinfo("竞价确认", "当前预测结果里没有候选股。", parent=self.app.root)
+            return
+
+        self.status_label.config(text=f"竞价确认 0/{total} ...")
+        self.app.status_var.set("正在执行竞价确认...")
+
+        self.opening_confirm_thread, _ = self.app._start_background_job(
+            self._run_opening_confirmation,
+            name="opening-confirm",
+            include_token=True,
+        )
+
+    def _run_opening_confirmation(self, cancel_token: CancelToken) -> None:
+        try:
+            fetcher = getattr(self.app.stock_filter, "fetcher", None)
+            if fetcher is None:
+                raise RuntimeError("找不到行情 fetcher")
+
+            def _progress(done: int, total: int, code: str) -> None:
+                if cancel_token.is_cancelled():
+                    raise StopIteration
+                self.app._post_to_ui(
+                    lambda d=done, t=total, c=code: self.status_label.config(
+                        text=f"竞价确认 {d}/{t}: {c}"
+                    )
+                )
+
+            result = opening_confirmation_service.confirm_candidate_lists(
+                self.lists or {},
+                fetcher=fetcher,
+                max_workers=2,
+                progress_callback=_progress,
+                log_fn=lambda msg: self.app._log_async(msg),
+            )
+            if cancel_token.is_cancelled():
+                return
+            self.app._post_to_ui(lambda r=result: self._apply_opening_confirmation_result(r))
+        except StopIteration:
+            self.app._post_to_ui(lambda: self.status_label.config(text="竞价确认已取消"))
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+            self.app._post_to_ui(lambda: self._show_error(f"竞价确认失败: {err}"))
+
+    def _apply_opening_confirmation_result(self, result: Dict[str, Any]) -> None:
+        self.opening_confirm_result = result or {}
+        try:
+            self._render_trees()
+        except Exception:
+            pass
+
+        counts = result.get("status_counts") or {}
+        summary = (
+            f"竞价确认完成: 可买 {counts.get('可买', 0)} / "
+            f"观察 {counts.get('观察', 0)} / "
+            f"放弃 {counts.get('放弃', 0)} / "
+            f"风险过高 {counts.get('风险过高', 0)}"
+        )
+        self.status_label.config(text=summary)
+        self.app.status_var.set(summary)
+        self._append_opening_confirmation_summary(result)
+
+    def _append_opening_confirmation_summary(self, result: Dict[str, Any]) -> None:
+        counts = result.get("status_counts") or {}
+        buy_rows: List[Dict[str, Any]] = []
+        observe_rows: List[Dict[str, Any]] = []
+        risk_rows: List[Dict[str, Any]] = []
+        for records in (self.lists or {}).values():
+            for rec in records or []:
+                confirmation = rec.get("opening_confirmation") or {}
+                status = confirmation.get("status")
+                if status == "可买":
+                    buy_rows.append(rec)
+                elif status == "观察":
+                    observe_rows.append(rec)
+                elif status in {"放弃", "风险过高"}:
+                    risk_rows.append(rec)
+
+        def _line(rec: Dict[str, Any]) -> str:
+            confirmation = rec.get("opening_confirmation") or {}
+            gap = confirmation.get("auction_gap_pct")
+            gap_text = f"{gap:+.1f}%" if isinstance(gap, (int, float)) else "-"
+            return (
+                f"  {rec.get('code', '')} {rec.get('name', '')} "
+                f"分={confirmation.get('score', rec.get('score', '-'))} "
+                f"竞={gap_text}  {confirmation.get('reason', '')}"
+            )
+
+        self.summary_text.config(state=tk.NORMAL)
+        self.summary_text.insert(tk.END, f"\n{'='*36}\n")
+        self.summary_text.insert(tk.END, "  竞价/开盘买点确认\n")
+        self.summary_text.insert(tk.END, f"{'='*36}\n")
+        self.summary_text.insert(
+            tk.END,
+            f"  生成时间: {result.get('generated_at', '-')}\n"
+            f"  汇总: 可买 {counts.get('可买', 0)} / 观察 {counts.get('观察', 0)} / "
+            f"放弃 {counts.get('放弃', 0)} / 风险过高 {counts.get('风险过高', 0)}\n"
+            f"  分时确认: {'已包含9:30开盘' if result.get('fetched_intraday') else '仅竞价'}\n",
+        )
+        if buy_rows:
+            self.summary_text.insert(tk.END, "\n  可买优先:\n")
+            for rec in buy_rows[:12]:
+                self.summary_text.insert(tk.END, _line(rec) + "\n")
+        if observe_rows:
+            self.summary_text.insert(tk.END, "\n  观察:\n")
+            for rec in observe_rows[:8]:
+                self.summary_text.insert(tk.END, _line(rec) + "\n")
+        if risk_rows:
+            self.summary_text.insert(tk.END, "\n  放弃/风险:\n")
+            for rec in risk_rows[:8]:
+                self.summary_text.insert(tk.END, _line(rec) + "\n")
+        self.summary_text.config(state=tk.DISABLED)
 
 
     # ============== 概念炒作 业务方法 ==============
@@ -2066,9 +2210,20 @@ class PredictTab:
             except Exception:
                 self.results_map = {}
 
+        existing_confirmations: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for cat, records in (self.lists or {}).items():
+            for old_rec in records or []:
+                confirmation = old_rec.get("opening_confirmation")
+                code = str(old_rec.get("code") or "").zfill(6)
+                if code and isinstance(confirmation, dict):
+                    existing_confirmations[(code, cat)] = confirmation
+
         def _enrich(records: List[Dict[str, Any]], cat: str) -> List[Dict[str, Any]]:
             for rec in records:
-                key = (str(rec.get("code") or "").zfill(6), cat)
+                code = str(rec.get("code") or "").zfill(6)
+                key = (code, cat)
+                if key in existing_confirmations:
+                    rec["opening_confirmation"] = existing_confirmations[key]
                 row = self.results_map.get(key)
                 if row:
                     # 用"开盘买、收盘卖"口径作为结果排序值；老记录回退到 t1_pct
@@ -2586,6 +2741,29 @@ class PredictTab:
     def _filter_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [r for r in (records or []) if self._matches_filters(r)]
 
+    def _opening_confirmation_cells(self, rec: Dict[str, Any]) -> Tuple[str, str]:
+        confirmation = rec.get("opening_confirmation") or {}
+        if not confirmation:
+            return "—", "—"
+        status = str(confirmation.get("status") or "观察")
+        parts: List[str] = []
+        gap = confirmation.get("auction_gap_pct")
+        if isinstance(gap, (int, float)):
+            parts.append(f"竞{gap:+.1f}%")
+        open_gap = confirmation.get("open_gap_pct")
+        if isinstance(open_gap, (int, float)):
+            parts.append(f"开{open_gap:+.1f}%")
+        amount = confirmation.get("auction_amount")
+        if isinstance(amount, (int, float)) and amount > 0:
+            if amount >= 100_000_000:
+                parts.append(f"{amount / 100_000_000:.2f}亿")
+            else:
+                parts.append(f"{amount / 10_000:.0f}万")
+        if not parts:
+            reason = str(confirmation.get("reason") or "").strip()
+            parts.append(reason[:18] if reason else "—")
+        return status, " ".join(parts)
+
     def _render_trees(self) -> None:
         """根据当前筛选条件渲染 5 个候选表。"""
         if not self.lists:
@@ -2633,6 +2811,7 @@ class PredictTab:
         self.cont_tree.delete(*self.cont_tree.get_children())
         for rec in cont_list:
             res_text, hit_tag = _result_cell("cont", rec.get("code", ""))
+            confirm_text, auction_text = self._opening_confirmation_cells(rec)
             tag = self._row_tag("cont", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
@@ -2645,6 +2824,8 @@ class PredictTab:
                 str(rec.get("break_count", 0)),
                 f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
                 str(rec.get("score", 0)),
+                confirm_text,
+                auction_text,
                 res_text,
                 rec.get("reasons", ""),
             )
@@ -2654,6 +2835,7 @@ class PredictTab:
         self.first_tree.delete(*self.first_tree.get_children())
         for rec in first_list:
             res_text, hit_tag = _result_cell("first", rec.get("code", ""))
+            confirm_text, auction_text = self._opening_confirmation_cells(rec)
             tag = self._row_tag("first", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
@@ -2666,6 +2848,8 @@ class PredictTab:
                 f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
                 str(rec.get("days_since_burst", 0)) if rec.get("days_since_burst") is not None else "-",
                 str(rec.get("score", 0)),
+                confirm_text,
+                auction_text,
                 res_text,
                 rec.get("reasons", ""),
             )
@@ -2675,6 +2859,7 @@ class PredictTab:
         self.fresh_tree.delete(*self.fresh_tree.get_children())
         for rec in fresh_list:
             res_text, hit_tag = _result_cell("fresh", rec.get("code", ""))
+            confirm_text, auction_text = self._opening_confirmation_cells(rec)
             tag = self._row_tag(
                 "fresh", hit_tag, rec.get("calibrated_score", rec.get("score", 0)),
             )
@@ -2702,6 +2887,8 @@ class PredictTab:
                 f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
                 f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
                 score_text,
+                confirm_text,
+                auction_text,
                 res_text,
                 reasons_text,
             )
@@ -2712,6 +2899,7 @@ class PredictTab:
         _PATTERN_LABELS = {"wrap": "断板反包"}
         for rec in wrap_list:
             res_text, hit_tag = _result_cell("wrap", rec.get("code", ""))
+            confirm_text, auction_text = self._opening_confirmation_cells(rec)
             tag = self._row_tag("wrap", hit_tag, rec.get("score", 0))
             vals = (
                 rec.get("code", ""),
@@ -2727,6 +2915,8 @@ class PredictTab:
                 f"{rec['worst_drop']:.1f}" if rec.get("worst_drop") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
                 str(rec.get("score", 0)),
+                confirm_text,
+                auction_text,
                 res_text,
                 rec.get("reasons", ""),
             )

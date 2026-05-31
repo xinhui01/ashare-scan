@@ -2474,6 +2474,17 @@ class StockDataFetcher:
             _intraday_mem_put(mem_key, payload)
         return _return(payload)
 
+    def get_auction_snapshot(self, stock_code: str) -> Optional[Dict[str, Any]]:
+        """获取当日 09:25 集合竞价撮合快照。"""
+        code = str(stock_code or "").strip().zfill(6)
+        if not code:
+            return None
+        return _retry_ak_call(
+            _fetch_eastmoney_auction_snapshot,
+            code,
+            logger=self._log,
+        )
+
     def prewarm_intraday_for_codes(
         self,
         codes: List[str],
