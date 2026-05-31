@@ -22,6 +22,8 @@ HOST = "tdx"
 _REQUEST_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
 _MIN_INTERVAL = 0.35
+_BEST_HOST_LOCK = threading.Lock()
+_BEST_HOST: str | None = None
 
 
 def is_available() -> bool:
@@ -93,6 +95,37 @@ def _tdx_market(Market: Any, code: str) -> Any:
     return market
 
 
+def _client_host(client: Any) -> str:
+    return str(getattr(client, "host", None) or getattr(client, "_host", "") or "").strip()
+
+
+def _best_host_client(TdxClient: Any) -> tuple[Any, str]:
+    global _BEST_HOST
+    with _BEST_HOST_LOCK:
+        cached_host = _BEST_HOST
+    if cached_host:
+        return TdxClient(cached_host, timeout=10.0), cached_host
+
+    try:
+        client = TdxClient.from_best_host(timeout=10.0, ping_timeout=3.0)
+    except TypeError:
+        client = TdxClient.from_best_host()
+    selected_host = _client_host(client)
+    if selected_host:
+        with _BEST_HOST_LOCK:
+            _BEST_HOST = selected_host
+    return client, selected_host
+
+
+def _forget_best_host(host: str) -> None:
+    global _BEST_HOST
+    if not host:
+        return
+    with _BEST_HOST_LOCK:
+        if _BEST_HOST == host:
+            _BEST_HOST = None
+
+
 def normalize_tdx_history_bars(bars: Iterable[Any]) -> "pd.DataFrame":
     rows = []
     for bar in bars or []:
@@ -133,20 +166,18 @@ def fetch_hist_frame(stock_code: str, start_date: str, end_date: str) -> "pd.Dat
 
     try:
         throttle()
-        try:
-            client_cm = TdxClient.from_best_host(ping_timeout=3.0)
-        except TypeError:
-            client_cm = TdxClient.from_best_host()
+        client_cm, selected_host = _best_host_client(TdxClient)
         with client_cm as client:
             bars = client.get_security_bars(market, code, KlineCategory.DAY, 0, count)
         out = normalize_tdx_history_bars(bars)
         if out.empty:
-            raise RuntimeError("tdx: empty history")
+            return pd.DataFrame()
         out = out[(out["date"] >= start_text) & (out["date"] <= end_text)]
         if out.empty:
-            raise RuntimeError("tdx: empty history in requested range")
+            return pd.DataFrame()
         mark_ok(HOST)
         return out.reset_index(drop=True)
     except Exception:
+        _forget_best_host(locals().get("selected_host", ""))
         mark_failed(HOST)
         raise

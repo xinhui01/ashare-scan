@@ -1,4 +1,5 @@
 import pandas as pd
+import types
 
 from data_source_models import DATA_SOURCE_OPTIONS
 from stock_data import StockDataFetcher
@@ -96,3 +97,113 @@ def test_get_history_data_uses_tdx_provider(monkeypatch):
 
     assert out is not None
     assert len(out) == 1
+
+
+def test_tdx_fetch_reuses_selected_host(monkeypatch):
+    from src.sources import tdx
+
+    calls = {"from_best_host": 0}
+
+    class Market:
+        SH = "sh"
+        SZ = "sz"
+        BJ = "bj"
+
+    class KlineCategory:
+        DAY = "day"
+
+    class FakeClient:
+        def __init__(self, host="best-host", port=7709, timeout=15.0, auto_reconnect=True):
+            self.host = host
+
+        @classmethod
+        def from_best_host(cls, **_kwargs):
+            calls["from_best_host"] += 1
+            return cls("best-host")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_security_bars(self, *_args):
+            return [
+                {
+                    "date": "2026-05-29",
+                    "open": 10.0,
+                    "close": 10.5,
+                    "high": 10.8,
+                    "low": 9.9,
+                    "vol": 1000.0,
+                    "amount": 1050000.0,
+                }
+            ]
+
+    monkeypatch.setattr(tdx, "is_available", lambda: True)
+    monkeypatch.setattr(tdx, "_BEST_HOST", None, raising=False)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "xmtdx",
+        types.SimpleNamespace(
+            TdxClient=FakeClient,
+            Market=Market,
+            KlineCategory=KlineCategory,
+        ),
+    )
+
+    first = tdx.fetch_hist_frame("600000", "20260529", "20260529")
+    second = tdx.fetch_hist_frame("600001", "20260529", "20260529")
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert calls["from_best_host"] == 1
+
+
+def test_tdx_empty_symbol_does_not_cool_down_source(monkeypatch):
+    from src.sources import tdx
+
+    failed_hosts = []
+
+    class Market:
+        SH = "sh"
+        SZ = "sz"
+        BJ = "bj"
+
+    class KlineCategory:
+        DAY = "day"
+
+    class FakeClient:
+        def __init__(self, host="best-host", port=7709, timeout=15.0, auto_reconnect=True):
+            self.host = host
+
+        @classmethod
+        def from_best_host(cls, **_kwargs):
+            return cls("best-host")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def get_security_bars(self, *_args):
+            return []
+
+    monkeypatch.setattr(tdx, "is_available", lambda: True)
+    monkeypatch.setattr(tdx, "_BEST_HOST", None)
+    monkeypatch.setattr(tdx, "mark_failed", lambda host: failed_hosts.append(host))
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "xmtdx",
+        types.SimpleNamespace(
+            TdxClient=FakeClient,
+            Market=Market,
+            KlineCategory=KlineCategory,
+        ),
+    )
+
+    out = tdx.fetch_hist_frame("600001", "20260529", "20260529")
+
+    assert out.empty
+    assert failed_hosts == []

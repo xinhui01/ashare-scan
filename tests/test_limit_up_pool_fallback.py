@@ -1,6 +1,7 @@
 """测试 StockDataFetcher._derive_limit_up_pool_from_spot 派生今日涨停池逻辑。
 
 兜底链：东财涨停池失败 → 全市场 spot（含新浪兜底）→ 过滤涨停股 → 递推连板数。
+spot 派生必须有昨日涨停池，避免把真实 N 板误标成首板。
 本测试只覆盖派生逻辑（_derive_limit_up_pool_from_spot），不联网。
 """
 from __future__ import annotations
@@ -29,6 +30,14 @@ def _make_spot(rows):
     ])
 
 
+def _make_prev_pool(rows=None):
+    rows = rows or [("000000", 1, "占位")]
+    return pd.DataFrame([
+        {"代码": code, "连板数": boards, "名称": name}
+        for code, boards, name in rows
+    ])
+
+
 class TestDeriveFromSpot:
     def test_none_spot_returns_empty(self, eod):
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=None):
@@ -48,7 +57,7 @@ class TestDeriveFromSpot:
             ("600002", 5.0, 5.0, 2.0, "钢铁", "齐鲁石化"),      # +5%, 不算
         ])
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=spot):
-            df = eod._derive_limit_up_pool_from_spot("20260520")
+            df = eod._derive_limit_up_pool_from_spot("20260520", prev_pool_df=_make_prev_pool())
         assert len(df) == 2
         assert set(df["代码"].astype(str).tolist()) == {"600000", "600001"}
 
@@ -59,7 +68,7 @@ class TestDeriveFromSpot:
             ("300002", 20.0, 24.0, 8.0, "电子", "DEF"),
         ])
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=spot):
-            df = eod._derive_limit_up_pool_from_spot("20260520")
+            df = eod._derive_limit_up_pool_from_spot("20260520", prev_pool_df=_make_prev_pool())
         assert len(df) == 1
         assert df.iloc[0]["代码"] == "300002"
 
@@ -70,7 +79,7 @@ class TestDeriveFromSpot:
             ("830002", 30.0, 13.0, 5.0, "材料", "BJ2"),
         ])
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=spot):
-            df = eod._derive_limit_up_pool_from_spot("20260520")
+            df = eod._derive_limit_up_pool_from_spot("20260520", prev_pool_df=_make_prev_pool())
         assert len(df) == 1
         assert df.iloc[0]["代码"] == "830002"
 
@@ -92,21 +101,21 @@ class TestDeriveFromSpot:
         assert int(df_indexed.loc["600200", "连板数"]) == 2
         assert int(df_indexed.loc["600300", "连板数"]) == 1
 
-    def test_no_prev_pool_defaults_to_one(self, eod):
+    def test_no_prev_pool_refuses_to_derive(self, eod):
         spot = _make_spot([
             ("600100", 10.0, 11.0, 5.0, "X", "A"),
             ("600200", 10.0, 11.0, 5.0, "X", "B"),
         ])
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=spot):
             df = eod._derive_limit_up_pool_from_spot("20260520", prev_pool_df=None)
-        assert (df["连板数"] == 1).all()
+        assert df.empty
 
     def test_required_columns_present(self, eod):
         spot = _make_spot([
             ("600100", 10.0, 11.0, 5.0, "银行", "A"),
         ])
         with patch.object(eod, "_fetch_spot_with_fallback", return_value=spot):
-            df = eod._derive_limit_up_pool_from_spot("20260520")
+            df = eod._derive_limit_up_pool_from_spot("20260520", prev_pool_df=_make_prev_pool())
         required = {"代码", "名称", "最新价", "涨跌幅", "换手率", "连板数", "所属行业"}
         assert required.issubset(set(df.columns))
 
