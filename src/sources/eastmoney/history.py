@@ -16,7 +16,12 @@ from typing import Callable, List, Optional, Tuple
 import pandas as pd
 
 from src.config import env_float
-from src.network.host_health import mark_failed, mark_ok
+from src.network.host_health import mark_failed as _mark_failed_host, mark_ok
+
+
+def mark_failed(url_or_host: str) -> None:
+    # 东方财富容易被封，失败后需要保守的长冷却（hard），不走回退源的软阶梯。
+    _mark_failed_host(url_or_host, hard=True)
 from src.sources.eastmoney import throttling as _throttling
 from src.sources.eastmoney.history_parser import parse_hist_json, request_params
 from src.sources.eastmoney.rate_limit import mirror_host_of

@@ -409,6 +409,81 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertTrue(any("603435" in item for item in logs))
 
+    def test_prereq_prefetches_uncached_new_stock_then_exempts(self):
+        """0 缓存的新涨停股：前置校验先定向补拉一次，再按新股豁免放过，不硬中止整批。"""
+        state = {"fetched": False, "force_calls": []}
+        raw_after = pd.DataFrame({
+            "date": ["2026-05-22", "2026-05-25", "2026-05-26",
+                     "2026-05-27", "2026-05-28", "2026-05-29"],
+            "close": [127.68, 99.49, 86.08, 73.25, 73.09, 80.4],
+        })
+
+        class _Fetcher:
+            as_of_trade_date = ""
+
+            def get_history_data(self, code, days=10, force_refresh=False, request_plan=None):
+                if force_refresh:
+                    state["fetched"] = True
+                    state["force_calls"].append((code, days))
+                return None  # cache-only 永远拿不到
+
+        def fake_load_history(code, limit=10):
+            return raw_after if state["fetched"] else pd.DataFrame()
+
+        class _FixedDatetime(_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 5, 29, 22, 0, 0)
+
+        logs = []
+        with (
+            patch("src.services.scoring.predict.datetime", _FixedDatetime),
+            patch("stock_store.load_history", side_effect=fake_load_history),
+        ):
+            missing = _check_prerequisites(
+                historical_mode=False,
+                pool_source="cache_db",
+                concept_themes_count=1,
+                board_strength={"机器人": 1.0},
+                sentiment_degraded=False,
+                zt_codes={"603435"},
+                fetcher=_Fetcher(),
+                build_local_cache_history_plan_fn=lambda **kwargs: object(),
+                log_fn=logs.append,
+            )
+
+        self.assertEqual(missing, [])
+        self.assertTrue(state["fetched"], "应触发一次 force_refresh 补拉")
+        self.assertEqual(state["force_calls"][0][0], "603435")
+
+    def test_prereq_no_prefetch_in_historical_mode(self):
+        """历史/回测模式：0 缓存不做实时补拉，仍按缺失中止（避免拉到非 as-of 数据）。"""
+        state = {"force": False}
+
+        class _Fetcher:
+            as_of_trade_date = "20260529"
+
+            def get_history_data(self, code, days=10, force_refresh=False, request_plan=None):
+                if force_refresh:
+                    state["force"] = True
+                return None
+
+        with patch("stock_store.load_history", return_value=pd.DataFrame()):
+            missing = _check_prerequisites(
+                historical_mode=True,
+                pool_source="cache_db",
+                concept_themes_count=1,
+                board_strength={"机器人": 1.0},
+                sentiment_degraded=False,
+                zt_codes={"603435"},
+                fetcher=_Fetcher(),
+                build_local_cache_history_plan_fn=lambda **kwargs: object(),
+                log_fn=lambda *_: None,
+            )
+
+        self.assertFalse(state["force"], "历史模式不应补拉")
+        self.assertTrue(any("603435" in m for m in missing))
+
 
 def test_fetch_spot_snapshot_enriches_em_industry_from_universe(monkeypatch):
     raw = pd.DataFrame([

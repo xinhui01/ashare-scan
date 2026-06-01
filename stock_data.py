@@ -198,6 +198,7 @@ _global_mark_host_failed = _host_health.mark_failed
 _global_mark_host_ok = _host_health.mark_ok
 _global_host_on_cooldown = _host_health.on_cooldown
 _global_host_cooldown_remaining = _host_health.cooldown_remaining
+_limit_host_inflight = _host_health.limit_host_inflight
 
 
 # ---- 东方财富全局熔断器 ----
@@ -683,7 +684,10 @@ class StockDataFetcher:
 
         plans: List[HistoryRequestPlan] = []
 
-        # 东方财富：每个健康镜像作为独立通道（熔断时 auto 模式跳过）
+        # 东方财富：每个健康镜像各建一个 plan 用于轮转分流。
+        # 注意：这些镜像 plan 的通道 key 都是 "eastmoney"（见 _history_plan_channel_key），
+        # 因此它们共用同一个 per_source 信号量 → 东财整体同一时刻只有 per_source_limit 个在跑，
+        # 镜像之间是“轮转”而非“并发”。这是有意为之：东财容易被封，刻意保守、不让镜像并发放大请求量。
         em_skipped = False
         if normalized in ("auto", "eastmoney"):
             if normalized == "auto" and _eastmoney_circuit_breaker_open():
@@ -931,7 +935,10 @@ class StockDataFetcher:
         if allowed_boards and "board" in universe.columns:
             allowed = {str(x).strip() for x in allowed_boards if str(x).strip()}
             if allowed:
-                universe = universe[universe["board"].astype(str).isin(allowed)].reset_index(drop=True)
+                board_col = universe["board"].astype(str).str.strip()
+                # 板块为空的票（多是新上市 / 从涨停池补进来、metadata 未补全）不参与板块过滤，
+                # 否则会被静默剔除 → 永远不进缓存 → 新涨停票预测被硬中止。
+                universe = universe[board_col.isin(allowed) | (board_col == "")].reset_index(drop=True)
         if max_stocks and max_stocks > 0:
             universe = universe.head(max_stocks).reset_index(drop=True)
         rows = universe.to_dict("records")
@@ -1014,10 +1021,13 @@ class StockDataFetcher:
 
         def _call_history_with_plan(code: str, plan: HistoryRequestPlan) -> Optional[pd.DataFrame]:
             channel_key = _history_plan_channel_key(plan)
-            semaphore = channel_limits.setdefault(
-                channel_key,
-                threading.BoundedSemaphore(per_source_limit),
-            )
+            # channel_limits 已在上方按所有计划的通道预建，这里只读取；
+            # 仅在极端竞态下才兜底新建，避免每次调用都白白构造一个一次性信号量。
+            semaphore = channel_limits.get(channel_key)
+            if semaphore is None:
+                semaphore = channel_limits.setdefault(
+                    channel_key, threading.BoundedSemaphore(per_source_limit)
+                )
             with semaphore:
                 return self.get_history_data(
                     code, days=days, force_refresh=True, request_plan=plan,
@@ -2159,7 +2169,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用新浪源补位。")
-                        df = _fetch_sina_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_sina_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2169,7 +2180,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用网易源补位。")
-                        df = _fetch_netease_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_netease_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2179,7 +2191,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用搜狐源补位。")
-                        df = _fetch_sohu_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_sohu_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2189,7 +2202,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用同花顺源补位。")
-                        df = _fetch_ths_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=1):
+                            df = _fetch_ths_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2199,7 +2213,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用华尔街见闻源补位。")
-                        df = _fetch_wscn_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_wscn_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2209,7 +2224,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用 BaoStock 源补位。")
-                        df = _fetch_baostock_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_baostock_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:
@@ -2219,7 +2235,8 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用通达信源补位。")
-                        df = _fetch_tdx_hist_frame(stock_code, start_date, end_date)
+                        with _limit_host_inflight(host, default_limit=2):
+                            df = _fetch_tdx_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
                         if self._log:

@@ -350,9 +350,21 @@ def _check_prerequisites(
                 history = None
             if history is None or history.empty:
                 history = _trim_history_as_of(_load_cached_history_for_prereq(code, 10), fetcher)
-                if history is None or history.empty:
-                    missing_kline.append(code)
-                    continue
+            if (history is None or getattr(history, "empty", True)) and not historical_mode:
+                # 全新涨停股本地完全没缓存（0 行）：新股豁免至少要有 1 根 K 才能判定，
+                # 否则会被当成"K 线缺失"硬中止整批预测。涨停池很小，这里对这几只 0 缓存的票
+                # 定向补拉一次历史（走默认 auto 回退链），再回查缓存重判。
+                # 历史/回测模式不补拉，避免拉到非 as-of 数据。
+                if log_fn:
+                    log_fn(f"涨停预测：{code} 本地无历史缓存，定向补拉一次…")
+                try:
+                    fetcher.get_history_data(code, days=60, force_refresh=True)
+                except Exception:
+                    pass
+                history = _trim_history_as_of(_load_cached_history_for_prereq(code, 10), fetcher)
+            if history is None or history.empty:
+                missing_kline.append(code)
+                continue
             if len(history) >= 10:
                 continue
             if _is_new_stock_history(history, today):

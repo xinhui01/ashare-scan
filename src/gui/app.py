@@ -1229,7 +1229,10 @@ class StockMonitorApp:
             if request.allowed_boards and "board" in universe.columns:
                 allowed = {str(x).strip() for x in request.allowed_boards if str(x).strip()}
                 if allowed:
-                    universe = universe[universe["board"].astype(str).isin(allowed)].reset_index(drop=True)
+                    board_col = universe["board"].astype(str).str.strip()
+                    # 板块为空的票（多是新上市 / 从涨停池补进来、metadata 未补全）不参与板块过滤，
+                    # 否则会被静默剔除 → 永远不进缓存 → 新涨停票预测被硬中止。
+                    universe = universe[board_col.isin(allowed) | (board_col == "")].reset_index(drop=True)
             if request.max_stocks and request.max_stocks > 0:
                 universe = universe.head(request.max_stocks).reset_index(drop=True)
             estimated_total = int(len(universe))
