@@ -1,10 +1,15 @@
 """BaoStock 历史日线源。
 
-BaoStock 不需要 token，但需要登录会话。这里按请求粒度登录/登出，避免
-长时间 GUI 进程里残留不可控连接状态；外层更新缓存会做每源并发限制。
+BaoStock 不需要 token，但需要登录会话。会话是**全局单例**：若每抓一只票都
+login/logout，会往 stdout 刷一堆 `login success! / logout success!`、拖慢，
+且并发时多个线程的 login/logout 会互相踩掉对方的会话。
+
+这里改为**全局持久登录 + 串行访问**：首次用时登录一次、之后复用；只有查询失败
+（疑似会话过期）才登出重置、下次重新登录；进程退出时兜底登出。
 """
 from __future__ import annotations
 
+import atexit
 import random
 import threading
 import time
@@ -25,6 +30,45 @@ HOST = "baostock.com"
 _REQUEST_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
 _MIN_INTERVAL = 0.6
+
+# baostock 会话全局单例：串行化访问 + 持久登录，避免刷屏/并发互踩。
+_SESSION_LOCK = threading.RLock()
+_LOGGED_IN = False
+
+
+def _ensure_logged_in(bs) -> None:
+    """惰性登录：已登录则直接复用，不重复 login（避免刷屏）。"""
+    global _LOGGED_IN
+    if _LOGGED_IN:
+        return
+    res = bs.login()
+    if str(getattr(res, "error_code", "0")) != "0":
+        raise RuntimeError(f"baostock login failed: {getattr(res, 'error_msg', '')}")
+    _LOGGED_IN = True
+
+
+def _logout_and_reset(bs) -> None:
+    """登出并清登录态（仅在查询失败/进程退出时调用）。"""
+    global _LOGGED_IN
+    try:
+        bs.logout()
+    except Exception:
+        pass
+    _LOGGED_IN = False
+
+
+@atexit.register
+def _atexit_logout() -> None:
+    global _LOGGED_IN
+    if not _LOGGED_IN:
+        return
+    try:
+        import baostock as bs  # type: ignore
+
+        bs.logout()
+    except Exception:
+        pass
+    _LOGGED_IN = False
 
 
 def throttle() -> None:
@@ -92,39 +136,33 @@ def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.
         "turn,tradestatus,pctChg"
     )
     throttle()
-    logged_in = False
-    try:
-        login_result = bs.login()
-        logged_in = True
-        if str(getattr(login_result, "error_code", "0")) != "0":
-            raise RuntimeError(f"baostock login failed: {getattr(login_result, 'error_msg', '')}")
-        rs = bs.query_history_k_data_plus(
-            symbol,
-            fields,
-            start_date=_date_text(start_date),
-            end_date=_date_text(end_date),
-            frequency="d",
-            adjustflag="3",
-        )
-        if str(getattr(rs, "error_code", "0")) != "0":
-            raise RuntimeError(f"baostock query failed: {getattr(rs, 'error_msg', '')}")
-        rows: List[List[str]] = []
-        while rs.next():
-            rows.append(rs.get_row_data())
-        if not rows:
-            raise RuntimeError("baostock: empty history")
-        df = pd.DataFrame(rows, columns=list(rs.fields))
-        out = normalize_baostock_history_frame(df)
-        if out.empty:
-            raise RuntimeError("baostock: empty normalized history")
-        mark_ok(HOST)
-        return out
-    except Exception:
-        mark_failed(HOST)
-        raise
-    finally:
-        if logged_in:
-            try:
-                bs.logout()
-            except Exception:
-                pass
+    # 串行化 baostock 访问：会话是全局单例，并发查询会互相踩。
+    with _SESSION_LOCK:
+        try:
+            _ensure_logged_in(bs)
+            rs = bs.query_history_k_data_plus(
+                symbol,
+                fields,
+                start_date=_date_text(start_date),
+                end_date=_date_text(end_date),
+                frequency="d",
+                adjustflag="3",
+            )
+            if str(getattr(rs, "error_code", "0")) != "0":
+                raise RuntimeError(f"baostock query failed: {getattr(rs, 'error_msg', '')}")
+            rows: List[List[str]] = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                raise RuntimeError("baostock: empty history")
+            df = pd.DataFrame(rows, columns=list(rs.fields))
+            out = normalize_baostock_history_frame(df)
+            if out.empty:
+                raise RuntimeError("baostock: empty normalized history")
+            mark_ok(HOST)
+            return out
+        except Exception:
+            mark_failed(HOST)
+            # 失败可能是会话过期：登出重置，下次调用会重新登录。
+            _logout_and_reset(bs)
+            raise
