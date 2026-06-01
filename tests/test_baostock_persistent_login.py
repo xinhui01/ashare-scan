@@ -75,6 +75,21 @@ class BaostockPersistentLoginTests(unittest.TestCase):
         self.assertEqual(self.fake.login_calls, 1, "持久登录：3 次抓取只 login 一次")
         self.assertEqual(self.fake.logout_calls, 0, "成功不应 logout")
 
+    def test_socket_timeout_applied_during_call_and_restored(self):
+        import socket
+        seen = {}
+        orig_login = self.fake.login
+
+        def _login_capturing():
+            seen["during"] = socket.getdefaulttimeout()
+            return orig_login()
+
+        self.fake.login = _login_capturing
+        before = socket.getdefaulttimeout()
+        bsrc.fetch_hist_frame("600000", "20260101", "20260131")
+        self.assertEqual(seen["during"], bsrc._bs_timeout(), "调用期间应有 socket 超时")
+        self.assertEqual(socket.getdefaulttimeout(), before, "调用后应恢复原超时")
+
     def test_failure_resets_session_for_relogin(self):
         # 先成功一次（登录）
         bsrc.fetch_hist_frame("600000", "20260101", "20260131")
