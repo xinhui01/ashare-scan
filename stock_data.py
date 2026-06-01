@@ -687,14 +687,34 @@ class StockDataFetcher:
     def set_default_limit_up_reason_source(self, source: str) -> None:
         self._default_limit_up_reason_source = self.normalize_limit_up_reason_source(source)
 
-    def _build_multi_source_plans(self, source: str) -> List[HistoryRequestPlan]:
+    def _build_multi_source_plans(
+        self,
+        source: str,
+        excluded_providers: Optional[set[str]] = None,
+    ) -> List[HistoryRequestPlan]:
         """构建多源并行请求计划列表，用于批量更新时分流。
         将可用的 eastmoney 镜像各自作为一个独立 plan，
         再加上其它完整历史源作为补充源，实现负载均衡。
         """
         normalized = self.normalize_history_source(source)
+        excluded = {str(x or "").strip().lower() for x in (excluded_providers or set()) if str(x or "").strip()}
 
         plans: List[HistoryRequestPlan] = []
+        non_em_providers: List[str] = []
+        if "sina" not in excluded and not _global_host_on_cooldown("finance.sina.com.cn"):
+            non_em_providers.append("sina")
+        if "ths" not in excluded and not _global_host_on_cooldown("d.10jqka.com.cn"):
+            non_em_providers.append("ths")
+        if "netease" not in excluded and not _global_host_on_cooldown("quotes.money.163.com"):
+            non_em_providers.append("netease")
+        if "sohu" not in excluded and not _global_host_on_cooldown("q.stock.sohu.com"):
+            non_em_providers.append("sohu")
+        if "wscn" not in excluded and not _global_host_on_cooldown("api-ddc-wscn.awtmt.com"):
+            non_em_providers.append("wscn")
+        if "baostock" not in excluded and not _global_host_on_cooldown("baostock.com"):
+            non_em_providers.append("baostock")
+        if "tdx" not in excluded and (normalized == "tdx" or _tdx_source_available()) and not _global_host_on_cooldown("tdx"):
+            non_em_providers.append("tdx")
 
         # 东方财富：每个健康镜像各建一个 plan 用于轮转分流。
         # 注意：这些镜像 plan 的通道 key 都是 "eastmoney"（见 _history_plan_channel_key），
@@ -708,64 +728,68 @@ class StockDataFetcher:
             else:
                 mirrors = self.get_available_history_mirrors()
                 for mirror in mirrors:
+                    providers = ("eastmoney",) + tuple(non_em_providers) if normalized == "auto" else ("eastmoney",)
                     plans.append(HistoryRequestPlan(
                         mode="network",
-                        provider_sequence=("eastmoney",),
+                        provider_sequence=providers,
                         mirror_urls=(mirror,),
                         reason=f"multi-source-eastmoney-{_history_mirror_host(mirror)}",
                     ))
 
+        # auto 模式下：只有东财不可用时，才把非东财源提升为主通道。
+        use_non_em_as_primary = normalized != "auto" or em_skipped or not plans
+
         # 新浪/网易/搜狐/同花顺/华尔街见闻：作为补充分流通道（跳过正在冷却的源）
-        if normalized in ("auto", "sina"):
-            if not _global_host_on_cooldown("finance.sina.com.cn"):
+        if normalized in ("auto", "sina") and use_non_em_as_primary:
+            if "sina" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("sina",),
                     mirror_urls=(),
                     reason="multi-source-sina",
                 ))
-        if normalized in ("auto", "netease"):
-            if not _global_host_on_cooldown("quotes.money.163.com"):
+        if normalized in ("auto", "netease") and use_non_em_as_primary:
+            if "netease" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("netease",),
                     mirror_urls=(),
                     reason="multi-source-netease",
                 ))
-        if normalized in ("auto", "sohu"):
-            if not _global_host_on_cooldown("q.stock.sohu.com"):
+        if normalized in ("auto", "sohu") and use_non_em_as_primary:
+            if "sohu" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("sohu",),
                     mirror_urls=(),
                     reason="multi-source-sohu",
                 ))
-        if normalized in ("auto", "ths"):
-            if not _global_host_on_cooldown("d.10jqka.com.cn"):
+        if normalized in ("auto", "ths") and use_non_em_as_primary:
+            if "ths" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("ths",),
                     mirror_urls=(),
                     reason="multi-source-ths",
                 ))
-        if normalized in ("auto", "wscn"):
-            if not _global_host_on_cooldown("api-ddc-wscn.awtmt.com"):
+        if normalized in ("auto", "wscn") and use_non_em_as_primary:
+            if "wscn" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("wscn",),
                     mirror_urls=(),
                     reason="multi-source-wscn",
                 ))
-        if normalized in ("auto", "baostock"):
-            if not _global_host_on_cooldown("baostock.com"):
+        if normalized in ("auto", "baostock") and use_non_em_as_primary:
+            if "baostock" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("baostock",),
                     mirror_urls=(),
                     reason="multi-source-baostock",
                 ))
-        if normalized in ("auto", "tdx"):
-            if (normalized == "tdx" or _tdx_source_available()) and not _global_host_on_cooldown("tdx"):
+        if normalized in ("auto", "tdx") and use_non_em_as_primary:
+            if "tdx" in non_em_providers:
                 plans.append(HistoryRequestPlan(
                     mode="network",
                     provider_sequence=("tdx",),
@@ -929,6 +953,52 @@ class StockDataFetcher:
         worker_count = min(max(requested, natural_workers), _history_total_concurrency_cap())
         return max(1, worker_count), per_source_limit, channel_count
 
+    def _probe_auto_history_providers(
+        self,
+        rows: List[Dict[str, Any]],
+        *,
+        days: int,
+    ) -> set[str]:
+        sample_codes: List[str] = []
+        seen: set[str] = set()
+        for item in rows:
+            code = str(item.get("code", "")).strip().zfill(6)
+            if code and code not in seen:
+                sample_codes.append(code)
+                seen.add(code)
+            if len(sample_codes) >= 3:
+                break
+        if not sample_codes:
+            return set()
+
+        candidates = ["sina", "ths", "netease", "sohu", "wscn", "baostock"]
+        if _tdx_source_available():
+            candidates.append("tdx")
+
+        excluded: set[str] = set()
+        probe_days = max(20, min(int(days or 0), 60))
+        for provider in candidates:
+            plan = self.build_history_request_plan(source=provider, force_refresh=True)
+            ok = False
+            for code in sample_codes:
+                try:
+                    df = self.get_history_data(
+                        code,
+                        days=probe_days,
+                        force_refresh=True,
+                        request_plan=plan,
+                    )
+                except Exception:
+                    df = None
+                if df is not None and not df.empty:
+                    ok = True
+                    break
+            if not ok:
+                excluded.add(provider)
+                if self._log:
+                    self._log(f"历史源预检失败，本轮临时屏蔽: {provider}")
+        return excluded
+
     def update_history_cache(
         self,
         max_stocks: int = 0,
@@ -1000,7 +1070,10 @@ class StockDataFetcher:
 
         # ---- 多源并行分流策略 ----
         source_str = source or self._default_history_source
-        multi_plans = self._build_multi_source_plans(source_str)
+        excluded_providers: set[str] = set()
+        if self.normalize_history_source(source_str) == "auto" and pending_rows:
+            excluded_providers = self._probe_auto_history_providers(pending_rows, days=days)
+        multi_plans = self._build_multi_source_plans(source_str, excluded_providers=excluded_providers)
         plan_count = len(multi_plans)
         worker_count, per_source_limit, channel_count = self._resolve_history_update_worker_count(
             workers,
@@ -2210,7 +2283,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用新浪源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_sina_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
@@ -2221,7 +2294,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用网易源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_netease_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
@@ -2232,7 +2305,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用搜狐源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_sohu_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
@@ -2254,7 +2327,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用华尔街见闻源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_wscn_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
@@ -2265,7 +2338,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用 BaoStock 源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_baostock_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e
@@ -2276,7 +2349,7 @@ class StockDataFetcher:
                     try:
                         if self._log:
                             self._log(f"历史 {stock_code} 正在使用通达信源补位。")
-                        with _limit_host_inflight(host, default_limit=2):
+                        with _limit_host_inflight(host, default_limit=1):
                             df = _fetch_tdx_hist_frame(stock_code, start_date, end_date)
                     except Exception as e:
                         last_error = e

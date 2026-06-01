@@ -136,6 +136,36 @@ class TestAppConfig(StockStoreTestCase):
         self.assertEqual(load_app_config("k")["v"], 2)
 
 
+class TestLimitUpPredictionPersistence(StockStoreTestCase):
+    def test_save_prediction_record_with_tuple_key_rules(self):
+        from stock_store import load_limit_up_prediction_by_date, save_limit_up_prediction_record
+
+        payload = {
+            "trade_date": "2026-06-01",
+            "summary": "ok",
+            "continuation_candidates": [],
+            "first_board_candidates": [],
+            "fresh_first_board_candidates": [],
+            "compare_context": {
+                "fresh_calibration_rules": {
+                    ("放量", "突破"): {
+                        "buyable": 20,
+                        "hit": 4,
+                        "rate": 20.0,
+                    }
+                }
+            },
+        }
+
+        save_limit_up_prediction_record(payload)
+        loaded = load_limit_up_prediction_by_date("2026-06-01")
+
+        self.assertIsNotNone(loaded)
+        rules = loaded["compare_context"]["fresh_calibration_rules"]
+        self.assertIn("['放量', '突破']", rules)
+        self.assertEqual(rules["['放量', '突破']"]["rate"], 20.0)
+
+
 class TestScanSnapshot(StockStoreTestCase):
     def test_save_and_load_snapshot(self):
         from stock_store import save_scan_snapshot, load_scan_snapshot

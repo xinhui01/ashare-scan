@@ -28,7 +28,7 @@ def test_update_history_cache_limits_parallelism_per_source(monkeypatch):
         HistoryRequestPlan(mode="network", provider_sequence=("netease",), reason="multi-source-netease"),
         HistoryRequestPlan(mode="network", provider_sequence=("sohu",), reason="multi-source-sohu"),
     ]
-    fetcher._build_multi_source_plans = lambda source: plans  # type: ignore[method-assign]
+    fetcher._build_multi_source_plans = lambda source, excluded_providers=None: plans  # type: ignore[method-assign]
 
     active = {name: 0 for name in ("sina", "netease", "sohu")}
     max_active = {name: 0 for name in active}
@@ -82,6 +82,125 @@ def test_non_eastmoney_history_sources_do_not_use_global_em_semaphore(monkeypatc
 
     assert result is not None
     assert len(result) == 1
+
+
+def test_non_eastmoney_history_sources_use_single_inflight_slot(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    provider_to_host = {
+        "sina": "finance.sina.com.cn",
+        "netease": "quotes.money.163.com",
+        "sohu": "q.stock.sohu.com",
+        "ths": "d.10jqka.com.cn",
+        "wscn": "api-ddc-wscn.awtmt.com",
+        "baostock": "baostock.com",
+        "tdx": "tdx",
+    }
+    seen_limits = {}
+
+    class _DummyLimit:
+        def __init__(self, host, default_limit):
+            seen_limits[host] = default_limit
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("stock_data._limit_host_inflight", lambda host, default_limit=2: _DummyLimit(host, default_limit))
+    monkeypatch.setattr("stock_data._save_history_store", lambda *args, **kwargs: None)
+    monkeypatch.setattr("stock_data.save_history_meta_store", lambda *args, **kwargs: None)
+
+    for provider in provider_to_host:
+        df = pd.DataFrame(
+            [{"date": "2026-04-22", "open": 10, "close": 11, "high": 12, "low": 9, "amount": 1000}]
+        )
+        monkeypatch.setattr(f"stock_data._fetch_{provider}_hist_frame", lambda *args, _df=df, **kwargs: _df)
+        plan = HistoryRequestPlan(mode="network", provider_sequence=(provider,), reason=f"test-{provider}")
+        result = fetcher.get_history_data("000001", days=1, force_refresh=True, request_plan=plan)
+        assert result is not None
+
+    assert seen_limits == {host: 1 for host in provider_to_host.values()}
+
+
+def test_auto_history_batch_prefers_eastmoney_and_keeps_fallback_inline(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    monkeypatch.setattr(
+        fetcher,
+        "get_available_history_mirrors",
+        lambda force_refresh=False: ["https://em1.example/api", "https://em2.example/api"],
+    )
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: False)
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: True)
+
+    plans = fetcher._build_multi_source_plans("auto")
+
+    assert len(plans) == 2
+    assert all(plan.provider_sequence[0] == "eastmoney" for plan in plans)
+    assert all(plan.provider_sequence != ("sina",) for plan in plans)
+    assert all("sina" in plan.provider_sequence for plan in plans)
+
+
+def test_auto_history_plan_excludes_sina_from_default_fallback_chain(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    monkeypatch.setattr(
+        fetcher,
+        "get_available_history_mirrors",
+        lambda force_refresh=False: ["https://em1.example/api"],
+    )
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: False)
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: True)
+
+    plan = fetcher.build_history_request_plan(source="auto", force_refresh=True)
+
+    assert plan.provider_sequence[0] == "eastmoney"
+    assert "sina" in plan.provider_sequence
+
+
+def test_auto_history_batch_can_temporarily_exclude_failed_providers(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    monkeypatch.setattr(
+        fetcher,
+        "get_available_history_mirrors",
+        lambda force_refresh=False: ["https://em1.example/api", "https://em2.example/api"],
+    )
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: False)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: False)
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: True)
+
+    plans = fetcher._build_multi_source_plans("auto", excluded_providers={"sina", "sohu"})
+
+    assert len(plans) == 2
+    assert all(plan.provider_sequence[0] == "eastmoney" for plan in plans)
+    assert all("sina" not in plan.provider_sequence for plan in plans)
+    assert all("sohu" not in plan.provider_sequence for plan in plans)
+    assert all("ths" in plan.provider_sequence for plan in plans)
+
+
+def test_update_history_cache_uses_probe_results_to_filter_auto_sources(monkeypatch):
+    universe = pd.DataFrame({"code": ["000001"], "name": ["A"]})
+    fetcher = _fetcher_with_universe(universe)
+    seen = {}
+
+    monkeypatch.setattr("stock_data._is_history_cache_fresh", lambda *args, **kwargs: False)
+    monkeypatch.setattr(fetcher, "_probe_auto_history_providers", lambda rows, days: {"sina", "sohu"})
+
+    def fake_build_plans(source, excluded_providers=None):
+        seen["source"] = source
+        seen["excluded"] = set(excluded_providers or set())
+        return [HistoryRequestPlan(mode="network", provider_sequence=("eastmoney",), reason="em")]
+
+    fetcher._build_multi_source_plans = fake_build_plans  # type: ignore[method-assign]
+    fetcher.get_history_data = lambda *args, **kwargs: pd.DataFrame(  # type: ignore[method-assign]
+        [{"date": "2026-04-22", "open": 1, "close": 1, "high": 1, "low": 1}]
+    )
+
+    result = fetcher.update_history_cache(days=1, workers=1, source="auto", fast_daily_append=False)
+
+    assert result["updated"] == 1
+    assert seen == {"source": "auto", "excluded": {"sina", "sohu"}}
 
 
 def test_update_history_cache_fast_appends_snapshot_before_network(tmp_path, monkeypatch):

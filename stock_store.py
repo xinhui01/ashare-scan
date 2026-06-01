@@ -31,6 +31,40 @@ _OPEN_CONNECTIONS_LOCK = threading.Lock()
 _CONNECTION_GENERATION = 0
 
 
+def _normalize_json_value(value: Any, seen: Optional[set[int]] = None) -> Any:
+    """Convert nested Python objects into JSON-safe structures."""
+    if seen is None:
+        seen = set()
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    obj_id = id(value)
+    if obj_id in seen:
+        return "<circular>"
+
+    if isinstance(value, dict):
+        seen.add(obj_id)
+        try:
+            return {
+                json.dumps(_normalize_json_value(key, seen.copy()), ensure_ascii=False)
+                if not isinstance(key, str) else key:
+                _normalize_json_value(item, seen.copy())
+                for key, item in value.items()
+            }
+        finally:
+            seen.discard(obj_id)
+
+    if isinstance(value, (list, tuple, set)):
+        seen.add(obj_id)
+        try:
+            return [_normalize_json_value(item, seen.copy()) for item in value]
+        finally:
+            seen.discard(obj_id)
+
+    return str(value)
+
+
 def _ensure_dir() -> None:
     _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1027,7 +1061,7 @@ def save_app_config(key: str, value: Any) -> None:
     if not key:
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    value_json = json.dumps(value, ensure_ascii=False, default=str)
+    value_json = json.dumps(_normalize_json_value(value), ensure_ascii=False)
 
     def _write():
         with _connect() as conn:
@@ -1098,7 +1132,7 @@ def save_limit_up_prediction_record(payload: Dict[str, Any]) -> None:
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
-        payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+        payload_json = json.dumps(_normalize_json_value(payload), ensure_ascii=False)
     except Exception:
         logger.exception("序列化涨停预测结果失败")
         return
