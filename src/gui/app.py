@@ -1217,7 +1217,15 @@ class StockMonitorApp:
             )
 
             self._post_to_ui(lambda: self.status_var.set("正在加载股票池并统计总数..."))
-            universe = scan_filter.fetcher.get_all_stocks(force_refresh=request.refresh_universe)
+            # 用户没手动勾"重新拉取股票池"时，若距上次全量刷新已超过阈值（默认 3 天），
+            # 自动刷一次，补全新票的名称/板块，省得用户记着手动勾。
+            auto_refresh_universe = (not request.refresh_universe) and \
+                scan_filter.fetcher.universe_refresh_overdue()
+            if auto_refresh_universe:
+                self._log_async("股票池距上次全量刷新已超过阈值，本次自动重新拉取一次（补全新票名称/板块）。")
+            universe = scan_filter.fetcher.get_all_stocks(
+                force_refresh=request.refresh_universe or auto_refresh_universe
+            )
             if token.is_cancelled():
                 self._post_to_ui(lambda: self._set_progressbar_indeterminate(False))
                 self._post_to_ui(lambda: self.result.scan_finished("历史缓存更新已停止"))

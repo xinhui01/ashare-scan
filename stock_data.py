@@ -96,6 +96,8 @@ from stock_store import (
     clear_history as clear_history_store,
     clear_scan_snapshots,
     clear_universe as clear_universe_store,
+    load_app_config as load_app_config_store,
+    save_app_config as save_app_config_store,
     history_coverage_summary as load_history_coverage_summary,
     load_all_history_meta_map as load_all_history_meta_map_store,
     load_fund_flow as load_fund_flow_store,
@@ -151,6 +153,15 @@ def _history_total_timeout_sec() -> float:
 
 def _history_host_cooldown_sec() -> float:
     return env_float("ASHARE_SCAN_HISTORY_HOST_COOLDOWN_SEC", default=180.0, lo=10.0, hi=1800.0)
+
+
+# 股票池"上次全量重新拉取"的时间戳标记（存 app_config），用于判断是否该自动刷新。
+_UNIVERSE_FULL_REFRESH_KEY = "universe_full_refresh_at"
+
+
+def _universe_max_age_days() -> float:
+    """股票池"全量重新拉取"的最大有效天数；超过则建议自动刷新一次（默认 3 天）。"""
+    return env_float("ASHARE_UNIVERSE_MAX_AGE_DAYS", default=3.0, lo=0.5, hi=60.0)
 
 
 def _history_max_mirrors_per_stock() -> int:
@@ -1972,9 +1983,37 @@ class StockDataFetcher:
         _save_fund_flow_store(code, df, keep_rows=max(60, days + 10))
         return df.tail(days).reset_index(drop=True)
 
+    def _mark_universe_refreshed(self) -> None:
+        """记录一次"全量重新拉取股票池"完成的时间戳。"""
+        try:
+            save_app_config_store(
+                _UNIVERSE_FULL_REFRESH_KEY,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        except Exception:
+            pass
+
+    def universe_refresh_overdue(self, max_age_days: Optional[float] = None) -> bool:
+        """股票池距上次"全量重新拉取"是否已超过 N 天。缺标记 / 解析失败一律视为 overdue。"""
+        threshold = _universe_max_age_days() if max_age_days is None else float(max_age_days)
+        try:
+            raw = str(load_app_config_store(_UNIVERSE_FULL_REFRESH_KEY, "") or "").strip()
+        except Exception:
+            raw = ""
+        if not raw:
+            return True
+        try:
+            last = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return True
+        return (datetime.now() - last).total_seconds() >= threshold * 86400.0
+
     def get_all_stocks(self, force_refresh: bool = False) -> pd.DataFrame:
         if _use_em_full_spot_for_list():
-            return self._get_all_stocks_em_spot()
+            df = self._get_all_stocks_em_spot()
+            if df is not None and not df.empty:
+                self._mark_universe_refreshed()
+            return df
         if os.environ.get("ASHARE_SCAN_REFRESH_UNIVERSE", "").strip().lower() in (
             "1",
             "true",
@@ -1994,6 +2033,7 @@ class StockDataFetcher:
         if not df.empty:
             _save_universe_store(df, self._log)
             self._set_universe_concepts_cache(df)
+            self._mark_universe_refreshed()
         return df
 
     def _get_all_stocks_em_spot(self) -> pd.DataFrame:
