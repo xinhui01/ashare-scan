@@ -553,6 +553,27 @@ def save_history(stock_code: str, df: pd.DataFrame) -> None:
         _retry_locked(_write)
 
 
+def count_history(stock_code: str) -> int:
+    """history 表里某只股票的真实总行数。
+
+    用于写 meta.row_count，避免被"增量抓取的那几十行"低估——save_history 是按
+    (code, trade_date) upsert 累积的，表里可能已攒了几百行历史，但单次抓取的 df
+    只有几十行；若用 len(df) 写 row_count，会让缓存新鲜度判定永远不达标、每轮重拉。
+    """
+    if not _DB_PATH.is_file():
+        return 0
+    code = str(stock_code).strip().zfill(6)
+
+    def _read():
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM history WHERE code = ?", (code,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    return int(_retry_locked(_read) or 0)
+
+
 def load_history(stock_code: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
     if not _DB_PATH.is_file():
         return None

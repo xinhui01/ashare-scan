@@ -96,6 +96,7 @@ from stock_store import (
     clear_history as clear_history_store,
     clear_scan_snapshots,
     clear_universe as clear_universe_store,
+    count_history as count_history_store,
     load_app_config as load_app_config_store,
     save_app_config as save_app_config_store,
     history_coverage_summary as load_history_coverage_summary,
@@ -2306,7 +2307,8 @@ class StockDataFetcher:
                 save_history_meta_store(
                     stock_code,
                     latest_td,
-                    len(df),
+                    # 用表里真实总行数，而非本次增量 df 的行数；否则缓存永远判不新鲜、每轮重拉。
+                    count_history_store(stock_code) or len(df),
                     source=provider_used,
                     partial_fields=partial_fields,
                     needs_repair=needs_repair,
@@ -2320,7 +2322,7 @@ class StockDataFetcher:
                 save_history_meta_store(
                     stock_code,
                     latest_td,
-                    len(df),
+                    count_history_store(stock_code) or len(df),
                     source=provider,
                     partial_fields=partial_fields,
                     needs_repair=1,
@@ -2340,7 +2342,7 @@ class StockDataFetcher:
                     save_history_meta_store(
                         stock_code,
                         latest_td or str(history_meta.get("latest_trade_date") or ""),
-                        len(history_df),
+                        count_history_store(stock_code) or len(history_df),
                         source=str(history_meta.get("source") or ""),
                         partial_fields=partial_fields,
                         needs_repair=1,
