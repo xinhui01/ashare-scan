@@ -42,6 +42,21 @@ class HostHealthCooldownTests(unittest.TestCase):
         hh.mark_failed(host)
         self.assertTrue(3595 <= self._remaining(host) <= 3600)
 
+    def test_fail_count_persists_across_cooldown_expiry(self):
+        """死源回归：冷却到期不该清失败计数，否则永远停在 60s、每 60s 被反复重试。"""
+        import time as _time
+        host = "demo.dead.com"
+        hh.mark_failed(host)  # 第1次 → 60s
+        self.assertTrue(55 <= self._remaining(host) <= 60)
+        # 模拟冷却到期：把到期时间戳改到过去，再走一次 on_cooldown 检查（分发层就是这么查的）
+        with hh._HOST_HEALTH_LOCK:
+            hh._HOST_HEALTH[host] = _time.time() - 1
+        self.assertFalse(hh.on_cooldown(host))  # 已过期，可重试
+        # 再次失败 → 必须升到第2档(5min)，而不是回到 60s
+        hh.mark_failed(host)
+        self.assertTrue(295 <= self._remaining(host) <= 300,
+                        "冷却到期后失败计数被错误清零，阶梯失效")
+
     def test_mark_ok_resets_ladder(self):
         host = "demo.reset.com"
         hh.mark_failed(host)

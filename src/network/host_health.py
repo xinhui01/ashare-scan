@@ -90,7 +90,10 @@ def on_cooldown(url_or_host: str, now: Optional[float] = None) -> bool:
         cooldown_until = _HOST_HEALTH.get(host, 0.0)
         if cooldown_until <= now:
             _HOST_HEALTH.pop(host, None)
-            _HOST_FAIL_COUNT.pop(host, None)
+            # 注意：不要在这里清 _HOST_FAIL_COUNT。失败计数是软/硬冷却阶梯的依据
+            # （连续失败 → 冷却越来越长）。只有真正成功（mark_ok）才清零；若一到期
+            # 就清零，死源每个冷却窗口都被当"第一次失败"(只冷 60s)放出来重试，永远
+            # 升不上去 → 死源被每 60s 反复调用、失败累积。
             return False
         return True
 
