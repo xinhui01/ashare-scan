@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 import pandas as pd
 
-from src.utils.codes import infer_exchange, infer_sz_board, norm_code_series
+from src.utils.codes import infer_exchange, infer_sz_board, is_bse_code, norm_code_series
 from src.utils.parsing import normalize_concepts_text
 from stock_logger import get_logger
 from stock_store import (
@@ -55,6 +55,7 @@ def load_universe(log: Optional[Callable[[str], None]] = None) -> Optional[pd.Da
     if "concepts" not in df.columns:
         df["concepts"] = ""
     df["code"] = norm_code_series(df["code"])
+    df = df[~df["code"].map(is_bse_code)].reset_index(drop=True)
     df["concepts"] = df["concepts"].astype(str).map(normalize_concepts_text)
     if log:
         log(f"已从 data/stock_store.sqlite3 读取股票池 {len(df)} 只")

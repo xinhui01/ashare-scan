@@ -419,6 +419,58 @@ _fetch_tdx_hist_frame = _src_tdx.fetch_hist_frame
 _tdx_source_available = _src_tdx.is_available
 
 
+_HISTORY_FALLBACK_PROVIDER_HOSTS: Dict[str, str] = {
+    "sina": "finance.sina.com.cn",
+    "ths": "d.10jqka.com.cn",
+    "netease": "quotes.money.163.com",
+    "sohu": "q.stock.sohu.com",
+    "wscn": "api-ddc-wscn.awtmt.com",
+    "baostock": "baostock.com",
+    "tdx": "tdx",
+}
+_HISTORY_FALLBACK_PROVIDER_ORDER: Tuple[str, ...] = (
+    "sina",
+    "ths",
+    "netease",
+    "sohu",
+    "wscn",
+    "baostock",
+)
+
+
+def _history_provider_host(provider: str) -> str:
+    return _HISTORY_FALLBACK_PROVIDER_HOSTS.get(str(provider or "").strip().lower(), "")
+
+
+def _history_provider_on_cooldown(provider: str) -> bool:
+    host = _history_provider_host(provider)
+    return bool(host and _global_host_on_cooldown(host))
+
+
+def _available_history_fallback_providers(
+    excluded_providers: Optional[set[str]] = None,
+    *,
+    force_tdx: bool = False,
+) -> Tuple[str, ...]:
+    excluded = {
+        str(x or "").strip().lower()
+        for x in (excluded_providers or set())
+        if str(x or "").strip()
+    }
+    providers: List[str] = []
+    for provider in _HISTORY_FALLBACK_PROVIDER_ORDER:
+        if provider in excluded or _history_provider_on_cooldown(provider):
+            continue
+        providers.append(provider)
+    if (
+        "tdx" not in excluded
+        and (force_tdx or _tdx_source_available())
+        and not _history_provider_on_cooldown("tdx")
+    ):
+        providers.append("tdx")
+    return tuple(providers)
+
+
 # 历史抓取主函数 + probe：实现已迁移到 src/sources/eastmoney/history.py
 _probe_history_mirror = _em_history.probe_mirror
 _fetch_eastmoney_hist_frame = _em_history.fetch_hist_frame
@@ -714,21 +766,12 @@ class StockDataFetcher:
         excluded = {str(x or "").strip().lower() for x in (excluded_providers or set()) if str(x or "").strip()}
 
         plans: List[HistoryRequestPlan] = []
-        non_em_providers: List[str] = []
-        if "sina" not in excluded and not _global_host_on_cooldown("finance.sina.com.cn"):
-            non_em_providers.append("sina")
-        if "ths" not in excluded and not _global_host_on_cooldown("d.10jqka.com.cn"):
-            non_em_providers.append("ths")
-        if "netease" not in excluded and not _global_host_on_cooldown("quotes.money.163.com"):
-            non_em_providers.append("netease")
-        if "sohu" not in excluded and not _global_host_on_cooldown("q.stock.sohu.com"):
-            non_em_providers.append("sohu")
-        if "wscn" not in excluded and not _global_host_on_cooldown("api-ddc-wscn.awtmt.com"):
-            non_em_providers.append("wscn")
-        if "baostock" not in excluded and not _global_host_on_cooldown("baostock.com"):
-            non_em_providers.append("baostock")
-        if "tdx" not in excluded and (normalized == "tdx" or _tdx_source_available()) and not _global_host_on_cooldown("tdx"):
-            non_em_providers.append("tdx")
+        non_em_providers = list(
+            _available_history_fallback_providers(
+                excluded,
+                force_tdx=(normalized == "tdx"),
+            )
+        )
 
         # 东方财富：每个健康镜像各建一个 plan 用于轮转分流。
         # 注意：这些镜像 plan 的通道 key 都是 "eastmoney"（见 _history_plan_channel_key），
@@ -811,9 +854,27 @@ class StockDataFetcher:
                     reason="multi-source-tdx",
                 ))
 
-        # 兜底：至少保证一个 auto plan
+        # 兜底：没有健康通道时明确 cache-only，避免把预检查排除/冷却的源又塞回队列。
         if not plans:
-            plans.append(self.build_history_request_plan(source=source, force_refresh=False))
+            if normalized == "auto":
+                reason = "history-provider=auto(no-healthy-provider)"
+                if em_skipped:
+                    reason = "history-provider=auto(eastmoney-circuit-open/no-healthy-fallback)"
+                plans.append(HistoryRequestPlan(
+                    mode="cache_only",
+                    provider_sequence=(),
+                    mirror_urls=(),
+                    reason=reason,
+                ))
+            elif normalized in excluded:
+                plans.append(HistoryRequestPlan(
+                    mode="cache_only",
+                    provider_sequence=(normalized,),
+                    mirror_urls=(),
+                    reason=f"history-provider={normalized}(excluded)",
+                ))
+            else:
+                plans.append(self.build_history_request_plan(source=source, force_refresh=False))
 
         return plans
 
@@ -957,14 +1018,18 @@ class StockDataFetcher:
     ) -> Tuple[int, int, int]:
         per_source_limit = _history_per_source_concurrency()
         channel_count = max(1, len({_history_plan_channel_key(plan) for plan in plans}))
-        natural_workers = max(1, channel_count * per_source_limit)
         try:
             requested = int(requested_workers or 0)
         except (TypeError, ValueError):
             requested = 0
         if requested <= 0:
             requested = self.history_request_concurrency_limit()
-        worker_count = min(max(requested, natural_workers), _history_total_concurrency_cap())
+        # 多源只负责分流，不再因为源通道数变多而自动抬高总并发。
+        worker_count = min(
+            max(1, requested),
+            self.history_request_concurrency_limit(),
+            _history_total_concurrency_cap(),
+        )
         return max(1, worker_count), per_source_limit, channel_count
 
     def _probe_auto_history_providers(
@@ -977,6 +1042,8 @@ class StockDataFetcher:
         seen: set[str] = set()
         for item in rows:
             code = str(item.get("code", "")).strip().zfill(6)
+            if _is_bse_code(code):
+                continue
             if code and code not in seen:
                 sample_codes.append(code)
                 seen.add(code)
@@ -1026,6 +1093,7 @@ class StockDataFetcher:
         fast_daily_append: bool = True,
     ) -> Dict[str, Any]:
         universe = self.get_all_stocks(force_refresh=refresh_universe)
+        universe = _drop_bse_universe(universe)
         if universe is None or universe.empty:
             return {"total": 0, "updated": 0, "failed": 0, "skipped": 0}
         if allowed_boards and "board" in universe.columns:
@@ -1155,18 +1223,11 @@ class StockDataFetcher:
             if _is_history_cache_fresh(code, max(1, days), self._log):
                 return code, name, True, True
 
-            # 检查分配的源是否已冷却，是则直接用 fallback
-            _host_map = {
-                "sina": "finance.sina.com.cn", "netease": "quotes.money.163.com",
-                "sohu": "q.stock.sohu.com",
-                "ths": "d.10jqka.com.cn", "wscn": "api-ddc-wscn.awtmt.com",
-                "baostock": "baostock.com",
-                "tdx": "tdx",
-            }
+            # 检查分配的源是否已冷却，是则直接用 fallback。
             assigned_all_cooled = all(
-                _global_host_on_cooldown(_host_map[p])
+                _history_provider_on_cooldown(p)
                 for p in assigned_plan.provider_sequence
-                if p in _host_map
+                if _history_provider_host(p)
             ) if assigned_plan.provider_sequence else False
 
             fallback_plan = _pick_fallback_plan(assigned_plan, item_index)
@@ -1244,54 +1305,36 @@ class StockDataFetcher:
 
     def build_history_request_plan(self, source: str = "auto", force_refresh: bool = False) -> HistoryRequestPlan:
         normalized = self.normalize_history_source(source)
-        if normalized == "sina":
+        if normalized in _HISTORY_FALLBACK_PROVIDER_HOSTS:
+            if _history_provider_on_cooldown(normalized):
+                return HistoryRequestPlan(
+                    mode="cache_only",
+                    provider_sequence=(normalized,),
+                    mirror_urls=(),
+                    reason=f"history-provider={normalized}(cooldown)",
+                )
             return HistoryRequestPlan(
                 mode="network",
-                provider_sequence=("sina",),
+                provider_sequence=(normalized,),
                 mirror_urls=(),
-                reason="history-provider=sina",
+                reason=f"history-provider={normalized}",
             )
-        if normalized == "netease":
+
+        non_em_providers = _available_history_fallback_providers()
+        if normalized == "auto" and _eastmoney_circuit_breaker_open():
+            # 东财熔断中：auto 模式只使用仍健康的非东财源；没有健康源就等待缓存/下一轮。
+            if non_em_providers:
+                return HistoryRequestPlan(
+                    mode="network",
+                    provider_sequence=non_em_providers,
+                    mirror_urls=(),
+                    reason="history-provider=auto(eastmoney-circuit-open)",
+                )
             return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("netease",),
+                mode="cache_only",
+                provider_sequence=(),
                 mirror_urls=(),
-                reason="history-provider=netease",
-            )
-        if normalized == "sohu":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("sohu",),
-                mirror_urls=(),
-                reason="history-provider=sohu",
-            )
-        if normalized == "ths":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("ths",),
-                mirror_urls=(),
-                reason="history-provider=ths",
-            )
-        if normalized == "wscn":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("wscn",),
-                mirror_urls=(),
-                reason="history-provider=wscn",
-            )
-        if normalized == "baostock":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("baostock",),
-                mirror_urls=(),
-                reason="history-provider=baostock",
-            )
-        if normalized == "tdx":
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=("tdx",),
-                mirror_urls=(),
-                reason="history-provider=tdx",
+                reason="history-provider=auto(eastmoney-circuit-open/no-healthy-fallback)",
             )
 
         mirrors = tuple(self.get_available_history_mirrors(force_refresh=force_refresh))
@@ -1316,18 +1359,6 @@ class StockDataFetcher:
                 reason=reason,
             )
 
-        _non_em_providers = ["sina", "ths", "netease", "sohu", "wscn", "baostock"]
-        if _tdx_source_available() and not _global_host_on_cooldown("tdx"):
-            _non_em_providers.append("tdx")
-        non_em_providers = tuple(_non_em_providers)
-        if _eastmoney_circuit_breaker_open():
-            # 东财熔断中：auto 模式直接用非东财源，避免无意义的重试
-            return HistoryRequestPlan(
-                mode="network",
-                provider_sequence=non_em_providers,
-                mirror_urls=(),
-                reason="history-provider=auto(eastmoney-circuit-open)",
-            )
         if mirrors:
             return HistoryRequestPlan(
                 mode="network",
@@ -1341,6 +1372,13 @@ class StockDataFetcher:
             reason = "；".join(f"{host}: {detail}" for host, detail in list(failures.items())[:3])
         if not reason:
             reason = "history-mirrors-unavailable"
+        if not non_em_providers:
+            return HistoryRequestPlan(
+                mode="cache_only",
+                provider_sequence=(),
+                mirror_urls=(),
+                reason=f"{reason}; no-healthy-fallback",
+            )
         return HistoryRequestPlan(
             mode="network",
             provider_sequence=non_em_providers,
@@ -2169,6 +2207,9 @@ class StockDataFetcher:
                     if str(x).startswith("688")
                     else _infer_sz_board(x)
                 )
+            stock_list = _drop_bse_universe(stock_list)
+            if stock_list is None or stock_list.empty:
+                return pd.DataFrame()
             save_universe_store(stock_list)
             self._set_universe_concepts_cache(stock_list)
             if self._log:
@@ -2199,6 +2240,14 @@ class StockDataFetcher:
             if len(end_date) != 8 or not end_date.isdigit():
                 end_date = datetime.now().strftime('%Y%m%d')
             min_rows = max(1, days)
+            if _is_bse_code(stock_code):
+                history_df = _load_history_store(stock_code, min_rows, end_date, self._log)
+                if history_df is not None and not history_df.empty:
+                    _increment_history_diagnostic("fallback_cache_returns")
+                    return history_df.tail(days).reset_index(drop=True)
+                if self._log:
+                    self._log(f"历史 {stock_code} 属于北交所/新三板代码，跳过外部历史源。")
+                return None
             history_meta = None if force_refresh else load_history_meta_store(stock_code)
             cache_requires_repair = _history_meta_requires_repair(history_meta)
             if request_plan is None:
@@ -2248,23 +2297,13 @@ class StockDataFetcher:
             if not provider_sequence:
                 provider_sequence = ["eastmoney"]
 
-            _PROVIDER_HOST = {
-                "sina": "finance.sina.com.cn",
-                "netease": "quotes.money.163.com",
-                "sohu": "q.stock.sohu.com",
-                "ths": "d.10jqka.com.cn",
-                "wscn": "api-ddc-wscn.awtmt.com",
-                "baostock": "baostock.com",
-                "tdx": "tdx",
-            }
-
             last_error: Optional[BaseException] = None
             best_partial: Optional[Tuple[pd.DataFrame, str, str]] = None
             for idx, provider in enumerate(provider_sequence):
                 provider_used = provider
                 # 跳过正在冷却中的源，避免无意义的调用和日志刷屏
-                host = _PROVIDER_HOST.get(provider)
-                if host and _global_host_on_cooldown(host):
+                host = _history_provider_host(provider)
+                if host and _history_provider_on_cooldown(provider):
                     last_error = RuntimeError(f"{provider} on cooldown, skipped")
                     continue
 

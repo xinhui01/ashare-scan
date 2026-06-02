@@ -45,6 +45,23 @@ class TestUniverse(StockStoreTestCase):
         loaded = load_universe()
         self.assertIsNone(loaded)
 
+    def test_save_universe_replaces_stale_codes_and_drops_bse(self):
+        from stock_store import save_universe, load_universe
+
+        save_universe(pd.DataFrame([
+            {"code": "000001", "name": "平安银行"},
+            {"code": "600000", "name": "浦发银行"},
+            {"code": "920225", "name": "北交旧票"},
+        ]))
+        save_universe(pd.DataFrame([
+            {"code": "000001", "name": "平安银行"},
+            {"code": "300001", "name": "特锐德"},
+        ]))
+
+        loaded = load_universe()
+        self.assertIsNotNone(loaded)
+        self.assertEqual(list(loaded["code"]), ["000001", "300001"])
+
 
 class TestHistory(StockStoreTestCase):
     def test_save_and_load_history(self):

@@ -187,3 +187,65 @@ def test_after_930_weak_open_downgrades_buy_signal():
     confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
     assert confirmation["status"] == "观察"
     assert "开盘转弱" in confirmation["reason"]
+
+
+def test_after_1000_uses_open_price_without_auction_call():
+    intraday = pd.DataFrame(
+        [
+            {
+                "time": pd.Timestamp("2026-06-01 09:30:00"),
+                "open": 10.30,
+                "close": 10.32,
+            }
+        ]
+    )
+    fetcher = FakeFetcher(
+        auctions={"600000": {"price": 10.50, "amount": 30_000_000}},
+        intraday={"600000": intraday},
+    )
+    candidate_lists = {
+        "fresh": [{"code": "600000", "close": 10.0, "score": 76}]
+    }
+
+    result = confirm_candidate_lists(
+        candidate_lists,
+        fetcher=fetcher,
+        now=datetime(2026, 6, 1, 10, 5),
+    )
+
+    assert fetcher.auction_calls == []
+    assert fetcher.intraday_calls == [("600000", {"include_meta": True})]
+    confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
+    assert confirmation["status"] == "观察"
+    assert round(confirmation["open_gap_pct"], 2) == 3.0
+    assert "按开盘确认" in confirmation["reason"]
+    assert "已过竞价买点窗口" in confirmation["reason"]
+    assert result["fetched_auction"] is False
+    assert result["fetched_intraday"] is True
+    assert result["skipped_reason"] == ""
+
+
+def test_after_1000_weak_open_can_abandon_candidate():
+    intraday = pd.DataFrame(
+        [
+            {
+                "time": pd.Timestamp("2026-06-01 09:30:00"),
+                "open": 9.60,
+                "close": 9.58,
+            }
+        ]
+    )
+    fetcher = FakeFetcher(intraday={"600000": intraday})
+    candidate_lists = {
+        "wrap": [{"code": "600000", "close": 10.0, "score": 75}]
+    }
+
+    confirm_candidate_lists(
+        candidate_lists,
+        fetcher=fetcher,
+        now=datetime(2026, 6, 1, 10, 5),
+    )
+
+    confirmation = candidate_lists["wrap"][0]["opening_confirmation"]
+    assert confirmation["status"] == "放弃"
+    assert "开盘低开过多" in confirmation["reason"]

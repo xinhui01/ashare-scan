@@ -29,6 +29,7 @@ from src.sources.limit_up_pool_service import (
     normalize_sina_spot_df,
     _enrich_spot_industry_from_universe,
 )
+from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
 
@@ -615,6 +616,8 @@ def parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
     迁自 StockFilter._parse_spot_record；行为零变化。
     """
     code = str(row.get("代码", "")).strip().zfill(6)
+    if is_bse_code(code):
+        return None
     if code in exclude_codes:
         return None
     name = str(row.get("名称", ""))

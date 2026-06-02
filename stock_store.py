@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from src.utils.codes import is_bse_code
 from stock_logger import get_logger
 
 logger = get_logger(__name__)
@@ -417,6 +418,13 @@ def save_universe(df: pd.DataFrame) -> None:
         if col not in out.columns:
             out[col] = ""
     out["code"] = out["code"].astype(str).str.strip().str.zfill(6)
+    out = out[
+        out["code"].str.len().eq(6)
+        & out["code"].str.isdigit()
+        & ~out["code"].map(is_bse_code)
+    ].drop_duplicates(subset=["code"], keep="first").reset_index(drop=True)
+    if out.empty:
+        return
     out["name"] = out["name"].astype(str).fillna("")
     out["exchange"] = out["exchange"].astype(str).fillna("")
     out["board"] = out["board"].astype(str).fillna("")
@@ -433,6 +441,26 @@ def save_universe(df: pd.DataFrame) -> None:
     ]
     def _write():
         with _connect() as conn:
+            # Treat a full universe refresh as authoritative: stale codes from
+            # previous providers must not survive and re-enter history refreshes.
+            conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS incoming_universe_codes(code TEXT PRIMARY KEY)"
+            )
+            conn.execute("DELETE FROM incoming_universe_codes")
+            conn.executemany(
+                "INSERT OR IGNORE INTO incoming_universe_codes(code) VALUES (?)",
+                [(code,) for code in codes],
+            )
+            conn.execute(
+                """
+                DELETE FROM universe
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM incoming_universe_codes incoming
+                    WHERE incoming.code = universe.code
+                )
+                """
+            )
             conn.executemany(
                 """
                 INSERT INTO universe(code, name, exchange, board, concepts, updated_at)
@@ -446,6 +474,7 @@ def save_universe(df: pd.DataFrame) -> None:
                 """,
                 rows,
             )
+            conn.execute("DELETE FROM incoming_universe_codes")
 
     with _DB_WRITE_LOCK:
         _retry_locked(_write)

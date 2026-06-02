@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from src.utils.codes import is_bse_code
 from .trade_calendar import TradePhase
 
 try:
@@ -106,6 +107,8 @@ def snapshot_row_to_history_row(
 
     code = _normalize_code(_pick(row, *_FIELD_ALIASES["code"]))
     if not code:
+        return None
+    if is_bse_code(code):
         return None
 
     close = _to_float(_pick(row, *_FIELD_ALIASES["close"]))

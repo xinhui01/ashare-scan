@@ -1259,11 +1259,20 @@ class PredictTab:
         def _line(rec: Dict[str, Any]) -> str:
             confirmation = rec.get("opening_confirmation") or {}
             gap = confirmation.get("auction_gap_pct")
-            gap_text = f"{gap:+.1f}%" if isinstance(gap, (int, float)) else "-"
+            gap_label = "竞"
+            if isinstance(gap, (int, float)):
+                gap_text = f"{gap:+.1f}%"
+            else:
+                open_gap = confirmation.get("open_gap_pct")
+                if isinstance(open_gap, (int, float)):
+                    gap_label = "开"
+                    gap_text = f"{open_gap:+.1f}%"
+                else:
+                    gap_text = "-"
             return (
                 f"  {rec.get('code', '')} {rec.get('name', '')} "
                 f"分={confirmation.get('score', rec.get('score', '-'))} "
-                f"竞={gap_text}  {confirmation.get('reason', '')}"
+                f"{gap_label}={gap_text}  {confirmation.get('reason', '')}"
             )
 
         self.summary_text.config(state=tk.NORMAL)
@@ -1295,6 +1304,9 @@ class PredictTab:
         skipped_reason = str((result or {}).get("skipped_reason") or "").strip()
         if skipped_reason:
             return f"未请求实时接口（{skipped_reason}）"
+        mode_note = str((result or {}).get("mode_note") or "").strip()
+        if mode_note:
+            return mode_note
         if result.get("fetched_intraday"):
             return "已包含9:30开盘"
         if result.get("fetched_auction"):

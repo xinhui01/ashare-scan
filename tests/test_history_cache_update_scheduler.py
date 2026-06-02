@@ -63,6 +63,27 @@ def test_update_history_cache_limits_parallelism_per_source(monkeypatch):
     assert sum(1 for value in max_active.values() if value == 1) == 3
 
 
+def test_history_cache_workers_do_not_expand_to_source_channel_count(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    plans = [
+        HistoryRequestPlan(mode="network", provider_sequence=(provider,), reason=f"multi-source-{provider}")
+        for provider in ("sina", "netease", "sohu", "ths", "wscn", "baostock")
+    ]
+
+    monkeypatch.setattr("stock_data._history_per_source_concurrency", lambda: 1, raising=False)
+    monkeypatch.setattr("stock_data._history_total_concurrency_cap", lambda: 12, raising=False)
+    monkeypatch.setattr("stock_data._history_request_concurrency", lambda: 2, raising=False)
+
+    worker_count, per_source_limit, channel_count = fetcher._resolve_history_update_worker_count(
+        requested_workers=9,
+        plans=plans,
+    )
+
+    assert channel_count == 6
+    assert per_source_limit == 1
+    assert worker_count == 2
+
+
 def test_non_eastmoney_history_sources_do_not_use_global_em_semaphore(monkeypatch):
     fetcher = _fetcher_with_universe(pd.DataFrame())
     plan = HistoryRequestPlan(mode="network", provider_sequence=("sina",), reason="test-sina")
@@ -179,6 +200,71 @@ def test_auto_history_batch_can_temporarily_exclude_failed_providers(monkeypatch
     assert all("ths" in plan.provider_sequence for plan in plans)
 
 
+def test_auto_history_batch_returns_cache_only_when_all_fallbacks_excluded(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    monkeypatch.setattr(fetcher, "get_available_history_mirrors", lambda: [])
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: False)
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: False)
+
+    plans = fetcher._build_multi_source_plans(
+        "auto",
+        excluded_providers={"sina", "ths", "netease", "sohu", "wscn", "baostock"},
+    )
+
+    assert len(plans) == 1
+    assert plans[0].cache_only
+    assert plans[0].provider_sequence == ()
+    assert "no-healthy-fallback" in plans[0].reason
+
+
+def test_auto_history_plan_cache_only_when_eastmoney_open_and_fallbacks_cooling(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    cooldown_hosts = {
+        "finance.sina.com.cn",
+        "d.10jqka.com.cn",
+        "quotes.money.163.com",
+        "q.stock.sohu.com",
+        "api-ddc-wscn.awtmt.com",
+        "baostock.com",
+    }
+
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: host in cooldown_hosts)
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: False)
+
+    plan = fetcher.build_history_request_plan(source="auto", force_refresh=True)
+
+    assert plan.cache_only
+    assert plan.provider_sequence == ()
+    assert "no-healthy-fallback" in plan.reason
+
+
+def test_auto_history_plan_filters_cooling_fallback_provider(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+
+    monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: host == "baostock.com")
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: False)
+
+    plan = fetcher.build_history_request_plan(source="auto", force_refresh=True)
+
+    assert not plan.cache_only
+    assert "baostock" not in plan.provider_sequence
+    assert "sina" in plan.provider_sequence
+
+
+def test_explicit_cooling_history_provider_uses_cache_only(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+
+    monkeypatch.setattr("stock_data._global_host_on_cooldown", lambda host: host == "baostock.com")
+
+    plan = fetcher.build_history_request_plan(source="baostock", force_refresh=True)
+
+    assert plan.cache_only
+    assert plan.provider_sequence == ("baostock",)
+
+
 def test_update_history_cache_uses_probe_results_to_filter_auto_sources(monkeypatch):
     universe = pd.DataFrame({"code": ["000001"], "name": ["A"]})
     fetcher = _fetcher_with_universe(universe)
@@ -201,6 +287,62 @@ def test_update_history_cache_uses_probe_results_to_filter_auto_sources(monkeypa
 
     assert result["updated"] == 1
     assert seen == {"source": "auto", "excluded": {"sina", "sohu"}}
+
+
+def test_update_history_cache_drops_bse_before_network(monkeypatch):
+    universe = pd.DataFrame(
+        {
+            "code": ["920225", "000001", "830799"],
+            "name": ["BSE-A", "A", "BSE-B"],
+            "board": ["北交所", "主板", "北交所"],
+        }
+    )
+    fetcher = _fetcher_with_universe(universe)
+    called_codes = []
+
+    monkeypatch.setattr("stock_data._is_history_cache_fresh", lambda *args, **kwargs: False)
+
+    def fake_get_history_data(code, **kwargs):
+        called_codes.append(code)
+        return pd.DataFrame(
+            [{"date": "2026-04-22", "open": 1, "close": 1, "high": 1, "low": 1}]
+        )
+
+    fetcher.get_history_data = fake_get_history_data  # type: ignore[method-assign]
+
+    result = fetcher.update_history_cache(
+        days=1,
+        workers=1,
+        source="sina",
+        fast_daily_append=False,
+    )
+
+    assert called_codes == ["000001"]
+    assert result["total"] == 1
+    assert result["updated"] == 1
+
+
+def test_auto_provider_probe_ignores_bse_sample_codes(monkeypatch):
+    fetcher = _fetcher_with_universe(pd.DataFrame())
+    seen_codes = []
+
+    monkeypatch.setattr("stock_data._tdx_source_available", lambda: False)
+
+    def fake_get_history_data(code, **kwargs):
+        seen_codes.append(code)
+        return pd.DataFrame(
+            [{"date": "2026-04-22", "open": 1, "close": 1, "high": 1, "low": 1}]
+        )
+
+    fetcher.get_history_data = fake_get_history_data  # type: ignore[method-assign]
+
+    excluded = fetcher._probe_auto_history_providers(
+        [{"code": "920225"}, {"code": "830799"}, {"code": "000001"}],
+        days=20,
+    )
+
+    assert excluded == set()
+    assert seen_codes == ["000001"] * 6
 
 
 def test_update_history_cache_fast_appends_snapshot_before_network(tmp_path, monkeypatch):

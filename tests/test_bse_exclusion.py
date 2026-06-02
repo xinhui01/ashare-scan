@@ -8,6 +8,9 @@
 """
 import pandas as pd
 
+from data_source_models import HistoryRequestPlan
+from src.services.scoring import first_board
+from src.services.scoring.predict import _check_prerequisites, _drop_bse_rows
 from src.utils.codes import is_bse_code
 from stock_data import StockDataFetcher, _drop_bse_universe
 
@@ -50,3 +53,74 @@ def test_sanitize_limit_up_pool_drops_bse():
     )
     out = StockDataFetcher._sanitize_limit_up_pool(df, drop_missing_seal_time=False)
     assert list(out["代码"]) == ["600000", "300750"]
+
+
+def test_get_history_data_skips_bse_network(monkeypatch):
+    fetcher = StockDataFetcher.__new__(StockDataFetcher)
+    fetcher._log = lambda msg: None
+    fetcher._default_history_source = "auto"
+
+    monkeypatch.setattr("stock_data._load_history_store", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "stock_data._fetch_sina_hist_frame",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("BSE history must not hit network providers")
+        ),
+    )
+
+    plan = HistoryRequestPlan(
+        mode="network",
+        provider_sequence=("sina",),
+        reason="test-sina",
+    )
+
+    assert fetcher.get_history_data("920225", days=1, force_refresh=True, request_plan=plan) is None
+
+
+def test_prediction_drops_bse_spot_and_pool_rows():
+    df = pd.DataFrame(
+        {
+            "代码": ["000001", "920225", "830799", "300750"],
+            "名称": ["平安银行", "北交A", "北交B", "宁德时代"],
+        }
+    )
+
+    out = _drop_bse_rows(df)
+
+    assert list(out["代码"]) == ["000001", "300750"]
+
+
+def test_prediction_parse_spot_record_skips_bse():
+    row = {
+        "代码": "920225",
+        "名称": "北交测试",
+        "最新价": 10.0,
+        "涨跌幅": 5.0,
+        "成交额": 10000_0000,
+    }
+
+    assert first_board.parse_spot_record(row, set()) is None
+
+
+def test_prediction_prereq_does_not_prefetch_bse_history():
+    calls = []
+
+    class _Fetcher:
+        def get_history_data(self, code, *args, **kwargs):
+            calls.append(code)
+            return None
+
+    missing = _check_prerequisites(
+        historical_mode=False,
+        pool_source="cache_db",
+        concept_themes_count=1,
+        board_strength={"银行": 1.0},
+        sentiment_degraded=False,
+        zt_codes={"920225"},
+        fetcher=_Fetcher(),
+        build_local_cache_history_plan_fn=lambda **kwargs: object(),
+        log_fn=lambda *_: None,
+    )
+
+    assert missing == []
+    assert calls == []

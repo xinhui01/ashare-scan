@@ -27,6 +27,7 @@ from src.services.scoring import fresh_calibration as _fresh_calibration
 from src.services.scoring import shared as _shared
 from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
+from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
 _BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
@@ -37,6 +38,22 @@ def _count_missing_industries(df: Optional[pd.DataFrame]) -> int:
         return 0
     industries = df["所属行业"].fillna("").astype(str).str.strip()
     return int(industries.str.lower().isin(_BLANK_INDUSTRY_VALUES).sum())
+
+
+def _drop_bse_rows(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    code_col = ""
+    for candidate in ("代码", "code"):
+        if candidate in df.columns:
+            code_col = candidate
+            break
+    if not code_col:
+        return df
+    mask = df[code_col].astype(str).str.strip().str.zfill(6).map(is_bse_code)
+    if not mask.any():
+        return df
+    return df.loc[~mask].reset_index(drop=True)
 
 
 @dataclass
@@ -289,6 +306,11 @@ def _check_prerequisites(
     返回"中止结果"，并把这份清单显示给用户去逐项修复。
     """
     missing: List[str] = []
+    zt_codes = {
+        str(code).strip().zfill(6)
+        for code in (zt_codes or set())
+        if str(code).strip() and not is_bse_code(str(code).strip().zfill(6))
+    }
 
     # 1. 涨停池来源必须可信
     trusted_sources = {"cache_db", "eastmoney", "cache_memory"}
@@ -492,6 +514,8 @@ def predict_limit_up_candidates(
         import stock_store as _stock_store
         try:
             spot_df = _stock_store.load_spot_snapshot_at(trade_date)
+            raw_cnt = 0 if spot_df is None else len(spot_df)
+            spot_df = _drop_bse_rows(spot_df)
             cnt = 0 if spot_df is None else len(spot_df)
             data_quality["spot"]["source"] = "local_history"
             data_quality["spot"]["rows"] = int(cnt)
@@ -503,6 +527,9 @@ def predict_limit_up_candidates(
                 )
             if log_fn:
                 log_fn(f"涨停预测[历史模式]：从 history 合成 spot 快照 {cnt} 行")
+                dropped = raw_cnt - cnt
+                if dropped > 0:
+                    log_fn(f"涨停预测[历史模式]：已过滤北交所 spot {dropped} 行")
         except Exception as e:
             if log_fn:
                 log_fn(f"涨停预测[历史模式]：合成 spot 失败: {e}")
@@ -553,11 +580,24 @@ def predict_limit_up_candidates(
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+        raw_spot_cnt = 0 if spot_df is None else len(spot_df)
+        spot_df = _drop_bse_rows(spot_df)
+
         # 记一笔实时 spot 行数（实时模式下行业字段由源接口直接给出）
         if spot_df is not None:
             data_quality["spot"]["source"] = "realtime"
             data_quality["spot"]["rows"] = int(len(spot_df))
             data_quality["spot"]["industry_missing"] = _count_missing_industries(spot_df)
+            dropped = raw_spot_cnt - len(spot_df)
+            if dropped > 0 and log_fn:
+                log_fn(f"涨停预测：已过滤北交所 spot {dropped} 行")
+
+    raw_pool_cnt = 0 if today_pool_df is None else len(today_pool_df)
+    today_pool_df = _drop_bse_rows(today_pool_df)
+    if raw_pool_cnt and today_pool_df is not None:
+        dropped = raw_pool_cnt - len(today_pool_df)
+        if dropped > 0 and log_fn:
+            log_fn(f"涨停预测：已过滤北交所涨停池 {dropped} 行")
 
     if today_pool_df is None or today_pool_df.empty:
         non_trading = False
@@ -617,7 +657,10 @@ def predict_limit_up_candidates(
         log_fn(f"涨停预测：统计热门行业完成，共 {len(hot_industries)} 个行业")
 
     if not today_pool_df.empty and "代码" in today_pool_df.columns:
-        zt_codes = set(today_pool_df["代码"].astype(str).str.strip().str.zfill(6))
+        zt_codes = {
+            code for code in today_pool_df["代码"].astype(str).str.strip().str.zfill(6)
+            if not is_bse_code(code)
+        }
         if log_fn:
             log_fn(f"涨停预测：提取涨停股代码 {len(zt_codes)} 只")
 
@@ -925,7 +968,10 @@ def predict_limit_up_candidates(
         if log_fn:
             log_fn("涨停预测：无全市场行情，跳过强势股筛选（首板候选将不可用）")
 
-    all_codes = list(set(pool_codes + candidate_codes))
+    all_codes = [
+        code for code in set(pool_codes + candidate_codes)
+        if code and not is_bse_code(str(code).strip().zfill(6))
+    ]
     if log_fn:
         log_fn(f"涨停预测：统一预取 {len(all_codes)} 只股票历史数据"
                f"（涨停池{len(pool_codes)} + 候选{len(candidate_codes)}）")
