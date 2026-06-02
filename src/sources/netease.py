@@ -105,12 +105,18 @@ def fetch_hist_frame(stock_code_in: str, start_date: str, end_date: str) -> "pd.
             df.columns = [c.strip().strip("'\"") for c in df.columns]
             df = df.rename(columns=col_map)
 
+            # 网易不按 0/1 前缀提供的代码（如北交所 920xxx）会返回非标准 CSV：
+            # 解析后非空但没有 date/close 列。这里直接判失败切换备用源，否则
+            # 下面的 dropna(subset=["date", "close"]) 会抛裸 KeyError('date')。
+            if "date" not in df.columns or "close" not in df.columns:
+                last_error = RuntimeError("netease: response missing date/close columns")
+                continue
+
             for col in ("open", "close", "high", "low", "volume", "amount", "change_pct", "change_amount", "turnover_rate"):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col].astype(str).str.strip(), errors="coerce")
 
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), errors="coerce").dt.date.astype(str)
+            df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), errors="coerce").dt.date.astype(str)
 
             df = df.dropna(subset=["date", "close"])
             df = df[df["close"] > 0]
