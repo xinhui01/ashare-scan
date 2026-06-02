@@ -481,6 +481,20 @@ _norm_code = _utils_codes.norm_code
 _infer_sz_board = _utils_codes.infer_sz_board
 
 
+_is_bse_code = _utils_codes.is_bse_code
+
+
+def _drop_bse_universe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """从股票池里剔除北交所（4/8/92 开头）。本系统不交易北交所，避免它们白白
+    占用历史抓取（这些源大多不提供北交所数据，每轮都会失败刷屏）。"""
+    if df is None or getattr(df, "empty", True) or "code" not in df.columns:
+        return df
+    mask = df["code"].map(_is_bse_code)
+    if not mask.any():
+        return df
+    return df[~mask].reset_index(drop=True)
+
+
 _infer_exchange = _utils_codes.infer_exchange
 
 
@@ -1828,6 +1842,10 @@ class StockDataFetcher:
         if df is None or df.empty:
             return df
         keep_mask = pd.Series(True, index=df.index)
+        # 本系统不交易北交所：从涨停池里剔除 4/8/92 开头，避免它们进入预测。
+        # 兼容历史脏缓存（旧版未过滤时入库的北交所涨停股，这里读出时一并清掉）。
+        if "代码" in df.columns:
+            keep_mask &= ~df["代码"].map(_is_bse_code)
         if "涨跌幅" in df.columns:
             chg = pd.to_numeric(df["涨跌幅"], errors="coerce")
             keep_mask &= chg.fillna(-999) > 0
@@ -2084,7 +2102,7 @@ class StockDataFetcher:
 
     def get_all_stocks(self, force_refresh: bool = False) -> pd.DataFrame:
         if _use_em_full_spot_for_list():
-            df = self._get_all_stocks_em_spot()
+            df = _drop_bse_universe(self._get_all_stocks_em_spot())
             if df is not None and not df.empty:
                 self._mark_universe_refreshed()
             return df
@@ -2095,7 +2113,7 @@ class StockDataFetcher:
         ):
             force_refresh = True
         if not force_refresh:
-            universe_df = _load_universe_store(self._log)
+            universe_df = _drop_bse_universe(_load_universe_store(self._log))
             if universe_df is not None and not universe_df.empty:
                 self._set_universe_concepts_cache(universe_df)
                 return universe_df
@@ -2103,7 +2121,7 @@ class StockDataFetcher:
             self._log(
                 "从交易所构建股票池（深交所+上交所含科创板，不含北交所）…"
             )
-        df = _build_a_share_universe(self._log)
+        df = _drop_bse_universe(_build_a_share_universe(self._log))
         if not df.empty:
             _save_universe_store(df, self._log)
             self._set_universe_concepts_cache(df)

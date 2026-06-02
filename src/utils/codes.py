@@ -42,3 +42,14 @@ def infer_exchange(code: str) -> str:
     """根据代码首位推断交易所归属（不区分北交所，与现有调用方保持一致）。"""
     c = str(code).strip().zfill(6)
     return "上交所" if c.startswith(("5", "6", "9")) else "深交所"
+
+
+def is_bse_code(code: str) -> bool:
+    """北交所（含原新三板精选层转板）代码判定。
+
+    沪深主板/创业板/科创板只用 0/3/6 开头；4/8 开头是新三板·北交所，
+    92 开头是北交所 2024 年起启用的新代码段（920xxx）。沪市 B 股 900xxx
+    虽以 9 开头但不是北交所，故只认 92 前缀、不认整段 9，避免误伤。
+    """
+    c = str(code).strip().zfill(6)
+    return c.startswith(("4", "8", "92"))
