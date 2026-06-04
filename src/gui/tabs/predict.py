@@ -134,7 +134,7 @@ class PredictTab:
 
         # ---- 操作栏 ----
         action_bar = ttk.Frame(predict_frame)
-        action_bar.pack(fill=tk.X, pady=(0, 6))
+        action_bar.pack(fill=tk.X, pady=(0, 2))
         ttk.Button(action_bar, text="开始预测", command=self.start).pack(side=tk.LEFT)
         ttk.Button(
             action_bar, text="竞价确认", command=self.confirm_opening_buy_points,
@@ -165,21 +165,24 @@ class PredictTab:
         self.lookback_var = tk.StringVar(value="5")
         ttk.Entry(action_bar, textvariable=self.lookback_var, width=4).pack(side=tk.LEFT)
         ttk.Label(action_bar, text="(回看N日涨停对比环境 + 识别二波接力)").pack(side=tk.LEFT, padx=6)
-        self.status_label = ttk.Label(action_bar, text="")
-        self.status_label.pack(side=tk.RIGHT, padx=8)
+
+        history_bar = ttk.Frame(predict_frame)
+        history_bar.pack(fill=tk.X, pady=(0, 6))
+        self.status_label = ttk.Label(history_bar, text="", anchor=tk.W)
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
         # 历史记录选择：可按日期查看每天的预测数据
         ttk.Button(
-            action_bar, text="刷新此日期",
+            history_bar, text="刷新此日期",
             command=self.refresh_selected_date,
         ).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Label(action_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
         self.history_var = tk.StringVar(value="")
         self.history_combo = ttk.Combobox(
-            action_bar, textvariable=self.history_var,
-            width=12, state="readonly", values=(),
+            history_bar, textvariable=self.history_var,
+            width=14, state="readonly", values=(),
         )
         self.history_combo.pack(side=tk.RIGHT)
+        ttk.Label(history_bar, text="历史记录:").pack(side=tk.RIGHT, padx=(12, 2))
         self.history_combo.bind(
             "<<ComboboxSelected>>", self._on_history_selected,
         )
@@ -522,7 +525,8 @@ class PredictTab:
         self.best_bucket_labels["wrap"] = wrap_best
         wrap_cols = ("code", "name", "industry", "pattern_kind", "change_pct", "close",
                      "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
-                     "worst_drop", "volume_ratio", "score", "confirm", "auction", "result", "reasons")
+                     "worst_drop", "volume_ratio", "popularity_rank", "score",
+                     "confirm", "auction", "result", "reasons")
         self.wrap_tree = ttk.Treeview(
             wrap_tab, columns=wrap_cols, show="headings", height=22, style="Predict.Treeview",
         )
@@ -533,6 +537,7 @@ class PredictTab:
             "prior_lu_date": ("前涨停日", 90), "prior_lu_close": ("前涨停价", 75),
             "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
             "worst_drop": ("最深阴线%", 80), "volume_ratio": ("量比", 60),
+            "popularity_rank": ("人气", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 300),
@@ -938,6 +943,7 @@ class PredictTab:
             "wrap_gap": record.get("wrap_gap_pct"),
             "days_since_lu": record.get("days_since_lu"),
             "worst_drop": record.get("worst_drop"),
+            "popularity_rank": record.get("popularity_rank"),
             "ma_spread": record.get("ma_spread_pct"),
             "ma20_slope": record.get("ma20_slope_pct"),
             "trend_10d": record.get("trend_10d"),
@@ -948,6 +954,13 @@ class PredictTab:
         value = value_map.get(column)
         if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
             return str(value or "")
+        if column == "popularity_rank":
+            if value is None or value == "":
+                return float("inf")
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float("inf")
         if value is None or value == "":
             return float("-inf")
         try:
@@ -1641,11 +1654,38 @@ class PredictTab:
             return
         win = tk.Toplevel(self.app.root)
         win.title(f"市场情绪明细 · {r.get('trade_date', '-')}")
-        win.geometry("760x640")
+        win.geometry("980x760")
+        win.minsize(820, 560)
         win.transient(self.app.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
 
-        body = ttk.Frame(win, padding=10)
-        body.pack(fill=tk.BOTH, expand=True)
+        root = ttk.Frame(win, padding=10)
+        root.grid(row=0, column=0, sticky=tk.NSEW)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(root, highlightthickness=0)
+        body_scroll = ttk.Scrollbar(root, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=body_scroll.set)
+        canvas.grid(row=0, column=0, sticky=tk.NSEW)
+        body_scroll.grid(row=0, column=1, sticky=tk.NS)
+
+        body = ttk.Frame(canvas)
+        body_window = canvas.create_window((0, 0), window=body, anchor=tk.NW)
+
+        def _sync_scroll_region(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_body_width(event) -> None:
+            canvas.itemconfigure(body_window, width=event.width)
+
+        def _on_mousewheel(event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        body.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _sync_body_width)
+        win.bind("<MouseWheel>", _on_mousewheel)
 
         score = int(r.get("score", 50))
         advice = r.get("position_suggest") or {}
@@ -1663,7 +1703,7 @@ class PredictTab:
         ).pack(side=tk.LEFT, padx=10)
 
         ttk.Label(
-            body, text=r.get("summary", ""), wraplength=720,
+            body, text=r.get("summary", ""), wraplength=900,
             foreground="#333",
         ).pack(anchor=tk.W, pady=(0, 8))
 
@@ -1689,7 +1729,7 @@ class PredictTab:
 
             ttk.Label(
                 state_box, text=f"判定理由: {state.get('reason', '-')}",
-                foreground="#444", wraplength=700, justify=tk.LEFT,
+                foreground="#444", wraplength=900, justify=tk.LEFT,
             ).pack(anchor=tk.W, pady=(4, 0))
 
             strat = state.get("strategy") or {}
@@ -1703,12 +1743,12 @@ class PredictTab:
                 ).pack(anchor=tk.W, pady=(4, 0))
                 ttk.Label(
                     state_box, text=f"操作要点: {strat.get('notes', '-')}",
-                    foreground="#444", wraplength=700, justify=tk.LEFT,
+                    foreground="#444", wraplength=900, justify=tk.LEFT,
                 ).pack(anchor=tk.W, pady=(2, 0))
                 ttk.Label(
                     state_box,
                     text="⚠ 33 天小样本回测显示该推荐尚需更长样本验证（接力日 T+1 实测亏损，反包炸过板全状态稳定为正）",
-                    foreground="#b71c1c", wraplength=700, justify=tk.LEFT,
+                    foreground="#b71c1c", wraplength=900, justify=tk.LEFT,
                 ).pack(anchor=tk.W, pady=(4, 0))
 
             # 轮动指标明细
@@ -1748,19 +1788,25 @@ class PredictTab:
                 for line in rot_lines:
                     ttk.Label(
                         state_box, text=line, foreground="#555",
-                        wraplength=700, justify=tk.LEFT,
+                        wraplength=900, justify=tk.LEFT,
                     ).pack(anchor=tk.W, pady=1)
 
         # 信号明细表
         cols = ("name", "value", "delta", "note")
         signals = r.get("signals") or []
-        tree_height = max(len(signals), 7)
-        tree = ttk.Treeview(body, columns=cols, show="headings", height=tree_height)
+        tree_height = min(max(len(signals), 7), 10)
+        signal_frame = ttk.Frame(body)
+        signal_frame.pack(fill=tk.X)
+        signal_frame.columnconfigure(0, weight=1)
+        tree = ttk.Treeview(signal_frame, columns=cols, show="headings", height=tree_height)
+        tree_y = ttk.Scrollbar(signal_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree_x = ttk.Scrollbar(signal_frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
         col_specs = {
-            "name": ("信号", 90, tk.W, False),
-            "value": ("数值", 110, tk.W, False),
-            "delta": ("加减分", 60, tk.CENTER, False),
-            "note": ("解读", 460, tk.W, True),
+            "name": ("信号", 110, tk.W, False),
+            "value": ("数值", 140, tk.W, False),
+            "delta": ("加减分", 70, tk.CENTER, False),
+            "note": ("解读", 620, tk.W, True),
         }
         for col, (h, w, anc, stretch) in col_specs.items():
             tree.heading(col, text=h)
@@ -1772,7 +1818,9 @@ class PredictTab:
                 f"+{d}" if d > 0 else (str(d) if d < 0 else "0"),
                 s.get("note", ""),
             ))
-        tree.pack(fill=tk.X)
+        tree.grid(row=0, column=0, sticky=tk.EW)
+        tree_y.grid(row=0, column=1, sticky=tk.NS)
+        tree_x.grid(row=1, column=0, sticky=tk.EW)
 
         # ===== 数据明细（铺出 raw 里 7 个信号未体现的字段）=====
         raw = r.get("raw") or {}
@@ -1813,9 +1861,8 @@ class PredictTab:
 
         codes = today_raw.get("codes") or []
         if codes:
-            shown = "、".join(codes[:20])
-            tail = f" … 共 {len(codes)} 只" if len(codes) > 20 else ""
-            lines.append(f"今日涨停代码: {shown}{tail}")
+            shown = "、".join(codes)
+            lines.append(f"今日涨停代码（{len(codes)}只）: {shown}")
 
         sh_pct = external_raw.get("sh_index_pct")
         dt_cnt = external_raw.get("down_limit_count")
@@ -1829,7 +1876,7 @@ class PredictTab:
         for line in lines:
             ttk.Label(
                 detail, text=line, anchor=tk.W, foreground="#444",
-                wraplength=700, justify=tk.LEFT,
+                wraplength=900, justify=tk.LEFT,
             ).pack(anchor=tk.W, pady=1)
 
         ttk.Label(
@@ -1837,8 +1884,8 @@ class PredictTab:
             foreground="#888",
         ).pack(anchor=tk.W, pady=(8, 0))
 
-        bottom = ttk.Frame(body)
-        bottom.pack(fill=tk.X, pady=(6, 0))
+        bottom = ttk.Frame(root)
+        bottom.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(8, 0))
         ttk.Button(
             bottom, text="刷新（强制重拉外部数据）",
             command=lambda: (win.destroy(), self._force_refresh_sentiment()),
@@ -2944,6 +2991,7 @@ class PredictTab:
                 str(rec.get("days_since_lu", "-")) if rec.get("days_since_lu") is not None else "-",
                 f"{rec['worst_drop']:.1f}" if rec.get("worst_drop") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                str(rec.get("popularity_rank")) if rec.get("popularity_rank") is not None else "-",
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,

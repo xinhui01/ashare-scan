@@ -27,6 +27,7 @@ from src.services.scoring import fresh_calibration as _fresh_calibration
 from src.services.scoring import shared as _shared
 from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
+from src.services import popularity_rank_service as _popularity_rank_service
 from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
@@ -1275,6 +1276,15 @@ def predict_limit_up_candidates(
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         filter_wrap_candidate_stocks_fn=_first_board.filter_wrap_candidate_stocks,
     )
+    popularity_stats = _popularity_rank_service.enrich_wrap_candidates_with_popularity(
+        broken_board_wrap_candidates, trade_date, log_fn=log_fn,
+    )
+    data_quality["popularity_rank"] = {
+        "source": _popularity_rank_service.EASTMONEY_STOCK_RANK_SOURCE,
+        "mode": "per_stock_history_after_wrap",
+        "target_trade_date": trade_date,
+        **popularity_stats,
+    }
 
     # 阶段8：趋势涨停候选（多头排列、稳健上行）
     if log_fn:
