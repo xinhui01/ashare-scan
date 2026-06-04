@@ -11,7 +11,7 @@ classifiers / shared）。
 from __future__ import annotations
 
 import logging
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -233,6 +233,184 @@ def _derive_board_strength_from_spot(spot_df: Optional[pd.DataFrame]) -> Dict[st
         return {}
     agg = df.groupby("所属行业")["涨跌幅"].mean()
     return {str(k): float(round(v, 2)) for k, v in agg.items()}
+
+
+def _trade_date_digits(value: str) -> str:
+    text = str(value or "").strip().replace("-", "").replace("/", "")
+    return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+
+def _trade_date_dash(value: str) -> str:
+    digits = _trade_date_digits(value)
+    return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}" if digits else str(value or "").strip()
+
+
+def _valid_spot_codes(spot_df: Optional[pd.DataFrame]) -> set[str]:
+    if spot_df is None or not isinstance(spot_df, pd.DataFrame) or spot_df.empty:
+        return set()
+    if "代码" not in spot_df.columns:
+        return set()
+    work = spot_df.copy()
+    work["代码"] = work["代码"].astype(str).str.strip().str.zfill(6)
+    if "最新价" in work.columns:
+        close = pd.to_numeric(work["最新价"], errors="coerce")
+        work = work[close.notna() & (close > 0)]
+    return {
+        code for code in work["代码"].tolist()
+        if code and not is_bse_code(code)
+    }
+
+
+def _universe_codes_for_history_fill(fetcher: Any, log_fn: Optional[Callable[[str], None]]) -> List[str]:
+    try:
+        universe = fetcher.get_all_stocks(force_refresh=False)
+    except TypeError:
+        universe = fetcher.get_all_stocks()
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"涨停预测[历史模式]：读取股票池失败，无法自动补齐历史快照: {exc}")
+        return []
+    if universe is None or not isinstance(universe, pd.DataFrame) or universe.empty:
+        return []
+    code_col = "code" if "code" in universe.columns else "代码" if "代码" in universe.columns else ""
+    if not code_col:
+        return []
+    codes = (
+        universe[code_col]
+        .astype(str)
+        .str.strip()
+        .str.zfill(6)
+        .dropna()
+        .tolist()
+    )
+    out: List[str] = []
+    seen: set[str] = set()
+    for code in codes:
+        if not code or code in seen or is_bse_code(code):
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def _make_force_history_plan(fetcher: Any) -> Optional[Any]:
+    source = str(getattr(fetcher, "_default_history_source", "auto") or "auto")
+    try:
+        return fetcher.build_history_request_plan(source=source, force_refresh=True)
+    except Exception:
+        return None
+
+
+def _ensure_historical_spot_snapshot(
+    trade_date: str,
+    *,
+    fetcher: Any,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+    """历史模式跨机器一致性：用在线历史日线补齐目标日全市场快照。"""
+    import stock_store as _stock_store
+    from stock_data import DaemonThreadPoolExecutor
+
+    target_digits = _trade_date_digits(trade_date)
+    target_dash = _trade_date_dash(trade_date)
+    stats: Dict[str, Any] = {
+        "target_date": target_digits,
+        "universe_rows": 0,
+        "initial_rows": 0,
+        "initial_coverage": 0.0,
+        "missing_before_fill": 0,
+        "filled": 0,
+        "failed": 0,
+        "final_rows": 0,
+        "final_coverage": 0.0,
+        "missing_after_fill": 0,
+    }
+
+    spot_df = _drop_bse_rows(_stock_store.load_spot_snapshot_at(target_digits or trade_date))
+    existing_codes = _valid_spot_codes(spot_df)
+    stats["initial_rows"] = len(existing_codes)
+
+    universe_codes = _universe_codes_for_history_fill(fetcher, log_fn)
+    stats["universe_rows"] = len(universe_codes)
+    if not universe_codes:
+        return spot_df, stats
+
+    missing_codes = [code for code in universe_codes if code not in existing_codes]
+    stats["initial_coverage"] = len(existing_codes) / len(universe_codes)
+    stats["missing_before_fill"] = len(missing_codes)
+    if not missing_codes:
+        stats["final_rows"] = len(existing_codes)
+        stats["final_coverage"] = stats["initial_coverage"]
+        return spot_df, stats
+
+    if log_fn:
+        log_fn(
+            f"涨停预测[历史模式]：{target_digits} 本机历史快照覆盖 "
+            f"{len(existing_codes)}/{len(universe_codes)}，在线补齐缺失 {len(missing_codes)} 只..."
+        )
+
+    request_plan = _make_force_history_plan(fetcher)
+    try:
+        history_limit = int(fetcher.history_request_concurrency_limit())
+    except Exception:
+        history_limit = 2
+    workers = max(1, min(history_limit, 4, len(missing_codes)))
+    completed = 0
+    filled = 0
+    failed = 0
+
+    def _fetch_one(code: str) -> bool:
+        df = fetcher.get_history_data(
+            code,
+            days=120,
+            force_refresh=True,
+            request_plan=request_plan,
+            as_of_trade_date=target_digits,
+        )
+        if df is None or getattr(df, "empty", True) or "date" not in df.columns:
+            return False
+        dates = (
+            df["date"].astype(str)
+            .str.replace("/", "-", regex=False)
+            .str.replace(".", "-", regex=False)
+        )
+        return bool((dates == target_dash).any())
+
+    executor = DaemonThreadPoolExecutor(max_workers=workers, thread_name_prefix="hist-spot-fill")
+    try:
+        futures = {executor.submit(_fetch_one, code): code for code in missing_codes}
+        for fut in as_completed(futures):
+            code = futures[fut]
+            try:
+                ok = bool(fut.result())
+            except Exception as exc:
+                ok = False
+                logger.debug("历史快照补齐 %s 失败: %s", code, exc)
+            completed += 1
+            if ok:
+                filled += 1
+            else:
+                failed += 1
+            if progress_callback and (completed == 1 or completed % 20 == 0 or completed == len(missing_codes)):
+                progress_callback(completed, len(missing_codes), f"历史快照补齐 {code}")
+    finally:
+        executor.shutdown(wait=True)
+
+    stats["filled"] = filled
+    stats["failed"] = failed
+    spot_df = _drop_bse_rows(_stock_store.load_spot_snapshot_at(target_digits or trade_date))
+    final_codes = _valid_spot_codes(spot_df)
+    stats["final_rows"] = len(final_codes)
+    stats["missing_after_fill"] = max(0, len(universe_codes) - len(final_codes))
+    stats["final_coverage"] = len(final_codes) / len(universe_codes)
+    if log_fn:
+        log_fn(
+            f"涨停预测[历史模式]：{target_digits} 历史快照补齐完成，"
+            f"新增成功 {filled} 只，失败 {failed} 只，最终覆盖 "
+            f"{len(final_codes)}/{len(universe_codes)}。"
+        )
+    return spot_df, stats
 
 
 def _is_new_stock_history(history: pd.DataFrame, today: datetime) -> bool:
@@ -510,20 +688,43 @@ def predict_limit_up_candidates(
         today_pool_df = fetcher.get_limit_up_pool(trade_date)
 
     if historical_mode:
-        # 历史模式：spot_df 从 history 表合成（"as of 收盘"），不走实时网络
-        import stock_store as _stock_store
+        # 历史模式：spot_df 从目标日历史日线合成。为保证跨电脑一致，
+        # 本机缺目标日 history 行时先按 as-of 日期在线补齐，再合成快照。
         try:
-            spot_df = _stock_store.load_spot_snapshot_at(trade_date)
+            spot_df, fill_stats = _ensure_historical_spot_snapshot(
+                trade_date,
+                fetcher=fetcher,
+                progress_callback=progress_callback,
+                log_fn=log_fn,
+            )
             raw_cnt = 0 if spot_df is None else len(spot_df)
             spot_df = _drop_bse_rows(spot_df)
             cnt = 0 if spot_df is None else len(spot_df)
-            data_quality["spot"]["source"] = "local_history"
+            data_quality["spot"]["source"] = "historical_online_filled" if int(fill_stats.get("filled") or 0) else "local_history"
             data_quality["spot"]["rows"] = int(cnt)
             data_quality["spot"]["industry_missing"] = _count_missing_industries(spot_df)
+            data_quality["spot"]["coverage"] = {
+                "universe_rows": int(fill_stats.get("universe_rows") or 0),
+                "initial_rows": int(fill_stats.get("initial_rows") or 0),
+                "initial_coverage": float(fill_stats.get("initial_coverage") or 0.0),
+                "missing_before_fill": int(fill_stats.get("missing_before_fill") or 0),
+                "filled": int(fill_stats.get("filled") or 0),
+                "failed": int(fill_stats.get("failed") or 0),
+                "final_rows": int(fill_stats.get("final_rows") or cnt),
+                "final_coverage": float(fill_stats.get("final_coverage") or 0.0),
+                "missing_after_fill": int(fill_stats.get("missing_after_fill") or 0),
+            }
             if cnt == 0:
                 data_quality["warnings"].append(
                     f"历史 spot 为空：本地 history 表无 {trade_date} 数据，"
-                    f"首板候选将无法筛选（请在线时打开软件触发当日 K 线下载）"
+                    f"且在线补齐未成功，首板候选将无法筛选"
+                )
+            elif int(fill_stats.get("missing_after_fill") or 0) > 0:
+                data_quality["warnings"].append(
+                    f"历史 spot 覆盖不完整：{trade_date} 最终覆盖 "
+                    f"{int(fill_stats.get('final_rows') or cnt)}/"
+                    f"{int(fill_stats.get('universe_rows') or 0)}，"
+                    f"仍缺 {int(fill_stats.get('missing_after_fill') or 0)} 只"
                 )
             if log_fn:
                 log_fn(f"涨停预测[历史模式]：从 history 合成 spot 快照 {cnt} 行")
@@ -975,9 +1176,9 @@ def predict_limit_up_candidates(
     if log_fn:
         log_fn(f"涨停预测：统一预取 {len(all_codes)} 只股票历史数据"
                f"（涨停池{len(pool_codes)} + 候选{len(candidate_codes)}）")
-    # 只使用本地缓存，不发起网络请求
+    # 实时模式保持只读本地缓存；历史模式为了跨电脑回放一致，允许按 as-of 日期补齐候选历史。
     _classifiers.prefetch_history_for_pool(
-        scoring_fetcher, all_codes, 65, progress_callback, True, log_fn=log_fn,
+        scoring_fetcher, all_codes, 65, progress_callback, not historical_mode, log_fn=log_fn,
     )
     if log_fn:
         log_fn("涨停预测：阶段3完成 - 历史数据预取结束")

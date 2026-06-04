@@ -11,6 +11,7 @@ from src.services.scoring.predict import (
     _AsOfHistoryFetcher,
     _check_prerequisites,
     _count_missing_industries,
+    _ensure_historical_spot_snapshot,
 )
 
 
@@ -534,6 +535,60 @@ def test_count_missing_industries_treats_placeholder_values_as_blank():
     df = pd.DataFrame({"所属行业": ["银行", "", None, " nan ", "-", "未知"]})
 
     assert _count_missing_industries(df) == 5
+
+
+def test_historical_spot_snapshot_online_fills_missing_target_rows(monkeypatch):
+    first_snapshot = pd.DataFrame([
+        {"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 1.0},
+    ])
+    final_snapshot = pd.DataFrame([
+        {"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 1.0},
+        {"代码": "002585", "名称": "双星新材", "最新价": 8.8, "涨跌幅": 5.2},
+    ])
+    load_calls = []
+
+    def fake_load_spot_snapshot_at(trade_date):
+        load_calls.append(trade_date)
+        return first_snapshot.copy() if len(load_calls) == 1 else final_snapshot.copy()
+
+    class _Fetcher:
+        def __init__(self):
+            self.calls = []
+
+        def get_all_stocks(self, force_refresh=False):
+            return pd.DataFrame({"code": ["000001", "002585", "920001"]})
+
+        def build_history_request_plan(self, source="auto", force_refresh=False):
+            return {"source": source, "force_refresh": force_refresh}
+
+        def history_request_concurrency_limit(self):
+            return 1
+
+        def get_history_data(self, code, **kwargs):
+            self.calls.append((code, kwargs))
+            return pd.DataFrame({
+                "date": ["2026-06-02", "2026-06-03"],
+                "close": [8.3, 8.8],
+            })
+
+    fetcher = _Fetcher()
+
+    monkeypatch.setattr("stock_store.load_spot_snapshot_at", fake_load_spot_snapshot_at)
+
+    spot_df, stats = _ensure_historical_spot_snapshot(
+        "20260603",
+        fetcher=fetcher,
+    )
+
+    assert spot_df is not None
+    assert set(spot_df["代码"].astype(str).tolist()) == {"000001", "002585"}
+    assert stats["filled"] == 1
+    assert stats["failed"] == 0
+    assert stats["universe_rows"] == 2
+    assert fetcher.calls[0][0] == "002585"
+    assert fetcher.calls[0][1]["force_refresh"] is True
+    assert fetcher.calls[0][1]["as_of_trade_date"] == "20260603"
+    assert fetcher.calls[0][1]["request_plan"] == {"source": "auto", "force_refresh": True}
 
 
 if __name__ == "__main__":

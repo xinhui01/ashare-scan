@@ -2292,7 +2292,11 @@ class StockDataFetcher:
                     return history_df.tail(days).reset_index(drop=True)
                 return None
 
-            start_date = (datetime.now() - timedelta(days=days + 15)).strftime('%Y%m%d')
+            try:
+                end_dt = datetime.strptime(end_date, "%Y%m%d")
+            except ValueError:
+                end_dt = datetime.now()
+            start_date = (end_dt - timedelta(days=days + 15)).strftime('%Y%m%d')
             provider_sequence = list(request_plan.provider_sequence) if request_plan is not None else ["eastmoney"]
             if not provider_sequence:
                 provider_sequence = ["eastmoney"]
