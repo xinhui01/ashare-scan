@@ -5,12 +5,55 @@ akshare 的 ``stock_zh_a_hist_min_em`` 在接口字段数变动时会抛 "Length
 """
 from __future__ import annotations
 
+import random
+import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from src.config import env_float, env_int
 from src.network.headers import random_eastmoney_headers
+from src.network.host_health import limit_host_inflight, mark_failed, mark_ok, on_cooldown
 from src.sources._common import first_existing_column
+from src.sources.eastmoney.mirrors import request_mirror_urls
+from src.sources.eastmoney.rate_limit import json_indicates_rate_limit, looks_like_rate_limit
+from src.sources.eastmoney.throttling import EastmoneyRateLimitError
+from src.utils import em_circuit_breaker
+
+
+_AUCTION_URL = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+_AUCTION_REQUEST_LOCK = threading.Lock()
+_AUCTION_NEXT_REQUEST_AT = 0.0
+
+
+def _auction_min_interval_sec() -> float:
+    return env_float("ASHARE_SCAN_AUCTION_MIN_INTERVAL_SEC", default=1.2, lo=0.2, hi=10.0)
+
+
+def _auction_inflight_limit() -> int:
+    return env_int("ASHARE_SCAN_AUCTION_INFLIGHT_LIMIT", default=1, lo=1, hi=4)
+
+
+def _auction_timeout() -> Tuple[float, float]:
+    connect = env_float("ASHARE_SCAN_AUCTION_CONNECT_TIMEOUT_SEC", default=3.0, lo=0.5, hi=10.0)
+    read = env_float("ASHARE_SCAN_AUCTION_READ_TIMEOUT_SEC", default=8.0, lo=1.0, hi=20.0)
+    return (connect, read)
+
+
+def _wait_for_auction_request_slot() -> None:
+    """竞价接口专用轻量节流，避免 9:25 后多线程对 push2 雪崩式请求。"""
+    global _AUCTION_NEXT_REQUEST_AT
+    interval = _auction_min_interval_sec()
+    next_interval = interval + random.uniform(0.0, interval * 0.25)
+    while True:
+        with _AUCTION_REQUEST_LOCK:
+            now = time.time()
+            wait_sec = _AUCTION_NEXT_REQUEST_AT - now
+            if wait_sec <= 0:
+                _AUCTION_NEXT_REQUEST_AT = now + next_interval
+                return
+        time.sleep(min(wait_sec, 0.5))
 
 
 def fetch_auction_snapshot(
@@ -22,7 +65,6 @@ def fetch_auction_snapshot(
     from stock_data import _use_bypass_proxy, _use_insecure_ssl
 
     market_code = 1 if str(stock_code).startswith("6") else 0
-    url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
@@ -32,25 +74,60 @@ def fetch_auction_snapshot(
         "secid": f"{market_code}.{stock_code}",
     }
     import requests
-    try:
-        req_kw = {
-            "url": url,
-            "params": params,
-            "timeout": 8.0,
-            "headers": random_eastmoney_headers(),
-        }
-        if _use_insecure_ssl():
-            req_kw["verify"] = False
-        with requests.Session() as session:
-            if _use_bypass_proxy():
-                session.trust_env = False
-            r = session.get(**req_kw)
-            r.raise_for_status()
-            data_json = r.json()
-    except Exception as exc:
-        if logger:
-            logger(f"竞价数据网络请求失败 {stock_code}: {exc}")
+
+    if em_circuit_breaker.is_open():
         return None
+
+    data_json: Optional[Dict[str, Any]] = None
+    last_error: Optional[BaseException] = None
+    attempted = False
+    for url in request_mirror_urls(_AUCTION_URL):
+        if on_cooldown(url) or em_circuit_breaker.is_open():
+            continue
+        attempted = True
+        try:
+            with limit_host_inflight(url, default_limit=_auction_inflight_limit()):
+                _wait_for_auction_request_slot()
+                headers = random_eastmoney_headers()
+                headers["Connection"] = "close"
+                req_kw = {
+                    "url": url,
+                    "params": params,
+                    "timeout": _auction_timeout(),
+                    "headers": headers,
+                }
+                if _use_insecure_ssl():
+                    req_kw["verify"] = False
+                with requests.Session() as session:
+                    if _use_bypass_proxy():
+                        session.trust_env = False
+                    r = session.get(**req_kw)
+                    response_text = r.text or ""
+                    if looks_like_rate_limit(r.status_code, response_text):
+                        raise EastmoneyRateLimitError(
+                            f"东方财富竞价接口返回 {r.status_code}，疑似触发限流"
+                        )
+                    r.raise_for_status()
+                    parsed_json = r.json()
+                    if not isinstance(parsed_json, dict):
+                        raise ValueError("东方财富竞价接口返回非字典 JSON")
+                    if json_indicates_rate_limit(parsed_json):
+                        raise EastmoneyRateLimitError("东方财富竞价接口返回限流提示")
+                    data_json = parsed_json
+            mark_ok(url)
+            em_circuit_breaker.record_success()
+            break
+        except Exception as exc:
+            last_error = exc
+            mark_failed(url)
+            em_circuit_breaker.record_failure()
+            continue
+
+    if data_json is None:
+        if attempted and logger and last_error is not None:
+            logger(f"竞价数据网络请求失败 {stock_code}: {last_error}")
+        return None
+
     if not data_json or not data_json.get("data"):
         return None
 

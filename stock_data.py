@@ -2498,6 +2498,60 @@ class StockDataFetcher:
             print(f"获取股票 {stock_code} 历史数据失败: {e}")
             return None
 
+    def _fetch_auction_snapshot_with_fallback(
+        self,
+        code: str,
+        *,
+        intraday_raw: Optional["pd.DataFrame"] = None,
+        log: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """获取当日 09:25 集合竞价撮合快照，按可靠度逐级兜底。"""
+        log_fn = self._log if log else None
+        try:
+            snapshot = _retry_ak_call(
+                _fetch_eastmoney_auction_snapshot,
+                code,
+                logger=log_fn,
+            )
+            if snapshot:
+                out = dict(snapshot)
+                out.setdefault("source", "eastmoney")
+                return out
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"竞价数据东财源失败 {code}: {exc}")
+
+        if intraday_raw is not None and not getattr(intraday_raw, "empty", True):
+            try:
+                snapshot = _snapshot_from_intraday_frame(
+                    intraday_raw,
+                    stock_code=code,
+                    source="eastmoney_intraday",
+                )
+                if snapshot:
+                    if log_fn:
+                        log_fn(f"竞价数据 {code} 使用东财分时09:25兜底。")
+                    return snapshot
+            except Exception as exc:
+                if log_fn:
+                    log_fn(f"竞价数据东财分时兜底失败 {code}: {exc}")
+
+        try:
+            raw = _retry_ak_call(
+                _fetch_sina_intraday_1min,
+                code,
+                logger=log_fn,
+            )
+            snapshot = _snapshot_from_intraday_frame(raw, stock_code=code, source="sina")
+            if snapshot:
+                if log_fn:
+                    log_fn(f"竞价数据 {code} 使用新浪09:25分时兜底。")
+                return snapshot
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"竞价数据新浪兜底失败 {code}: {exc}")
+        return None
+
     def get_intraday_data(
         self,
         stock_code: str,
@@ -2574,15 +2628,10 @@ class StockDataFetcher:
                         ndays=5,
                         logger=self._log,
                     )
-                    try:
-                        auction_snapshot = _retry_ak_call(
-                            _fetch_eastmoney_auction_snapshot,
-                            code,
-                            logger=self._log,
-                        )
-                    except Exception as pre_exc:
-                        if self._log:
-                            self._log(f"分时行情(东财竞价) {code} 获取失败，继续使用常规分时: {pre_exc}")
+                    auction_snapshot = self._fetch_auction_snapshot_with_fallback(
+                        code,
+                        intraday_raw=raw,
+                    )
                 except Exception as e:
                     last_error = e
                     if self._log:
@@ -2593,6 +2642,11 @@ class StockDataFetcher:
                     # 不再抛 akshare 的 "list index out of range"。
                     from src.sources.sina import fetch_intraday_1min as _fetch_sina_intraday_1min
                     raw = _retry_ak_call(_fetch_sina_intraday_1min, code, logger=self._log)
+                    auction_snapshot = _snapshot_from_intraday_frame(
+                        raw,
+                        stock_code=code,
+                        source="sina",
+                    )
                 except Exception as e:
                     last_error = e
                     if self._log:
@@ -2670,35 +2724,7 @@ class StockDataFetcher:
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return None
-        try:
-            snapshot = _retry_ak_call(
-                _fetch_eastmoney_auction_snapshot,
-                code,
-                logger=self._log,
-            )
-            if snapshot:
-                out = dict(snapshot)
-                out.setdefault("source", "eastmoney")
-                return out
-        except Exception as exc:
-            if self._log:
-                self._log(f"竞价数据东财源失败 {code}: {exc}")
-
-        try:
-            raw = _retry_ak_call(
-                _fetch_sina_intraday_1min,
-                code,
-                logger=self._log,
-            )
-            snapshot = _snapshot_from_intraday_frame(raw, stock_code=code, source="sina")
-            if snapshot:
-                if self._log:
-                    self._log(f"竞价数据 {code} 使用新浪09:25分时兜底。")
-                return snapshot
-        except Exception as exc:
-            if self._log:
-                self._log(f"竞价数据新浪兜底失败 {code}: {exc}")
-        return None
+        return self._fetch_auction_snapshot_with_fallback(code)
 
     def prewarm_intraday_for_codes(
         self,
@@ -2759,12 +2785,11 @@ class StockDataFetcher:
             # 当日有效的 auction snapshot
             auction_snapshot = None
             if today_str in trade_dates:
-                try:
-                    auction_snapshot = _retry_ak_call(
-                        _fetch_eastmoney_auction_snapshot, code, logger=None,
-                    )
-                except Exception:
-                    auction_snapshot = None
+                auction_snapshot = self._fetch_auction_snapshot_with_fallback(
+                    code,
+                    intraday_raw=raw,
+                    log=False,
+                )
                 if auction_snapshot is not None and str(auction_snapshot.get("trade_date") or "") != today_str:
                     auction_snapshot = None
 
