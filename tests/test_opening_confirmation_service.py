@@ -2,7 +2,10 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.services.opening_confirmation_service import confirm_candidate_lists
+from src.services.opening_confirmation_service import (
+    _category_gap_window,
+    confirm_candidate_lists,
+)
 
 
 class FakeFetcher:
@@ -249,3 +252,23 @@ def test_after_1000_weak_open_can_abandon_candidate():
     confirmation = candidate_lists["wrap"][0]["opening_confirmation"]
     assert confirmation["status"] == "放弃"
     assert "开盘低开过多" in confirmation["reason"]
+
+
+def test_trend_category_gap_window():
+    assert _category_gap_window("trend", {}, 10.0) == (-0.5, 4.5, 8.5)
+    assert _category_gap_window("trend", {}, 20.0) == (-0.5, 4.5, 18.5)
+
+
+def test_trend_category_uses_chinese_label():
+    fetcher = FakeFetcher(
+        auctions={"600000": {"price": 10.20, "amount": 30_000_000}}
+    )
+    candidate_lists = {
+        "trend": [{"code": "600000", "close": 10.0, "score": 76}]
+    }
+
+    confirm_candidate_lists(candidate_lists, fetcher=fetcher, now=datetime(2026, 6, 1, 9, 26))
+
+    confirmation = candidate_lists["trend"][0]["opening_confirmation"]
+    assert confirmation["category"] == "趋势涨停"
+    assert confirmation["status"] == "可买"

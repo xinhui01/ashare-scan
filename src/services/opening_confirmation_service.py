@@ -13,6 +13,7 @@ _CATEGORY_LABELS = {
     "first": "二波接力",
     "fresh": "首板涨停",
     "wrap": "反包",
+    "trend": "趋势涨停",
 }
 _STATUS_ORDER = {"可买": 0, "观察": 1, "放弃": 2, "风险过高": 3}
 
@@ -90,6 +91,9 @@ def _category_gap_window(category: str, rec: Dict[str, Any], limit_pct: float) -
         return 0.0, min(5.8, limit_pct - 2.0), limit_pct - 1.0
     if category == "first":
         return -0.3, min(5.0, limit_pct - 2.5), limit_pct - 1.2
+    if category == "trend":
+        # 趋势股通常温和开盘：容忍小幅低开（趋势未破），高开过多则追高风险大
+        return -0.5, min(4.5, limit_pct - 2.5), limit_pct - 1.5
     try:
         boards = int(rec.get("consecutive_boards") or rec.get("boards") or 1)
     except (TypeError, ValueError):

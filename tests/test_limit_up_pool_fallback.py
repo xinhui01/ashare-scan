@@ -6,10 +6,14 @@ spot 派生必须有昨日涨停池，避免把真实 N 板误标成首板。
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import pytest
 from unittest.mock import patch
 
+from src.sources.limit_up_pool_service import _spot_fallback_allowed
+from src.utils.trade_calendar import SyncTarget, TradePhase
 from stock_data import StockDataFetcher
 
 
@@ -172,6 +176,104 @@ class TestLimitUpPoolEmptyRetry:
         assert not df.empty
         assert "20260520" in fetcher._limit_up_pool_cache
         assert not fetcher._limit_up_pool_cache["20260520"].empty
+
+    def test_past_date_does_not_use_realtime_spot_fallback(self, monkeypatch):
+        """历史日期缺涨停池时不能用实时 spot 派生，避免跨电脑回放不一致。"""
+        fetcher = self._build_fetcher()
+        calls = {"derive": 0}
+
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20000101")
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr(fetcher, "_recent_trade_dates", lambda d, n: ["19991231", "20000101"])
+        # 守卫内部会走交易日历判定（akshare 网络加载），mock 掉保持测试离线
+        monkeypatch.setattr(
+            "src.sources.limit_up_pool_service.resolve_sync_target_trade_date",
+            lambda *a, **k: SyncTarget("2026-06-09", TradePhase.NON_TRADING),
+        )
+
+        def _derive(*_args, **_kwargs):
+            calls["derive"] += 1
+            return pd.DataFrame([{"代码": "600000", "连板数": 1, "最新价": 11.0, "涨跌幅": 10.0}])
+
+        monkeypatch.setattr(fetcher, "_derive_limit_up_pool_from_spot", _derive)
+
+        df = fetcher.get_limit_up_pool("20000101")
+
+        assert df.empty
+        assert calls["derive"] == 0
+        assert fetcher.get_pool_source("20000101") == "empty"
+
+    def test_prev_pool_past_date_does_not_use_realtime_spot_fallback(self, monkeypatch):
+        """昨日涨停池路径同样不能用实时 spot 派生历史日期。"""
+        fetcher = self._build_fetcher()
+        calls = {"derive": 0}
+
+        monkeypatch.setattr(fetcher, "_normalize_trade_date", lambda d: "20000101")
+        monkeypatch.setattr("stock_data._eastmoney_circuit_breaker_open", lambda: True)
+        monkeypatch.setattr("stock_store.load_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr("stock_store.save_limit_up_pool", lambda *args, **kwargs: None)
+        monkeypatch.setattr(fetcher, "_recent_trade_dates", lambda d, n: ["19991231", "20000101"])
+        # 守卫内部会走交易日历判定（akshare 网络加载），mock 掉保持测试离线
+        monkeypatch.setattr(
+            "src.sources.limit_up_pool_service.resolve_sync_target_trade_date",
+            lambda *a, **k: SyncTarget("2026-06-09", TradePhase.NON_TRADING),
+        )
+
+        def _derive(*_args, **_kwargs):
+            calls["derive"] += 1
+            return pd.DataFrame([{"代码": "600000", "连板数": 1, "最新价": 11.0, "涨跌幅": 10.0}])
+
+        monkeypatch.setattr(fetcher, "_derive_limit_up_pool_from_spot", _derive)
+
+        df = fetcher.get_previous_limit_up_pool("20000101")
+
+        assert df.empty
+        assert calls["derive"] == 0
+        assert fetcher.get_pool_source("20000101", previous=True) == "empty"
+
+
+class TestSpotFallbackAllowed:
+    """_spot_fallback_allowed 纯单元测试：注入 now + calendar，零网络。"""
+
+    # 连续交易日历；2026-06-13 / 06-14 是周末
+    CAL = ["2026-06-08", "2026-06-09", "2026-06-10", "2026-06-11", "2026-06-12"]
+
+    def test_weekend_allows_last_trading_day(self):
+        # 周六：spot 冻结在周五收盘快照 → 允许派生周五的池子
+        assert _spot_fallback_allowed(
+            "20260612", now=datetime(2026, 6, 13, 11, 0), calendar=self.CAL
+        )
+
+    def test_intraday_rejects_earlier_trading_day(self):
+        # 交易日盘中：spot 是今天的实时行情，不能派生更早历史日期（关键拦截场景）
+        assert not _spot_fallback_allowed(
+            "20260611", now=datetime(2026, 6, 12, 10, 30), calendar=self.CAL
+        )
+
+    def test_pre_open_allows_previous_trading_day(self):
+        # 交易日竞价撮合（09:25）前：spot 仍是上一交易日收盘快照 → 允许
+        assert _spot_fallback_allowed(
+            "20260611", now=datetime(2026, 6, 12, 8, 50), calendar=self.CAL
+        )
+
+    def test_today_allowed(self):
+        # date_key == 今天：交易日盘中，spot 就是当天 → 允许
+        assert _spot_fallback_allowed(
+            "20260612", now=datetime(2026, 6, 12, 10, 30), calendar=self.CAL
+        )
+
+    def test_distant_history_rejected(self):
+        # 久远历史日期：任何时刻都拒绝
+        assert not _spot_fallback_allowed(
+            "20000101", now=datetime(2026, 6, 13, 11, 0), calendar=self.CAL
+        )
+
+    def test_blank_date_key_rejected(self):
+        assert not _spot_fallback_allowed(
+            "", now=datetime(2026, 6, 12, 10, 30), calendar=self.CAL
+        )
 
 
 class TestSanitizeSealTime:

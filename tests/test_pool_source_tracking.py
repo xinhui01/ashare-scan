@@ -80,6 +80,10 @@ class TestPoolSourceTracking:
             f, "_derive_limit_up_pool_from_spot",
             lambda *args, **kwargs: pd.DataFrame([{"代码": "600000", "连板数": 1, "最新价": 11.0, "涨跌幅": 10.0}]),
         )
+        monkeypatch.setattr(
+            "src.sources.limit_up_pool_service._spot_fallback_allowed",
+            lambda *a, **k: True,
+        )
         f.get_limit_up_pool("20260520")
         assert f.get_pool_source("20260520") == "spot_fallback"
 

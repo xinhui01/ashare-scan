@@ -15,6 +15,7 @@ late-binding，便于测试 monkey-patch `stock_data.*`。
 """
 from __future__ import annotations
 
+from datetime import datetime, time as dtime
 from typing import Any, Callable, Dict, List, Optional
 
 import akshare as ak
@@ -22,9 +23,35 @@ import pandas as pd
 import requests
 
 from src.utils import parsing as _utils_parsing
+from src.utils.trade_calendar import resolve_sync_target_trade_date
 
 _safe_float = _utils_parsing.safe_float
 _BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
+
+
+def _spot_fallback_allowed(date_key: str, *, now=None, calendar=None) -> bool:
+    """实时 spot 快照只允许派生它真正代表的交易日的池子。
+
+    - date_key == 今天：交易日盘中/盘后，spot 就是当天 → 允许
+    - 休市窗口（非交易日全天、交易日竞价开始前）：spot 冻结在最近一个
+      已收盘交易日 → 允许 date_key 等于该交易日
+    其余历史日期一律拒绝，避免把当前行情写入历史日期。
+    """
+    key = str(date_key or "").strip()
+    if not key:
+        return False
+    current = now or datetime.now()
+    if key == current.strftime("%Y%m%d"):
+        return True
+    try:
+        # 09:25 = 集合竞价撮合时刻：交易日此刻之前 spot 仍是上一交易日收盘快照
+        target = resolve_sync_target_trade_date(
+            current, calendar=calendar, close_time=dtime(9, 25)
+        )
+        return target.target_date.replace("-", "") == key
+    except Exception:
+        # 日历加载等异常时保守拒绝：宁可跳过兜底，也不污染历史日期
+        return False
 
 
 def _clean_industry_value(value: Any) -> str:
@@ -495,6 +522,15 @@ def get_limit_up_pool(
             log_fn(f"涨停池 {date_key} 东财熔断中，尝试 spot 兜底")
 
     # 4. spot 兜底：仅在东财异常/熔断时触发，从全市场 spot 派生
+    if not _spot_fallback_allowed(date_key):
+        fetcher._last_pool_source[date_key] = "empty"
+        if log_fn:
+            log_fn(
+                f"涨停池 {date_key} 跳过实时 spot 兜底：目标日期与当前 spot 快照不对应，"
+                "避免把当前行情写入历史日期"
+            )
+        return pd.DataFrame()
+
     recent = fetcher._recent_trade_dates(date_key, 2)
     prev_date = recent[0] if len(recent) >= 2 else ""
     prev_pool = load_limit_up_pool(prev_date) if prev_date else None
@@ -570,6 +606,15 @@ def get_previous_limit_up_pool(
             log_fn(f"昨日涨停池 {date_key} 东财熔断中，尝试 spot 兜底")
 
     # spot 兜底：用 date_key 当日 spot 派生，prev_pool 用 date_key 的前一交易日 pool
+    if not _spot_fallback_allowed(date_key):
+        fetcher._last_prev_pool_source[date_key] = "empty"
+        if log_fn:
+            log_fn(
+                f"昨日涨停池 {date_key} 跳过实时 spot 兜底：目标日期与当前 spot 快照不对应，"
+                "避免把当前行情写入历史日期"
+            )
+        return pd.DataFrame()
+
     try:
         recent = fetcher._recent_trade_dates(date_key, 2)
         prev_date = recent[0] if len(recent) >= 2 else ""
