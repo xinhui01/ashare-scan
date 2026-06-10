@@ -68,7 +68,6 @@ class SnapshotRowToHistoryRowTest(unittest.TestCase):
         for raw, expected in [
             ("sh600000", "600000"),
             ("SZ000001", "000001"),
-            ("bj830000", "830000"),
             ("1", "000001"),
             ("  600000  ", "600000"),
         ]:
@@ -76,6 +75,14 @@ class SnapshotRowToHistoryRowTest(unittest.TestCase):
             result = snapshot_row_to_history_row(row, "2026-04-22", TradePhase.CLOSED)
             self.assertIsNotNone(result)
             self.assertEqual(result["code"], expected)
+
+    def test_bse_code_excluded(self):
+        """北交所（4/8/92 开头）全系统排除：快照行直接丢弃。"""
+        for raw in ("bj830000", "430047", "920001"):
+            row = {"代码": raw, "最新价": 10.0}
+            self.assertIsNone(
+                snapshot_row_to_history_row(row, "2026-04-22", TradePhase.CLOSED)
+            )
 
     def test_batch_conversion_skips_invalid(self):
         rows = [

@@ -179,8 +179,9 @@ class TestLimitUpPredictionPersistence(StockStoreTestCase):
 
         self.assertIsNotNone(loaded)
         rules = loaded["compare_context"]["fresh_calibration_rules"]
-        self.assertIn("['放量', '突破']", rules)
-        self.assertEqual(rules["['放量', '突破']"]["rate"], 20.0)
+        # tuple key 经 _normalize_json_value 用 json.dumps 序列化为 JSON 数组字符串
+        self.assertIn('["放量", "突破"]', rules)
+        self.assertEqual(rules['["放量", "突破"]']["rate"], 20.0)
 
 
 class TestScanSnapshot(StockStoreTestCase):
