@@ -19,6 +19,7 @@ from tkinter import ttk, messagebox, filedialog
 from scan_models import FilterSettings, ScanRequest
 from data_source_models import DATA_SOURCE_OPTIONS
 from src.gui.log_drainer import LogDrainer
+from src.gui.progress_throttle import ProgressThrottle
 from src.gui.tree_enhancer import attach_enhancers_recursively as _attach_tree_enhancers
 from src.gui.ui_dispatch import UIDispatcher
 from src.gui.tabs.log import LogTab
@@ -1262,10 +1263,38 @@ class StockMonitorApp:
             last_failed = 0
             last_skipped = 0
 
+            progress_throttle = ProgressThrottle(interval_ms=120.0)
+
             def progress_callback(current, total, code, name, updated, failed, skipped):
                 nonlocal last_updated, last_failed, last_skipped
                 if token.is_cancelled() or not self.is_updating_cache:
                     raise StopIteration
+                # 失败检测要逐只比对，故每次都更新基准；outcome 文字只在采样推送时用。
+                is_failure = failed > last_failed
+                if updated > last_updated:
+                    outcome_text = "成功"
+                elif is_failure:
+                    outcome_text = "失败"
+                elif skipped > last_skipped:
+                    outcome_text = "跳过"
+                else:
+                    outcome_text = "完成"
+                last_updated = updated
+                last_failed = failed
+                last_skipped = skipped
+
+                # 失败的票始终留一条日志（排查用），不受节流影响。
+                if is_failure:
+                    self._log_async(
+                        f"缓存失败 {code} {name}（成功{updated} 跳过{skipped} 失败{failed}）"
+                    )
+
+                # 进度刷新按时间节流：把每只一次的回报压成至多每 120ms 一次，
+                # 避免上万次 root.after(0) 淹没主线程。最后一只必定推送。
+                is_final = current >= total
+                if not progress_throttle.should_emit(_time.time() * 1000.0, is_final=is_final):
+                    return
+
                 progress = (current / total) * 100 if total else 0
                 elapsed = _time.time() - cache_t0
                 speed = current / elapsed if elapsed > 0 else 0
@@ -1275,17 +1304,6 @@ class StockMonitorApp:
                 else:
                     eta_text = f"{int(eta_sec)}秒"
                 remaining = max(0, total - current)
-                if updated > last_updated:
-                    outcome_text = "成功"
-                elif failed > last_failed:
-                    outcome_text = "失败"
-                elif skipped > last_skipped:
-                    outcome_text = "跳过"
-                else:
-                    outcome_text = "完成"
-                last_updated = updated
-                last_failed = failed
-                last_skipped = skipped
                 status_text = (
                     f"更新缓存 {current}/{total} ({progress:.0f}%) "
                     f"| 速度 {speed:.1f}只/秒 | 预计剩余 {eta_text} "
@@ -1295,12 +1313,11 @@ class StockMonitorApp:
                     f"缓存进度 {current}/{total}，剩余 {remaining} 只，"
                     f"{outcome_text} {code} {name}；成功{updated} 跳过{skipped} 失败{failed}"
                 )
-                self._post_to_ui(lambda: self.progress_var.set(progress))
+                # 三合一：一次回投里设好进度条/进度文字/状态栏，回调数再降 2/3。
                 self._post_to_ui(
-                    lambda c=current, t=total, u=updated, s=skipped, f=failed:
-                        self._set_progress_text(c, t, f"成功{u} 跳过{s} 失败{f}"),
+                    lambda p=progress, c=current, t=total, u=updated, s=skipped, f=failed, st=status_text:
+                        self._apply_cache_progress(p, c, t, u, s, f, st)
                 )
-                self._post_to_ui(lambda s=status_text: self.status_var.set(s))
 
             result = scan_filter.fetcher.update_history_cache(
                 max_stocks=request.max_stocks,
@@ -1344,6 +1361,18 @@ class StockMonitorApp:
             self._post_to_ui(lambda et=error_text: self._show_network_error_alert(et))
         finally:
             self._unregister_cancel_token(token)
+
+    def _apply_cache_progress(
+        self, progress, current, total, updated, skipped, failed, status_text,
+    ) -> None:
+        """在主线程一次性应用缓存进度（进度条 + 进度文字 + 状态栏）。
+
+        合并原先的三个 _post_to_ui 回调为一个，配合 ProgressThrottle 的时间节流，
+        把缓存更新期间的主线程回调数从「每只 ×3」压到「每 120ms ×1」。
+        """
+        self.progress_var.set(progress)
+        self._set_progress_text(current, total, f"成功{updated} 跳过{skipped} 失败{failed}")
+        self.status_var.set(status_text)
 
     def _get_tree_selected_code(self, tree) -> str:
         selection = tree.selection()
