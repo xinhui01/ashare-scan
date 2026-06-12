@@ -683,6 +683,7 @@ def analyze_market_sentiment(
     end_date: Optional[str] = None,
     *,
     fetch_external: bool = True,
+    include_previous: bool = True,
     log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """计算市场情绪综合分 + 仓位建议。
@@ -690,6 +691,7 @@ def analyze_market_sentiment(
     Args:
         end_date: 目标交易日（YYYYMMDD），默认取 limit_up_pool 最新一天
         fetch_external: True 时联网拉跌停池 / 上证指数；False 时只用本地涨停池数据
+        include_previous: True 时附带昨日完整情绪（previous 字段），用于复盘对比
         log: 日志回调
 
     Returns 详见模块顶部 docstring。
@@ -865,6 +867,29 @@ def analyze_market_sentiment(
         f"状态 {market_state['label']} → {market_state['strategy']['label']}"
     )
 
+    # 昨日完整情绪（复盘对比用）：递归算一次 T-1，include_previous=False 防止无限递归。
+    # 涨停池数据在本地、外部数据按日缓存，正常情况下这一步不产生额外联网。
+    previous: Optional[Dict[str, Any]] = None
+    if include_previous and yest_date:
+        try:
+            prev_full = analyze_market_sentiment(
+                yest_date,
+                fetch_external=fetch_external,
+                include_previous=False,
+                log=log,
+            )
+            if prev_full.get("market_state"):
+                previous = {
+                    "trade_date": prev_full.get("trade_date"),
+                    "score": prev_full.get("score"),
+                    "position_suggest": prev_full.get("position_suggest"),
+                    "market_state": prev_full.get("market_state"),
+                    "signals": prev_full.get("signals"),
+                    "summary": prev_full.get("summary"),
+                }
+        except Exception:
+            logger.exception("计算昨日情绪失败（不影响当日结果）")
+
     return {
         "trade_date": end,
         "score": score,
@@ -872,6 +897,7 @@ def analyze_market_sentiment(
         "signals": signals,
         "summary": summary,
         "market_state": market_state,
+        "previous": previous,
         "raw": {
             "today": today_agg,
             "yesterday_date": yest_date,

@@ -266,6 +266,8 @@ class PredictTab:
             sent_bar, text="", font=("", 11, "bold"),
         )
         self.sentiment_state_label.pack(side=tk.LEFT, padx=(0, 12))
+        self.sentiment_prev_label = ttk.Label(sent_bar, text="")
+        self.sentiment_prev_label.pack(side=tk.LEFT, padx=(0, 12))
         self.sentiment_summary_label = ttk.Label(
             sent_bar, text="点击右侧「刷新」分析市场情绪", foreground="#666",
         )
@@ -1761,6 +1763,30 @@ class PredictTab:
                 )
             else:
                 self.sentiment_state_label.config(text="")
+            # 较昨日变化（复盘看边际：好转/恶化/持平）
+            prev = r.get("previous") or {}
+            prev_state_label = (prev.get("market_state") or {}).get("label", "")
+            if prev:
+                prev_score = int(prev.get("score", 50))
+                diff = score - prev_score
+                if diff > 0:
+                    trend_color, arrow = "#2e7d32", "↑"
+                elif diff < 0:
+                    trend_color, arrow = "#c62828", "↓"
+                else:
+                    trend_color, arrow = "#666", "→"
+                if prev_state_label and prev_state_label != state_label:
+                    state_part = f" · {prev_state_label}→{state_label}"
+                elif prev_state_label:
+                    state_part = f" · {state_label}持续"
+                else:
+                    state_part = ""
+                self.sentiment_prev_label.config(
+                    text=f"较昨日{arrow} {prev_score}→{score} ({diff:+d}){state_part}",
+                    foreground=trend_color,
+                )
+            else:
+                self.sentiment_prev_label.config(text="")
             # 显示 5 个最重要指标的缩略
             sigs = r.get("signals") or []
             key_names = ("涨停数", "晋级率", "最高连板", "大盘", "跌停数")
@@ -1921,6 +1947,66 @@ class PredictTab:
                         state_box, text=line, foreground="#555",
                         wraplength=900, justify=tk.LEFT,
                     ).pack(anchor=tk.W, pady=1)
+
+        # ===== 昨日对比（复盘视角：情绪边际变化）=====
+        prev = r.get("previous") or {}
+        if prev:
+            prev_score = int(prev.get("score", 50))
+            diff = score - prev_score
+            if diff > 0:
+                trend_text, trend_color = "情绪好转", "#2e7d32"
+            elif diff < 0:
+                trend_text, trend_color = "情绪恶化", "#c62828"
+            else:
+                trend_text, trend_color = "情绪持平", "#666"
+            prev_state = prev.get("market_state") or {}
+            prev_strat = prev_state.get("strategy") or {}
+            today_strat = state.get("strategy") or {}
+            prev_advice = prev.get("position_suggest") or {}
+
+            prev_box = ttk.LabelFrame(
+                body, text=f"昨日对比 · {prev.get('trade_date', '-')}", padding=8,
+            )
+            prev_box.pack(fill=tk.X, pady=(0, 8))
+            ttk.Label(
+                prev_box,
+                text=f"综合分: {prev_score} → {score} ({diff:+d})  ·  {trend_text}",
+                font=("", 12, "bold"), foreground=trend_color,
+            ).pack(anchor=tk.W)
+            ttk.Label(
+                prev_box,
+                text=(
+                    f"状态: {prev_state.get('label', '-')} → {state.get('label', '-')}"
+                    f"    打法: {prev_strat.get('label', '-')} → {today_strat.get('label', '-')}"
+                ),
+                foreground="#333", wraplength=900, justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(4, 0))
+            ttk.Label(
+                prev_box,
+                text=(
+                    f"仓位: {prev_advice.get('label', '-')}"
+                    f"(上限 {(prev_strat.get('position_cap') or 0)*100:.0f}%)"
+                    f" → {advice.get('label', '-')}"
+                    f"(上限 {(today_strat.get('position_cap') or 0)*100:.0f}%)"
+                ),
+                foreground="#333", wraplength=900, justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(2, 0))
+            # 7 个信号逐项对比：昨日值 → 今日值
+            prev_sigs = {
+                s.get("name"): s for s in (prev.get("signals") or [])
+            }
+            sig_parts: List[str] = []
+            for s in r.get("signals") or []:
+                name = s.get("name", "")
+                p = prev_sigs.get(name)
+                if p is None:
+                    continue
+                sig_parts.append(f"{name} {p.get('value', '-')}→{s.get('value', '-')}")
+            if sig_parts:
+                ttk.Label(
+                    prev_box, text="信号变化: " + " · ".join(sig_parts),
+                    foreground="#555", wraplength=900, justify=tk.LEFT,
+                ).pack(anchor=tk.W, pady=(2, 0))
 
         # 信号明细表
         cols = ("name", "value", "delta", "note")
