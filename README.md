@@ -123,9 +123,10 @@ Windows 下如果不想记命令参数，直接双击根目录里的 `run_tasks.
 run_tasks.bat
 ```
 
-也可以直接运行单个批处理脚本；它们已经内置常用参数（全量、60 天、3 线程、auto 数据源、预测回溯 5 天）：
+也可以直接运行单个批处理脚本；任务脚本已经内置常用参数（全量、60 天、3 线程、auto 数据源、预测回溯 5 天）：
 
 ```bat
+start_app.bat
 update_cache.bat
 predict_today.bat
 update_and_predict.bat
