@@ -7,7 +7,7 @@
 1. limit_up_pool (SQLite)            — 涨停数 / 炸板 / 连板高度 / 4+板数量
 2. limit_up_pool[T-1] vs [T]         — 昨日涨停今日继续涨停率（赚钱效应）
 3. ak.stock_zt_pool_dtgc_em          — 跌停池（按日，需要联网）
-4. ak.stock_zh_index_daily_em        — 上证/深证指数日 K（需要联网）
+4. ak.stock_zh_index_daily_em        — 上证/深成指日 K（需要联网）
 
 联网拉到的数据按 trade_date 缓存到 app_config，同一天只拉一次。
 """
@@ -155,6 +155,20 @@ def _signal_index(idx_pct: Optional[float], name: str = "上证") -> Tuple[int, 
         delta, note = -10, "明显下跌"
     sign = "+" if idx_pct >= 0 else ""
     return delta, f"{name} {sign}{idx_pct:.2f}% · {note}"
+
+
+def _format_index_detail(name: str, pct: Optional[float]) -> str:
+    if pct is None:
+        return f"{name} -"
+    sign = "+" if pct >= 0 else ""
+    return f"{name} {sign}{pct:.2f}%"
+
+
+def _composite_index_pct(sh_pct: Optional[float], sz_pct: Optional[float]) -> Optional[float]:
+    values = [v for v in (sh_pct, sz_pct) if v is not None]
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def _signal_down_limit(n_dt: int) -> Tuple[int, str]:
@@ -358,8 +372,14 @@ def _compute_pct_from_index_df(df, date_key: str) -> Optional[float]:
     return (today_close / prev_close - 1.0) * 100
 
 
-def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optional[float]:
-    """三源级联拉上证当日涨跌幅：东财 → 新浪 → 腾讯。任一成功即返回。"""
+def _fetch_index_pct(
+    date_key: str,
+    *,
+    symbol: str,
+    name: str,
+    log: Callable[[str], None],
+) -> Optional[float]:
+    """三源级联拉指数当日涨跌幅：东财 → 新浪 → 腾讯。任一成功即返回。"""
     import akshare as ak
     from datetime import datetime as _dt, timedelta
 
@@ -368,7 +388,7 @@ def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optiona
         end_dt = _dt.strptime(date_key, "%Y%m%d")
         start_dt = end_dt - timedelta(days=10)
         df = ak.stock_zh_index_daily_em(
-            symbol="sh000001",
+            symbol=symbol,
             start_date=start_dt.strftime("%Y%m%d"),
             end_date=date_key,
         )
@@ -376,44 +396,60 @@ def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optiona
         if pct is not None:
             return pct
     except Exception as exc:
-        log(f"  上证指数(东财)拉取失败: {exc}")
+        log(f"  {name}(东财)拉取失败: {exc}")
 
     # 2. 新浪：拉全量历史，毫秒级解析
     try:
-        df = ak.stock_zh_index_daily(symbol="sh000001")
+        df = ak.stock_zh_index_daily(symbol=symbol)
         pct = _compute_pct_from_index_df(df, date_key)
         if pct is not None:
-            log(f"  上证指数(东财失败，新浪兜底成功)")
+            log(f"  {name}(东财失败，新浪兜底成功)")
             return pct
     except Exception as exc:
-        log(f"  上证指数(新浪)拉取失败: {exc}")
+        log(f"  {name}(新浪)拉取失败: {exc}")
 
     # 3. 腾讯：拉全量历史，逐分块下载较慢但稳
     try:
-        df = ak.stock_zh_index_daily_tx(symbol="sh000001")
+        df = ak.stock_zh_index_daily_tx(symbol=symbol)
         pct = _compute_pct_from_index_df(df, date_key)
         if pct is not None:
-            log(f"  上证指数(东财/新浪失败，腾讯兜底成功)")
+            log(f"  {name}(东财/新浪失败，腾讯兜底成功)")
             return pct
     except Exception as exc:
-        log(f"  上证指数(腾讯)拉取失败: {exc}")
+        log(f"  {name}(腾讯)拉取失败: {exc}")
 
     return None
 
 
+def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optional[float]:
+    return _fetch_index_pct(date_key, symbol="sh000001", name="上证指数", log=log)
+
+
+def _fetch_sz_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optional[float]:
+    return _fetch_index_pct(date_key, symbol="sz399001", name="深成指", log=log)
+
+
 def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, Any]:
-    """拉跌停数 + 上证指数涨跌幅，缓存按日。"""
+    """拉跌停数 + 上证/深成指涨跌幅，缓存按日。"""
     cache_key = f"{CACHE_KEY_PREFIX}{date_key}"
     cached = stock_store.load_app_config(cache_key, default=None)
     if isinstance(cached, dict) and cached.get("ok"):
         # 二次校验：旧版可能写过 ok=True 但字段是 None 的"半成功"缓存。
         # 检测到这种情况就忽略缓存，强制重拉一次。
         if (cached.get("down_limit_count") is not None
-                and cached.get("sh_index_pct") is not None):
+                and cached.get("sh_index_pct") is not None
+                and cached.get("sz_index_pct") is not None
+                and cached.get("index_composite_pct") is not None):
             return cached
         log(f"  外部数据缓存字段缺失（旧版半成功记录），忽略缓存重拉")
 
-    out: Dict[str, Any] = {"date_key": date_key, "down_limit_count": None, "sh_index_pct": None}
+    out: Dict[str, Any] = {
+        "date_key": date_key,
+        "down_limit_count": None,
+        "sh_index_pct": None,
+        "sz_index_pct": None,
+        "index_composite_pct": None,
+    }
 
     # 触发网络补丁（确保 SSL bypass 生效）
     _ = stock_data  # noqa: F841
@@ -426,14 +462,21 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
         log(f"  跌停池拉取失败: {exc}")
 
     out["sh_index_pct"] = _fetch_sh_index_pct(date_key, log=log)
+    out["sz_index_pct"] = _fetch_sz_index_pct(date_key, log=log)
+    out["index_composite_pct"] = _composite_index_pct(
+        out.get("sh_index_pct"),
+        out.get("sz_index_pct"),
+    )
 
     out["fetched_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 只在两个外部字段都拿到时才缓存为"完整成功"。
+    # 只在外部字段都拿到时才缓存为"完整成功"。
     # 半失败状态不写缓存，让下次调用继续重试，避免 SSL/网络瞬时抖动导致
     # 大盘/跌停数据永久 None。
     all_fetched = (
         out.get("down_limit_count") is not None
         and out.get("sh_index_pct") is not None
+        and out.get("sz_index_pct") is not None
+        and out.get("index_composite_pct") is not None
     )
     out["ok"] = all_fetched
     if all_fetched:
@@ -444,7 +487,8 @@ def _fetch_external(date_key: str, *, log: Callable[[str], None]) -> Dict[str, A
     else:
         log(
             f"  外部数据未完整拿到（跌停={out.get('down_limit_count')}, "
-            f"上证pct={out.get('sh_index_pct')}），本次不缓存，下次重试"
+            f"上证pct={out.get('sh_index_pct')}, 深成指pct={out.get('sz_index_pct')}），"
+            f"本次不缓存，下次重试"
         )
     return out
 
@@ -782,7 +826,12 @@ def analyze_market_sentiment(
 
     external = (
         _fetch_external(end, log=_l) if fetch_external else
-        {"down_limit_count": None, "sh_index_pct": None}
+        {
+            "down_limit_count": None,
+            "sh_index_pct": None,
+            "sz_index_pct": None,
+            "index_composite_pct": None,
+        }
     )
 
     # 计算 7 个信号
@@ -816,11 +865,22 @@ def analyze_market_sentiment(
                     "value": (f"{today_continued}/{yest_lu}" if yest_lu else "-"),
                     "delta": delta, "note": note})
 
-    delta, note = _signal_index(external.get("sh_index_pct"), "上证")
+    index_pct = external.get("index_composite_pct")
+    if index_pct is None:
+        index_pct = _composite_index_pct(
+            external.get("sh_index_pct"),
+            external.get("sz_index_pct"),
+        )
+    delta, note = _signal_index(index_pct, "大盘")
+    if index_pct is not None:
+        note = (
+            f"{note}（{_format_index_detail('上证', external.get('sh_index_pct'))}，"
+            f"{_format_index_detail('深成指', external.get('sz_index_pct'))}）"
+        )
     score += delta
     signals.append({"name": "大盘",
-                    "value": (f"{external.get('sh_index_pct'):+.2f}%"
-                              if external.get("sh_index_pct") is not None else "-"),
+                    "value": (f"{index_pct:+.2f}%"
+                              if index_pct is not None else "-"),
                     "delta": delta, "note": note})
 
     delta, note = _signal_down_limit(_safe_int(external.get("down_limit_count"), 0))
@@ -852,8 +912,8 @@ def analyze_market_sentiment(
     if yest_lu:
         rate = today_continued / yest_lu * 100
         parts.append(f"晋级 {rate:.0f}%")
-    if external.get("sh_index_pct") is not None:
-        parts.append(f"上证 {external['sh_index_pct']:+.2f}%")
+    if index_pct is not None:
+        parts.append(f"大盘 {index_pct:+.2f}%")
     if external.get("down_limit_count") is not None:
         parts.append(f"跌停 {external['down_limit_count']} 只")
     summary = (

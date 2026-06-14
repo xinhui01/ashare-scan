@@ -122,3 +122,46 @@ def test_default_date_still_uses_latest_cached(monkeypatch):
     result = svc.analyze_market_sentiment(None, fetch_external=False, log=lambda _s: None)
 
     assert result["trade_date"] == "20260522"
+
+
+def test_market_index_signal_uses_shenzhen_composite_when_available(monkeypatch):
+    monkeypatch.setattr(svc.stock_store, "list_limit_up_pool_trade_dates", lambda: ["20260612"])
+    monkeypatch.setattr(svc, "_ensure_pool_dates_ready", lambda date_keys, log: [])
+    monkeypatch.setattr(
+        svc,
+        "_load_pool_aggregates",
+        lambda d: {
+            "lu_count": 40,
+            "broken_count": 10,
+            "broken_total_times": 10,
+            "max_boards": 4,
+            "high_board_count_4plus": 1,
+            "codes": ["000001"],
+            "top_industries": [("银行", 10)],
+            "hhi": 0.25,
+        },
+    )
+    monkeypatch.setattr(
+        svc, "_avg_lu_count_5d",
+        lambda end_date: (40.0, ["20260611"], {"20260611": 40}),
+    )
+    monkeypatch.setattr(svc, "_previous_pool_date", lambda end_date: "")
+    monkeypatch.setattr(
+        svc,
+        "_fetch_external",
+        lambda date_key, log: {
+            "down_limit_count": 0,
+            "sh_index_pct": -2.0,
+            "sz_index_pct": 2.0,
+            "index_composite_pct": 0.0,
+        },
+    )
+
+    result = svc.analyze_market_sentiment("20260612", fetch_external=True, log=lambda _s: None)
+
+    market_signal = next(s for s in result["signals"] if s["name"] == "大盘")
+    assert market_signal["value"] == "+0.00%"
+    assert market_signal["delta"] == 0
+    assert "上证 -2.00%" in market_signal["note"]
+    assert "深成指 +2.00%" in market_signal["note"]
+    assert "大盘 +0.00%" in result["summary"]

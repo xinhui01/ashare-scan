@@ -2081,13 +2081,21 @@ class PredictTab:
             shown = "、".join(codes)
             lines.append(f"今日涨停代码（{len(codes)}只）: {shown}")
 
+        market_pct = external_raw.get("index_composite_pct")
         sh_pct = external_raw.get("sh_index_pct")
+        sz_pct = external_raw.get("sz_index_pct")
         dt_cnt = external_raw.get("down_limit_count")
         fetched_at = external_raw.get("fetched_at") or "-"
+        if market_pct is None:
+            index_values = [v for v in (sh_pct, sz_pct) if v is not None]
+            market_pct = sum(index_values) / len(index_values) if index_values else None
+        market_disp = f"{market_pct:+.2f}%" if market_pct is not None else "—"
         sh_disp = f"{sh_pct:+.2f}%" if sh_pct is not None else "—"
+        sz_disp = f"{sz_pct:+.2f}%" if sz_pct is not None else "—"
         dt_disp = f"{dt_cnt} 只" if dt_cnt is not None else "—"
         lines.append(
-            f"外部数据: 上证 {sh_disp}  ·  跌停 {dt_disp}  ·  拉取于 {fetched_at}"
+            f"外部数据: 大盘 {market_disp}（上证 {sh_disp} / 深成指 {sz_disp}）"
+            f"  ·  跌停 {dt_disp}  ·  拉取于 {fetched_at}"
         )
 
         for line in lines:
