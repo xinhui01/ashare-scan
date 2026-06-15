@@ -115,7 +115,14 @@ python main.py predict-today
 
 # 先更新缓存，再预测
 python main.py update-and-predict --max-stocks 0 --workers 3 --source auto
+
+# 获取今日市场情绪评分（默认今天；数据缺失时打印前置步骤）
+python main.py sentiment
+python main.py sentiment --date 20260612   # 指定交易日
 ```
+
+> 情绪需要当日 + 最近 5 个交易日的涨停池，收盘后（约 15:30 起）联网拉取最稳；
+> 拿不到数据时命令会直接列出前置步骤（是否交易日 / 是否已收盘 / 网络是否可达 / 先跑 `update_and_predict.bat`）。
 
 Windows 下如果不想记命令参数，直接双击根目录里的 `run_tasks.bat`，按菜单选择：
 

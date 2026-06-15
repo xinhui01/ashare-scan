@@ -13,8 +13,9 @@ from typing import Optional, Sequence
 from stock_filter import StockFilter
 from stock_store import ensure_store_ready
 
-# 单开关：True=不走系统代理（推荐，避免代理导致东财接口断连）；False=沿用系统代理
-BYPASS_PROXY = True
+# 默认沿用系统/环境代理（trust_env=True）。网络出口交给启动 bat 的 _set_proxy.bat：
+# 本地 Clash(7897) 开着就走 Clash，没开就走直连。改回 True 可强制全程不走代理（旧行为）。
+BYPASS_PROXY = False
 
 
 def _check_runtime() -> None:
@@ -87,6 +88,13 @@ def _build_parser() -> argparse.ArgumentParser:
     update_and_predict.add_argument("--date", default="", help="预测日期，支持 YYYYMMDD / YYYY-MM-DD / M/D。")
     update_and_predict.add_argument("--lookback", type=int, default=5, help="回溯天数，范围 2-15，默认 5。")
     update_and_predict.add_argument("--historical", action="store_true", help="按历史模式预测指定日期。")
+
+    sentiment = subparsers.add_parser(
+        "sentiment",
+        help="获取今日（或指定日期）市场情绪综合评分；数据缺失时打印前置步骤。",
+    )
+    sentiment.add_argument("--date", default="", help="目标日期，支持 YYYYMMDD / YYYY-MM-DD / M/D；默认今天。")
+    sentiment.add_argument("--no-external", action="store_true", help="不联网拉跌停池/大盘指数，仅用本地涨停池。")
 
     return parser
 
@@ -178,6 +186,109 @@ def _run_predict_today(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_sentiment_trade_date(date_arg: str) -> str:
+    """情绪默认看『今天』本身（不静默回退到上一交易日）。
+
+    用户要的是当日情绪，今天没数据时应提示前置步骤，而不是悄悄给昨天的结论。
+    只有显式传 --date 时才归一化该日期。
+    """
+    if date_arg:
+        target = _normalize_predict_date(date_arg)
+        if not target:
+            raise ValueError(f"无法识别日期: {date_arg}")
+        return target
+    return datetime.now().strftime("%Y%m%d")
+
+
+def _print_sentiment_success(result: dict) -> None:
+    date = result.get("trade_date", "")
+    score = result.get("score", 0)
+    pos = result.get("position_suggest") or {}
+    state = result.get("market_state") or {}
+    strat = state.get("strategy") or {}
+    print("")
+    print(f"========== 市场情绪 {date} ==========")
+    print(f"综合评分: {score}/100  →  建议仓位: {pos.get('label', '-')}（{pos.get('ratio', '-')}）")
+    print(
+        f"市场状态: {state.get('label', '-')}  置信 {state.get('confidence', '-')}"
+        f"  → {strat.get('label', '-')}"
+    )
+    if strat.get("notes"):
+        print(f"  打法: {strat['notes']}")
+    print(f"一句话: {result.get('summary', '')}")
+
+    signals = result.get("signals") or []
+    if signals:
+        print("")
+        print("信号明细:")
+        for s in signals:
+            delta = s.get("delta", 0)
+            print(f"  {s.get('name', '')}: {s.get('value', '')}  ({delta:+d})  {s.get('note', '')}")
+
+    prev = result.get("previous") or {}
+    if prev:
+        prev_state = (prev.get("market_state") or {}).get("label", "-")
+        print("")
+        print(f"昨日({prev.get('trade_date', '')}): {prev.get('score', '-')} 分 / 状态 {prev_state}")
+
+
+def _print_sentiment_prerequisites(target: str, result: dict) -> None:
+    summary = str(result.get("summary") or "无法计算市场情绪。")
+    raw = result.get("raw") or {}
+    missing = [str(d) for d in (raw.get("missing_pool_dates") or [])]
+
+    is_trading = True
+    try:
+        from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day
+        parsed = datetime.strptime(target, "%Y%m%d").date()
+        is_trading = _is_trading_day(parsed, _get_trade_calendar())
+    except (ValueError, ImportError):
+        pass
+
+    print("")
+    print(f"[!] 无法获取 {target} 的市场情绪")
+    print(f"  原因: {summary}")
+    print("")
+    print("请按以下前置步骤排查：")
+    if not is_trading:
+        print(f"  1. {target} 不是交易日（周末/节假日），没有涨停数据。请在交易日收盘后再运行。")
+        print("  2. 查看最近一个交易日：sentiment.bat --date <YYYYMMDD>")
+    else:
+        print("  1. 是否已收盘？涨停池要等当天收盘后（约 15:00 之后）才完整，建议 15:30 之后再跑。")
+        print("  2. 网络是否可达？东财涨停池接口需直连（项目默认绕过系统代理）；")
+        print("     先确认能访问 push2.eastmoney.com，公司网/受限网络可能拦截。")
+        print("  3. 情绪需要『今日 + 最近 5 个交易日』的涨停池，缺失会自动联网补齐，补不齐就会失败。")
+        if missing:
+            print(f"     当前仍缺: {'、'.join(missing)}")
+        print("  4. 兜底：先运行 update_and_predict.bat（预测流程会顺带把今日涨停池写入本地），再重跑本脚本；")
+        print("     东财间歇性熔断时，稍等几分钟重试即可。")
+    print("")
+
+
+def _run_sentiment(args: argparse.Namespace) -> int:
+    ensure_store_ready()
+    try:
+        target = _resolve_sentiment_trade_date(str(args.date or ""))
+    except ValueError as exc:
+        print(str(exc))
+        return 2
+
+    from src.services.market_sentiment_service import analyze_market_sentiment
+
+    result = analyze_market_sentiment(
+        target,
+        fetch_external=not bool(args.no_external),
+        log=lambda msg: print(msg),
+    )
+
+    if result.get("market_state"):
+        _print_sentiment_success(result)
+        return 0
+
+    _print_sentiment_prerequisites(target, result)
+    return 1
+
+
 def _run_gui() -> int:
     from stock_logger import get_logger
     logger = get_logger(__name__)
@@ -208,6 +319,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cache_rc = _run_update_cache(args)
         predict_rc = _run_predict_today(args)
         return predict_rc if predict_rc != 0 else cache_rc
+    if args.command == "sentiment":
+        return _run_sentiment(args)
     parser.error(f"未知命令: {args.command}")
     return 2
 

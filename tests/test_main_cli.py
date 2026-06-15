@@ -76,6 +76,58 @@ def test_predict_today_command_calls_predictor(monkeypatch):
     assert calls["historical_mode"] is False
 
 
+def test_sentiment_command_prints_summary_on_success(monkeypatch, capsys):
+    import src.services.market_sentiment_service as mss
+
+    def fake_analyze(target, **kwargs):
+        return {
+            "trade_date": target,
+            "score": 72,
+            "position_suggest": {"label": "7 成", "ratio": 0.7},
+            "signals": [{"name": "涨停数", "value": "42", "delta": 5, "note": "强"}],
+            "summary": "涨停 42 只。综合 72 分 → 建议 7 成。",
+            "market_state": {
+                "label": "接力日",
+                "confidence": 0.85,
+                "strategy": {"label": "连板接力", "notes": "重点 2-4 板"},
+            },
+        }
+
+    monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
+    monkeypatch.setattr(mss, "analyze_market_sentiment", fake_analyze)
+
+    rc = main.main(["sentiment", "--date", "20260612"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "市场情绪 20260612" in out
+    assert "接力日" in out
+
+
+def test_sentiment_command_prints_prerequisites_on_missing_data(monkeypatch, capsys):
+    import src.services.market_sentiment_service as mss
+
+    def fake_analyze(target, **kwargs):
+        # 数据缺失分支：服务返回的 dict 不含 market_state
+        return {
+            "trade_date": target,
+            "score": 50,
+            "signals": [],
+            "summary": "本地无 limit_up_pool 缓存，无法判断情绪。",
+            "raw": {"missing_pool_dates": ["20260612"]},
+        }
+
+    monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
+    monkeypatch.setattr(mss, "analyze_market_sentiment", fake_analyze)
+
+    rc = main.main(["sentiment", "--date", "20260612"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "前置步骤" in out
+    assert "无法获取" in out
+
+
 def test_update_and_predict_runs_prediction_after_cache_failures(monkeypatch):
     calls = []
 

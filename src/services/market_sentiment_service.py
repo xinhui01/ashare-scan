@@ -379,24 +379,49 @@ def _fetch_index_pct(
     name: str,
     log: Callable[[str], None],
 ) -> Optional[float]:
-    """三源级联拉指数当日涨跌幅：东财 → 新浪 → 腾讯。任一成功即返回。"""
+    """拉指数当日涨跌幅。当日(盘中)优先实时快照；历史日走 东财→新浪→腾讯 日线级联。"""
+    import time
     import akshare as ak
     from datetime import datetime as _dt, timedelta
 
-    # 1. 东财：支持 start/end，最快；间歇性熔断
-    try:
-        end_dt = _dt.strptime(date_key, "%Y%m%d")
-        start_dt = end_dt - timedelta(days=10)
-        df = ak.stock_zh_index_daily_em(
-            symbol=symbol,
-            start_date=start_dt.strftime("%Y%m%d"),
-            end_date=date_key,
-        )
-        pct = _compute_pct_from_index_df(df, date_key)
-        if pct is not None:
-            return pct
-    except Exception as exc:
-        log(f"  {name}(东财)拉取失败: {exc}")
+    # 0. 当前交易日(盘中)：日线接口要么抽风(东财 push2his)、要么没有今天(新浪/腾讯日线)，
+    #    故优先用新浪实时快照 stock_zh_index_spot_sina（host=hq.sinajs.cn，不碰 push2his）
+    #    直接取当日涨跌幅，支撑“实时情绪”。仅 date_key==今天 时走这条；历史日跳过。
+    if date_key == _dt.now().strftime("%Y%m%d"):
+        try:
+            spot = ak.stock_zh_index_spot_sina()
+            if spot is not None and not spot.empty and "代码" in spot.columns:
+                row = spot[spot["代码"].astype(str) == symbol]
+                if not row.empty:
+                    try:
+                        pct = float(row.iloc[0].get("涨跌幅"))
+                    except (TypeError, ValueError):
+                        pct = None
+                    if pct is not None and pct == pct:  # 过滤 None / NaN
+                        log(f"  {name}(新浪实时快照) 当日 {pct:+.2f}%")
+                        return pct
+        except Exception as exc:
+            log(f"  {name}(新浪实时快照)拉取失败: {exc}")
+
+    # 1. 东财日线：历史日首选；盘中也带实时 K 但 push2his 间歇抽风，故对瞬时抖动
+    #    （ProxyError/RemoteDisconnected）重试几次兜底。
+    end_dt = _dt.strptime(date_key, "%Y%m%d")
+    start_dt = end_dt - timedelta(days=10)
+    for _attempt in range(3):
+        try:
+            df = ak.stock_zh_index_daily_em(
+                symbol=symbol,
+                start_date=start_dt.strftime("%Y%m%d"),
+                end_date=date_key,
+            )
+            pct = _compute_pct_from_index_df(df, date_key)
+            if pct is not None:
+                return pct
+            break  # 连上了但当天无此行（历史日缺数据）→ 不重试，转兜底源
+        except Exception as exc:
+            log(f"  {name}(东财)拉取失败(第 {_attempt + 1}/3 次): {exc}")
+            if _attempt < 2:
+                time.sleep(0.6)
 
     # 2. 新浪：拉全量历史，毫秒级解析
     try:
