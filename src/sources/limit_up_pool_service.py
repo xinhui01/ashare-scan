@@ -28,6 +28,32 @@ from src.utils.trade_calendar import resolve_sync_target_trade_date
 _safe_float = _utils_parsing.safe_float
 _BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
 
+# 涨停池在收盘前持续封板变化，15:30 之后视为基本稳定（与 cache_freshness 同口径）。
+_POOL_STABLE_HOUR = 15
+_POOL_STABLE_MINUTE = 30
+
+
+def _current_dt() -> datetime:
+    """当前时间（独立 seam，便于测试 monkeypatch 注入固定时刻）。"""
+    return datetime.now()
+
+
+def _today_pool_should_refresh(date_key: str) -> bool:
+    """今日涨停池是否需绕过缓存、实时重抓。
+
+    仅当 ``date_key`` == 当前自然日 且 当前时间 < 15:30（尚未收盘、池仍在封板）
+    时返回 True：此刻缓存里多半是早盘残缺快照，必须实时重抓东财才能反映真实盘面。
+    历史日期的涨停池不再变化，永远走缓存。
+    """
+    if not date_key:
+        return False
+    now = _current_dt()
+    if str(date_key).replace("-", "") != now.strftime("%Y%m%d"):
+        return False
+    return now.hour < _POOL_STABLE_HOUR or (
+        now.hour == _POOL_STABLE_HOUR and now.minute < _POOL_STABLE_MINUTE
+    )
+
 
 def _spot_fallback_allowed(date_key: str, *, now=None, calendar=None) -> bool:
     """实时 spot 快照只允许派生它真正代表的交易日的池子。
@@ -461,6 +487,10 @@ def get_limit_up_pool(
 
     三级缓存：内存 → SQLite → 网络请求。
     历史日期的数据一旦入库，后续永远从本地读取。
+
+    例外：当 date_key 是今日且未收盘(<15:30)时，涨停池仍在封板变化，
+    缓存里多半是早盘残缺快照——此时绕过内存/SQLite 命中、强制重抓东财，
+    让实时盘中视图随盘推进刷新；重抓失败/返空时回退已有缓存，绝不清空视图。
     """
     # 在函数内 import 以支持测试 monkey-patch `stock_data.*`
     from stock_data import _eastmoney_circuit_breaker_open, _retry_ak_call
@@ -469,29 +499,51 @@ def get_limit_up_pool(
     if not date_key:
         return pd.DataFrame()
 
-    # 1. 内存缓存
+    from stock_store import load_limit_up_pool, save_limit_up_pool
+
+    # 今日涨停池在收盘(15:30)前仍在封板，缓存里多半是早盘残缺快照；此时绕过缓存
+    # 实时重抓东财，让实时盘中视图随盘推进刷新。历史日期池不变，照常走缓存。
+    refresh_today = _today_pool_should_refresh(date_key)
+
+    # 1. 内存缓存（refresh_today 时跳过命中，但保留引用作为联网失败兜底）
     mem_cached = fetcher._limit_up_pool_cache.get(date_key)
-    if mem_cached is not None and not mem_cached.empty:
-        fetcher._last_pool_source[date_key] = "cache_memory"
-        return mem_cached
-    if mem_cached is not None and mem_cached.empty and log_fn:
-        log_fn(f"涨停池 {date_key} 内存缓存为空，重新尝试数据源")
+    if not refresh_today:
+        if mem_cached is not None and not mem_cached.empty:
+            fetcher._last_pool_source[date_key] = "cache_memory"
+            return mem_cached
+        if mem_cached is not None and mem_cached.empty and log_fn:
+            log_fn(f"涨停池 {date_key} 内存缓存为空，重新尝试数据源")
 
     # 2. SQLite 持久缓存（也做一次过滤，防止历史脏数据继续展示）
-    from stock_store import load_limit_up_pool, save_limit_up_pool
     db_cached = load_limit_up_pool(date_key)
+    db_cached_clean: Optional[pd.DataFrame] = None
     if db_cached is not None and not db_cached.empty:
         # 缓存可能是反推/spot 派生池（无封板时间是正常的），故不按封板时间剔除
-        db_cached = fetcher._sanitize_limit_up_pool(db_cached, drop_missing_seal_time=False)
-        if db_cached is not None and not db_cached.empty:
-            fetcher._limit_up_pool_cache[date_key] = db_cached
+        db_cached_clean = fetcher._sanitize_limit_up_pool(db_cached, drop_missing_seal_time=False)
+    if not refresh_today:
+        if db_cached_clean is not None and not db_cached_clean.empty:
+            fetcher._limit_up_pool_cache[date_key] = db_cached_clean
             fetcher._last_pool_source[date_key] = "cache_db"
             if log_fn:
-                log_fn(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached)} 只")
-            return db_cached
+                log_fn(f"涨停池 {date_key} 从本地缓存加载 {len(db_cached_clean)} 只")
+            return db_cached_clean
         # 缓存清洗后变空：不缓存空值，继续往下走东财 / spot 兜底（含腾讯）
-        if log_fn:
+        if db_cached is not None and not db_cached.empty and log_fn:
             log_fn(f"涨停池 {date_key} 本地缓存清洗后为空，继续尝试在线源")
+
+    if refresh_today and log_fn:
+        log_fn(f"涨停池 {date_key} 为今日且未收盘(<15:30)，绕过缓存实时重抓东财")
+
+    def _cached_fallback() -> Optional[pd.DataFrame]:
+        """实时重抓失败/返空时回退已有缓存，避免把实时视图清空。"""
+        if mem_cached is not None and not mem_cached.empty:
+            fetcher._last_pool_source[date_key] = "cache_memory"
+            return mem_cached
+        if db_cached_clean is not None and not db_cached_clean.empty:
+            fetcher._limit_up_pool_cache[date_key] = db_cached_clean
+            fetcher._last_pool_source[date_key] = "cache_db"
+            return db_cached_clean
+        return None
 
     # 3. 东财涨停池接口（正常路径）
     em_ok = not _eastmoney_circuit_breaker_open()
@@ -510,6 +562,11 @@ def get_limit_up_pool(
                     log_fn(f"涨停池 {date_key} 东财 {len(df)} 只{drop_note}，已保存")
                 return df
             # 东财返空（非异常）：合法结果（如节假日），不触发 spot 兜底（避免无谓 30s 等）
+            fb = _cached_fallback()
+            if fb is not None:
+                if log_fn:
+                    log_fn(f"涨停池 {date_key} 东财返空，沿用已有缓存 {len(fb)} 只")
+                return fb
             fetcher._last_pool_source[date_key] = "empty"
             if log_fn:
                 log_fn(f"涨停池 {date_key} 东财返空，返回空（不缓存，下次重试）")
@@ -523,6 +580,11 @@ def get_limit_up_pool(
 
     # 4. spot 兜底：仅在东财异常/熔断时触发，从全市场 spot 派生
     if not _spot_fallback_allowed(date_key):
+        fb = _cached_fallback()
+        if fb is not None:
+            if log_fn:
+                log_fn(f"涨停池 {date_key} 跳过 spot 兜底，沿用已有缓存 {len(fb)} 只")
+            return fb
         fetcher._last_pool_source[date_key] = "empty"
         if log_fn:
             log_fn(
@@ -550,6 +612,11 @@ def get_limit_up_pool(
         if log_fn:
             log_fn(f"涨停池 {date_key} spot 兜底失败: {exc}")
 
+    fb = _cached_fallback()
+    if fb is not None:
+        if log_fn:
+            log_fn(f"涨停池 {date_key} 所有源均失败，沿用已有缓存 {len(fb)} 只")
+        return fb
     fetcher._last_pool_source[date_key] = "empty"
     if log_fn:
         log_fn(f"涨停池 {date_key} 所有源均失败，返回空（不缓存空结果）")
@@ -818,7 +885,7 @@ def compare_limit_up_pools_window(
 
     daily_stats: List[Dict[str, Any]] = []
     for trade_date in trade_dates:
-        pool_df = fetcher.get_limit_up_pool(trade_date)  # 命中缓存，不会重复请求
+        pool_df = fetcher.get_limit_up_pool(trade_date)  # 历史日期命中缓存；今日盘中会实时重抓（每个日期至多一次）
         first_df = pd.DataFrame()
         if not pool_df.empty and "连板数" in pool_df.columns:
             first_df = pool_df[pool_df["连板数"] == 1].copy()
