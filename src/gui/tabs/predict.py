@@ -1007,17 +1007,65 @@ class PredictTab:
             return "score_mid"
         return "score_low"
 
-    def _row_tag(self, category: str, hit_tag: Optional[str], score: Any) -> str:
+    @staticmethod
+    def _cont_subcategory_from_boards(boards: Any) -> str:
+        """按当前连板数映射保留涨停子类别：1板=1进2，2板=2进3，依此类推。"""
+        try:
+            b = int(boards)
+        except (TypeError, ValueError):
+            b = 1
+        if b <= 1:
+            return "cont_1to2"
+        if b == 2:
+            return "cont_2to3"
+        if b == 3:
+            return "cont_3to4"
+        if b == 4:
+            return "cont_4to5"
+        return "cont_5plus"
+
+    def _best_bucket_for_row(
+        self,
+        category: str,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Tuple[int, int]]:
+        """行级高亮桶：cont 优先用对应 1进2/2进3 子类，子类不足再退回总类。"""
+        best_map = self.best_buckets or {}
+        if category == "cont" and record is not None:
+            sub_cat = self._cont_subcategory_from_boards(record.get("consecutive_boards"))
+            sub_best = best_map.get(sub_cat)
+            if sub_best is not None:
+                return sub_best
+        return best_map.get(category)
+
+    @staticmethod
+    def _bucket_score_for_row(
+        category: str,
+        score: Any,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """返回用于历史分段匹配的分数，必须与准确率表 predicted_score 同源。"""
+        if category == "fresh" and record is not None:
+            return record.get("score", score)
+        return score
+
+    def _row_tag(
+        self,
+        category: str,
+        hit_tag: Optional[str],
+        score: Any,
+        record: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """决定预测候选行的背景色 tag。
 
         优先级：hit/miss（已回填的次日结果）> best_bucket（历史最优分数段）> 分数段色。
         """
         if hit_tag:
             return hit_tag
-        best = (self.best_buckets or {}).get(category)
+        best = self._best_bucket_for_row(category, record)
         if best is not None:
             try:
-                s = int(score)
+                s = int(self._bucket_score_for_row(category, score, record))
                 if best[0] <= s <= best[1]:
                     return "best_bucket"
             except (TypeError, ValueError):
@@ -1163,8 +1211,14 @@ class PredictTab:
         from src.services import prediction_accuracy_service as svc
 
         def _priority(rec: Dict[str, Any]) -> float:
+            effective_rates = rates
+            if cat_key == "cont":
+                sub_cat = self._cont_subcategory_from_boards(rec.get("consecutive_boards"))
+                sub_rates = self._get_bucket_rates(sub_cat)
+                if any(info.get("eligible") for info in sub_rates.values()):
+                    effective_rates = sub_rates
             bucket = svc.score_to_bucket(rec.get("score"))
-            info = rates.get(bucket)
+            info = effective_rates.get(bucket)
             if not info or not info.get("eligible"):
                 return -1.0
             return float(info.get("rate") or 0.0)
@@ -3133,7 +3187,7 @@ class PredictTab:
         for rec in cont_list:
             res_text, hit_tag = _result_cell("cont", rec.get("code", ""))
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
-            tag = self._row_tag("cont", hit_tag, rec.get("score", 0))
+            tag = self._row_tag("cont", hit_tag, rec.get("score", 0), rec)
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
@@ -3183,6 +3237,7 @@ class PredictTab:
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
             tag = self._row_tag(
                 "fresh", hit_tag, rec.get("calibrated_score", rec.get("score", 0)),
+                rec,
             )
             score_text = str(rec.get("score", 0))
             if rec.get("calibrated_score") is not None:
@@ -3551,15 +3606,18 @@ class PredictTab:
         labels = self.subcategory_best_labels or {}
         if not labels:
             return
+        best_map = dict(self.best_buckets or {})
         for cat, lbl in labels.items():
             best = self._find_best_bucket_for_category(cat)
             if best is None:
+                best_map[cat] = None
                 try:
                     lbl.configure(text="-（样本不足）", foreground="#888")
                 except Exception:
                     pass
                 continue
             (lo, hi), info = best
+            best_map[cat] = (lo, hi)
             rate = float(info.get("rate") or 0.0)
             hit = int(info.get("hit") or 0)
             buyable = int(info.get("buyable") or 0)
@@ -3574,6 +3632,7 @@ class PredictTab:
                 lbl.configure(text=txt, foreground=fg)
             except Exception:
                 pass
+        self.best_buckets = best_map
 
 
     # ============== 命中对比窗口 ==============
