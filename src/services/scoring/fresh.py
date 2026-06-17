@@ -1,12 +1,15 @@
-"""首板涨停（fresh）评分。
+"""首板涨停（fresh）评分 —— "资金接入型"策略（2026-06 改造）。
 
 2 个模块级函数（参数注入模式）：
-- scan_fresh_first_board_candidates_cached: 从今日强势股池扫候选并逐只评分（带冷却期过滤）
-- score_fresh_first_board: 主评分（冷却期判定 + 量价启动 + 均线位置 + 行业/题材/资金面共振）
+- scan_fresh_first_board_candidates_cached: 从"资金接入型"入口池扫候选并逐只评分（带冷却期过滤）
+- score_fresh_first_board: 主评分（冷却期 + 资金接入(量能) + 止跌 + 板块题材联动 + 股性/盘子）
+
+策略要点：按"资金有没有进来"选票，不按"位置高低"选票。入口 D-1 涨幅 [-4%,+5%]
+（覆盖实测 81% 前一天不强势的首板），主信号=资金接入(量能)+止跌，强加权=板块题材联动。
 
 依赖：StockDataFetcher（fetcher 参数）+ 可选 log_fn /
 limit_up_threshold_pct_fn / build_local_cache_history_plan_fn /
-filter_strong_stocks_fn。
+filter_candidates_fn（注入 first_board.filter_capital_inflow_candidates）。
 """
 from __future__ import annotations
 
@@ -17,7 +20,11 @@ import pandas as pd
 
 from src.services.scoring import shared as _shared
 from src.services.scoring import fresh_calibration as _fresh_calibration
-from src.services.scoring.helpers import _count_historical_any_limit_up
+from src.services.scoring.helpers import (
+    _count_historical_any_limit_up,
+    detect_stop_falling,
+    detect_volume_ignition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,32 +51,26 @@ def scan_fresh_first_board_candidates_cached(
     log_fn: Optional[Callable[[str], None]] = None,
     limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
-    filter_strong_stocks_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+    filter_candidates_fn: Optional[Callable[..., List[Dict[str, Any]]]] = None,
 ) -> List[Dict[str, Any]]:
-    """从全市场强势股中识别"近期未涨停、明日有望首封"的候选。
+    """识别"资金接入型首板"候选：近期未涨停、今日止跌 + 资金进场、明日有望首封。
 
-    与 `scan_followthrough_candidates_cached` 区别：
-    - 承接候选：最近曾涨停过、回落到 MA5 附近的股票
-    - 首板候选：最近 N 日未出现过涨停，今日量价启动、逼近涨停的"新生力量"
-
-    迁自 StockFilter._scan_fresh_first_board_candidates_cached；行为零变化。
+    策略（2026-06：从"强势突破型"改造为"资金接入型"）：实测 81% 的真实首板，
+    涨停前一天涨幅 < +3%（中位 -0.3%），旧的 +3~9.5% 强势入口漏掉八成。改为
+    按"资金有没有进来"选票、不按"位置高低"选票——入口放宽到 D-1 涨幅 [-4%,+5%]
+    （由 filter_candidates_fn 注入，见 first_board.filter_capital_inflow_candidates），
+    评分以"资金接入(量能) + 止跌"为主、"板块题材联动"为强加权。
     """
     if spot_df is None or spot_df.empty:
         return []
 
-    if filter_strong_stocks_fn is None:
-        # 没有注入强势股筛选函数时无法继续；保持原行为（原方法必然依赖 self._filter_strong_stocks）
+    if filter_candidates_fn is None:
+        # 未注入入口筛选函数时无法继续（上层 predict.py 负责注入）
         return []
 
-    # 入口涨幅 [+3%, +9.5%)：实证表明 < 3% 涨幅的"潜伏型"虽然在真实
-    # 首板里占 53%，但 base rate 太低（全市场样本太多），加进来反而拉低
-    # precision。保留原范围，靠评分函数提升高分段命中率。
     merged: List[Dict[str, Any]] = []
     seen: set = set()
-    for rec in filter_strong_stocks_fn(spot_df, zt_codes):
-        chg = rec.get("change_pct")
-        if chg is None or chg < 3.0 or chg >= 9.5:
-            continue
+    for rec in filter_candidates_fn(spot_df, zt_codes):
         if rec["code"] in seen:
             continue
         seen.add(rec["code"])
@@ -129,25 +130,23 @@ def score_fresh_first_board(
     limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """对"近期未涨停、今日量价启动"的强势股评分。
+    """资金接入型首板评分：近期未涨停、今日"止跌 + 资金进场"、明日有望首封。
 
-    强制条件：最近 cooldown_days 个交易日内不存在涨停过。命中冷却期返回 None。
+    强制条件：最近 cooldown_days 个交易日内不存在涨停过（才算"首板"）。命中冷却期返回 None。
 
-    ⚠ 校准警示（2026-05-29，27 天 accuracy 表 425 候选 / 420 可买）：
-    旧的"涨幅 8%+ +28 / 量比爆量 +22"组合实测呈**反向校准**：
-      - 50-59 分: loose hit 10.5% (n=192)
-      - 60-69 分: loose hit  2.4% (n=41)  ← 倒挂 4x
-      - 70-79 分: loose hit  0.0% (n=4)
-    入口涨幅 8%+ 的样本 avg T+1 = -1.33%、≥+5% 占比仅 5%；
-    入口涨幅 3-4% 的样本 avg T+1 = +0.85%、≥+5% 占比 25%。
-    A 股真涨停股盘中较快封板，收盘停在 8-9.5% 的多为"想冲没冲上"的滞涨
-    / 高位放量出货，T+1 均值回归概率远大于继续上攻。
+    2026-06 策略改造（从"强势突破型"翻成"资金接入型"）：
+    旧 fresh 模"今日 +3~9.5% 强势 + 多头排列"，但实测最近 30 天 81% 的真实首板，
+    涨停前一天涨幅 < +3%（中位 -0.3%），旧入口漏掉八成；"超跌+资金接入"型首板
+    占比一个月 23%→最近一周 56%，旧逻辑还给这类空头/破位票扣分。
 
-    2026-05-29 调整：
-    1) 翻转当日涨幅权重曲线 —— 3-6% 给最高分，6%+ 弱化甚至倒扣
-    2) 拉开股性活跃度 spread —— 跟实盘经验"凡涨停过的更易再次首板涨停，
-       僵尸股首板成功率低"对齐
-    样本仅 27 天，待累积更多数据后再回收 / 微调。
+    新评分按"资金有没有进来"选票、不按"位置高低"选票：
+    - 主信号：资金接入（量比放大 / 地量启动）+ 止跌（不创新低 / 长下影·十字星 / 收复MA5）
+    - 强加权：板块题材联动（同板块今日涨停家数）+ 题材发酵阶段
+    - 次加权：股性（曾涨停，不再惩罚僵尸冷票）、流通盘适中、换手健康
+    - 降权：高位放量（出货嫌疑）、大盘情绪冰点；位置只用于扣分不做主筛
+
+    注：fund_flow 表覆盖率不足（每日仅 ~8 只、且数据陈旧），资金接入退化为纯量能口径。
+    评估口径见复盘定位——主看"识别形态 vs 当日真实首板形态吻合度"，非 avg_oc PnL。
     """
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
 
@@ -198,70 +197,125 @@ def score_fresh_first_board(
     score = 0.0
     reasons: List[str] = []
 
-    # 1. 当日涨幅 —— 2026-05-29 翻转：3-6% 给最高分（实证最佳入口），
-    #    6-8% 弱化，8%+ 直接倒扣（高位放量滞涨 / T+1 均值回归）。
-    if change_pct is not None:
-        if change_pct >= 8.0:
-            score -= 8
-            reasons.append(f"涨{change_pct:.1f}%高位滞涨-8")
-        elif change_pct >= 6.0:
-            score += 4
-            reasons.append(f"涨{change_pct:.1f}%放量上攻+4")
-        elif change_pct >= 4.0:
-            score += 16
-            reasons.append(f"涨{change_pct:.1f}%突破+16")
-        elif change_pct >= 3.0:
-            score += 20
-            reasons.append(f"涨{change_pct:.1f}%温和启动+20")
-
-    # 2. 量比放大（叠加 20 日校验，剔除"缩量调整里的假放量"）
+    # === 主信号①：资金接入（纯量能口径——fund_flow 覆盖率不足已弃用）===
     vol_ratio, vol_ratio_20 = _shared.vol_ratio_with_baseline(volume, t)
     if vol_ratio is not None:
-        if vol_ratio >= 2.5:
-            score += 22
-            reasons.append(f"量比{vol_ratio:.1f}x爆量+22")
-        elif vol_ratio >= 1.8:
+        if vol_ratio >= 2.0:
             score += 14
-            reasons.append(f"量比{vol_ratio:.1f}x放量+14")
-        elif vol_ratio >= 1.3:
-            score += 6
-            reasons.append(f"量比{vol_ratio:.1f}x温和放量+6")
-        elif vol_ratio < 1.0:
-            score -= 10
-            reasons.append(f"量比{vol_ratio:.1f}x缩量-10")
-
-        if vol_ratio >= 1.3 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+            reasons.append(f"放量资金进{vol_ratio:.1f}x+14")
+        elif vol_ratio >= 1.5:
+            score += 10
+            reasons.append(f"放量资金进{vol_ratio:.1f}x+10")
+        elif vol_ratio >= 1.2:
+            score += 5
+            reasons.append(f"温和资金进{vol_ratio:.1f}x+5")
+        elif vol_ratio < 0.8:
             score -= 8
-            reasons.append(f"5d量比{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-8")
+            reasons.append(f"缩量无资金{vol_ratio:.1f}x-8")
+        # 5d 放量但 20d 仍缩 = 相对前 5 天的假放量
+        if vol_ratio >= 1.3 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+            score -= 6
+            reasons.append(f"5d{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
 
-    # 3. 均线位置：站上 MA5/MA10/MA20
+    ignition = detect_volume_ignition(history)
+    if ignition["ignited"]:
+        score += 8
+        reasons.append(ignition["label"] + "+8")
+
+    # === 主信号②：止跌企稳（先走弱、今日见止跌迹象——资金低位介入的时机）===
+    stop = detect_stop_falling(history)
+    if stop["stabilizing"]:
+        # 有反转 K 线(锤子/十字/收复MA5)才给满分；仅"不创新低"无反转形态止跌偏弱，降权
+        strong_turn = stop["hammer"] or stop["doji"] or stop["reclaim_ma5"]
+        stab = min(10 + (3 if stop["reclaim_ma5"] else 0), 13) if strong_turn else 5
+        score += stab
+        reasons.append((stop["label"] or "止跌企稳") + f"+{stab}")
+    elif stop["prior_weak"] and not stop["no_new_low"]:
+        # 仍在下跌且今日续创新低 = 接飞刀
+        score -= 6
+        reasons.append("下跌中续创新低-6")
+
+    # === 强加权：板块题材联动（同板块今日涨停家数——比单票资金更难造假）===
+    # 候选 industry 来自 spot（universe 证监会粗命名），跟 hot_industries（涨停池东财
+    # 窄命名）实测 0% 对得上；改用 limit_up_stock_meta 的东财行业（与涨停池 100% 同命名、
+    # 覆盖曾涨停过的有股性票）映射后再查，否则板块联动信号全是死的。
+    em_industry_map = compare_context.get("em_industry_map") or {}
+    link_industry = em_industry_map.get(code) or industry
+    hot = hot_industries.get(link_industry, 0) if link_industry else 0
+    if hot >= 4:
+        score += 16
+        reasons.append(f"同板块今日{hot}涨停+16")
+    elif hot == 3:
+        score += 12
+        reasons.append(f"同板块今日{hot}涨停+12")
+    elif hot == 2:
+        score += 8
+        reasons.append(f"同板块今日{hot}涨停+8")
+
+    theme_bonus, theme_reason = _shared.theme_bonus(code, link_industry, compare_context)
+    if theme_bonus > 0:
+        score += theme_bonus
+        if theme_reason:
+            reasons.append(theme_reason)
+
+    # 题材发酵阶段（萌芽/主升 顺风、末期/退潮 逆风）——之前算好但 fresh 没用上
+    phase = (compare_context.get("code_to_concept_phase") or {}).get(code)
+    if phase in ("萌芽", "主升"):
+        score += 4
+        reasons.append(f"题材{phase}期+4")
+    elif phase in ("末期", "退潮"):
+        score -= 4
+        reasons.append(f"题材{phase}期-4")
+
+    # === 次加权：股性（曾涨停加分；不再对僵尸冷票惩罚——资金接入型常是冷票）===
+    occ_count, last_hit_days = _count_historical_any_limit_up(
+        history, code, lookback_days=60, threshold_fn=threshold_fn,
+    )
+    if occ_count >= 3:
+        stock_bonus, label = 8, "股性活跃"
+    elif occ_count >= 1:
+        stock_bonus, label = 4, "曾涨停"
+    else:
+        stock_bonus, label = 0, "冷票"
+    if stock_bonus > 0 and last_hit_days is not None and last_hit_days <= 20:
+        stock_bonus = min(stock_bonus + 2, 10)
+    if stock_bonus > 0:
+        score += stock_bonus
+        reasons.append(f"近60日{occ_count}次涨停{label}+{stock_bonus}")
+
+    # === 次加权：流通盘（游资做首板偏中小盘，百亿大盘难封）===
+    float_mcap = rec.get("float_mcap")
+    if float_mcap:
+        yi = float_mcap / 1e8
+        if yi <= 50:
+            score += 4
+            reasons.append(f"小盘{yi:.0f}亿易封+4")
+        elif yi <= 150:
+            score += 2
+            reasons.append(f"盘子{yi:.0f}亿适中+2")
+        elif yi >= 400:
+            score -= 4
+            reasons.append(f"大盘{yi:.0f}亿难封-4")
+
+    # === 次：换手健康度 ===
+    if turnover is not None:
+        if 3 <= turnover <= 15:
+            score += 4
+            reasons.append(f"换手{turnover:.1f}%健康+4")
+        elif turnover > 30:
+            score -= 6
+            reasons.append(f"换手{turnover:.1f}%过热-6")
+        elif turnover < 1.0:
+            score -= 3
+            reasons.append(f"换手{turnover:.1f}%枯竭-3")
+
+    # === 降权：位置只用于扣分（不做主筛、不正向奖励低位）===
     ma5 = close.rolling(5, min_periods=5).mean()
-    ma10 = close.rolling(10, min_periods=10).mean()
-    ma20 = close.rolling(20, min_periods=20).mean()
     ma5_val = float(ma5.iloc[t]) if not pd.isna(ma5.iloc[t]) else None
-    ma10_val = float(ma10.iloc[t]) if not pd.isna(ma10.iloc[t]) else None
-    ma20_val = float(ma20.iloc[t]) if not pd.isna(ma20.iloc[t]) else None
     dist_ma5_pct = None
     if ma5_val and ma5_val > 0 and latest_close is not None:
         dist_ma5_pct = round((latest_close / ma5_val - 1) * 100, 2)
 
-    if (
-        latest_close is not None and ma5_val and ma10_val and ma20_val
-        and latest_close >= ma5_val >= ma10_val >= ma20_val
-    ):
-        score += 14
-        reasons.append("多头排列+14")
-    elif (
-        latest_close is not None and ma5_val and ma10_val
-        and latest_close >= ma5_val >= ma10_val
-    ):
-        score += 8
-        reasons.append("站上MA5/10+8")
-    elif latest_close is not None and ma5_val and latest_close < ma5_val * 0.99:
-        score -= 8
-        reasons.append("跌破MA5-8")
-
-    # 4. 60日位置：避开高位接盘
     position_60d = None
     if t >= 60:
         window60 = close.iloc[t - 60:t + 1].dropna()
@@ -272,96 +326,30 @@ def score_fresh_first_board(
                 position_60d = round((latest_close - lo) / (hi - lo) * 100, 1)
     if position_60d is not None:
         if position_60d >= 92:
-            score -= 10
-            reasons.append(f"60日位置{position_60d:.0f}%过高-10")
-        elif position_60d <= 35:
-            score += 8
-            reasons.append(f"60日位置{position_60d:.0f}%低位+8")
-        elif 35 < position_60d <= 70:
-            score += 4
-            reasons.append(f"60日位置{position_60d:.0f}%中位+4")
+            score -= 8
+            reasons.append(f"60日位置{position_60d:.0f}%过高-8")
+        elif position_60d >= 85 and vol_ratio is not None and vol_ratio >= 1.5:
+            score -= 8
+            reasons.append(f"高位{position_60d:.0f}%放量出货嫌疑-8")
 
-    # 5. 5日/10日趋势
+    # === 降权：大盘情绪冰点 / 晋级率低 ===
+    sent_score = int(compare_context.get("sentiment_score") or 50)
+    if sent_score < 35:
+        score -= 10
+        reasons.append(f"情绪冰点{sent_score}-10")
+    elif sent_score < 50:
+        score -= 5
+        reasons.append(f"情绪偏冷{sent_score}-5")
+
+    latest_cont_rate = compare_context.get("latest_continuation_rate")
+    if latest_cont_rate is not None and latest_cont_rate < 25:
+        score -= 5
+        reasons.append(f"昨日晋级率{latest_cont_rate:.0f}%低-5")
+
+    # trend_5d 仅用于输出展示（不参与评分）
     trend_5d = None
     if t >= 5 and not pd.isna(close.iloc[t - 5]) and float(close.iloc[t - 5]) > 0 and latest_close is not None:
         trend_5d = round((latest_close / float(close.iloc[t - 5]) - 1) * 100, 1)
-    if trend_5d is not None:
-        if trend_5d > 22:
-            score -= 8
-            reasons.append(f"5日已涨{trend_5d:.1f}%过急-8")
-        elif 4 <= trend_5d <= 18:
-            score += 6
-            reasons.append(f"5日涨{trend_5d:.1f}%稳健+6")
-
-    # 6. 行业共振
-    if industry and hot_industries.get(industry, 0) >= 3:
-        score += 12
-        reasons.append(f"热门板块({hot_industries[industry]}只)+12")
-    elif industry and hot_industries.get(industry, 0) >= 2:
-        score += 6
-        reasons.append(f"板块联动({hot_industries[industry]}只)+6")
-
-    # 6b. 题材热度（来自 AI 题材聚类缓存）
-    theme_bonus, theme_reason = _shared.theme_bonus(code, industry, compare_context)
-    if theme_bonus > 0:
-        score += theme_bonus
-        if theme_reason:
-            reasons.append(theme_reason)
-
-    # 6c. 板块联动（行业涨跌幅加分）
-    flow_bonus, flow_reasons = _shared.capital_flow_bonus(code, compare_context)
-    if flow_bonus != 0:
-        score += flow_bonus
-        reasons.extend(flow_reasons)
-
-    # 7. 换手率
-    if turnover is not None:
-        if 5 <= turnover <= 15:
-            score += 6
-            reasons.append(f"换手{turnover:.1f}%健康+6")
-        elif 15 < turnover <= 25:
-            score += 2
-            reasons.append(f"换手{turnover:.1f}%偏高+2")
-        elif turnover > 30:
-            score -= 6
-            reasons.append(f"换手{turnover:.1f}%过热-6")
-        elif turnover < 1.5:
-            score -= 4
-            reasons.append(f"换手{turnover:.1f}%偏冷-4")
-
-    # 8. 大盘环境调节：晋级率高时稍加分，低时减分
-    latest_cont_rate = compare_context.get("latest_continuation_rate")
-    if latest_cont_rate is not None:
-        if latest_cont_rate >= 60:
-            score += 5
-            reasons.append(f"昨日晋级率{latest_cont_rate:.0f}%+5")
-        elif latest_cont_rate < 25:
-            score -= 5
-            reasons.append(f"昨日晋级率{latest_cont_rate:.0f}%-5")
-
-    # 9. 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚。
-    # 2026-05-29 spread 从 [+6, -3] 拉宽到 [+12, -10]，对齐实盘经验
-    # "凡涨停过的股更易再次首板涨停，僵尸股首板成功率低"；
-    # 同时 fresh 高分段 45 条明细中过半带"僵尸股"标签 → 旧 -3 力度不够把它们压下去。
-    occ_count, last_hit_days = _count_historical_any_limit_up(
-        history, code, lookback_days=60, threshold_fn=threshold_fn,
-    )
-    if occ_count >= 5:
-        stock_bonus, label = 12, "妖股性"
-    elif occ_count >= 3:
-        stock_bonus, label = 8, "股性活跃"
-    elif occ_count >= 1:
-        stock_bonus, label = 4, "曾涨停"
-    else:
-        stock_bonus, label = -10, "僵尸股"
-    if stock_bonus > 0 and last_hit_days is not None and last_hit_days <= 20:
-        stock_bonus = min(stock_bonus + 2, 14)
-        reasons.append(f"近60日{occ_count}次涨停{label}(最近{last_hit_days}日){stock_bonus:+d}")
-    elif stock_bonus > 0:
-        reasons.append(f"近60日{occ_count}次涨停{label}{stock_bonus:+d}")
-    else:
-        reasons.append(f"近60日无涨停{label}{stock_bonus:+d}")
-    score += stock_bonus
 
     final_score = max(0, min(100, int(round(score))))
     return {
@@ -377,7 +365,9 @@ def score_fresh_first_board(
         "trend_5d": trend_5d,
         "position_60d": position_60d,
         "cooldown_days": cooldown_days,
+        "stabilizing": stop["stabilizing"],
+        "volume_ignited": ignition["ignited"],
         "score": final_score,
-        "reasons": " / ".join(reasons[:8]),
+        "reasons": " / ".join(reasons[:10]),
         "predict_type": "首板涨停",
     }

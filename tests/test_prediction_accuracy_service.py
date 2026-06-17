@@ -185,7 +185,8 @@ class TestFreshScoreBucketVersioning(unittest.TestCase):
             "hit_strict": 0,
             "t1_open_close_pct": 5.5,
             "t1_pct": 6.0,
-            "reasons": "涨4.5%突破+16 / 量比1.8x放量+14",
+            # 资金接入型改造后的新词表（放量资金进 / 同板块今日 / 止跌 …）
+            "reasons": "放量资金进1.8x+14 / 同板块今日3涨停+12 / 长下影止跌+10",
         }
 
         with (
@@ -202,6 +203,18 @@ class TestFreshScoreBucketVersioning(unittest.TestCase):
         self.assertEqual(by_label["50-59"]["buyable"], 1)
         self.assertEqual(by_label["50-59"]["hit"], 1)
         self.assertEqual(by_label["70-79"]["buyable"], 0)
+
+    def test_marker_free_new_row_classified_as_current(self):
+        # 审计 finding: 合法新候选(量比∈[0.8,1.2)无量能词、止跌仅收复MA5不含"止跌"子串、
+        # hot<2 无"同板块今日")reasons 一个旧白名单词都不含——黑名单判定下仍应算"当前版"
+        marker_free = {
+            "category": "fresh",
+            "reasons": "收复MA5+13 / 近60日4次涨停股性活跃+10 / 换手8.0%健康+4 / 小盘30亿易封+4",
+        }
+        self.assertTrue(svc._is_current_fresh_score_row(marker_free))
+
+        legacy = {"category": "fresh", "reasons": "涨9.1%逼近涨停+28 / 量比2.9x爆量+22"}
+        self.assertFalse(svc._is_current_fresh_score_row(legacy))
 
 
 if __name__ == "__main__":

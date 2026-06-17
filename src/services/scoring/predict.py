@@ -622,6 +622,7 @@ def predict_limit_up_candidates(
     """
     # 这里 import 是为了避免顶层 import 循环（stock_store / llm_theme_clustering 等老模块）
     from stock_store import (
+        load_all_limit_up_industries,
         save_last_limit_up_prediction,
         save_limit_up_prediction_record,
     )
@@ -1143,6 +1144,15 @@ def predict_limit_up_candidates(
     compare_context["market_max_boards"] = market_max_boards
     compare_context["market_top_codes"] = market_top_codes
 
+    # 资金接入型首板的板块联动：候选 spot 行业是 universe（证监会粗命名），跟涨停池
+    # （东财窄命名）0% 对得上；limit_up_stock_meta 的 industry 与涨停池 100% 同命名，
+    # 覆盖所有曾涨停过的票。建一份 {code: 东财行业} 供 fresh 把候选行业映射到涨停池命名。
+    try:
+        compare_context["em_industry_map"] = load_all_limit_up_industries()
+    except Exception as exc:
+        logger.debug("加载涨停股行业映射失败: %s", exc)
+        compare_context["em_industry_map"] = {}
+
     # 题材阶段映射已在阶段 2.5（concept_hype）一并完成，无需重复调用。
 
     # 阶段3：统一预取所有需要的历史数据（一次搞定）
@@ -1262,7 +1272,7 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_strong_stocks_fn=_first_board.filter_strong_stocks,
+        filter_candidates_fn=_first_board.filter_capital_inflow_candidates,
     )
 
     # 阶段7：断板反包候选（近期涨停被打掉，今日逼近反包）

@@ -714,6 +714,36 @@ def filter_wrap_candidate_stocks(
     return records
 
 
+def filter_capital_inflow_candidates(
+    spot_df: pd.DataFrame, exclude_codes: set
+) -> List[Dict[str, Any]]:
+    """筛选"资金接入型首板"入口池：当日涨幅 ∈ [-4%, +5%]（止跌/微启动区）。
+
+    与 filter_strong_stocks（+3%~9.95% 强势）口径相反：实测最近 30 天 81% 的
+    真实首板，涨停前一天涨幅 < +3%（中位 -0.3%）。资金接入型首板靠"止跌 +
+    资金进场"判定，不靠"今日已强势"，所以入口放宽到 [-4%, +5%]，覆盖被强势
+    口径漏掉的大多数首板。额外带回流通市值（float_mcap）供"流通盘适中"加权。
+
+    沿用 parse_spot_record 的基础过滤（排除 ST / 北交所 / 停牌 / 成交额 < 5000万）。
+    """
+    records = []
+    for _, row in spot_df.iterrows():
+        rec = parse_spot_record(row, exclude_codes)
+        if rec is None:
+            continue
+        chg = rec.get("change_pct")
+        if chg is None or chg < -4.0 or chg > 5.0:
+            continue
+        mc = row.get("流通市值")
+        try:
+            rec["float_mcap"] = float(mc) if pd.notna(mc) else None
+        except (TypeError, ValueError):
+            rec["float_mcap"] = None
+        records.append(rec)
+    records.sort(key=lambda x: -(x.get("amount") or 0))
+    return records
+
+
 def score_first_board_by_profile(
     rec: Dict[str, Any],
     hot_industries: Dict[str, int],

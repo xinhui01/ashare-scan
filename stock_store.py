@@ -2130,6 +2130,37 @@ def load_industry_map(codes: List[str]) -> Dict[str, str]:
     return out
 
 
+def load_all_limit_up_industries() -> Dict[str, str]:
+    """全量加载 limit_up_stock_meta 的 {code: industry}（东财命名）。
+
+    用于"资金接入型首板"的板块联动：候选股从 spot 拿到的行业是 universe（证监会
+    粗命名），跟涨停池（东财窄命名）对不上（实测 0% 完全相等）；而 limit_up_stock_meta
+    的 industry 直接来自涨停池、与之 100% 同命名，且覆盖所有"曾涨停过"的票（≈有股性的
+    候选）。一次性读全表（数千行）建映射，避免 load_industry_map 的 IN(...) 变量上限。
+    """
+    if not _DB_PATH.is_file():
+        return {}
+    out: Dict[str, str] = {}
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT code, industry FROM limit_up_stock_meta WHERE industry != ''"
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("全量读取涨停股行业失败")
+        return {}
+    for row in rows or []:
+        c = str(row["code"] or "").strip().zfill(6)
+        ind = str(row["industry"] or "").strip()
+        if c and ind:
+            out[c] = ind
+    return out
+
+
 def backfill_prediction_accuracy_industry() -> int:
     """一次性回填：从 limit_up_stock_meta 把 industry 补到 accuracy 表里。
 

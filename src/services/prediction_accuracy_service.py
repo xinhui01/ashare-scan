@@ -737,18 +737,23 @@ SCORE_BUCKETS: List[Tuple[str, int, int]] = [
     ("80-100", 80, 100),
 ]
 
-_CURRENT_FRESH_SCORE_MARKERS: Tuple[str, ...] = (
-    "高位滞涨-8",
-    "放量上攻+4",
-    "突破+16",
-    "温和启动+20",
+# 旧"强势突破型"fresh 评分的独有词（含跨多个旧版本）。新"资金接入型"reasons 绝不含这些词。
+# 用黑名单(反向判定)而非白名单：白名单会漏判——某些合法新候选(量比∈[0.8,1.2) 无量能词、
+# 止跌仅由"收复MA5/十字星/不创新低"触发不含"止跌"子串、hot<2 无"同板块今日")可能一个白名单
+# 词都不含，会被误当旧版剔除出 fresh 统计。黑名单只认旧版独有词，新版加新理由词也不会误判。
+_LEGACY_FRESH_SCORE_MARKERS: Tuple[str, ...] = (
+    "逼近涨停", "爆量", "高位滞涨", "放量上攻", "突破", "温和启动",
+    "多头排列", "站上MA", "跌破MA5",
 )
 
 
 def _is_current_fresh_score_row(row: Dict[str, Any]) -> bool:
-    """Whether a fresh-row score was produced by the current scorer weights."""
+    """是否为当前(资金接入型)评分产出的 fresh 行。
+
+    反向判定：含任一旧"强势突破型"独有词即判为旧版；否则视为当前版。
+    """
     reasons = str(row.get("reasons") or "")
-    return any(marker in reasons for marker in _CURRENT_FRESH_SCORE_MARKERS)
+    return not any(marker in reasons for marker in _LEGACY_FRESH_SCORE_MARKERS)
 
 
 def _load_recent_rows(

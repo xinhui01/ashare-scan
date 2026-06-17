@@ -1,6 +1,9 @@
-"""K 线历史形态统计 helper：识别"成功二波接力/连板/反包"形态 + 任意涨停次数。
+"""K 线历史形态统计 helper：识别"成功二波接力/连板/反包"形态 + 任意涨停次数，
+以及"资金接入型首板"用的止跌企稳 / 地量启动单日信号。
 
-4 个函数无状态，输入是 history DataFrame + 配置参数，输出是 (occurrence_count, days_since_last_hit) 元组。
+- _count_historical_* 4 个：输入 history DataFrame + 配置，输出 (occurrence_count, days_since_last_hit)。
+- detect_stop_falling / detect_volume_ignition：输入 history DataFrame，输出当日信号 dict。
+所有函数无状态。
 """
 from __future__ import annotations
 
@@ -193,3 +196,123 @@ def _count_historical_wrap(
             last_hit_idx = b
     last_days = (t - last_hit_idx) if last_hit_idx is not None else None
     return (occ, last_days)
+
+
+def detect_stop_falling(history_df: "pd.DataFrame", lookback: int = 5) -> dict:
+    """止跌企稳信号（today = 最后一行）。
+
+    用于"资金接入型首板"评分：先有一段走弱（prior_weak），今天出现止跌迹象
+    （不创新低 / 长下影锤子 / 十字星 / 收复 MA5）→ 资金可能正在低位介入。
+
+    返回 dict（缺数据时各项 False）：
+      no_new_low / hammer / doji / reclaim_ma5 / prior_weak / stabilizing / label
+    其中 ``stabilizing = prior_weak and (任一止跌迹象)``，是主判定；
+    label 是给评分理由用的中文标签。
+    """
+    empty = {
+        "no_new_low": False, "hammer": False, "doji": False,
+        "reclaim_ma5": False, "prior_weak": False, "stabilizing": False,
+        "label": "",
+    }
+    if history_df is None or len(history_df) < lookback + 2:
+        return empty
+    df = history_df.sort_values("date").reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    open_ = pd.to_numeric(df["open"], errors="coerce") if "open" in df.columns else pd.Series(dtype=float)
+    high = pd.to_numeric(df["high"], errors="coerce") if "high" in df.columns else pd.Series(dtype=float)
+    low = pd.to_numeric(df["low"], errors="coerce") if "low" in df.columns else pd.Series(dtype=float)
+    t = len(df) - 1
+    if pd.isna(close.iloc[t]):
+        return empty
+    c = float(close.iloc[t])
+    o = float(open_.iloc[t]) if not open_.empty and not pd.isna(open_.iloc[t]) else c
+    h = float(high.iloc[t]) if not high.empty and not pd.isna(high.iloc[t]) else c
+    lo = float(low.iloc[t]) if not low.empty and not pd.isna(low.iloc[t]) else c
+    rng = h - lo
+    body = abs(c - o)
+    lower_shadow = min(o, c) - lo
+
+    # 前期走弱：近 10 日收益为负（下跌中 / 超跌背景，但不作硬条件）
+    prior_weak = False
+    if t >= 10 and not pd.isna(close.iloc[t - 10]) and float(close.iloc[t - 10]) > 0:
+        prior_weak = (c / float(close.iloc[t - 10]) - 1) < 0.0
+
+    # 不创新低：今日最低 > 前 lookback 日最低
+    prior_low_win = low.iloc[max(0, t - lookback):t].dropna()
+    no_new_low = bool(not prior_low_win.empty and lo > float(prior_low_win.min()))
+
+    # 长下影（锤子）：下影 ≥ 2×实体 且收盘落在当日上半区
+    hammer = bool(rng > 0 and lower_shadow >= 2 * body and (c - lo) >= 0.5 * rng)
+
+    # 十字星：实体 ≤ 30% 振幅
+    doji = bool(rng > 0 and body <= 0.3 * rng)
+
+    # 收复 MA5：今日收 > MA5 且昨日收 < 昨日 MA5
+    reclaim_ma5 = False
+    if t >= 5:
+        ma5 = close.rolling(5, min_periods=5).mean()
+        if (not pd.isna(ma5.iloc[t]) and not pd.isna(ma5.iloc[t - 1])
+                and not pd.isna(close.iloc[t - 1])):
+            reclaim_ma5 = bool(
+                c > float(ma5.iloc[t]) and float(close.iloc[t - 1]) < float(ma5.iloc[t - 1])
+            )
+
+    turn = hammer or doji or reclaim_ma5 or no_new_low
+    stabilizing = bool(prior_weak and turn)
+
+    labels = []
+    if reclaim_ma5:
+        labels.append("收复MA5")
+    if hammer:
+        labels.append("长下影止跌")
+    if doji:
+        labels.append("十字星企稳")
+    if no_new_low and not (hammer or doji):
+        labels.append("不创新低")
+    return {
+        "no_new_low": no_new_low, "hammer": hammer, "doji": doji,
+        "reclaim_ma5": reclaim_ma5, "prior_weak": prior_weak,
+        "stabilizing": stabilizing, "label": "+".join(labels),
+    }
+
+
+def detect_volume_ignition(
+    history_df: "pd.DataFrame",
+    dry_window: int = 5,
+    baseline_window: int = 20,
+    ignite_mult: float = 1.5,
+    dry_ratio: float = 0.85,
+) -> dict:
+    """地量启动信号（today = 最后一行）：近期缩量(地量) + 今日明显放量。
+
+    比单纯"量比 > X"更准地抓"资金从地量里刚进场那一刻"：要求今天之前的
+    ``dry_window`` 天均量明显低于更早 ``baseline_window`` 段（缩量蓄势），
+    且今天放量 ≥ ``ignite_mult`` 倍于那段地量。
+
+    返回 dict：today_ratio / was_dry / ignited / label
+    """
+    empty = {"today_ratio": None, "was_dry": False, "ignited": False, "label": ""}
+    if history_df is None or len(history_df) < baseline_window + 2:
+        return empty
+    df = history_df.sort_values("date").reset_index(drop=True)
+    vol = pd.to_numeric(df["volume"], errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
+    if vol.empty:
+        return empty
+    t = len(df) - 1
+    if pd.isna(vol.iloc[t]) or float(vol.iloc[t]) <= 0:
+        return empty
+    cur = float(vol.iloc[t])
+    recent = vol.iloc[max(0, t - dry_window):t].dropna()        # 今日之前 dry_window 天
+    base = vol.iloc[max(0, t - baseline_window):t - dry_window].dropna()
+    if recent.empty or float(recent.mean()) <= 0:
+        return empty
+    today_ratio = round(cur / float(recent.mean()), 2)
+    was_dry = bool(
+        not base.empty and float(base.mean()) > 0
+        and float(recent.mean()) < float(base.mean()) * dry_ratio
+    )
+    ignited = bool(was_dry and today_ratio >= ignite_mult)
+    return {
+        "today_ratio": today_ratio, "was_dry": was_dry, "ignited": ignited,
+        "label": f"地量启动{today_ratio:.1f}x" if ignited else "",
+    }
