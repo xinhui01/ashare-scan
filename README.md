@@ -137,7 +137,11 @@ start_app.bat
 update_cache.bat
 predict_today.bat
 update_and_predict.bat
+sentiment.bat
+今日市场情绪.bat
 ```
+
+其中 `今日市场情绪.bat` 是中文文件名入口，作用和 `sentiment.bat` 一样，适合直接双击获取今日市场情绪。
 
 如果是第一次运行，建议先确认依赖已安装：
 

@@ -57,6 +57,13 @@ def test_sentiment_bat_runs_sentiment_command():
     assert 'if "%~1"=="" pause' in text
 
 
+def test_chinese_sentiment_bat_alias_calls_sentiment_script():
+    text = _script_text("今日市场情绪.bat")
+
+    assert 'call "%~dp0sentiment.bat" %*' in text
+    assert "exit /b %ERRORLEVEL%" in text
+
+
 def test_run_tasks_bat_offers_a_menu_without_remembering_commands():
     text = _script_text("run_tasks.bat")
 
