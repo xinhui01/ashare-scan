@@ -47,6 +47,11 @@ TREND_LABELS = {
     "flat": "走平",
     "declining": "下降",
 }
+SOURCE_PRIORITY = {
+    "概念": 0,
+    "LLM题材": 1,
+    "行业": 2,
+}
 
 
 def compute_opportunity_score(record: Dict[str, Any]) -> int:
@@ -99,6 +104,11 @@ def trend_label(trend: Any) -> str:
     """把内部趋势枚举转成界面友好的中文。"""
     value = str(trend or "").strip()
     return TREND_LABELS.get(value, value)
+
+
+def _source_priority(source: Any) -> int:
+    """主线展示优先细题材；行业只作为没有细题材时的兜底。"""
+    return SOURCE_PRIORITY.get(str(source or "").strip(), 9)
 
 
 def _normalize_date(s: Any) -> str:
@@ -409,6 +419,19 @@ def _build_main_line_summary(
     }
 
 
+def _empty_stats() -> Dict[str, Any]:
+    return {
+        "total_concepts": 0,
+        "active_concepts": 0,
+        "total_limit_ups": 0,
+        "fresh_concepts": [],
+        "primary_source": "行业",
+        "concept_pairs": 0,
+        "concept_covered_codes": 0,
+        "llm_cache_days": 0,
+    }
+
+
 # ============== 对外主入口 ==============
 
 def analyze_concept_hype(
@@ -443,10 +466,7 @@ def analyze_concept_hype(
             "trade_dates": [],
             "concepts": [],
             "main_line": {"name": "", "summary": "本地无 limit_up_pool 缓存，无法分析。"},
-            "stats": {
-                "total_concepts": 0, "active_concepts": 0,
-                "total_limit_ups": 0, "fresh_concepts": [],
-            },
+            "stats": _empty_stats(),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -469,10 +489,7 @@ def analyze_concept_hype(
             "end_date": actual_end, "start_date": actual_start,
             "trade_dates": window_dates, "concepts": [],
             "main_line": {"name": "", "summary": "窗口内涨停池均为空。"},
-            "stats": {
-                "total_concepts": 0, "active_concepts": 0,
-                "total_limit_ups": 0, "fresh_concepts": [],
-            },
+            "stats": _empty_stats(),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -485,6 +502,11 @@ def analyze_concept_hype(
     # LLM 题材缓存（增强信号 2）
     llm_themes_per_day = _load_llm_theme_per_day(window_dates)
     _l(f"  LLM 题材缓存命中 {len(llm_themes_per_day)}/{len(window_dates)} 天")
+    primary_source = (
+        "概念" if concept_pairs > 0
+        else "LLM题材" if llm_themes_per_day
+        else "行业"
+    )
 
     # 构建 (concept_label, source) -> {date: [member, ...]} 的逆排
     label_to_day_members: Dict[Tuple[str, str], Dict[str, List[Dict[str, Any]]]] = (
@@ -524,9 +546,10 @@ def analyze_concept_hype(
         if rec:
             ranked.append(rec)
 
-    # 排序：机会分 desc → 今涨停 desc → 累计 desc
+    # 排序：细题材来源优先 → 机会分 desc → 今涨停 desc → 累计 desc
     ranked.sort(
         key=lambda r: (
+            _source_priority(r.get("source")),
             -int(r.get("opportunity_score", 0)),
             -int(r["today_count"]),
             -int(r["total_limit_ups"]),
@@ -561,6 +584,10 @@ def analyze_concept_hype(
             "active_concepts": active_count,
             "total_limit_ups": total_lu,
             "fresh_concepts": fresh,
+            "primary_source": primary_source,
+            "concept_pairs": concept_pairs,
+            "concept_covered_codes": len(code_to_concepts),
+            "llm_cache_days": len(llm_themes_per_day),
         },
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }

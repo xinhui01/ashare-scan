@@ -778,8 +778,8 @@ class PredictTab:
             "点击「开始分析」识别近 N 个交易日正在被炒作的概念/行业。\n\n"
             "数据维度：\n"
             "  · 行业（涨停池自带，必有）\n"
-            "  · 概念（依赖“刷新概念库”，未刷则跳过）\n"
-            "  · LLM 题材（依赖涨停对比 tab AI 聚类缓存）\n\n"
+            "  · 概念（本地主流程，依赖“刷新概念库”，未刷则跳过）\n"
+            "  · LLM 题材（只读已有缓存，可选增强，不会现场调用模型）\n\n"
             "判定口径：\n"
             "  · 起爆日：单日涨停数 ≥ 3 且 ≥ 前 3 日均值的 2 倍\n"
             "  · 持续天数：起爆日 → 基准日\n"
@@ -1569,6 +1569,15 @@ class PredictTab:
             f"题材数 {stats.get('total_concepts', 0)}（今日活跃 "
             f"{stats.get('active_concepts', 0)}） | 累计涨停 "
             f"{stats.get('total_limit_ups', 0)} 次"
+        )
+        primary = stats.get("primary_source") or "行业"
+        concept_pairs = int(stats.get("concept_pairs") or 0)
+        concept_codes = int(stats.get("concept_covered_codes") or 0)
+        llm_days = int(stats.get("llm_cache_days") or 0)
+        lines.append(
+            f"分析口径：{primary}优先"
+            f"（概念库 {concept_pairs} 对 / 覆盖 {concept_codes} 只；"
+            f"LLM缓存 {llm_days} 天，仅增强）"
         )
         lines.append("")
         if ml.get("name"):
@@ -2597,6 +2606,7 @@ class PredictTab:
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
         compare_context = result.get("compare_context", {})
+        theme_prediction = result.get("theme_prediction") or {}
 
         # ---- 填充摘要 ----
         self.summary_text.config(state=tk.NORMAL)
@@ -2633,7 +2643,7 @@ class PredictTab:
             th = dq.get("themes") or {}
             th_state = "已加载" if th.get("loaded") else "未加载"
             txt.insert(tk.END,
-                f"  AI 题材聚类: {th_state}（{th.get('themes', 0)} 个题材 / "
+                f"  题材识别: {th_state}（{th.get('themes', 0)} 个题材 / "
                 f"覆盖 {th.get('covered_codes', 0)} 只涨停股）\n"
             )
             bs = dq.get("board_strength") or {}
@@ -2697,6 +2707,61 @@ class PredictTab:
                     f"  昨首板{item.get('yesterday_first_count', 0):2d}只  "
                     f"晋级{item.get('continued_count', 0):2d}只  "
                     f"晋级率={rate_text}\n",
+                )
+
+        theme_groups = theme_prediction.get("groups") or []
+        if theme_groups:
+            role_order = theme_prediction.get("role_order") or [
+                "core", "relay", "repair", "replenish", "watch",
+            ]
+            role_labels = {
+                "core": "连板核心",
+                "relay": "二波接力",
+                "repair": "反包修复",
+                "replenish": "首板补涨",
+                "watch": "趋势观察",
+                **(theme_prediction.get("role_labels") or {}),
+            }
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  主线题材候选\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for group in theme_groups[:5]:
+                source = group.get("source") or "题材"
+                phase = group.get("phase") or "-"
+                score = int(group.get("opportunity_score") or 0)
+                candidate_count = int(group.get("candidate_count") or 0)
+                txt.insert(
+                    tk.END,
+                    f"  【{group.get('name', '-')}】{source}/{phase} "
+                    f"机会分={score} 候选={candidate_count}\n",
+                )
+                roles = group.get("roles") or {}
+                for role in role_order:
+                    rows = roles.get(role) or []
+                    if not rows:
+                        continue
+                    label = role_labels.get(role, role)
+                    top = rows[:3]
+                    names = []
+                    for rec in top:
+                        score_text = int(rec.get("calibrated_score") or rec.get("score") or 0)
+                        match = rec.get("theme_match") or ""
+                        suffix = f"/{match}" if match and match != "个股命中" else ""
+                        names.append(
+                            f"{rec.get('code', '')} {rec.get('name', '')}"
+                            f"({score_text}{suffix})"
+                        )
+                    extra = "" if len(rows) <= 3 else f" 等{len(rows)}只"
+                    txt.insert(
+                        tk.END,
+                        f"    {label}: {'、'.join(names)}{extra}\n",
+                    )
+            ungrouped = theme_prediction.get("ungrouped") or {}
+            ungrouped_count = int(ungrouped.get("candidate_count") or 0)
+            if ungrouped_count:
+                txt.insert(
+                    tk.END,
+                    f"  非主线观察: {ungrouped_count} 只（未命中当前主线题材）\n",
                 )
 
         # 保留涨停 TOP10

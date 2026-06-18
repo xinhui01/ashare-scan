@@ -1309,6 +1309,34 @@ def predict_limit_up_candidates(
         filter_ma5_pullback_stocks_fn=_first_board.filter_ma5_pullback_stocks,
     )
 
+    try:
+        from src.services.prediction_theme_service import build_theme_prediction_groups
+        theme_prediction = build_theme_prediction_groups(
+            {
+                "continuation_candidates": continuation_candidates,
+                "first_board_candidates": first_board_candidates,
+                "fresh_first_board_candidates": fresh_first_board_candidates,
+                "broken_board_wrap_candidates": broken_board_wrap_candidates,
+                "trend_limit_up_candidates": trend_limit_up_candidates,
+            },
+            hype_result=hype,
+            compare_context=compare_context,
+        )
+    except Exception as exc:
+        logger.debug("构建题材优先候选失败: %s", exc)
+        theme_prediction = {
+            "groups": [],
+            "ungrouped": {},
+            "role_order": [],
+            "role_labels": {},
+            "stats": {
+                "theme_count": 0,
+                "total_candidates": 0,
+                "grouped_candidates": 0,
+                "ungrouped_candidates": 0,
+            },
+        }
+
     # 摘要
     summary_lines = [
         f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
@@ -1332,8 +1360,22 @@ def predict_limit_up_candidates(
     if theme_size_map:
         top_themes = sorted(theme_size_map.items(), key=lambda x: -x[1])[:3]
         summary_lines.append(
-            f"AI 题材聚类：{'、'.join(f'{k}({v}只)' for k, v in top_themes)}"
+            f"题材识别：{'、'.join(f'{k}({v}只)' for k, v in top_themes)}"
         )
+    theme_groups = theme_prediction.get("groups") or []
+    if theme_groups:
+        role_labels = theme_prediction.get("role_labels") or {}
+        role_order = theme_prediction.get("role_order") or []
+        parts = []
+        for group in theme_groups[:3]:
+            role_parts = []
+            for role in role_order:
+                cnt = int((group.get("counts") or {}).get(role) or 0)
+                if cnt:
+                    role_parts.append(f"{role_labels.get(role, role)}{cnt}")
+            role_text = "/".join(role_parts) or "候选0"
+            parts.append(f"{group.get('name')}({role_text})")
+        summary_lines.append(f"主线题材候选：{'、'.join(parts)}")
     if board_strength:
         top_boards = sorted(board_strength.items(), key=lambda x: -x[1])[:5]
         summary_lines.append(
@@ -1351,6 +1393,7 @@ def predict_limit_up_candidates(
         "trend_limit_up_candidates": trend_limit_up_candidates,
         "hot_industries": hot_industries,
         "compare_context": compare_context,
+        "theme_prediction": theme_prediction,
         "summary": "\n".join(summary_lines),
         "data_quality": data_quality,
     }
