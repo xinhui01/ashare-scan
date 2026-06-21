@@ -142,3 +142,42 @@ def test_direct_code_theme_overrides_industry_fallback():
 
     assert result["groups"][0]["name"] == "机器人"
     assert result["groups"][0]["roles"]["replenish"][0]["theme_match"] == "个股命中"
+
+
+def test_industry_only_hype_does_not_create_theme_groups():
+    prediction = {
+        "fresh_first_board_candidates": [
+            {
+                "code": "300252",
+                "name": "金信诺",
+                "industry": "电气机械和器材",
+                "score": 72,
+            }
+        ],
+    }
+    hype = {
+        "concepts": [
+            {
+                "name": "电气机械和器材",
+                "source": "行业",
+                "phase": "萌芽",
+                "opportunity_score": 72,
+                "members": [{"code": "300252", "name": "金信诺"}],
+                "related_industries": [{"name": "电气机械和器材", "count": 4}],
+            }
+        ],
+    }
+    compare_context = {
+        "code_theme_map": {"300252": "电气机械和器材"},
+        "theme_size_map": {"电气机械和器材": 4},
+    }
+
+    result = build_theme_prediction_groups(
+        prediction,
+        hype_result=hype,
+        compare_context=compare_context,
+    )
+
+    assert result["groups"] == []
+    assert result["ungrouped"]["roles"]["replenish"][0]["code"] == "300252"
+    assert result["ungrouped"]["roles"]["replenish"][0]["theme_name"] == ""

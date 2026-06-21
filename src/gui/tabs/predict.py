@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -161,6 +162,10 @@ class PredictTab:
         self.thread: Optional[threading.Thread] = None
         self.result: Optional[Dict[str, Any]] = None
         self.results_map: Dict = {}
+        self.candidate_theme_by_code: Dict[str, str] = {}
+        self.candidate_theme_by_industry: Dict[str, str] = {}
+        self.candidate_real_theme_names: set = set()
+        self.candidate_industry_theme_names: set = set()
         self.opening_confirm_thread: Optional[threading.Thread] = None
         self.opening_confirm_result: Optional[Dict[str, Any]] = None
         self.prewarm_thread: Optional[threading.Thread] = None
@@ -188,8 +193,14 @@ class PredictTab:
 
         style = ttk.Style()
         style.configure("Predict.Treeview", rowheight=24)
+        style.configure("PredictCandidate.Treeview", rowheight=56)
         style.map(
             "Predict.Treeview",
+            background=[("selected", "#2f6fd6")],
+            foreground=[("selected", "#ffffff")],
+        )
+        style.map(
+            "PredictCandidate.Treeview",
             background=[("selected", "#2f6fd6")],
             foreground=[("selected", "#ffffff")],
         )
@@ -356,6 +367,8 @@ class PredictTab:
 
         self.filter_count_label = ttk.Label(filter_bar, text="", foreground="#666")
         self.filter_count_label.pack(side=tk.RIGHT, padx=8)
+        self.theme_data_status_label = ttk.Label(filter_bar, text="", foreground="#666")
+        self.theme_data_status_label.pack(side=tk.RIGHT, padx=(8, 0))
 
         # ---- 主区域：左侧摘要 + 右侧表格 ----
         body = ttk.PanedWindow(predict_frame, orient=tk.HORIZONTAL)
@@ -393,13 +406,15 @@ class PredictTab:
 
         # 连板延续候选 Tab
         cont_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(cont_tab, text="保留涨停候选")
+        self.table_nb.add(cont_tab, text=self._candidate_tab_title("cont", 0, 0))
         cont_stat = ttk.Label(cont_tab, text="历史命中率: -", foreground="#444",
-                              anchor=tk.W, padding=(6, 2))
+                              anchor=tk.W, padding=(6, 2), wraplength=900,
+                              justify=tk.LEFT)
         cont_stat.pack(side=tk.TOP, fill=tk.X)
         self.stat_labels["cont"] = cont_stat
         cont_best = ttk.Label(cont_tab, text="历史最优段: -",
-                              foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+                              foreground="#b8860b", anchor=tk.W, padding=(6, 1),
+                              wraplength=900, justify=tk.LEFT)
         cont_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["cont"] = cont_best
 
@@ -454,28 +469,34 @@ class PredictTab:
             # 兼容旧 stat_labels：让 sub_key 指向 recent_lbl（"近20d"列），
             # 这样 _apply_accuracy 现有 sub_key 分支的 fallback 仍能工作
             self.stat_labels[sub_key] = recent_lbl
-        cont_cols = ("code", "name", "industry", "boards", "change_pct", "close",
-                     "seal_time", "breaks", "turnover", "score", "confirm", "auction", "result", "reasons")
+        cont_cols = ("code", "name", "industry", "theme", "boards", "change_pct",
+                     "seal_time", "score", "confirm", "auction", "result", "reasons")
         self.cont_tree = ttk.Treeview(
-            cont_tab, columns=cont_cols, show="headings", height=22, style="Predict.Treeview",
+            cont_tab, columns=cont_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70), "close": ("收盘价", 70),
-            "seal_time": ("首封时间", 80), "breaks": ("炸板", 50),
-            "turnover": ("换手%", 65), "score": ("预测分", 65),
+            "code": ("代码", 70), "name": ("名称", 85),
+            "industry": ("行业", 85), "theme": ("题材", 110),
+            "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70),
+            "seal_time": ("首封时间", 80), "score": ("预测分", 65),
             "confirm": ("确认", 70), "auction": ("竞价/开盘", 115),
             "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
+            "reasons": ("预测依据", 260),
         }.items():
             self.cont_tree.heading(
                 col, text=heading,
                 command=lambda c=col: self._on_heading_click("cont", c),
             )
-            self.cont_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+            self.cont_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("industry", "theme", "reasons") else tk.W,
+                stretch=False,
+            )
         sb_cont = ttk.Scrollbar(cont_tab, orient=tk.VERTICAL, command=self.cont_tree.yview)
-        self.cont_tree.configure(yscrollcommand=sb_cont.set)
+        xsb_cont = ttk.Scrollbar(cont_tab, orient=tk.HORIZONTAL, command=self.cont_tree.xview)
+        self.cont_tree.configure(yscrollcommand=sb_cont.set, xscrollcommand=xsb_cont.set)
         sb_cont.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_cont.pack(side=tk.BOTTOM, fill=tk.X)
         self.cont_tree.pack(fill=tk.BOTH, expand=True)
         self.cont_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
         self.cont_tree.bind("<Double-1>", self._on_stock_double_click)
@@ -489,38 +510,46 @@ class PredictTab:
 
         # 首板候选 Tab
         first_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(first_tab, text="二波接力候选")
+        self.table_nb.add(first_tab, text=self._candidate_tab_title("first", 0, 0))
         first_stat = ttk.Label(first_tab, text="历史命中率: -", foreground="#444",
-                               anchor=tk.W, padding=(6, 2))
+                               anchor=tk.W, padding=(6, 2), wraplength=900,
+                               justify=tk.LEFT)
         first_stat.pack(side=tk.TOP, fill=tk.X)
         self.stat_labels["first"] = first_stat
         first_best = ttk.Label(first_tab, text="历史最优段: -",
-                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1),
+                               wraplength=900, justify=tk.LEFT)
         first_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["first"] = first_best
-        first_cols = ("code", "name", "industry", "change_pct", "close",
-                      "burst_date", "burst_ratio", "dist_ma5", "days_since_burst",
-                      "score", "confirm", "auction", "result", "reasons")
+        first_cols = ("code", "name", "industry", "theme", "change_pct",
+                      "burst_ratio", "dist_ma5", "score",
+                      "confirm", "auction", "result", "reasons")
         self.first_tree = ttk.Treeview(
-            first_tab, columns=first_cols, show="headings", height=22, style="Predict.Treeview",
+            first_tab, columns=first_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
-            "burst_date": ("爆量日", 90), "burst_ratio": ("爆量倍数", 70),
-            "dist_ma5": ("距MA5%", 65), "days_since_burst": ("距爆量日", 65),
+            "code": ("代码", 70), "name": ("名称", 85),
+            "industry": ("行业", 85), "theme": ("题材", 110),
+            "change_pct": ("今日涨幅%", 75), "burst_ratio": ("爆量倍数", 70),
+            "dist_ma5": ("距MA5%", 65),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
+            "reasons": ("预测依据", 260),
         }.items():
             self.first_tree.heading(
                 col, text=heading,
                 command=lambda c=col: self._on_heading_click("first", c),
             )
-            self.first_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+            self.first_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("industry", "theme", "reasons") else tk.W,
+                stretch=False,
+            )
         sb_first = ttk.Scrollbar(first_tab, orient=tk.VERTICAL, command=self.first_tree.yview)
-        self.first_tree.configure(yscrollcommand=sb_first.set)
+        xsb_first = ttk.Scrollbar(first_tab, orient=tk.HORIZONTAL, command=self.first_tree.xview)
+        self.first_tree.configure(yscrollcommand=sb_first.set, xscrollcommand=xsb_first.set)
         sb_first.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_first.pack(side=tk.BOTTOM, fill=tk.X)
         self.first_tree.pack(fill=tk.BOTH, expand=True)
         self.first_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
         self.first_tree.bind("<Double-1>", self._on_stock_double_click)
@@ -533,39 +562,47 @@ class PredictTab:
 
         # 首板涨停候选 Tab（最近 N 日未涨停、今日量价启动）
         fresh_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(fresh_tab, text="首板涨停候选")
+        self.table_nb.add(fresh_tab, text=self._candidate_tab_title("fresh", 0, 0))
         fresh_stat = ttk.Label(fresh_tab, text="历史命中率: -", foreground="#444",
-                               anchor=tk.W, padding=(6, 2))
+                               anchor=tk.W, padding=(6, 2), wraplength=900,
+                               justify=tk.LEFT)
         fresh_stat.pack(side=tk.TOP, fill=tk.X)
         self.stat_labels["fresh"] = fresh_stat
         fresh_best = ttk.Label(fresh_tab, text="历史最优段: -",
-                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1),
+                               wraplength=900, justify=tk.LEFT)
         fresh_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["fresh"] = fresh_best
-        fresh_cols = ("code", "name", "industry", "change_pct", "close",
-                      "volume_ratio", "dist_ma5", "trend_5d", "position_60d",
-                      "turnover", "score", "confirm", "auction", "result", "reasons")
+        fresh_cols = ("code", "name", "industry", "theme", "change_pct",
+                      "volume_ratio", "dist_ma5", "trend_5d",
+                      "score", "confirm", "auction", "result", "reasons")
         self.fresh_tree = ttk.Treeview(
-            fresh_tab, columns=fresh_cols, show="headings", height=22, style="Predict.Treeview",
+            fresh_tab, columns=fresh_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "code": ("代码", 70), "name": ("名称", 85),
+            "industry": ("行业", 85), "theme": ("题材", 110),
+            "change_pct": ("今日涨幅%", 75),
             "volume_ratio": ("量比", 60), "dist_ma5": ("距MA5%", 65),
-            "trend_5d": ("5日涨幅%", 70), "position_60d": ("60日位置%", 75),
-            "turnover": ("换手%", 65),
+            "trend_5d": ("5日涨幅%", 70),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
+            "reasons": ("预测依据", 260),
         }.items():
             self.fresh_tree.heading(
                 col, text=heading,
                 command=lambda c=col: self._on_heading_click("fresh", c),
             )
-            self.fresh_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+            self.fresh_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("industry", "theme", "reasons") else tk.W,
+                stretch=False,
+            )
         sb_fresh = ttk.Scrollbar(fresh_tab, orient=tk.VERTICAL, command=self.fresh_tree.yview)
-        self.fresh_tree.configure(yscrollcommand=sb_fresh.set)
+        xsb_fresh = ttk.Scrollbar(fresh_tab, orient=tk.HORIZONTAL, command=self.fresh_tree.xview)
+        self.fresh_tree.configure(yscrollcommand=sb_fresh.set, xscrollcommand=xsb_fresh.set)
         sb_fresh.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_fresh.pack(side=tk.BOTTOM, fill=tk.X)
         self.fresh_tree.pack(fill=tk.BOTH, expand=True)
         self.fresh_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
         self.fresh_tree.bind("<Double-1>", self._on_stock_double_click)
@@ -578,42 +615,48 @@ class PredictTab:
 
         # 断板反包候选 Tab（近期涨停被打掉，今日逼近反包）
         wrap_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(wrap_tab, text="反包候选")
+        self.table_nb.add(wrap_tab, text=self._candidate_tab_title("wrap", 0, 0))
         wrap_stat = ttk.Label(wrap_tab, text="历史命中率: -", foreground="#444",
-                              anchor=tk.W, padding=(6, 2))
+                              anchor=tk.W, padding=(6, 2), wraplength=900,
+                              justify=tk.LEFT)
         wrap_stat.pack(side=tk.TOP, fill=tk.X)
         self.stat_labels["wrap"] = wrap_stat
         wrap_best = ttk.Label(wrap_tab, text="历史最优段: -",
-                              foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+                              foreground="#b8860b", anchor=tk.W, padding=(6, 1),
+                              wraplength=900, justify=tk.LEFT)
         wrap_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["wrap"] = wrap_best
-        wrap_cols = ("code", "name", "industry", "pattern_kind", "change_pct", "close",
-                     "prior_lu_date", "prior_lu_close", "wrap_gap", "days_since_lu",
-                     "worst_drop", "volume_ratio", "popularity_rank", "score",
-                     "confirm", "auction", "result", "reasons")
+        wrap_cols = ("code", "name", "industry", "theme", "pattern_kind", "change_pct",
+                     "prior_lu_date", "wrap_gap", "days_since_lu",
+                     "score", "confirm", "auction", "result", "reasons")
         self.wrap_tree = ttk.Treeview(
-            wrap_tab, columns=wrap_cols, show="headings", height=22, style="Predict.Treeview",
+            wrap_tab, columns=wrap_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
+            "code": ("代码", 70), "name": ("名称", 85),
+            "industry": ("行业", 85), "theme": ("题材", 110),
             "pattern_kind": ("形态", 70),
-            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
-            "prior_lu_date": ("前涨停日", 90), "prior_lu_close": ("前涨停价", 75),
+            "change_pct": ("今日涨幅%", 75),
+            "prior_lu_date": ("前涨停日", 90),
             "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
-            "worst_drop": ("最深阴线%", 80), "volume_ratio": ("量比", 60),
-            "popularity_rank": ("人气", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
+            "reasons": ("预测依据", 260),
         }.items():
             self.wrap_tree.heading(
                 col, text=heading,
                 command=lambda c=col: self._on_heading_click("wrap", c),
             )
-            self.wrap_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+            self.wrap_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("industry", "theme", "reasons") else tk.W,
+                stretch=False,
+            )
         sb_wrap = ttk.Scrollbar(wrap_tab, orient=tk.VERTICAL, command=self.wrap_tree.yview)
-        self.wrap_tree.configure(yscrollcommand=sb_wrap.set)
+        xsb_wrap = ttk.Scrollbar(wrap_tab, orient=tk.HORIZONTAL, command=self.wrap_tree.xview)
+        self.wrap_tree.configure(yscrollcommand=sb_wrap.set, xscrollcommand=xsb_wrap.set)
         sb_wrap.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_wrap.pack(side=tk.BOTTOM, fill=tk.X)
         self.wrap_tree.pack(fill=tk.BOTH, expand=True)
         self.wrap_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
         self.wrap_tree.bind("<Double-1>", self._on_stock_double_click)
@@ -626,41 +669,48 @@ class PredictTab:
 
         # 趋势涨停候选 Tab（多头排列、稳健上行，明日有望加速）
         trend_tab = ttk.Frame(self.table_nb)
-        self.table_nb.add(trend_tab, text="趋势涨停候选")
+        self.table_nb.add(trend_tab, text=self._candidate_tab_title("trend", 0, 0))
         trend_stat = ttk.Label(trend_tab, text="历史命中率: -", foreground="#444",
-                               anchor=tk.W, padding=(6, 2))
+                               anchor=tk.W, padding=(6, 2), wraplength=900,
+                               justify=tk.LEFT)
         trend_stat.pack(side=tk.TOP, fill=tk.X)
         self.stat_labels["trend"] = trend_stat
         trend_best = ttk.Label(trend_tab, text="历史最优段: -",
-                               foreground="#b8860b", anchor=tk.W, padding=(6, 1))
+                               foreground="#b8860b", anchor=tk.W, padding=(6, 1),
+                               wraplength=900, justify=tk.LEFT)
         trend_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["trend"] = trend_best
-        trend_cols = ("code", "name", "industry", "change_pct", "close",
-                      "ma_spread", "ma20_slope", "dist_ma5", "trend_5d",
-                      "trend_10d", "position_60d", "volume_ratio", "turnover",
-                      "score", "confirm", "auction", "result", "reasons")
+        trend_cols = ("code", "name", "industry", "theme", "change_pct",
+                      "ma_spread", "ma20_slope", "trend_5d",
+                      "volume_ratio", "score", "confirm", "auction", "result", "reasons")
         self.trend_tree = ttk.Treeview(
-            trend_tab, columns=trend_cols, show="headings", height=22, style="Predict.Treeview",
+            trend_tab, columns=trend_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85), "industry": ("行业", 85),
-            "change_pct": ("今日涨幅%", 75), "close": ("收盘价", 70),
+            "code": ("代码", 70), "name": ("名称", 85),
+            "industry": ("行业", 85), "theme": ("题材", 110),
+            "change_pct": ("今日涨幅%", 75),
             "ma_spread": ("均线差%", 70), "ma20_slope": ("MA20斜率%", 80),
-            "dist_ma5": ("距MA5%", 65), "trend_5d": ("5日涨幅%", 70),
-            "trend_10d": ("10日涨幅%", 75), "position_60d": ("60日位置%", 75),
-            "volume_ratio": ("量比", 60), "turnover": ("换手%", 65),
+            "trend_5d": ("5日涨幅%", 70),
+            "volume_ratio": ("量比", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
-            "reasons": ("预测依据", 300),
+            "reasons": ("预测依据", 260),
         }.items():
             self.trend_tree.heading(
                 col, text=heading,
                 command=lambda c=col: self._on_heading_click("trend", c),
             )
-            self.trend_tree.column(col, width=w, anchor=tk.CENTER if col != "reasons" else tk.W)
+            self.trend_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("industry", "theme", "reasons") else tk.W,
+                stretch=False,
+            )
         sb_trend = ttk.Scrollbar(trend_tab, orient=tk.VERTICAL, command=self.trend_tree.yview)
-        self.trend_tree.configure(yscrollcommand=sb_trend.set)
+        xsb_trend = ttk.Scrollbar(trend_tab, orient=tk.HORIZONTAL, command=self.trend_tree.xview)
+        self.trend_tree.configure(yscrollcommand=sb_trend.set, xscrollcommand=xsb_trend.set)
         sb_trend.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_trend.pack(side=tk.BOTTOM, fill=tk.X)
         self.trend_tree.pack(fill=tk.BOTH, expand=True)
         self.trend_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
         self.trend_tree.bind("<Double-1>", self._on_stock_double_click)
@@ -688,7 +738,7 @@ class PredictTab:
         - 下：选中题材的涨停成员表（双击跳详情）
         """
         hype_tab = ttk.Frame(parent_nb)
-        parent_nb.add(hype_tab, text="概念炒作")
+        parent_nb.add(hype_tab, text=self._candidate_tab_title("concept", 0, 0))
         self.concept_hype_tab = hype_tab
 
         # ---- 操作栏 ----
@@ -697,6 +747,10 @@ class PredictTab:
         ttk.Button(
             action, text="开始分析", command=self._start_concept_hype_analysis,
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            action, text="刷新概念库",
+            command=self._refresh_concept_index_from_predict,
+        ).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(action, text="基准日期:").pack(side=tk.LEFT, padx=(10, 2))
         self.concept_hype_end_date_var = tk.StringVar(
             value=datetime.now().strftime("%Y%m%d"),
@@ -1039,6 +1093,37 @@ class PredictTab:
         return best_map.get(category)
 
     @staticmethod
+    def _candidate_tab_title(category: str, shown: int, total: int) -> str:
+        names = {
+            "cont": "保留",
+            "first": "二波",
+            "fresh": "首板",
+            "wrap": "反包",
+            "trend": "趋势",
+            "concept": "概念",
+        }
+        name = names.get(category, category)
+        if category == "concept":
+            return name
+        return f"{name}({shown}/{total})" if shown != total else f"{name}({total})"
+
+    @staticmethod
+    def _accuracy_header_text(
+        name: str,
+        yesterday: str,
+        dates: int,
+        rate: float,
+        hit: int,
+        buyable: int,
+        avg_pct: float,
+    ) -> str:
+        return (
+            f"{name} · 昨日 {yesterday} · "
+            f"近{dates}日 {rate:.1f}% ({hit}/{buyable}) · "
+            f"均涨 {avg_pct:+.2f}%"
+        )
+
+    @staticmethod
     def _bucket_score_for_row(
         category: str,
         score: Any,
@@ -1076,6 +1161,127 @@ class PredictTab:
             return self._score_tag(0)
 
     @staticmethod
+    def _display_text_units(text: Any) -> int:
+        units = 0
+        for ch in str(text or ""):
+            if ch in "\r\n":
+                continue
+            units += 2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1
+        return units
+
+    @classmethod
+    def _clip_text_units(cls, text: str, max_units: int) -> str:
+        if max_units <= 0:
+            return ""
+        out: List[str] = []
+        used = 0
+        for ch in str(text or ""):
+            ch_units = cls._display_text_units(ch)
+            if out and used + ch_units > max_units:
+                break
+            if not out and ch_units > max_units:
+                break
+            out.append(ch)
+            used += ch_units
+        return "".join(out)
+
+    @classmethod
+    def _split_long_reason_piece(cls, piece: str, max_units: int) -> List[str]:
+        lines: List[str] = []
+        current = ""
+        for ch in piece:
+            candidate = f"{current}{ch}"
+            if current and cls._display_text_units(candidate) > max_units:
+                lines.append(current)
+                current = ch
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        return lines or [piece]
+
+    @classmethod
+    def _wrap_reason_cell_text(
+        cls,
+        value: Any,
+        *,
+        max_units: int = 28,
+        max_lines: int = 3,
+    ) -> str:
+        text = " ".join(str(value or "").replace("\r", "\n").split())
+        if not text or cls._display_text_units(text) <= max_units:
+            return text
+
+        lines: List[str] = []
+        current = ""
+        for raw_piece in text.split(" / "):
+            piece = raw_piece.strip()
+            if not piece:
+                continue
+            candidate = f"{current} / {piece}" if current else piece
+            if current and cls._display_text_units(candidate) > max_units:
+                lines.append(current)
+                current = ""
+            if cls._display_text_units(piece) > max_units:
+                if current:
+                    lines.append(current)
+                    current = ""
+                lines.extend(cls._split_long_reason_piece(piece, max_units))
+            else:
+                current = f"{current} / {piece}" if current else piece
+        if current:
+            lines.append(current)
+
+        if max_lines > 0 and len(lines) > max_lines:
+            kept = lines[:max_lines]
+            overflow = " / ".join(lines[max_lines - 1:])
+            suffix = "..."
+            clipped = cls._clip_text_units(
+                overflow,
+                max(1, max_units - cls._display_text_units(suffix)),
+            ).rstrip()
+            kept[-1] = f"{clipped}{suffix}" if clipped else suffix
+            lines = kept
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _reason_wrap_units_for_tree(cls, tree: Any) -> int:
+        configured_width = 260
+        visible_width = configured_width
+        try:
+            configured_width = int(tree.column("reasons", "width") or configured_width)
+            visible_width = configured_width
+        except Exception:
+            pass
+        try:
+            columns = list(tree.cget("columns") or [])
+            tree_width = int(tree.winfo_width() or 0)
+            if tree_width > 100 and "reasons" in columns:
+                prior_width = 0
+                for col in columns:
+                    if col == "reasons":
+                        break
+                    try:
+                        prior_width += int(tree.column(col, "width") or 0)
+                    except Exception:
+                        pass
+                tail_width = tree_width - prior_width - 28
+                if tail_width > 0:
+                    visible_width = min(configured_width, tail_width)
+        except Exception:
+            pass
+        return max(18, min(36, int((visible_width - 18) / 6.8)))
+
+    @classmethod
+    def _reason_cell_text(cls, tree: Any, value: Any) -> str:
+        return cls._wrap_reason_cell_text(
+            value,
+            max_units=cls._reason_wrap_units_for_tree(tree),
+            max_lines=3,
+        )
+
+    @staticmethod
     def _sort_value(record: Dict[str, Any], column: str):
         opening_confirmation = record.get("opening_confirmation") or {}
         confirm_status = str(opening_confirmation.get("status") or "")
@@ -1083,6 +1289,7 @@ class PredictTab:
         value_map = {
             "code": record.get("code"),
             "name": record.get("name"),
+            "theme": record.get("theme") or record.get("theme_name"),
             "industry": record.get("industry"),
             "boards": record.get("consecutive_boards"),
             "change_pct": record.get("change_pct"),
@@ -1115,7 +1322,7 @@ class PredictTab:
             "auction": opening_confirmation.get("auction_gap_pct"),
         }
         value = value_map.get(column)
-        if column in {"name", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
+        if column in {"name", "theme", "industry", "reasons", "seal_time", "burst_date", "code", "prior_lu_date"}:
             return str(value or "")
         if column == "popularity_rank":
             if value is None or value == "":
@@ -1130,6 +1337,110 @@ class PredictTab:
             return float(value)
         except (TypeError, ValueError):
             return str(value)
+
+    @staticmethod
+    def _normalize_candidate_code(value: Any) -> str:
+        text = str(value or "").strip()
+        if text.endswith(".0"):
+            text = text[:-2]
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if len(digits) >= 6:
+            return digits[-6:]
+        return digits.zfill(6) if digits else ""
+
+    def _rebuild_candidate_theme_index(
+        self,
+        theme_prediction: Dict[str, Any],
+        concept_hype_result: Dict[str, Any],
+        compare_context: Dict[str, Any],
+    ) -> None:
+        by_code: Dict[str, str] = {}
+        by_industry: Dict[str, str] = {}
+        real_theme_names = set()
+        industry_theme_names = set()
+
+        def put_code(code_value: Any, theme_value: Any, *, overwrite: bool = False) -> None:
+            code = self._normalize_candidate_code(code_value)
+            theme = str(theme_value or "").strip()
+            if code and theme and (overwrite or code not in by_code):
+                by_code[code] = theme
+
+        def put_industry(industry_value: Any, theme_value: Any, *, overwrite: bool = False) -> None:
+            industry = str(industry_value or "").strip()
+            theme = str(theme_value or "").strip()
+            if industry and theme and (overwrite or industry not in by_industry):
+                by_industry[industry] = theme
+
+        for group in (theme_prediction or {}).get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            theme_name = str(group.get("name") or "").strip()
+            source = str(group.get("source") or "").strip()
+            if not theme_name:
+                continue
+            if source == "行业":
+                industry_theme_names.add(theme_name)
+                continue
+            real_theme_names.add(theme_name)
+            roles = group.get("roles") or {}
+            for rows in roles.values():
+                for rec in rows or []:
+                    if isinstance(rec, dict):
+                        put_code(rec.get("code"), theme_name, overwrite=True)
+
+        for concept in (concept_hype_result or {}).get("concepts") or []:
+            if not isinstance(concept, dict):
+                continue
+            theme_name = str(concept.get("name") or "").strip()
+            source = str(concept.get("source") or "").strip()
+            if not theme_name:
+                continue
+            if source == "行业":
+                industry_theme_names.add(theme_name)
+                continue
+            real_theme_names.add(theme_name)
+            for member in concept.get("members") or []:
+                if isinstance(member, dict):
+                    put_code(member.get("code"), theme_name)
+            for item in concept.get("related_industries") or []:
+                if isinstance(item, dict):
+                    put_industry(item.get("name"), theme_name)
+
+        self.candidate_theme_by_code = by_code
+        self.candidate_theme_by_industry = by_industry
+        self.candidate_real_theme_names = real_theme_names
+        self.candidate_industry_theme_names = industry_theme_names
+
+    def _candidate_theme_label(self, rec: Dict[str, Any]) -> str:
+        direct = str(
+            rec.get("theme") or rec.get("theme_name") or rec.get("concept") or ""
+        ).strip()
+        if direct and self._is_direct_candidate_theme_allowed(direct, rec):
+            return direct
+        code = self._normalize_candidate_code(rec.get("code"))
+        if code and code in self.candidate_theme_by_code:
+            return self.candidate_theme_by_code[code]
+        industry = str(rec.get("industry") or "").strip()
+        if industry and industry in self.candidate_theme_by_industry:
+            return self.candidate_theme_by_industry[industry]
+        return ""
+
+    def _is_direct_candidate_theme_allowed(
+        self,
+        theme_name: str,
+        rec: Dict[str, Any],
+    ) -> bool:
+        theme = str(theme_name or "").strip()
+        if not theme:
+            return False
+        industry = str((rec or {}).get("industry") or "").strip()
+        if industry and theme == industry:
+            return False
+        real_names = getattr(self, "candidate_real_theme_names", set()) or set()
+        industry_names = getattr(self, "candidate_industry_theme_names", set()) or set()
+        if theme in industry_names and theme not in real_names:
+            return False
+        return True
 
     def _sort_records(
         self,
@@ -1516,6 +1827,223 @@ class PredictTab:
 
     # ============== 概念炒作 业务方法 ==============
 
+    def _refresh_concept_index_from_predict(self) -> None:
+        refresh = getattr(self.app, "_refresh_concept_index_dialog", None)
+        if callable(refresh):
+            refresh()
+            return
+        messagebox.showinfo(
+            "刷新概念库",
+            "当前应用没有可用的概念库刷新入口。",
+            parent=self.app.root,
+        )
+
+    @staticmethod
+    def _concept_hype_theme_source_hint(result: Dict[str, Any]) -> str:
+        concepts = (result or {}).get("concepts") or []
+        has_real_theme = any(
+            str(c.get("source") or "").strip() in {"概念", "LLM题材"}
+            for c in concepts
+            if isinstance(c, dict)
+        )
+        if has_real_theme:
+            return ""
+        if not concepts:
+            return ""
+        stats = (result or {}).get("stats") or {}
+        concept_pairs = int(stats.get("concept_pairs") or 0)
+        llm_days = int(stats.get("llm_cache_days") or 0)
+        if concept_pairs <= 0 and llm_days <= 0:
+            return (
+                "提示：当前只有行业来源，预测表「题材」列不会用行业名填充；"
+                "请先刷新概念库，或准备 LLM 题材缓存后重新分析/预测。"
+            )
+        return (
+            "提示：当前未命中概念/LLM题材，预测表「题材」列暂不显示行业名。"
+        )
+
+    @staticmethod
+    def _theme_column_status_text(
+        concept_hype_result: Dict[str, Any],
+        theme_prediction: Optional[Dict[str, Any]] = None,
+        compare_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        concepts = (concept_hype_result or {}).get("concepts") or []
+        real_count = sum(
+            1
+            for c in concepts
+            if (
+                isinstance(c, dict)
+                and str(c.get("source") or "").strip() in {"概念", "LLM题材"}
+            )
+        )
+        if real_count > 0:
+            return f"题材列: 已命中 {real_count} 个概念/LLM题材。"
+
+        industry_count = sum(
+            1
+            for c in concepts
+            if isinstance(c, dict) and str(c.get("source") or "").strip() == "行业"
+        )
+        stats = (concept_hype_result or {}).get("stats") or {}
+        concept_pairs = int(stats.get("concept_pairs") or 0)
+        llm_days = int(stats.get("llm_cache_days") or 0)
+        if industry_count and concept_pairs <= 0 and llm_days <= 0:
+            return (
+                f"题材列: 当前只有 {industry_count} 个行业来源，概念库为空、"
+                "LLM缓存为0；不会用行业名凑数，请点「概念」页的「刷新概念库」"
+                "后重新分析/预测。"
+            )
+        if industry_count:
+            return (
+                "题材列: 当前未命中概念/LLM题材；行业只作参考，"
+                "不会填入题材列。"
+            )
+
+        groups = (theme_prediction or {}).get("groups") or []
+        if groups:
+            real_groups = [
+                g for g in groups
+                if isinstance(g, dict)
+                and str(g.get("source") or "").strip() in {"概念", "LLM题材"}
+            ]
+            if not real_groups:
+                return (
+                    "题材列: 当前主线分组没有概念/LLM题材，已忽略行业型分组。"
+                )
+
+        ctx = compare_context or {}
+        if ctx.get("code_theme_map") or ctx.get("theme_size_map"):
+            return (
+                "题材列: 这份历史结果缺少新的概念炒作明细，已忽略旧题材映射；"
+                "请重新分析或刷新概念库后重新预测。"
+            )
+        return ""
+
+    @classmethod
+    def _theme_status_bar_text(
+        cls,
+        concept_hype_result: Dict[str, Any],
+        theme_prediction: Optional[Dict[str, Any]] = None,
+        compare_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str]:
+        full_text = cls._theme_column_status_text(
+            concept_hype_result, theme_prediction, compare_context,
+        )
+        if not full_text:
+            return "", "#666"
+        if "已命中" in full_text:
+            return full_text.replace("题材列:", "题材:"), "#2e7d32"
+        if "概念库为空" in full_text:
+            return "题材: 概念库为空，先刷新概念库", "#ef6c00"
+        if "历史结果缺少" in full_text:
+            return "题材: 缺少概念明细，请重新分析", "#ef6c00"
+        return "题材: 未命中概念/LLM题材", "#ef6c00"
+
+    def _refresh_theme_data_status_label(
+        self,
+        concept_hype_result: Optional[Dict[str, Any]] = None,
+        theme_prediction: Optional[Dict[str, Any]] = None,
+        compare_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        label = getattr(self, "theme_data_status_label", None)
+        if label is None:
+            return
+        text, color = self._theme_status_bar_text(
+            concept_hype_result or {},
+            theme_prediction or {},
+            compare_context or {},
+        )
+        try:
+            label.configure(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def _rebuild_theme_prediction_from_hype(
+        self,
+        hype_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not self.result:
+            return {}
+        lists = self.lists or {}
+        if not lists:
+            return self.result.get("theme_prediction") or {}
+        try:
+            from src.services.prediction_theme_service import build_theme_prediction_groups
+            theme_prediction = build_theme_prediction_groups(
+                {
+                    "continuation_candidates": lists.get("cont") or [],
+                    "first_board_candidates": lists.get("first") or [],
+                    "fresh_first_board_candidates": lists.get("fresh") or [],
+                    "broken_board_wrap_candidates": lists.get("wrap") or [],
+                    "trend_limit_up_candidates": lists.get("trend") or [],
+                },
+                hype_result=hype_result or {},
+                compare_context=self.result.get("compare_context") or {},
+            )
+        except Exception:
+            logger.exception("回填题材后重建候选分组失败")
+            return self.result.get("theme_prediction") or {}
+        self.result["concept_hype_result"] = hype_result or {}
+        self.result["theme_prediction"] = theme_prediction
+        try:
+            stock_store.save_last_limit_up_prediction(self.result)
+            if self.result.get("trade_date"):
+                stock_store.save_limit_up_prediction_record(self.result)
+        except Exception:
+            logger.debug("保存回填后的题材预测结果失败", exc_info=True)
+        return theme_prediction
+
+    def _sync_concept_hype_for_result(
+        self,
+        current_date: str,
+        concept_hype_result: Dict[str, Any],
+    ) -> None:
+        if concept_hype_result and hasattr(self, "concept_hype_summary"):
+            self._apply_concept_hype_result(concept_hype_result)
+            return
+        if not current_date or not hasattr(self, "concept_hype_status"):
+            return
+        running = (
+            self.concept_hype_thread is not None
+            and self.concept_hype_thread.is_alive()
+        )
+        if running:
+            return
+        self.concept_hype_status.config(text="加载题材...", foreground="#1565c0")
+
+        def _backfill_concept_hype():
+            try:
+                hype_result = concept_hype_service.analyze_concept_hype(
+                    end_date=current_date,
+                    lookback=10,
+                    log=lambda s: self.app._post_to_ui(
+                        lambda m=s: self.app._log(m)
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                self.app._post_to_ui(
+                    lambda m=err: self.app._log(f"题材分析回填失败: {m}")
+                )
+                self.app._post_to_ui(
+                    lambda: self.concept_hype_status.config(
+                        text="题材未加载", foreground="#c62828",
+                    )
+                )
+                return
+            self.app._post_to_ui(
+                lambda r=hype_result: self._apply_concept_hype_result(r)
+            )
+
+        t = threading.Thread(
+            target=_backfill_concept_hype,
+            name="concept-hype-backfill",
+            daemon=True,
+        )
+        self.concept_hype_thread = t
+        t.start()
+
     def _start_concept_hype_analysis(self) -> None:
         """点击"开始分析"：后台跑 concept_hype_service.analyze_concept_hype。"""
         if self.concept_hype_thread is not None and self.concept_hype_thread.is_alive():
@@ -1579,6 +2107,9 @@ class PredictTab:
             f"（概念库 {concept_pairs} 对 / 覆盖 {concept_codes} 只；"
             f"LLM缓存 {llm_days} 天，仅增强）"
         )
+        source_hint = self._concept_hype_theme_source_hint(result or {})
+        if source_hint:
+            lines.append(source_hint)
         lines.append("")
         if ml.get("name"):
             lines.append("【主线】")
@@ -1599,12 +2130,42 @@ class PredictTab:
         self.concept_hype_summary.insert(tk.END, "\n".join(lines))
         self.concept_hype_summary.config(state=tk.DISABLED)
         # 状态
+        status_text = f"已分析 · {result.get('generated_at', '')}"
+        status_color = "#2e7d32"
+        if source_hint:
+            status_text += " · 仅行业来源"
+            status_color = "#ef6c00"
         self.concept_hype_status.config(
-            text=f"已分析 · {result.get('generated_at', '')}",
-            foreground="#2e7d32",
+            text=status_text,
+            foreground=status_color,
         )
+        try:
+            theme_prediction = (
+                self._rebuild_theme_prediction_from_hype(result or {})
+                if self.result else {}
+            )
+            self._refresh_theme_data_status_label(
+                result or {},
+                theme_prediction or (self.result or {}).get("theme_prediction") or {},
+                (self.result or {}).get("compare_context") or {},
+            )
+        except Exception:
+            pass
         # 列表
         self._refresh_concept_hype_list()
+        try:
+            if self.result:
+                self._rebuild_candidate_theme_index(
+                    self.result.get("theme_prediction") or {},
+                    self.concept_hype_result,
+                    self.result.get("compare_context") or {},
+                )
+                for records in (self.lists or {}).values():
+                    for rec in records or []:
+                        rec["theme"] = self._candidate_theme_label(rec)
+                self._render_trees()
+        except Exception:
+            pass
         # 清空成员表
         for it in self.concept_hype_members_tree.get_children():
             self.concept_hype_members_tree.delete(it)
@@ -2581,9 +3142,21 @@ class PredictTab:
                 if code and isinstance(confirmation, dict):
                     existing_confirmations[(code, cat)] = confirmation
 
+        compare_context = result.get("compare_context", {})
+        concept_hype_result = result.get("concept_hype_result") or {}
+        theme_prediction = result.get("theme_prediction") or {}
+        self._rebuild_candidate_theme_index(
+            theme_prediction, concept_hype_result, compare_context,
+        )
+        self._refresh_theme_data_status_label(
+            concept_hype_result, theme_prediction, compare_context,
+        )
+
         def _enrich(records: List[Dict[str, Any]], cat: str) -> List[Dict[str, Any]]:
             for rec in records:
                 code = str(rec.get("code") or "").zfill(6)
+                theme = self._candidate_theme_label(rec)
+                rec["theme"] = theme or ""
                 key = (code, cat)
                 if key in existing_confirmations:
                     rec["opening_confirmation"] = existing_confirmations[key]
@@ -2605,8 +3178,6 @@ class PredictTab:
         trend_list = self._sort_records(_enrich(list(result.get("trend_limit_up_candidates", [])), "trend"), "trend")
         hot_industries = result.get("hot_industries", {})
         profile = result.get("profile", {})
-        compare_context = result.get("compare_context", {})
-        theme_prediction = result.get("theme_prediction") or {}
 
         # ---- 填充摘要 ----
         self.summary_text.config(state=tk.NORMAL)
@@ -2646,6 +3217,14 @@ class PredictTab:
                 f"  题材识别: {th_state}（{th.get('themes', 0)} 个题材 / "
                 f"覆盖 {th.get('covered_codes', 0)} 只涨停股）\n"
             )
+            industry_groups = int(th.get("industry_groups") or 0)
+            if industry_groups:
+                txt.insert(tk.END, f"  行业兜底: {industry_groups} 个行业分组（不填入题材列）\n")
+            theme_column_status = self._theme_column_status_text(
+                concept_hype_result, theme_prediction, compare_context,
+            )
+            if theme_column_status:
+                txt.insert(tk.END, f"  {theme_column_status}\n")
             bs = dq.get("board_strength") or {}
             txt.insert(tk.END,
                 f"  板块强度: {'已加载' if bs.get('loaded') else '未启用'} "
@@ -2709,7 +3288,10 @@ class PredictTab:
                     f"晋级率={rate_text}\n",
                 )
 
-        theme_groups = theme_prediction.get("groups") or []
+        theme_groups = [
+            g for g in (theme_prediction.get("groups") or [])
+            if isinstance(g, dict) and str(g.get("source") or "").strip() != "行业"
+        ]
         if theme_groups:
             role_order = theme_prediction.get("role_order") or [
                 "core", "relay", "repair", "replenish", "watch",
@@ -2854,6 +3436,7 @@ class PredictTab:
             "wrap": wrap_list, "trend": trend_list,
         }
         self.compare_context = compare_context
+        self._sync_concept_hype_for_result(current_date, concept_hype_result)
 
         # 刷新行业下拉选项
         self._refresh_industry_options()
@@ -3150,8 +3733,11 @@ class PredictTab:
 
         kw = (self.filter_keyword.get() or "").strip().lower()
         if kw:
+            theme = self._candidate_theme_label(rec)
             haystack = " ".join(str(rec.get(f, "") or "") for f in
-                                ("code", "name", "industry", "reasons", "predict_type"))
+                                ("code", "name", "industry", "reasons", "predict_type", "theme"))
+            if theme:
+                haystack = f"{haystack} {theme}"
             if kw not in haystack.lower():
                 return False
 
@@ -3160,15 +3746,8 @@ class PredictTab:
             if (rec.get("industry") or "").strip() != ind_filter:
                 return False
 
-        ctx = self.compare_context or {}
-        code = (rec.get("code") or "").strip().zfill(6)
-
         if self.filter_theme_only.get():
-            theme_map = ctx.get("code_theme_map") or {}
-            industry_heat = ctx.get("industry_theme_heat") or {}
-            in_theme = code in theme_map
-            ind_heat = industry_heat.get((rec.get("industry") or ""), 0)
-            if not in_theme and ind_heat < 2:
+            if not self._candidate_theme_label(rec):
                 return False
 
         return True
@@ -3257,17 +3836,15 @@ class PredictTab:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                self._candidate_theme_label(rec),
                 str(rec.get("consecutive_boards", 1)),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
                 rec.get("first_board_time", "-"),
-                str(rec.get("break_count", 0)),
-                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
                 res_text,
-                rec.get("reasons", ""),
+                self._reason_cell_text(self.cont_tree, rec.get("reasons", "")),
             )
             self.cont_tree.insert("", tk.END, values=vals, tags=(tag,))
 
@@ -3281,17 +3858,15 @@ class PredictTab:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
-                rec.get("burst_date", "-") or "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
                 f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
-                str(rec.get("days_since_burst", 0)) if rec.get("days_since_burst") is not None else "-",
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
                 res_text,
-                rec.get("reasons", ""),
+                self._reason_cell_text(self.first_tree, rec.get("reasons", "")),
             )
             self.first_tree.insert("", tk.END, values=vals, tags=(tag,))
 
@@ -3320,18 +3895,16 @@ class PredictTab:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
                 f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
                 f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
-                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
-                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
                 score_text,
                 confirm_text,
                 auction_text,
                 res_text,
-                reasons_text,
+                self._reason_cell_text(self.fresh_tree, reasons_text),
             )
             self.fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
 
@@ -3346,21 +3919,17 @@ class PredictTab:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                self._candidate_theme_label(rec),
                 _PATTERN_LABELS.get(rec.get("pattern_kind", ""), rec.get("predict_type", "-")),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
                 rec.get("prior_lu_date", "-") or "-",
-                f"{rec['prior_lu_close']:.2f}" if rec.get("prior_lu_close") is not None else "-",
                 f"{rec['wrap_gap_pct']:.1f}" if rec.get("wrap_gap_pct") is not None else "-",
                 str(rec.get("days_since_lu", "-")) if rec.get("days_since_lu") is not None else "-",
-                f"{rec['worst_drop']:.1f}" if rec.get("worst_drop") is not None else "-",
-                f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
-                str(rec.get("popularity_rank")) if rec.get("popularity_rank") is not None else "-",
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
                 res_text,
-                rec.get("reasons", ""),
+                self._reason_cell_text(self.wrap_tree, rec.get("reasons", "")),
             )
             self.wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
 
@@ -3374,21 +3943,17 @@ class PredictTab:
                 rec.get("code", ""),
                 rec.get("name", ""),
                 rec.get("industry", ""),
+                self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
-                f"{rec['close']:.2f}" if rec.get("close") is not None else "-",
                 f"{rec['ma_spread_pct']:.1f}" if rec.get("ma_spread_pct") is not None else "-",
                 f"{rec['ma20_slope_pct']:.2f}" if rec.get("ma20_slope_pct") is not None else "-",
-                f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
                 f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
-                f"{rec['trend_10d']:.1f}" if rec.get("trend_10d") is not None else "-",
-                f"{rec['position_60d']:.0f}" if rec.get("position_60d") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
-                f"{rec['turnover']:.1f}" if rec.get("turnover") is not None else "-",
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
                 res_text,
-                rec.get("reasons", ""),
+                self._reason_cell_text(self.trend_tree, rec.get("reasons", "")),
             )
             self.trend_tree.insert("", tk.END, values=vals, tags=(tag,))
 
@@ -3399,13 +3964,11 @@ class PredictTab:
         total_fresh = len(raw.get("fresh", []))
         total_wrap = len(raw.get("wrap", []))
         total_trend = len(raw.get("trend", []))
-        def _label(name: str, shown: int, total: int) -> str:
-            return f"{name}({shown}/{total})" if shown != total else f"{name}({total})"
-        self.table_nb.tab(0, text=_label("保留涨停候选", len(cont_list), total_cont))
-        self.table_nb.tab(1, text=_label("二波接力候选", len(first_list), total_first))
-        self.table_nb.tab(2, text=_label("首板涨停候选", len(fresh_list), total_fresh))
-        self.table_nb.tab(3, text=_label("反包候选", len(wrap_list), total_wrap))
-        self.table_nb.tab(4, text=_label("趋势涨停候选", len(trend_list), total_trend))
+        self.table_nb.tab(0, text=self._candidate_tab_title("cont", len(cont_list), total_cont))
+        self.table_nb.tab(1, text=self._candidate_tab_title("first", len(first_list), total_first))
+        self.table_nb.tab(2, text=self._candidate_tab_title("fresh", len(fresh_list), total_fresh))
+        self.table_nb.tab(3, text=self._candidate_tab_title("wrap", len(wrap_list), total_wrap))
+        self.table_nb.tab(4, text=self._candidate_tab_title("trend", len(trend_list), total_trend))
 
         shown_total = (
             len(cont_list) + len(first_list) + len(fresh_list)
@@ -3568,14 +4131,12 @@ class PredictTab:
                 continue
             elif buyable <= 0:
                 txt = (
-                    f"{name} · 昨日命中率 {y_str} · 历史近{dates}日: "
-                    f"-（暂无回填数据）"
+                    f"{name} · 昨日 {y_str} · "
+                    f"近{dates}日 -（暂无回填数据）"
                 )
             else:
-                txt = (
-                    f"{name} · 昨日命中率 {y_str} · "
-                    f"近{dates}日 {rate:.1f}% ({hit}/{buyable})  "
-                    f"平均次日涨幅 {avg_pct:+.2f}%"
+                txt = self._accuracy_header_text(
+                    name, y_str, dates, rate, hit, buyable, avg_pct,
                 )
             try:
                 lbl.configure(text=txt)

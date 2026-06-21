@@ -106,9 +106,12 @@ def _build_theme_indexes(
         name = str(raw.get("name") or "").strip()
         if not name:
             continue
+        source = str(raw.get("source") or "").strip() or "题材"
+        if source == "行业":
+            continue
         meta = {
             "name": name,
-            "source": str(raw.get("source") or "").strip() or "题材",
+            "source": source,
             "phase": str(raw.get("phase") or "").strip(),
             "trend": str(raw.get("trend") or "").strip(),
             "opportunity_score": int(raw.get("opportunity_score") or 0),
@@ -122,21 +125,9 @@ def _build_theme_indexes(
     theme_size_map = compare_context.get("theme_size_map") or {}
     for name, size in theme_size_map.items():
         theme_name = str(name or "").strip()
-        if not theme_name:
+        if not theme_name or theme_name not in concept_meta:
             continue
-        meta = concept_meta.setdefault(
-            theme_name,
-            {
-                "name": theme_name,
-                "source": "题材",
-                "phase": "",
-                "trend": "",
-                "opportunity_score": 0,
-                "today_count": 0,
-                "total_limit_ups": 0,
-                "member_count": 0,
-            },
-        )
+        meta = concept_meta[theme_name]
         try:
             meta["member_count"] = max(int(meta.get("member_count") or 0), int(size or 0))
         except (TypeError, ValueError):
@@ -145,7 +136,7 @@ def _build_theme_indexes(
     for code, name in (compare_context.get("code_theme_map") or {}).items():
         c = _normalize_code(code)
         theme_name = str(name or "").strip()
-        if c and theme_name:
+        if c and theme_name in concept_meta:
             code_to_theme[c] = theme_name
 
     for raw in concepts:

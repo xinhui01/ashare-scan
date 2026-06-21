@@ -891,6 +891,7 @@ def predict_limit_up_candidates(
     for c in concepts:
         try:
             name = str(c.get("name") or "").strip()
+            source = str(c.get("source") or "").strip()
             phase = str(c.get("phase") or "")
             members = c.get("members") or []
             codes_in_theme = [
@@ -900,7 +901,7 @@ def predict_limit_up_candidates(
             codes_in_theme = [x for x in codes_in_theme if x]
         except Exception:
             continue
-        if not name or len(codes_in_theme) < 2:
+        if not name or source == "行业" or len(codes_in_theme) < 2:
             continue
         size = len(codes_in_theme)
         # 题材规模取最大命中（同名题材跨多 source 时合并）
@@ -931,15 +932,27 @@ def predict_limit_up_candidates(
     compare_context["theme_size_map"] = theme_size_map
     compare_context["code_to_concept_phase"] = code_to_phase
 
-    data_quality["themes"]["loaded"] = bool(concepts)
-    data_quality["themes"]["themes"] = len(concepts)
+    real_concepts = [
+        c for c in concepts
+        if isinstance(c, dict) and str(c.get("source") or "").strip() != "行业"
+    ]
+    industry_concepts_count = max(0, len(concepts) - len(real_concepts))
+    hype_stats = hype.get("stats") or {}
+    data_quality["themes"]["loaded"] = bool(real_concepts)
+    data_quality["themes"]["themes"] = len(real_concepts)
+    data_quality["themes"]["industry_groups"] = industry_concepts_count
     data_quality["themes"]["covered_codes"] = len(code_theme_map)
     data_quality["themes"]["source"] = "concept_hype"
+    data_quality["themes"]["concept_pairs"] = int(hype_stats.get("concept_pairs") or 0)
+    data_quality["themes"]["concept_covered_codes"] = int(
+        hype_stats.get("concept_covered_codes") or 0
+    )
+    data_quality["themes"]["llm_cache_days"] = int(hype_stats.get("llm_cache_days") or 0)
 
     if log_fn:
-        if concepts:
+        if real_concepts:
             log_fn(
-                f"涨停预测：概念炒作识别 {len(concepts)} 个题材，"
+                f"涨停预测：概念炒作识别 {len(real_concepts)} 个真实题材，"
                 f"覆盖 {len(code_theme_map)} 只涨停股 / "
                 f"{len(industry_theme_heat)} 个行业 / "
                 f"阶段映射 {len(code_to_phase)} 只 "
@@ -947,6 +960,11 @@ def predict_limit_up_candidates(
                 f"主升 {sum(1 for v in code_to_phase.values() if v == '主升')} / "
                 f"末期 {sum(1 for v in code_to_phase.values() if v == '末期')} / "
                 f"退潮 {sum(1 for v in code_to_phase.values() if v == '退潮')})"
+            )
+        elif concepts:
+            log_fn(
+                f"涨停预测：概念炒作仅识别到 {industry_concepts_count} 个行业来源，"
+                "未命中概念库/LLM题材；题材列不会用行业名填充"
             )
         else:
             log_fn(
@@ -1393,6 +1411,7 @@ def predict_limit_up_candidates(
         "trend_limit_up_candidates": trend_limit_up_candidates,
         "hot_industries": hot_industries,
         "compare_context": compare_context,
+        "concept_hype_result": hype,
         "theme_prediction": theme_prediction,
         "summary": "\n".join(summary_lines),
         "data_quality": data_quality,

@@ -1603,6 +1603,9 @@ class StockMonitorApp:
                 f"覆盖 {result.get('total_codes', 0)} 只，"
                 f"耗时 {result.get('duration_seconds', 0):.0f}s"
             )
+            warnings = result.get("warnings") or []
+            if warnings:
+                summary += f"；提示：{'；'.join(str(w) for w in warnings[:3])}"
             self._post_to_ui(lambda s=summary: self.status_var.set(s))
             self._post_to_ui(lambda s=summary: self._log(s))
         except Exception as exc:
