@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.services.scoring import shared as _shared
 from src.services.scoring.helpers import _count_historical_continuation
+from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,9 @@ def score_continuation(
     first_time = rec.get("first_board_time", "")
     industry = rec.get("industry", "")
     turnover = rec.get("turnover")
+    accumulation_score = 0
+    accumulation_risk_penalty = 0
+    accumulation_metrics: Dict[str, Any] = {"accumulation_days": 30}
 
     # 1. 连板数基础分
     # 数据反馈：cont 主类 17.7% 命中，首板 (cont_1to2) 仅 14.5%；
@@ -190,6 +194,19 @@ def score_continuation(
                 score -= 4
                 reasons.append(f"5d量比{vol_ratio:.1f}x但20d{vol_ratio_20:.1f}x假放量-4")
 
+        raw_accumulation_score, raw_accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
+            _score_accumulation_signal(close, volume, t_idx)
+        )
+        accumulation_score = int(round(raw_accumulation_score * 0.8))
+        accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.8))
+        accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
+        accumulation_metrics["accumulation_weight"] = 0.8
+        if accumulation_score or accumulation_risk_penalty:
+            score += accumulation_score + accumulation_risk_penalty
+            if accumulation_score > 0:
+                reasons.append(f"30日潜伏铺垫x0.8+{accumulation_score}")
+            reasons.extend(accumulation_reasons)
+
     # === 历史同类形态加分：近 90 日内的连板成功次数 ===
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
     occ_count, last_hit_days = _count_historical_continuation(
@@ -225,6 +242,9 @@ def score_continuation(
         "break_count": break_count,
         "first_board_time": first_time,
         "board_amount": board_amount,
+        "accumulation_score": accumulation_score,
+        "accumulation_risk_penalty": accumulation_risk_penalty,
+        **accumulation_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:8]),
         "predict_type": "连板延续",

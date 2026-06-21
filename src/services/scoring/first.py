@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.services.scoring import shared as _shared
 from src.services.scoring.helpers import _count_historical_followthrough
+from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,10 @@ def score_followthrough_candidate(
     breakout_20d = False       # 是否突破近 20 日新高
     above_ma10 = False
     position_60d = None
+    accumulation_score = 0
+    accumulation_risk_penalty = 0
+    accumulation_reasons: List[str] = []
+    accumulation_metrics: Dict[str, Any] = {"accumulation_days": 30}
 
     if history is not None and not history.empty and len(history) >= 10:
         df = history.sort_values("date").reset_index(drop=True)
@@ -298,6 +303,14 @@ def score_followthrough_candidate(
                 prior_lu_pattern = "一字"
             elif close_at_high and open_at_high and low_far_from_high:
                 prior_lu_pattern = "T字"
+
+        raw_accumulation_score, raw_accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
+            _score_accumulation_signal(close, volume, t)
+        )
+        accumulation_score = int(round(raw_accumulation_score * 0.7))
+        accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.7))
+        accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
+        accumulation_metrics["accumulation_weight"] = 0.7
     else:
         # 历史数据不足时给保守默认（不阻塞硬过滤；scoring 块会跳过这些维度）
         prior_wave_boards = 0
@@ -332,6 +345,12 @@ def score_followthrough_candidate(
     if relay_bonus:
         score += relay_bonus
         reasons.append(f"距前涨停{days_since_prior_lu}日+{relay_bonus}")
+
+    if accumulation_score or accumulation_risk_penalty:
+        score += accumulation_score + accumulation_risk_penalty
+        if accumulation_score > 0:
+            reasons.append(f"30日潜伏铺垫x0.7+{accumulation_score}")
+        reasons.extend(accumulation_reasons)
 
     # 2. 当日表现 —— 2026-05-29 校准翻转：
     # 旧版"潜伏+收强 +22"基于 22 条早期样本（命中 30%+），但累积 589 条 first 样本后：
@@ -547,6 +566,9 @@ def score_followthrough_candidate(
         "broken_prior_lu_low": broken_prior_lu_low,
         "window_lu_count": window_lu_count,
         "prior_lu_pattern": prior_lu_pattern,
+        "accumulation_score": accumulation_score,
+        "accumulation_risk_penalty": accumulation_risk_penalty,
+        **accumulation_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:10]),
         "predict_type": "二波接力",

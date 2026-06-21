@@ -17,6 +17,7 @@ import pandas as pd
 
 from src.services.scoring import shared as _shared
 from src.services.scoring.helpers import _count_historical_wrap
+from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,19 @@ def score_broken_board_wrap(
 
     score = 0.0
     reasons: List[str] = []
+
+    raw_accumulation_score, raw_accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
+        _score_accumulation_signal(close, volume, t)
+    )
+    accumulation_score = int(round(raw_accumulation_score * 0.4))
+    accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.4))
+    accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
+    accumulation_metrics["accumulation_weight"] = 0.4
+    if accumulation_score or accumulation_risk_penalty:
+        score += accumulation_score + accumulation_risk_penalty
+        if accumulation_score > 0:
+            reasons.append(f"30日潜伏铺垫x0.4+{accumulation_score}")
+        reasons.extend(accumulation_reasons)
 
     # ---- 前置连板加分（核心因子）----
     # 端到端回测：2板 9.3%、3板 11.9%、≥4板 15.5%（反包率随连板线性提升）
@@ -439,6 +453,9 @@ def score_broken_board_wrap(
         "bearish_days": bearish_days,
         "volume_ratio": vol_ratio,
         "pattern_kind": pattern_kind,
+        "accumulation_score": accumulation_score,
+        "accumulation_risk_penalty": accumulation_risk_penalty,
+        **accumulation_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:8]),
         "predict_type": predict_type,

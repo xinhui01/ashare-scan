@@ -470,7 +470,7 @@ class PredictTab:
             # 这样 _apply_accuracy 现有 sub_key 分支的 fallback 仍能工作
             self.stat_labels[sub_key] = recent_lbl
         cont_cols = ("code", "name", "industry", "theme", "boards", "change_pct",
-                     "seal_time", "score", "confirm", "auction", "result", "reasons")
+                     "seal_time", "accumulation", "score", "confirm", "auction", "result", "reasons")
         self.cont_tree = ttk.Treeview(
             cont_tab, columns=cont_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
@@ -479,6 +479,7 @@ class PredictTab:
             "industry": ("行业", 85), "theme": ("题材", 110),
             "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70),
             "seal_time": ("首封时间", 80), "score": ("预测分", 65),
+            "accumulation": ("潜伏分", 60),
             "confirm": ("确认", 70), "auction": ("竞价/开盘", 115),
             "result": ("结果", 90),
             "reasons": ("预测依据", 260),
@@ -522,7 +523,7 @@ class PredictTab:
         first_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["first"] = first_best
         first_cols = ("code", "name", "industry", "theme", "change_pct",
-                      "burst_ratio", "dist_ma5", "score",
+                      "burst_ratio", "dist_ma5", "accumulation", "score",
                       "confirm", "auction", "result", "reasons")
         self.first_tree = ttk.Treeview(
             first_tab, columns=first_cols, show="headings", height=22, style="PredictCandidate.Treeview",
@@ -532,6 +533,7 @@ class PredictTab:
             "industry": ("行业", 85), "theme": ("题材", 110),
             "change_pct": ("今日涨幅%", 75), "burst_ratio": ("爆量倍数", 70),
             "dist_ma5": ("距MA5%", 65),
+            "accumulation": ("潜伏分", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 260),
@@ -575,7 +577,7 @@ class PredictTab:
         self.best_bucket_labels["fresh"] = fresh_best
         fresh_cols = ("code", "name", "industry", "theme", "change_pct",
                       "volume_ratio", "dist_ma5", "trend_5d",
-                      "score", "confirm", "auction", "result", "reasons")
+                      "accumulation", "score", "confirm", "auction", "result", "reasons")
         self.fresh_tree = ttk.Treeview(
             fresh_tab, columns=fresh_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
@@ -585,6 +587,7 @@ class PredictTab:
             "change_pct": ("今日涨幅%", 75),
             "volume_ratio": ("量比", 60), "dist_ma5": ("距MA5%", 65),
             "trend_5d": ("5日涨幅%", 70),
+            "accumulation": ("潜伏分", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 260),
@@ -628,7 +631,7 @@ class PredictTab:
         self.best_bucket_labels["wrap"] = wrap_best
         wrap_cols = ("code", "name", "industry", "theme", "pattern_kind", "change_pct",
                      "prior_lu_date", "wrap_gap", "days_since_lu",
-                     "score", "confirm", "auction", "result", "reasons")
+                     "accumulation", "score", "confirm", "auction", "result", "reasons")
         self.wrap_tree = ttk.Treeview(
             wrap_tab, columns=wrap_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
@@ -639,6 +642,7 @@ class PredictTab:
             "change_pct": ("今日涨幅%", 75),
             "prior_lu_date": ("前涨停日", 90),
             "wrap_gap": ("反包缺口%", 80), "days_since_lu": ("距前涨停", 70),
+            "accumulation": ("潜伏分", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 260),
@@ -1452,15 +1456,15 @@ class PredictTab:
         if table_kind == "cont":
             column = self.cont_sort_column
             reverse = self.cont_sort_reverse
-            secondary = ["score", "boards", "change_pct", "turnover"]
+            secondary = ["score", "accumulation", "boards", "change_pct", "turnover"]
         elif table_kind == "fresh":
             column = self.fresh_sort_column
             reverse = self.fresh_sort_reverse
-            secondary = ["score", "calibrated_hit_rate", "volume_ratio", "change_pct", "turnover"]
+            secondary = ["score", "calibrated_hit_rate", "accumulation", "volume_ratio", "change_pct", "turnover"]
         elif table_kind == "wrap":
             column = self.wrap_sort_column
             reverse = self.wrap_sort_reverse
-            secondary = ["score", "wrap_gap", "change_pct", "volume_ratio"]
+            secondary = ["score", "accumulation", "wrap_gap", "change_pct", "volume_ratio"]
         elif table_kind == "trend":
             column = self.trend_sort_column
             reverse = self.trend_sort_reverse
@@ -1471,7 +1475,7 @@ class PredictTab:
         else:
             column = self.first_sort_column
             reverse = self.first_sort_reverse
-            secondary = ["score", "burst_ratio", "dist_ma5", "change_pct"]
+            secondary = ["score", "accumulation", "burst_ratio", "dist_ma5", "change_pct"]
         if column in secondary:
             secondary = [c for c in secondary if c != column]
 
@@ -1559,20 +1563,20 @@ class PredictTab:
                 self.cont_sort_reverse = not self.cont_sort_reverse
             else:
                 self.cont_sort_column = column
-                self.cont_sort_reverse = column in {"score", "boards", "change_pct", "close", "turnover", "breaks", "confirm", "auction"}
+                self.cont_sort_reverse = column in {"score", "accumulation", "boards", "change_pct", "close", "turnover", "breaks", "confirm", "auction"}
         elif table_kind == "fresh":
             if column == self.fresh_sort_column:
                 self.fresh_sort_reverse = not self.fresh_sort_reverse
             else:
                 self.fresh_sort_column = column
-                self.fresh_sort_reverse = column in {"score", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover", "confirm", "auction"}
+                self.fresh_sort_reverse = column in {"score", "accumulation", "volume_ratio", "change_pct", "close", "trend_5d", "position_60d", "turnover", "confirm", "auction"}
         elif table_kind == "wrap":
             if column == self.wrap_sort_column:
                 self.wrap_sort_reverse = not self.wrap_sort_reverse
             else:
                 self.wrap_sort_column = column
                 # 反包缺口越小越好，因此 wrap_gap / days_since_lu 默认升序
-                self.wrap_sort_reverse = column in {"score", "change_pct", "close", "volume_ratio", "prior_lu_close", "confirm", "auction"}
+                self.wrap_sort_reverse = column in {"score", "accumulation", "change_pct", "close", "volume_ratio", "prior_lu_close", "confirm", "auction"}
         elif table_kind == "trend":
             if column == self.trend_sort_column:
                 self.trend_sort_reverse = not self.trend_sort_reverse
@@ -1589,7 +1593,7 @@ class PredictTab:
                 self.first_sort_reverse = not self.first_sort_reverse
             else:
                 self.first_sort_column = column
-                self.first_sort_reverse = column in {"score", "burst_ratio", "change_pct", "close", "dist_ma5", "days_since_burst", "confirm", "auction"}
+                self.first_sort_reverse = column in {"score", "accumulation", "burst_ratio", "change_pct", "close", "dist_ma5", "days_since_burst", "confirm", "auction"}
 
         if self.result:
             self._apply_result(self.result)
@@ -3842,6 +3846,7 @@ class PredictTab:
                 str(rec.get("consecutive_boards", 1)),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 rec.get("first_board_time", "-"),
+                str(rec.get("accumulation_score", 0)),
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
@@ -3864,6 +3869,7 @@ class PredictTab:
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
                 f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
+                str(rec.get("accumulation_score", 0)),
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,
@@ -3902,6 +3908,7 @@ class PredictTab:
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
                 f"{rec['dist_ma5_pct']:.1f}" if rec.get("dist_ma5_pct") is not None else "-",
                 f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
+                str(rec.get("accumulation_score", 0)),
                 score_text,
                 confirm_text,
                 auction_text,
@@ -3927,6 +3934,7 @@ class PredictTab:
                 rec.get("prior_lu_date", "-") or "-",
                 f"{rec['wrap_gap_pct']:.1f}" if rec.get("wrap_gap_pct") is not None else "-",
                 str(rec.get("days_since_lu", "-")) if rec.get("days_since_lu") is not None else "-",
+                str(rec.get("accumulation_score", 0)),
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,

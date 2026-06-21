@@ -364,6 +364,8 @@ def score_trend_limit_up(
     accumulation_score, accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
         _score_accumulation_signal(close, volume, t)
     )
+    accumulation_metrics["accumulation_raw_score"] = accumulation_score
+    accumulation_metrics["accumulation_weight"] = 1.0
     if accumulation_score or accumulation_risk_penalty:
         score += accumulation_score + accumulation_risk_penalty
         reasons.extend(accumulation_reasons)
