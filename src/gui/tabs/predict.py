@@ -682,7 +682,7 @@ class PredictTab:
         self.best_bucket_labels["trend"] = trend_best
         trend_cols = ("code", "name", "industry", "theme", "change_pct",
                       "ma_spread", "ma20_slope", "trend_5d",
-                      "volume_ratio", "score", "confirm", "auction", "result", "reasons")
+                      "volume_ratio", "accumulation", "score", "confirm", "auction", "result", "reasons")
         self.trend_tree = ttk.Treeview(
             trend_tab, columns=trend_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
@@ -693,6 +693,7 @@ class PredictTab:
             "ma_spread": ("均线差%", 70), "ma20_slope": ("MA20斜率%", 80),
             "trend_5d": ("5日涨幅%", 70),
             "volume_ratio": ("量比", 60),
+            "accumulation": ("潜伏分", 60),
             "score": ("预测分", 65), "confirm": ("确认", 70),
             "auction": ("竞价/开盘", 115), "result": ("结果", 90),
             "reasons": ("预测依据", 260),
@@ -1317,6 +1318,7 @@ class PredictTab:
             "ma_spread": record.get("ma_spread_pct"),
             "ma20_slope": record.get("ma20_slope_pct"),
             "trend_10d": record.get("trend_10d"),
+            "accumulation": record.get("accumulation_score"),
             "result": record.get("_t1_pct"),
             "confirm": confirm_rank,
             "auction": opening_confirmation.get("auction_gap_pct"),
@@ -1463,7 +1465,7 @@ class PredictTab:
             column = self.trend_sort_column
             reverse = self.trend_sort_reverse
             secondary = [
-                "score", "ma_spread", "ma20_slope", "trend_5d",
+                "score", "accumulation", "ma_spread", "ma20_slope", "trend_5d",
                 "change_pct", "volume_ratio", "turnover",
             ]
         else:
@@ -1577,7 +1579,7 @@ class PredictTab:
             else:
                 self.trend_sort_column = column
                 self.trend_sort_reverse = column in {
-                    "score", "change_pct", "close", "ma_spread",
+                    "score", "accumulation", "change_pct", "close", "ma_spread",
                     "ma20_slope", "trend_5d", "trend_10d",
                     "position_60d", "volume_ratio", "turnover",
                     "confirm", "auction",
@@ -3949,6 +3951,7 @@ class PredictTab:
                 f"{rec['ma20_slope_pct']:.2f}" if rec.get("ma20_slope_pct") is not None else "-",
                 f"{rec['trend_5d']:.1f}" if rec.get("trend_5d") is not None else "-",
                 f"{rec['volume_ratio']:.2f}" if rec.get("volume_ratio") is not None else "-",
+                str(rec.get("accumulation_score", 0)),
                 str(rec.get("score", 0)),
                 confirm_text,
                 auction_text,

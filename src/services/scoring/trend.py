@@ -15,7 +15,7 @@ filter_strong_stocks_fn / filter_ma5_pullback_stocks_fn。
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -32,6 +32,99 @@ def _default_limit_up_threshold_pct(code: str) -> float:
     if c.startswith(("43", "83", "87", "88", "92")):
         return 29.5
     return 9.5
+
+
+def _score_accumulation_signal(
+    close: pd.Series,
+    volume: pd.Series,
+    t: int,
+    *,
+    window: int = 30,
+) -> Tuple[int, int, List[str], Dict[str, Any]]:
+    """趋势涨停专用：评估中长周期温和吸筹，不参与首板/反包/连板。"""
+    if t < window:
+        return 0, 0, [], {"accumulation_days": window}
+
+    close_num = pd.to_numeric(close, errors="coerce")
+    volume_num = pd.to_numeric(volume, errors="coerce")
+    window_close = close_num.iloc[t - window:t + 1].dropna()
+    window_volume = volume_num.iloc[t - window:t + 1].dropna()
+    if len(window_close) < window * 0.8:
+        return 0, 0, [], {"accumulation_days": window}
+
+    latest_close = float(window_close.iloc[-1])
+    start_close = float(window_close.iloc[0])
+    if start_close <= 0 or latest_close <= 0:
+        return 0, 0, [], {"accumulation_days": window}
+
+    score = 0
+    risk_penalty = 0
+    reasons: List[str] = []
+    metrics: Dict[str, Any] = {"accumulation_days": window}
+
+    gain_30d = round((latest_close / start_close - 1) * 100, 1)
+    metrics["accumulation_gain_30d"] = gain_30d
+    if 4 <= gain_30d <= 24:
+        score += 6
+        reasons.append(f"潜伏{window}日重心上移{gain_30d:+.1f}%+6")
+    elif 0 <= gain_30d < 4:
+        score += 2
+        reasons.append(f"潜伏{window}日小幅抬升{gain_30d:+.1f}%+2")
+    elif gain_30d > 35:
+        risk_penalty -= 8
+        reasons.append(f"30日涨{gain_30d:+.1f}%过热-8")
+
+    ma10 = close_num.rolling(10, min_periods=10).mean()
+    if t >= 20 and not pd.isna(ma10.iloc[t]) and not pd.isna(ma10.iloc[t - 10]):
+        ma10_slope_pct = round((float(ma10.iloc[t]) / float(ma10.iloc[t - 10]) - 1) * 100, 1)
+        metrics["accumulation_ma10_slope_pct"] = ma10_slope_pct
+        if ma10_slope_pct >= 3:
+            score += 5
+            reasons.append(f"MA10中期抬升{ma10_slope_pct:+.1f}%+5")
+        elif ma10_slope_pct <= -2:
+            risk_penalty -= 4
+            reasons.append(f"MA10走弱{ma10_slope_pct:+.1f}%-4")
+
+    if len(window_volume) >= window * 0.8:
+        recent_vol = window_volume.iloc[-10:].mean()
+        prior_vol = window_volume.iloc[:20].mean()
+        vol_lift = None
+        if prior_vol and not pd.isna(prior_vol) and prior_vol > 0:
+            vol_lift = round(float(recent_vol / prior_vol), 2)
+            metrics["accumulation_volume_lift"] = vol_lift
+            if 1.05 <= vol_lift <= 1.8:
+                score += 6
+                reasons.append(f"温和放量{vol_lift:.2f}x+6")
+            elif 1.8 < vol_lift <= 2.6:
+                score += 2
+                reasons.append(f"放量偏快{vol_lift:.2f}x+2")
+            elif vol_lift > 2.6:
+                risk_penalty -= 5
+                reasons.append(f"中期爆量{vol_lift:.2f}x-5")
+
+        returns = window_close.pct_change()
+        aligned_volume = window_volume.reindex(window_close.index)
+        up_volume = aligned_volume[returns > 0].mean()
+        down_volume = aligned_volume[returns < 0].mean()
+        if (
+            up_volume is not None and down_volume is not None
+            and not pd.isna(up_volume) and not pd.isna(down_volume)
+            and down_volume > 0
+        ):
+            up_down_ratio = round(float(up_volume / down_volume), 2)
+            metrics["accumulation_up_down_volume_ratio"] = up_down_ratio
+            if up_down_ratio >= 1.08:
+                score += 4
+                reasons.append(f"涨放跌缩{up_down_ratio:.2f}x+4")
+
+    if t >= 10 and not pd.isna(close_num.iloc[t - 10]) and float(close_num.iloc[t - 10]) > 0:
+        gain_10d = round((latest_close / float(close_num.iloc[t - 10]) - 1) * 100, 1)
+        metrics["accumulation_gain_10d"] = gain_10d
+        if gain_10d > 22:
+            risk_penalty -= 6
+            reasons.append(f"10日涨{gain_10d:+.1f}%过急-6")
+
+    return min(score, 20), risk_penalty, reasons, metrics
 
 
 def scan_trend_limit_up_candidates_cached(
@@ -268,6 +361,13 @@ def score_trend_limit_up(
             score -= 8
             reasons.append(f"5日{trend_5d:+.1f}%过急-8")
 
+    accumulation_score, accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
+        _score_accumulation_signal(close, volume, t)
+    )
+    if accumulation_score or accumulation_risk_penalty:
+        score += accumulation_score + accumulation_risk_penalty
+        reasons.extend(accumulation_reasons)
+
     # 60 日位置：50~80 中位偏上为最佳
     if 50 <= position_60d <= 80:
         score += 10
@@ -348,6 +448,9 @@ def score_trend_limit_up(
         "trend_5d": trend_5d,
         "trend_10d": trend_10d,
         "volume_ratio": vol_ratio,
+        "accumulation_score": accumulation_score,
+        "accumulation_risk_penalty": accumulation_risk_penalty,
+        **accumulation_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:8]),
         "predict_type": "趋势涨停",
