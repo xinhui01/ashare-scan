@@ -85,6 +85,50 @@ def theme_bonus(
     return 0.0, None
 
 
+def theme_fund_bonus(
+    code: str,
+    industry: str,
+    compare_context: Dict[str, Any],
+) -> Tuple[float, List[str]]:
+    """题材/板块资金潜伏 + 爆发加分。"""
+    code_scores = compare_context.get("code_theme_fund_score") or {}
+    industry_scores = compare_context.get("industry_theme_fund_score") or {}
+    code_theme_map = compare_context.get("code_theme_map") or {}
+    theme_acc_map = compare_context.get("theme_fund_accumulation_map") or {}
+    theme_breakout_map = compare_context.get("theme_breakout_map") or {}
+
+    score = 0
+    source = ""
+    theme_name = str(code_theme_map.get(code) or "").strip()
+    if code in code_scores:
+        score = int(code_scores.get(code) or 0)
+        source = "题材资金"
+    elif industry and industry in industry_scores:
+        score = int(industry_scores.get(industry) or 0)
+        source = "板块资金"
+
+    if score <= 0:
+        return 0.0, []
+
+    acc = int(theme_acc_map.get(theme_name, 0)) if theme_name else 0
+    burst = int(theme_breakout_map.get(theme_name, 0)) if theme_name else 0
+    reasons: List[str] = []
+    if score >= 75:
+        bonus = 8.0
+    elif score >= 60:
+        bonus = 6.0
+    elif score >= 45:
+        bonus = 4.0
+    elif score >= 30:
+        bonus = 2.0
+    else:
+        bonus = 0.0
+    if bonus:
+        detail = f"潜{acc}/爆{burst}" if theme_name else f"{score}"
+        reasons.append(f"{source}{detail}+{int(bonus)}")
+    return bonus, reasons
+
+
 def capital_flow_bonus(
     code: str,
     compare_context: Dict[str, Any],

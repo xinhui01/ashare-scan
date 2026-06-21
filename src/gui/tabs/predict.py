@@ -41,6 +41,7 @@ from src.services import (
     opening_confirmation_service,
     prediction_accuracy_service,
 )
+from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.utils.cancel_token import CancelToken
 from src.utils.trade_calendar import (
     _get_trade_calendar,
@@ -223,6 +224,9 @@ class PredictTab:
         ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             action_bar, text="AI 博弈短报", command=self.open_daily_brief_window,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            action_bar, text="导出Excel", command=self.export_prediction_excel,
         ).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(
             action_bar, text="NIM Key", command=self.open_nim_key_dialog,
@@ -1029,6 +1033,50 @@ class PredictTab:
         except Exception:
             pass
 
+    def _export_payload_with_current_filters(self) -> Dict[str, Any]:
+        payload = dict(self.result or {})
+        lists = self.lists or {}
+        payload["continuation_candidates"] = list(self._filter_records(lists.get("cont", [])))
+        payload["first_board_candidates"] = list(self._filter_records(lists.get("first", [])))
+        payload["fresh_first_board_candidates"] = list(self._filter_records(lists.get("fresh", [])))
+        payload["broken_board_wrap_candidates"] = list(self._filter_records(lists.get("wrap", [])))
+        payload["trend_limit_up_candidates"] = list(self._filter_records(lists.get("trend", [])))
+        return payload
+
+    def export_prediction_excel(self) -> None:
+        """导出当前预测结果为 Excel（按当前筛选条件）。"""
+        if not self.result or not self.lists:
+            messagebox.showinfo(
+                "导出Excel",
+                "暂无可导出的预测结果，请先开始预测或加载历史记录。",
+                parent=self.app.root,
+            )
+            return
+        trade_date = str(self.result.get("trade_date") or self.date_var.get() or "").strip()
+        default_name = f"涨停预测_{trade_date or datetime.now().strftime('%Y%m%d')}.xlsx"
+        path = filedialog.asksaveasfilename(
+            parent=self.app.root,
+            title="导出涨停预测Excel",
+            defaultextension=".xlsx",
+            initialfile=default_name,
+            filetypes=[("Excel 文件", "*.xlsx")],
+        )
+        if not path:
+            return
+        try:
+            written = export_prediction_to_excel(
+                self._export_payload_with_current_filters(),
+                path,
+            )
+        except Exception as exc:
+            messagebox.showerror("导出Excel", f"导出失败: {exc}", parent=self.app.root)
+            return
+        messagebox.showinfo("导出Excel", f"已导出:\n{written}", parent=self.app.root)
+        try:
+            self.app.status_var.set(f"已导出涨停预测Excel: {written}")
+        except Exception:
+            pass
+
     # ============================== NVIDIA NIM API Key ==============================
 
     def open_nim_key_dialog(self) -> None:
@@ -1285,6 +1333,24 @@ class PredictTab:
             max_units=cls._reason_wrap_units_for_tree(tree),
             max_lines=3,
         )
+
+    @staticmethod
+    def _set_full_cell_text(tree: Any, iid: Any, column: str, value: Any) -> None:
+        try:
+            full_texts = getattr(tree, "_full_cell_texts", None)
+            if full_texts is None:
+                full_texts = {}
+                setattr(tree, "_full_cell_texts", full_texts)
+            full_texts[(iid, column)] = str(value or "")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _clear_full_cell_texts(tree: Any) -> None:
+        try:
+            setattr(tree, "_full_cell_texts", {})
+        except Exception:
+            pass
 
     @staticmethod
     def _sort_value(record: Dict[str, Any], column: str):
@@ -3834,6 +3900,7 @@ class PredictTab:
 
         # ---- 填充连板延续表格 ----
         self.cont_tree.delete(*self.cont_tree.get_children())
+        self._clear_full_cell_texts(self.cont_tree)
         for rec in cont_list:
             res_text, hit_tag = _result_cell("cont", rec.get("code", ""))
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
@@ -3853,10 +3920,12 @@ class PredictTab:
                 res_text,
                 self._reason_cell_text(self.cont_tree, rec.get("reasons", "")),
             )
-            self.cont_tree.insert("", tk.END, values=vals, tags=(tag,))
+            iid = self.cont_tree.insert("", tk.END, values=vals, tags=(tag,))
+            self._set_full_cell_text(self.cont_tree, iid, "reasons", rec.get("reasons", ""))
 
         # ---- 填充首板候选表格 ----
         self.first_tree.delete(*self.first_tree.get_children())
+        self._clear_full_cell_texts(self.first_tree)
         for rec in first_list:
             res_text, hit_tag = _result_cell("first", rec.get("code", ""))
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
@@ -3876,10 +3945,12 @@ class PredictTab:
                 res_text,
                 self._reason_cell_text(self.first_tree, rec.get("reasons", "")),
             )
-            self.first_tree.insert("", tk.END, values=vals, tags=(tag,))
+            iid = self.first_tree.insert("", tk.END, values=vals, tags=(tag,))
+            self._set_full_cell_text(self.first_tree, iid, "reasons", rec.get("reasons", ""))
 
         # ---- 填充首板涨停候选表格 ----
         self.fresh_tree.delete(*self.fresh_tree.get_children())
+        self._clear_full_cell_texts(self.fresh_tree)
         for rec in fresh_list:
             res_text, hit_tag = _result_cell("fresh", rec.get("code", ""))
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
@@ -3915,10 +3986,12 @@ class PredictTab:
                 res_text,
                 self._reason_cell_text(self.fresh_tree, reasons_text),
             )
-            self.fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
+            iid = self.fresh_tree.insert("", tk.END, values=vals, tags=(tag,))
+            self._set_full_cell_text(self.fresh_tree, iid, "reasons", reasons_text)
 
         # ---- 填充反包候选表格 ----
         self.wrap_tree.delete(*self.wrap_tree.get_children())
+        self._clear_full_cell_texts(self.wrap_tree)
         _PATTERN_LABELS = {"wrap": "断板反包"}
         for rec in wrap_list:
             res_text, hit_tag = _result_cell("wrap", rec.get("code", ""))
@@ -3941,10 +4014,12 @@ class PredictTab:
                 res_text,
                 self._reason_cell_text(self.wrap_tree, rec.get("reasons", "")),
             )
-            self.wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
+            iid = self.wrap_tree.insert("", tk.END, values=vals, tags=(tag,))
+            self._set_full_cell_text(self.wrap_tree, iid, "reasons", rec.get("reasons", ""))
 
         # ---- 填充趋势涨停候选表格 ----
         self.trend_tree.delete(*self.trend_tree.get_children())
+        self._clear_full_cell_texts(self.trend_tree)
         for rec in trend_list:
             res_text, hit_tag = _result_cell("trend", rec.get("code", ""))
             confirm_text, auction_text = self._opening_confirmation_cells(rec)
@@ -3966,7 +4041,8 @@ class PredictTab:
                 res_text,
                 self._reason_cell_text(self.trend_tree, rec.get("reasons", "")),
             )
-            self.trend_tree.insert("", tk.END, values=vals, tags=(tag,))
+            iid = self.trend_tree.insert("", tk.END, values=vals, tags=(tag,))
+            self._set_full_cell_text(self.trend_tree, iid, "reasons", rec.get("reasons", ""))
 
         # 更新 Tab 标题：显示「筛选后/总数」
         raw = self.lists or {}

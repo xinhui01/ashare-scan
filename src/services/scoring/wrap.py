@@ -390,6 +390,13 @@ def score_broken_board_wrap(
         if theme_reason:
             reasons.append(theme_reason)
 
+    theme_fund_bonus, theme_fund_reasons = _shared.theme_fund_bonus(
+        code, industry, compare_context
+    )
+    if theme_fund_bonus:
+        score += min(theme_fund_bonus, 4)
+        reasons.extend(theme_fund_reasons)
+
     # ---- 板块联动（行业涨跌幅加分） ----
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(code, compare_context)
     if flow_bonus != 0:

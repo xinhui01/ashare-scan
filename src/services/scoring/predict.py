@@ -932,6 +932,19 @@ def predict_limit_up_candidates(
     compare_context["theme_size_map"] = theme_size_map
     compare_context["code_to_concept_phase"] = code_to_phase
 
+    try:
+        from src.services.theme_fund_service import build_theme_fund_context
+        theme_fund_context = build_theme_fund_context(
+            concepts,
+            fetcher=scoring_fetcher,
+            build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
+        )
+    except Exception as exc:
+        logger.debug("计算题材资金潜伏/爆发失败: %s", exc)
+        theme_fund_context = {}
+        data_quality["warnings"].append(f"题材资金潜伏/爆发评分失败: {exc}")
+    compare_context.update(theme_fund_context)
+
     real_concepts = [
         c for c in concepts
         if isinstance(c, dict) and str(c.get("source") or "").strip() != "行业"
@@ -948,6 +961,12 @@ def predict_limit_up_candidates(
         hype_stats.get("concept_covered_codes") or 0
     )
     data_quality["themes"]["llm_cache_days"] = int(hype_stats.get("llm_cache_days") or 0)
+    data_quality["themes"]["fund_themes"] = len(
+        theme_fund_context.get("theme_fund_score_map") or {}
+    )
+    data_quality["themes"]["sentiment_delta"] = int(
+        theme_fund_context.get("theme_sentiment_delta") or 0
+    )
 
     if log_fn:
         if real_concepts:
@@ -1059,12 +1078,19 @@ def predict_limit_up_candidates(
         sent = analyze_market_sentiment(
             trade_date, fetch_external=True, log=log_fn,
         )
-        compare_context["sentiment_score"] = int(sent.get("score", 50))
+        base_sentiment_score = int(sent.get("score", 50))
+        theme_sentiment_delta = int(compare_context.get("theme_sentiment_delta") or 0)
+        compare_context["sentiment_base_score"] = base_sentiment_score
+        compare_context["sentiment_score"] = max(
+            0, min(100, base_sentiment_score + theme_sentiment_delta)
+        )
         compare_context["sentiment_label"] = (
             (sent.get("position_suggest") or {}).get("label", "")
         )
         data_quality["sentiment"]["loaded"] = True
         data_quality["sentiment"]["score"] = compare_context["sentiment_score"]
+        data_quality["sentiment"]["base_score"] = base_sentiment_score
+        data_quality["sentiment"]["theme_delta"] = theme_sentiment_delta
         data_quality["sentiment"]["label"] = compare_context.get("sentiment_label", "")
         # 检查 sentiment 自身是否降级（跌停 / 上证拉失败时 raw.external.ok=False）
         sent_external = ((sent.get("raw") or {}).get("external") or {})
@@ -1076,6 +1102,7 @@ def predict_limit_up_candidates(
         if log_fn:
             log_fn(
                 f"涨停预测：市场情绪 {compare_context['sentiment_score']}/100"
+                f"（基础{base_sentiment_score}, 题材{theme_sentiment_delta:+d}）"
                 f" → {compare_context['sentiment_label']}"
             )
     except Exception as exc:
@@ -1379,6 +1406,15 @@ def predict_limit_up_candidates(
         top_themes = sorted(theme_size_map.items(), key=lambda x: -x[1])[:3]
         summary_lines.append(
             f"题材识别：{'、'.join(f'{k}({v}只)' for k, v in top_themes)}"
+        )
+    theme_fund_score_map = compare_context.get("theme_fund_score_map") or {}
+    if theme_fund_score_map:
+        top_fund_themes = sorted(
+            theme_fund_score_map.items(), key=lambda x: -int(x[1])
+        )[:3]
+        summary_lines.append(
+            "题材资金："
+            + "、".join(f"{name}({int(score)})" for name, score in top_fund_themes)
         )
     theme_groups = theme_prediction.get("groups") or []
     if theme_groups:

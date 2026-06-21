@@ -272,6 +272,13 @@ def score_fresh_first_board(
         if theme_reason:
             reasons.append(theme_reason)
 
+    theme_fund_bonus, theme_fund_reasons = _shared.theme_fund_bonus(
+        code, link_industry, compare_context
+    )
+    if theme_fund_bonus:
+        score += min(theme_fund_bonus, 5)
+        reasons.extend(theme_fund_reasons)
+
     # 题材发酵阶段（萌芽/主升 顺风、末期/退潮 逆风）——之前算好但 fresh 没用上
     phase = (compare_context.get("code_to_concept_phase") or {}).get(code)
     if phase in ("萌芽", "主升"):

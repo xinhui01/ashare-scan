@@ -423,6 +423,13 @@ def score_followthrough_candidate(
         if theme_reason:
             reasons.append(theme_reason)
 
+    theme_fund_bonus, theme_fund_reasons = _shared.theme_fund_bonus(
+        code, industry, compare_context
+    )
+    if theme_fund_bonus:
+        score += min(theme_fund_bonus, 5)
+        reasons.extend(theme_fund_reasons)
+
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(code, compare_context)
     if flow_bonus != 0:
         score += flow_bonus

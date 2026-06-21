@@ -174,6 +174,13 @@ class TreeviewEnhancer:
         if col_name is None:
             return ""
         try:
+            full_texts = getattr(self.tree, "_full_cell_texts", None) or {}
+            full_text = full_texts.get((row, col_name))
+            if full_text:
+                return str(full_text)
+        except Exception:
+            pass
+        try:
             return str(self.tree.set(row, col_name) or "")
         except Exception:
             return ""

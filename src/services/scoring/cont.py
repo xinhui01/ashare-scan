@@ -335,6 +335,13 @@ def score_continuation_by_compare(
         if theme_reason:
             reasons.append(theme_reason)
 
+    theme_fund_bonus, theme_fund_reasons = _shared.theme_fund_bonus(
+        rec.get("code", ""), rec.get("industry", ""), compare_context
+    )
+    if theme_fund_bonus:
+        score += theme_fund_bonus
+        reasons.extend(theme_fund_reasons)
+
     # 板块联动（行业涨跌幅加分）
     flow_bonus, flow_reasons = _shared.capital_flow_bonus(
         rec.get("code", ""), compare_context,

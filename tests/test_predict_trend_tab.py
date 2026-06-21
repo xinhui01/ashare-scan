@@ -56,3 +56,11 @@ def test_trend_candidates_are_wired_from_payload_to_gui_table():
     assert "self.trend_tree.insert" in render_src
     assert '"trend",' in accuracy_src
     assert '("cont", "first", "fresh", "wrap", "trend")' in bucket_src
+
+
+def test_prediction_tab_has_excel_export_action():
+    build_src = inspect.getsource(PredictTab._build)
+    export_src = inspect.getsource(PredictTab.export_prediction_excel)
+
+    assert 'text="导出Excel"' in build_src
+    assert "export_prediction_to_excel" in export_src
