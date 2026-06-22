@@ -277,6 +277,12 @@ def score_trend_limit_up(
 
     score = 0.0
     reasons: List[str] = []
+    relative_strength_metrics: Dict[str, Any] = {
+        "relative_strength_available": False,
+        "relative_strength_score": None,
+        "relative_strength_benchmark": "",
+        "relative_strength_note": "强弱因子未启用",
+    }
 
     # 多头排列强度（MA5/MA20 的开口）
     ma_spread_pct = round((ma5_val - ma20_val) / ma20_val * 100, 2)
@@ -366,6 +372,15 @@ def score_trend_limit_up(
     )
     accumulation_metrics["accumulation_raw_score"] = accumulation_score
     accumulation_metrics["accumulation_weight"] = 1.0
+    rs_bonus, rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+        code,
+        df,
+        compare_context,
+        category="trend",
+    )
+    if rs_bonus:
+        score += rs_bonus
+        reasons.extend(rs_reasons)
     if accumulation_score or accumulation_risk_penalty:
         score += accumulation_score + accumulation_risk_penalty
         reasons.extend(accumulation_reasons)
@@ -460,6 +475,7 @@ def score_trend_limit_up(
         "accumulation_score": accumulation_score,
         "accumulation_risk_penalty": accumulation_risk_penalty,
         **accumulation_metrics,
+        **relative_strength_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:8]),
         "predict_type": "趋势涨停",

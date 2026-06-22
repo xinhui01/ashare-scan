@@ -197,6 +197,12 @@ def score_fresh_first_board(
 
     score = 0.0
     reasons: List[str] = []
+    relative_strength_metrics: Dict[str, Any] = {
+        "relative_strength_available": False,
+        "relative_strength_score": None,
+        "relative_strength_benchmark": "",
+        "relative_strength_note": "强弱因子未启用",
+    }
 
     raw_accumulation_score, raw_accumulation_risk_penalty, accumulation_reasons, accumulation_metrics = (
         _score_accumulation_signal(close, volume, t)
@@ -205,6 +211,15 @@ def score_fresh_first_board(
     accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.4))
     accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
     accumulation_metrics["accumulation_weight"] = 0.4
+    rs_bonus, rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+        code,
+        df,
+        compare_context,
+        category="fresh",
+    )
+    if rs_bonus:
+        score += rs_bonus
+        reasons.extend(rs_reasons)
     if accumulation_score or accumulation_risk_penalty:
         score += accumulation_score + accumulation_risk_penalty
         if accumulation_score > 0:
@@ -391,6 +406,7 @@ def score_fresh_first_board(
         "accumulation_score": accumulation_score,
         "accumulation_risk_penalty": accumulation_risk_penalty,
         **accumulation_metrics,
+        **relative_strength_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:10]),
         "predict_type": "首板涨停",

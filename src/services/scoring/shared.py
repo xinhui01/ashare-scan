@@ -129,6 +129,55 @@ def theme_fund_bonus(
     return bonus, reasons
 
 
+def relative_strength_bonus(
+    code: str,
+    history: Optional[pd.DataFrame],
+    compare_context: Dict[str, Any],
+    *,
+    category: str = "",
+    boards: int = 0,
+) -> Tuple[float, List[str], Dict[str, Any]]:
+    """Return score adjustment and display fields for stock/index relative strength.
+
+    Missing index data is intentionally not neutralized into 0. Callers receive
+    explicit availability fields so UI/export can show that the factor was skipped.
+    """
+    from src.services.relative_strength_service import (
+        benchmark_symbol_for_stock,
+        score_stock_relative_strength,
+    )
+
+    benchmark = benchmark_symbol_for_stock(code)
+    index_history = (compare_context.get("relative_strength_index_history") or {}).get(benchmark)
+    result = score_stock_relative_strength(
+        code,
+        history if history is not None else pd.DataFrame(),
+        index_history,
+        category=category,
+        boards=boards,
+    )
+    metrics = dict(result.get("metrics") or {})
+    metrics.update({
+        "relative_strength_available": bool(result.get("available")),
+        "relative_strength_score": result.get("score"),
+        "relative_strength_benchmark": result.get("benchmark") or benchmark,
+        "relative_strength_note": result.get("warning") or "",
+    })
+    if not result.get("available"):
+        return 0.0, [], metrics
+
+    score = int(result.get("score") or 0)
+    if score == 0:
+        return 0.0, [], metrics
+    first_reason = ""
+    reasons = result.get("reasons") or []
+    if reasons:
+        first_reason = str(reasons[0])
+    sign = f"+{score}" if score > 0 else str(score)
+    detail = f"({first_reason})" if first_reason else ""
+    return float(score), [f"强弱分{sign}{detail}"], metrics
+
+
 def capital_flow_bonus(
     code: str,
     compare_context: Dict[str, Any],

@@ -38,6 +38,7 @@ def score_continuation(
     *,
     fetcher,
     log_fn: Optional[Callable[[str], None]] = None,
+    compare_context: Optional[Dict[str, Any]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
     limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
 ) -> Dict[str, Any]:
@@ -59,6 +60,12 @@ def score_continuation(
     accumulation_score = 0
     accumulation_risk_penalty = 0
     accumulation_metrics: Dict[str, Any] = {"accumulation_days": 30}
+    relative_strength_metrics: Dict[str, Any] = {
+        "relative_strength_available": False,
+        "relative_strength_score": None,
+        "relative_strength_benchmark": "",
+        "relative_strength_note": "强弱因子未启用",
+    }
 
     # 1. 连板数基础分
     # 数据反馈：cont 主类 17.7% 命中，首板 (cont_1to2) 仅 14.5%；
@@ -201,11 +208,30 @@ def score_continuation(
         accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.8))
         accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
         accumulation_metrics["accumulation_weight"] = 0.8
+        if compare_context is not None:
+            rs_bonus, rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+                code,
+                df,
+                compare_context,
+                category="cont",
+                boards=boards,
+            )
+            if rs_bonus:
+                score += rs_bonus
+                reasons.extend(rs_reasons)
         if accumulation_score or accumulation_risk_penalty:
             score += accumulation_score + accumulation_risk_penalty
             if accumulation_score > 0:
                 reasons.append(f"30日潜伏铺垫x0.8+{accumulation_score}")
             reasons.extend(accumulation_reasons)
+    elif compare_context is not None:
+        _rs_bonus, _rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+            code,
+            history,
+            compare_context,
+            category="cont",
+            boards=boards,
+        )
 
     # === 历史同类形态加分：近 90 日内的连板成功次数 ===
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
@@ -245,8 +271,9 @@ def score_continuation(
         "accumulation_score": accumulation_score,
         "accumulation_risk_penalty": accumulation_risk_penalty,
         **accumulation_metrics,
+        **relative_strength_metrics,
         "score": final_score,
-        "reasons": " / ".join(reasons[:8]),
+        "reasons": " / ".join(reasons[:12]),
         "predict_type": "连板延续",
     }
 
@@ -270,6 +297,7 @@ def score_continuation_by_compare(
         rec, hot_industries,
         fetcher=fetcher,
         log_fn=log_fn,
+        compare_context=compare_context,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
     )

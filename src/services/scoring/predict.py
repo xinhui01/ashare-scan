@@ -659,6 +659,7 @@ def predict_limit_up_candidates(
         "themes": {"loaded": False, "themes": 0, "covered_codes": 0},
         "board_strength": {"loaded": False, "rows": 0},
         "sentiment": {"loaded": False, "score": None, "degraded": False},
+        "relative_strength": {"loaded": False, "benchmarks": 0, "warnings": []},
         "warnings": [],
         "timing_hint": _compute_timing_hint(trade_date, historical_mode),
     }
@@ -673,6 +674,46 @@ def predict_limit_up_candidates(
         if historical_mode
         else fetcher
     )
+    try:
+        from src.services.relative_strength_service import build_relative_strength_context
+        relative_strength_context = build_relative_strength_context(
+            trade_date,
+            log_fn=log_fn,
+        )
+    except Exception as exc:
+        logger.debug("加载相对指数强弱数据失败: %s", exc)
+        relative_strength_context = {
+            "relative_strength_index_history": {},
+            "relative_strength_index_meta": {},
+            "relative_strength_warnings": [f"指数历史加载失败，强弱因子已跳过: {exc}"],
+        }
+    compare_context.update(relative_strength_context)
+    relative_strength_histories = (
+        relative_strength_context.get("relative_strength_index_history") or {}
+    )
+    relative_strength_warnings = [
+        str(x) for x in (relative_strength_context.get("relative_strength_warnings") or [])
+        if str(x).strip()
+    ]
+    data_quality["relative_strength"] = {
+        "loaded": bool(relative_strength_histories),
+        "benchmarks": len(relative_strength_histories),
+        "warnings": relative_strength_warnings,
+    }
+    for warning in relative_strength_warnings:
+        data_quality["warnings"].append(warning)
+    if log_fn:
+        if relative_strength_histories:
+            names = {
+                "sh000001": "上证",
+                "sz399001": "深成指",
+            }
+            loaded = " / ".join(
+                names.get(symbol, symbol) for symbol in relative_strength_histories
+            )
+            log_fn(f"涨停预测：相对指数强弱数据已加载（{loaded}）")
+        else:
+            log_fn("涨停预测：相对指数强弱数据不可用，强弱因子将显示为空")
 
     # 阶段2：获取今日涨停池 + 全市场行情
     if log_fn:

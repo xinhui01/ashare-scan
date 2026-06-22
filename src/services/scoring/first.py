@@ -162,6 +162,12 @@ def score_followthrough_candidate(
     accumulation_risk_penalty = 0
     accumulation_reasons: List[str] = []
     accumulation_metrics: Dict[str, Any] = {"accumulation_days": 30}
+    relative_strength_metrics: Dict[str, Any] = {
+        "relative_strength_available": False,
+        "relative_strength_score": None,
+        "relative_strength_benchmark": "",
+        "relative_strength_note": "强弱因子未启用",
+    }
 
     if history is not None and not history.empty and len(history) >= 10:
         df = history.sort_values("date").reset_index(drop=True)
@@ -311,6 +317,15 @@ def score_followthrough_candidate(
         accumulation_risk_penalty = int(round(raw_accumulation_risk_penalty * 0.7))
         accumulation_metrics["accumulation_raw_score"] = raw_accumulation_score
         accumulation_metrics["accumulation_weight"] = 0.7
+        rs_bonus, rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+            code,
+            df,
+            compare_context,
+            category="first",
+        )
+        if rs_bonus:
+            score += rs_bonus
+            reasons.extend(rs_reasons)
     else:
         # 历史数据不足时给保守默认（不阻塞硬过滤；scoring 块会跳过这些维度）
         prior_wave_boards = 0
@@ -318,6 +333,12 @@ def score_followthrough_candidate(
         broken_prior_lu_low = False
         window_lu_count = 0
         prior_lu_pattern = "normal"
+        _rs_bonus, _rs_reasons, relative_strength_metrics = _shared.relative_strength_bonus(
+            code,
+            history,
+            compare_context,
+            category="first",
+        )
 
     # ---- 硬性过滤（基于 1118 只历史涨停股 T 日特征统计放宽）----
     if change_pct is None or change_pct < -3.0 or change_pct >= 9.5:
@@ -576,6 +597,7 @@ def score_followthrough_candidate(
         "accumulation_score": accumulation_score,
         "accumulation_risk_penalty": accumulation_risk_penalty,
         **accumulation_metrics,
+        **relative_strength_metrics,
         "score": final_score,
         "reasons": " / ".join(reasons[:10]),
         "predict_type": "二波接力",
