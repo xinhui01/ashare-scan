@@ -28,6 +28,10 @@ from src.services.scoring import shared as _shared
 from src.services.scoring import trend as _trend
 from src.services.scoring import wrap as _wrap
 from src.services import popularity_rank_service as _popularity_rank_service
+from src.services.market_focus_advice_service import (
+    build_market_focus_advice,
+    format_market_focus_advice_lines,
+)
 from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
@@ -1516,6 +1520,18 @@ def predict_limit_up_candidates(
             f"强势板块 TOP5：{'、'.join(f'{k}({v:+.1f}%)' for k, v in top_boards)}"
         )
 
+    category_counts = {
+        "cont": len(continuation_candidates),
+        "first": len(first_board_candidates),
+        "fresh": len(fresh_first_board_candidates),
+        "wrap": len(broken_board_wrap_candidates),
+        "trend": len(trend_limit_up_candidates),
+    }
+    market_focus_advice = build_market_focus_advice(compare_context, category_counts)
+    if market_focus_advice:
+        compare_context["market_focus_advice"] = market_focus_advice
+        summary_lines.extend(format_market_focus_advice_lines(market_focus_advice))
+
     result = {
         "trade_date": trade_date,
         "profile": profile,
@@ -1529,6 +1545,7 @@ def predict_limit_up_candidates(
         "compare_context": compare_context,
         "concept_hype_result": hype,
         "theme_prediction": theme_prediction,
+        "market_focus_advice": market_focus_advice,
         "summary": "\n".join(summary_lines),
         "data_quality": data_quality,
     }

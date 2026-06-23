@@ -41,6 +41,10 @@ from src.services import (
     opening_confirmation_service,
     prediction_accuracy_service,
 )
+from src.services.market_focus_advice_service import (
+    format_market_focus_advice_lines,
+    resolve_market_focus_advice,
+)
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.utils.cancel_token import CancelToken
 from src.utils.trade_calendar import (
@@ -3287,7 +3291,17 @@ class PredictTab:
             except Exception:
                 pass
 
-        txt.insert(tk.END, result.get("summary", "") + "\n")
+        summary_text = str(result.get("summary") or "")
+        txt.insert(tk.END, summary_text + "\n")
+
+        market_focus_advice = resolve_market_focus_advice(result)
+        market_focus_lines = format_market_focus_advice_lines(market_focus_advice)
+        if market_focus_lines and not all(line in summary_text for line in market_focus_lines):
+            txt.insert(tk.END, f"\n{'='*36}\n")
+            txt.insert(tk.END, "  行情打法建议\n")
+            txt.insert(tk.END, f"{'='*36}\n")
+            for line in market_focus_lines:
+                txt.insert(tk.END, f"  {line}\n")
 
         # ---- 数据健康度（让用户一眼看出本次预测哪些维度是真数据、哪些是 fallback）----
         if dq:

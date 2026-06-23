@@ -9,6 +9,11 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from src.services.market_focus_advice_service import (
+    format_market_focus_advice_lines,
+    resolve_market_focus_advice,
+)
+
 
 CandidateSpec = Tuple[str, str, List[Tuple[str, str]]]
 UNCONFIRMED_TEXT = "未确认"
@@ -189,6 +194,8 @@ def _write_summary(wb: Workbook, prediction: Dict[str, Any]) -> None:
     ws.title = "汇总"
     ctx = prediction.get("compare_context") or {}
     specs_count = {name: len(prediction.get(key) or []) for name, key, _cols in CANDIDATE_SPECS}
+    market_focus_advice = resolve_market_focus_advice(prediction)
+    market_focus_lines = format_market_focus_advice_lines(market_focus_advice)
     rows = [
         ["交易日", prediction.get("trade_date", "")],
         ["回溯天数", prediction.get("lookback_days", "")],
@@ -199,6 +206,10 @@ def _write_summary(wb: Workbook, prediction: Dict[str, Any]) -> None:
         ["市场状态", ctx.get("market_state_label", "")],
         ["情绪打法", (ctx.get("market_state_strategy") or {}).get("label", "")],
         ["轮动分", (ctx.get("market_rotation") or {}).get("rotation_score", "")],
+        ["行情打法建议", "\n".join(market_focus_lines)],
+        ["今日重点池", market_focus_advice.get("focus_text", "") if market_focus_advice else ""],
+        ["备选观察", market_focus_advice.get("secondary_text", "") if market_focus_advice else ""],
+        ["谨慎/回避池", market_focus_advice.get("avoid_text", "") if market_focus_advice else ""],
         ["预测摘要", prediction.get("summary", "")],
     ]
     for name, count in specs_count.items():

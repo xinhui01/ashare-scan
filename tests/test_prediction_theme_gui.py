@@ -138,6 +138,15 @@ def test_prediction_summary_labels_industry_heat_as_observation_not_buy_directio
     assert "明日热点板块预测" not in apply_src
 
 
+def test_prediction_summary_renders_market_focus_advice():
+    apply_src = inspect.getsource(PredictTab._apply_result)
+    predict_src = inspect.getsource(scoring_predict.predict_limit_up_candidates)
+
+    assert "format_market_focus_advice_lines" in apply_src
+    assert "行情打法建议" in apply_src
+    assert '"market_focus_advice": market_focus_advice' in predict_src
+
+
 def test_prediction_accuracy_text_is_compact_for_header_label():
     text = PredictTab._accuracy_header_text(
         "首板涨停",
