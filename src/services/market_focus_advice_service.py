@@ -114,6 +114,37 @@ def _format_items(items: Sequence[Mapping[str, Any]], *, warn_zero: bool = False
     return "、".join(parts)
 
 
+def _sentiment_score(compare_context: Mapping[str, Any]) -> int | None:
+    raw_score = compare_context.get("sentiment_score")
+    if raw_score is None:
+        sentiment = compare_context.get("sentiment") or {}
+        if isinstance(sentiment, Mapping):
+            raw_score = sentiment.get("score") or sentiment.get("sentiment_score")
+    try:
+        return int(raw_score)
+    except (TypeError, ValueError):
+        return None
+
+
+def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str]) -> List[str]:
+    state_label = str(compare_context.get("market_state_label") or "").strip()
+    score = _sentiment_score(compare_context)
+    has_fresh_focus = "fresh" in primary
+    if not has_fresh_focus:
+        return []
+
+    rules = [
+        "执行规则：谁所在板块最强、谁先主动放量上板，优先做谁；没有板块共振，一个都不做。"
+    ]
+    if state_label in {"轮动日", "退潮日", "过渡日"}:
+        rules.append("执行规则：弱情绪日只做确认，不做预测型埋伏。")
+    if score is not None and score < 30:
+        rules.append(
+            "弱情绪过滤：市场情绪低于30分时，首板池只作为观察名单；必须等板块共振 + 个股主动上板确认。"
+        )
+    return rules
+
+
 def prediction_category_counts(prediction: Mapping[str, Any]) -> Dict[str, int]:
     """Return candidate counts in the five scoring categories."""
     counts: Dict[str, int] = {}
@@ -177,6 +208,7 @@ def build_market_focus_advice(
 
     avoid_text = _format_items(avoid_items)
     state_text = state_label or str((strategy or {}).get("label") or "市场状态")
+    execution_rules = _execution_rules(compare_context, primary)
 
     return {
         "state_label": state_label,
@@ -187,6 +219,7 @@ def build_market_focus_advice(
         "focus_text": focus_text,
         "secondary_text": secondary_text,
         "avoid_text": avoid_text,
+        "execution_rules": execution_rules,
         "reason": reason,
         "summary": f"行情打法建议：{state_text} → {reason}" if reason else f"行情打法建议：{state_text}",
     }
@@ -217,6 +250,9 @@ def format_market_focus_advice_lines(advice: Mapping[str, Any]) -> List[str]:
     avoid_text = str(advice.get("avoid_text") or "").strip()
     if focus_text:
         lines.append(f"今日重点池：{focus_text}")
+    execution_rules = advice.get("execution_rules") or []
+    if isinstance(execution_rules, Sequence) and not isinstance(execution_rules, (str, bytes)):
+        lines.extend(str(rule).strip() for rule in execution_rules if str(rule).strip())
     if secondary_text:
         lines.append(f"备选观察：{secondary_text}")
     if avoid_text:

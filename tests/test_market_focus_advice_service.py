@@ -51,3 +51,19 @@ def test_market_focus_advice_formats_summary_lines_for_ui_and_excel():
     assert "今日重点池：首板涨停(5只)" in lines
     assert "备选观察：二波接力(2只)、反包(1只)" in lines
     assert "谨慎/回避池：保留涨停/连板(3只)、趋势涨停(0只)" in lines
+
+
+def test_weak_rotation_day_formats_confirmation_execution_rules():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "sentiment_score": 24,
+        },
+        {"cont": 1, "first": 13, "fresh": 8, "wrap": 27, "trend": 43},
+    )
+
+    lines = format_market_focus_advice_lines(advice)
+
+    assert "执行规则：谁所在板块最强、谁先主动放量上板，优先做谁；没有板块共振，一个都不做。" in lines
+    assert "弱情绪过滤：市场情绪低于30分时，首板池只作为观察名单；必须等板块共振 + 个股主动上板确认。" in lines

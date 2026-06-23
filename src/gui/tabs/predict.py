@@ -4128,7 +4128,17 @@ class PredictTab:
         vals = tree.item(sel[0], "values")
         if vals:
             code = str(vals[0]).strip().zfill(6)
-            self.app.status_var.set(f"预测候选: {code} {vals[1] if len(vals) > 1 else ''}")
+            name = str(vals[1]).strip() if len(vals) > 1 else ""
+            status_text = f"预测候选: {code} {name}".strip()
+            if name:
+                try:
+                    self.app.root.clipboard_clear()
+                    self.app.root.clipboard_append(name)
+                    self.app.root.update_idletasks()
+                    status_text = f"{status_text} | 已复制名称: {name}"
+                except tk.TclError as exc:
+                    status_text = f"{status_text} | 复制名称失败: {exc}"
+            self.app.status_var.set(status_text)
 
     def _on_stock_double_click(self, event):
         tree = event.widget
