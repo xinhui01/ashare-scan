@@ -438,6 +438,13 @@ def score_continuation_by_compare(
         score += 3
         reasons.append(f"情绪温热{sent_score}+3")
 
+    style_bonus, style_reasons = _shared.market_style_bias(
+        "cont", code, ind, compare_context, boards=boards
+    )
+    if style_bonus:
+        score += style_bonus
+        reasons.extend(style_reasons)
+
     final_score = max(0, min(100, int(round(score))))
     base["score"] = final_score
     base["reasons"] = " / ".join(reasons[:12])

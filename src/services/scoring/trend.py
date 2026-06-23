@@ -432,6 +432,13 @@ def score_trend_limit_up(
         score += flow_bonus
         reasons.extend(flow_reasons)
 
+    style_bonus, style_reasons = _shared.market_style_bias(
+        "trend", code, industry, compare_context
+    )
+    if style_bonus:
+        score += style_bonus
+        reasons.extend(style_reasons)
+
     # 换手率
     if turnover is not None:
         if 3 <= turnover <= 12:

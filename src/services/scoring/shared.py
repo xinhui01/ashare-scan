@@ -1,9 +1,10 @@
 """跨 scorer 复用的评分调节因子。
 
-5 个无状态函数：
+6 个无状态函数：
 - parse_full_pool: 把涨停池 DataFrame 转 records 列表
 - count_pool_industries: 涨停池行业分布
 - theme_bonus: AI 题材聚类热度加分
+- market_style_bias: 市场状态/轮动风格加减分
 - capital_flow_bonus: 板块涨跌幅加分（行业联动）
 - vol_ratio_with_baseline: 5/20 日量比双口径计算
 
@@ -127,6 +128,119 @@ def theme_fund_bonus(
         detail = f"潜{acc}/爆{burst}" if theme_name else f"{score}"
         reasons.append(f"{source}{detail}+{int(bonus)}")
     return bonus, reasons
+
+
+def _text_set(values: Any) -> set[str]:
+    if isinstance(values, (list, tuple, set)):
+        return {str(item).strip() for item in values if str(item).strip()}
+    text = str(values or "").strip()
+    return {text} if text else set()
+
+
+def _matches_any_name(value: str, names: set[str]) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return any(text == name or text in name or name in text for name in names if name)
+
+
+def market_style_bias(
+    category: str,
+    code: str,
+    industry: str,
+    compare_context: Dict[str, Any],
+    *,
+    boards: int = 0,
+) -> Tuple[float, List[str]]:
+    """根据市场状态推荐打法做风格加减分。
+
+    市场情绪服务已给出"接力日/轮动日/退潮日/冰点日/过渡日"和轮动明细。
+    个股评分不能只看总情绪分，否则轮动日会把老主线接力误当成强势方向。
+    """
+    if not isinstance(compare_context, dict):
+        return 0.0, []
+
+    market_state = compare_context.get("market_state") or {}
+    label = str(compare_context.get("market_state_label") or market_state.get("label") or "").strip()
+    if not label:
+        return 0.0, []
+
+    rotation = (
+        compare_context.get("market_rotation")
+        or compare_context.get("rotation")
+        or (compare_context.get("raw") or {}).get("rotation")
+        or {}
+    )
+    new_names = _text_set(rotation.get("new_industries"))
+    theme_name = str((compare_context.get("code_theme_map") or {}).get(code) or "").strip()
+    phase = str((compare_context.get("code_to_concept_phase") or {}).get(code) or "").strip()
+    is_new_direction = (
+        phase == "萌芽"
+        or _matches_any_name(industry, new_names)
+        or _matches_any_name(theme_name, new_names)
+    )
+
+    cat = str(category or "").strip().lower()
+    is_cont = cat in {"cont", "continuation"}
+    is_first = cat in {"first", "followthrough", "relay"}
+    is_fresh = cat in {"fresh", "first_board", "first-board"}
+    is_wrap = cat in {"wrap", "broken_board_wrap", "broken-board-wrap"}
+    is_trend = cat in {"trend", "trend_limit_up", "trend-limit-up"}
+
+    if label == "轮动日":
+        if is_fresh:
+            if is_new_direction:
+                return 10.0, ["轮动日首板新题材+10"]
+            return 4.0, ["轮动日首板优先+4"]
+        if is_cont:
+            if is_new_direction and boards <= 2:
+                return -6.0, ["轮动日新方向接力谨慎-6"]
+            penalty = -15.0 if boards >= 3 else -12.0
+            return penalty, [f"轮动日老主线接力降权{int(penalty)}"]
+        if is_first:
+            if is_new_direction:
+                return -4.0, ["轮动日二波新方向谨慎-4"]
+            return -10.0, ["轮动日二波接力降权-10"]
+        if is_wrap:
+            return 4.0, ["轮动日反包修复+4"]
+        if is_trend:
+            return -4.0, ["轮动日趋势票降权-4"]
+
+    if label == "接力日":
+        if is_cont and boards >= 2:
+            return 6.0, ["接力日连板核心+6"]
+        if is_first:
+            return 4.0, ["接力日二波接力+4"]
+        if is_fresh and not is_new_direction:
+            return -2.0, ["接力日非新方向首板-2"]
+
+    if label == "过渡日":
+        if is_fresh:
+            return 3.0, ["过渡日首板试错+3"]
+        if is_cont and boards >= 3:
+            return -5.0, ["过渡日高位接力谨慎-5"]
+
+    if label == "退潮日":
+        if is_cont or is_first:
+            return -15.0, ["退潮日接力降权-15"]
+        if is_wrap:
+            return 8.0, ["退潮日反包修复+8"]
+        if is_fresh:
+            return -4.0, ["退潮日首板控仓-4"]
+        if is_trend:
+            return -6.0, ["退潮日趋势票降权-6"]
+
+    if label == "冰点日":
+        if is_cont or is_first:
+            return -20.0, ["冰点日接力回避-20"]
+        if is_wrap:
+            return 6.0, ["冰点日超跌反包+6"]
+        if is_fresh:
+            return -8.0, ["冰点日首板试错降权-8"]
+        if is_trend:
+            return -8.0, ["冰点日趋势票降权-8"]
+
+    return 0.0, []
 
 
 def relative_strength_bonus(

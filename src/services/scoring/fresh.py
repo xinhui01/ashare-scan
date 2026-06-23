@@ -303,6 +303,13 @@ def score_fresh_first_board(
         score -= 4
         reasons.append(f"题材{phase}期-4")
 
+    style_bonus, style_reasons = _shared.market_style_bias(
+        "fresh", code, link_industry, compare_context
+    )
+    if style_bonus:
+        score += style_bonus
+        reasons.extend(style_reasons)
+
     # === 次加权：股性（曾涨停加分；不再对僵尸冷票惩罚——资金接入型常是冷票）===
     occ_count, last_hit_days = _count_historical_any_limit_up(
         history, code, lookback_days=60, threshold_fn=threshold_fn,

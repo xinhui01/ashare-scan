@@ -174,6 +174,48 @@ def build_compare_market_context(
     }
 
 
+def _apply_market_sentiment_context(
+    compare_context: Dict[str, Any],
+    data_quality: Dict[str, Any],
+    sent: Dict[str, Any],
+) -> None:
+    """把市场情绪服务结果写入 compare_context，供所有 scorer 复用。"""
+    base_sentiment_score = int(sent.get("score", 50))
+    theme_sentiment_delta = int(compare_context.get("theme_sentiment_delta") or 0)
+    final_sentiment_score = max(0, min(100, base_sentiment_score + theme_sentiment_delta))
+    market_state = sent.get("market_state") or {}
+    market_strategy = market_state.get("strategy") or {}
+    raw = sent.get("raw") or {}
+    rotation = raw.get("rotation") or {}
+
+    compare_context["sentiment_base_score"] = base_sentiment_score
+    compare_context["sentiment_score"] = final_sentiment_score
+    compare_context["sentiment_label"] = (
+        (sent.get("position_suggest") or {}).get("label", "")
+    )
+    compare_context["market_state"] = market_state
+    compare_context["market_state_label"] = str(market_state.get("label") or "")
+    compare_context["market_state_strategy"] = market_strategy
+    compare_context["market_rotation"] = rotation
+
+    sentiment_quality = data_quality.setdefault("sentiment", {})
+    sentiment_quality["loaded"] = True
+    sentiment_quality["score"] = final_sentiment_score
+    sentiment_quality["base_score"] = base_sentiment_score
+    sentiment_quality["theme_delta"] = theme_sentiment_delta
+    sentiment_quality["label"] = compare_context.get("sentiment_label", "")
+    sentiment_quality["market_state"] = compare_context.get("market_state_label", "")
+    sentiment_quality["strategy_label"] = market_strategy.get("label", "")
+    sentiment_quality["rotation_score"] = rotation.get("rotation_score", "")
+
+    sent_external = (raw.get("external") or {})
+    if not sent_external.get("ok", True):
+        sentiment_quality["degraded"] = True
+        data_quality.setdefault("warnings", []).append(
+            "市场情绪外部数据降级：跌停池/上证指数未完整拉到"
+        )
+
+
 def _compute_timing_hint(trade_date: str, historical_mode: bool) -> str:
     """预测时机提示：盘中 / 盘后 / 历史模式 reason 数据完整度差异。
 
@@ -1119,32 +1161,17 @@ def predict_limit_up_candidates(
         sent = analyze_market_sentiment(
             trade_date, fetch_external=True, log=log_fn,
         )
-        base_sentiment_score = int(sent.get("score", 50))
-        theme_sentiment_delta = int(compare_context.get("theme_sentiment_delta") or 0)
-        compare_context["sentiment_base_score"] = base_sentiment_score
-        compare_context["sentiment_score"] = max(
-            0, min(100, base_sentiment_score + theme_sentiment_delta)
-        )
-        compare_context["sentiment_label"] = (
-            (sent.get("position_suggest") or {}).get("label", "")
-        )
-        data_quality["sentiment"]["loaded"] = True
-        data_quality["sentiment"]["score"] = compare_context["sentiment_score"]
-        data_quality["sentiment"]["base_score"] = base_sentiment_score
-        data_quality["sentiment"]["theme_delta"] = theme_sentiment_delta
-        data_quality["sentiment"]["label"] = compare_context.get("sentiment_label", "")
-        # 检查 sentiment 自身是否降级（跌停 / 上证拉失败时 raw.external.ok=False）
-        sent_external = ((sent.get("raw") or {}).get("external") or {})
-        if not sent_external.get("ok", True):
-            data_quality["sentiment"]["degraded"] = True
-            data_quality["warnings"].append(
-                "市场情绪外部数据降级：跌停池/上证指数未完整拉到"
-            )
+        _apply_market_sentiment_context(compare_context, data_quality, sent)
         if log_fn:
+            state_label = compare_context.get("market_state_label", "")
+            strategy_label = (compare_context.get("market_state_strategy") or {}).get("label", "")
+            state_part = f"；状态 {state_label} → {strategy_label}" if state_label else ""
             log_fn(
                 f"涨停预测：市场情绪 {compare_context['sentiment_score']}/100"
-                f"（基础{base_sentiment_score}, 题材{theme_sentiment_delta:+d}）"
+                f"（基础{compare_context['sentiment_base_score']}, "
+                f"题材{int(compare_context.get('theme_sentiment_delta') or 0):+d}）"
                 f" → {compare_context['sentiment_label']}"
+                f"{state_part}"
             )
     except Exception as exc:
         logger.debug("接入市场情绪评分失败: %s", exc)
@@ -1440,6 +1467,18 @@ def predict_limit_up_candidates(
         summary_lines.append(f"昨日首板最新晋级率：{latest_cont_rate:.1f}%")
     if avg_cont_rate is not None:
         summary_lines.append(f"近{compare_context.get('pair_count', 0)}组平均晋级率：{avg_cont_rate:.1f}%")
+    state_label = str(compare_context.get("market_state_label") or "").strip()
+    if state_label:
+        strategy_label = str(
+            (compare_context.get("market_state_strategy") or {}).get("label") or ""
+        ).strip()
+        rotation_score = (compare_context.get("market_rotation") or {}).get("rotation_score")
+        state_line = f"市场状态：{state_label}"
+        if strategy_label:
+            state_line += f" → {strategy_label}"
+        if isinstance(rotation_score, (int, float)):
+            state_line += f"（轮动分{int(rotation_score):+d}）"
+        summary_lines.append(state_line)
     if hot_industries:
         top3 = sorted(hot_industries.items(), key=lambda x: -x[1])[:3]
         summary_lines.append(f"热门行业：{'、'.join(f'{k}({v})' for k, v in top3)}")

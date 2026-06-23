@@ -16,6 +16,11 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
             "sentiment_score": 72,
             "sentiment_base_score": 65,
             "theme_sentiment_delta": 7,
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "market_rotation": {"rotation_score": 42},
+            "pair_count": 5,
+            "avg_continuation_rate": 10.8,
             "theme_fund_score_map": {"机器人": 68},
             "theme_fund_accumulation_map": {"机器人": 18},
             "theme_breakout_map": {"机器人": 34},
@@ -63,5 +68,13 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
     assert "潜伏分" in headers
     assert "预测依据" in headers
     assert wb["保留涨停"]["A2"].value == "300001"
+    assert wb["保留涨停"]["K2"].value == "未确认"
+    assert wb["保留涨停"]["L2"].value == "需9:25后竞价确认"
+    summary_values = [cell.value for cell in wb["汇总"]["B"] if cell.value]
+    assert "轮动日" in summary_values
+    assert "首板新题材 / 避开老主线" in summary_values
+    assert 42 in summary_values
+    assert any("候选仅为观察池" in str(value) for value in summary_values)
+    assert any("平均晋级率仅10.8%" in str(value) for value in summary_values)
     assert wb["题材资金"]["A2"].value == "机器人"
     assert wb["题材资金"]["E2"].value == 68

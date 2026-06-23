@@ -418,6 +418,13 @@ def score_broken_board_wrap(
         score += flow_bonus
         reasons.extend(flow_reasons)
 
+    style_bonus, style_reasons = _shared.market_style_bias(
+        "wrap", code, industry, compare_context, boards=streak
+    )
+    if style_bonus:
+        score += style_bonus
+        reasons.extend(style_reasons)
+
     # ---- 大盘环境（共用）----
     latest_cont_rate = compare_context.get("latest_continuation_rate")
     if latest_cont_rate is not None:

@@ -456,6 +456,13 @@ def score_followthrough_candidate(
         score += flow_bonus
         reasons.extend(flow_reasons)
 
+    style_bonus, style_reasons = _shared.market_style_bias(
+        "first", code, industry, compare_context
+    )
+    if style_bonus:
+        score += style_bonus
+        reasons.extend(style_reasons)
+
     # 6. 形态加分 —— 2026-05-29 调整：
     # "突破20日新高" 实测反指 -3.8% (n=215)，归零（加速顶常见特征，不再加分）。
     # "站稳MA10" 无显著方向性 (+1.2% diff, p>0.05)，保留 +4。

@@ -3505,13 +3505,13 @@ class PredictTab:
                     f"  {rec['code']} {rec.get('name', ''):6s}  涨{chg_text:6s} {ma_text:9s}  "
                     f"分={rec['score']:3d}  {rec.get('reasons', '')}\n")
 
-        # 明日热点板块预测（基于今日涨停股的行业分布；今日热点延续到明日）
+        # 今日涨停行业分布：只表示当日涨停聚集方向，不等同于次日买入方向。
         if hot_industries:
             sorted_inds = sorted(hot_industries.items(), key=lambda x: -x[1])
             total_zt = sum(hot_industries.values()) or 1
             top5 = sorted_inds[:5]
             txt.insert(tk.END, f"\n{'='*36}\n")
-            txt.insert(tk.END, f"  明日热点板块预测（TOP5 · 基于今日涨停股分布）\n")
+            txt.insert(tk.END, f"  今日涨停行业分布（TOP5 · 次日观察，不是买入方向）\n")
             txt.insert(tk.END, f"{'='*36}\n")
             for k, v in top5:
                 ratio = v / total_zt * 100.0

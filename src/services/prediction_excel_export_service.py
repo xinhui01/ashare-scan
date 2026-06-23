@@ -11,6 +11,8 @@ from openpyxl.utils import get_column_letter
 
 
 CandidateSpec = Tuple[str, str, List[Tuple[str, str]]]
+UNCONFIRMED_TEXT = "未确认"
+UNCONFIRMED_AUCTION_TEXT = "需9:25后竞价确认"
 
 
 CANDIDATE_SPECS: List[CandidateSpec] = [
@@ -93,6 +95,41 @@ def _record_value(record: Dict[str, Any], key: str) -> Any:
     return value
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_candidate_records(prediction: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for _sheet_name, key, _columns in CANDIDATE_SPECS:
+        for rec in prediction.get(key) or []:
+            if isinstance(rec, dict):
+                yield rec
+
+
+def _build_operation_hint(prediction: Dict[str, Any]) -> str:
+    ctx = prediction.get("compare_context") or {}
+    hints: List[str] = []
+    candidates = list(_iter_candidate_records(prediction))
+    if candidates and not any((rec.get("opening_confirmation") or {}) for rec in candidates):
+        hints.append(
+            "未做竞价/开盘确认：候选仅为观察池，不应直接按表买入；"
+            "次日9:25后先执行竞价确认。"
+        )
+    avg_cont_rate = _safe_float(ctx.get("avg_continuation_rate"))
+    if avg_cont_rate is not None and avg_cont_rate < 15:
+        pair_count = int(ctx.get("pair_count") or 0)
+        hints.append(
+            f"近{pair_count}组平均晋级率仅{avg_cont_rate:.1f}%，接力环境偏冷；"
+            "保留涨停需降低优先级，放弃无确认票。"
+        )
+    if candidates:
+        hints.append("热门行业/题材只表示涨停聚集，不等同买入方向。")
+    return "\n".join(hints)
+
+
 def _theme_for_record(record: Dict[str, Any], compare_context: Dict[str, Any]) -> str:
     theme = str(record.get("theme") or record.get("theme_name") or "").strip()
     if theme:
@@ -110,12 +147,12 @@ def _prepare_records(records: Iterable[Dict[str, Any]], compare_context: Dict[st
         rec = dict(raw)
         rec["theme"] = _theme_for_record(rec, compare_context)
         confirm = rec.get("opening_confirmation") or {}
-        if isinstance(confirm, dict):
+        if isinstance(confirm, dict) and confirm:
             rec["_confirm_text"] = confirm.get("status") or ""
             rec["_auction_text"] = confirm.get("summary") or confirm.get("auction_status") or ""
         else:
-            rec["_confirm_text"] = ""
-            rec["_auction_text"] = ""
+            rec["_confirm_text"] = UNCONFIRMED_TEXT
+            rec["_auction_text"] = UNCONFIRMED_AUCTION_TEXT
         rec["_result_text"] = rec.get("result") or rec.get("_result_text") or ""
         out.append(rec)
     return out
@@ -159,10 +196,16 @@ def _write_summary(wb: Workbook, prediction: Dict[str, Any]) -> None:
         ["市场情绪分", ctx.get("sentiment_score", "")],
         ["基础情绪分", ctx.get("sentiment_base_score", "")],
         ["题材情绪增量", ctx.get("theme_sentiment_delta", "")],
+        ["市场状态", ctx.get("market_state_label", "")],
+        ["情绪打法", (ctx.get("market_state_strategy") or {}).get("label", "")],
+        ["轮动分", (ctx.get("market_rotation") or {}).get("rotation_score", "")],
         ["预测摘要", prediction.get("summary", "")],
     ]
     for name, count in specs_count.items():
         rows.append([f"{name}数量", count])
+    operation_hint = _build_operation_hint(prediction)
+    if operation_hint:
+        rows.append(["操作提示", operation_hint])
     for row in rows:
         ws.append(row)
     for cell in ws["A"]:

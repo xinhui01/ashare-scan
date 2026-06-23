@@ -131,6 +131,13 @@ def test_prediction_candidate_tabs_use_short_titles():
     assert 'self.table_nb.tab(2, text=self._candidate_tab_title("fresh"' in render_src
 
 
+def test_prediction_summary_labels_industry_heat_as_observation_not_buy_direction():
+    apply_src = inspect.getsource(PredictTab._apply_result)
+
+    assert "今日涨停行业分布" in apply_src
+    assert "明日热点板块预测" not in apply_src
+
+
 def test_prediction_accuracy_text_is_compact_for_header_label():
     text = PredictTab._accuracy_header_text(
         "首板涨停",
