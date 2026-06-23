@@ -419,6 +419,12 @@ _fetch_tdx_hist_frame = _src_tdx.fetch_hist_frame
 _tdx_source_available = _src_tdx.is_available
 
 
+# ---- finshare 历史日线 ----
+# 试验源：只在显式选择 source=finshare 时使用，不加入默认 auto 分流。
+from src.sources import finshare as _src_finshare
+_fetch_finshare_hist_frame = _src_finshare.fetch_hist_frame
+
+
 _HISTORY_FALLBACK_PROVIDER_HOSTS: Dict[str, str] = {
     "sina": "finance.sina.com.cn",
     "ths": "d.10jqka.com.cn",
@@ -427,6 +433,7 @@ _HISTORY_FALLBACK_PROVIDER_HOSTS: Dict[str, str] = {
     "wscn": "api-ddc-wscn.awtmt.com",
     "baostock": "baostock.com",
     "tdx": "tdx",
+    "finshare": "finshare",
 }
 _HISTORY_FALLBACK_PROVIDER_ORDER: Tuple[str, ...] = (
     "sina",
@@ -2416,6 +2423,17 @@ class StockDataFetcher:
                         last_error = e
                         if self._log:
                             self._log(f"历史 {stock_code} 使用通达信源失败: {e}")
+                        continue
+                elif provider == "finshare":
+                    try:
+                        if self._log:
+                            self._log(f"历史 {stock_code} 正在使用 finshare 试验源补位。")
+                        with _limit_host_inflight(host, default_limit=1):
+                            df = _fetch_finshare_hist_frame(stock_code, start_date, end_date)
+                    except Exception as e:
+                        last_error = e
+                        if self._log:
+                            self._log(f"历史 {stock_code} 使用 finshare 试验源失败: {e}")
                         continue
                 else:
                     last_error = RuntimeError(f"unsupported-history-provider: {provider}")
