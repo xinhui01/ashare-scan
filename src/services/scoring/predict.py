@@ -36,6 +36,17 @@ from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
 _BLANK_INDUSTRY_VALUES = {"", "-", "--", "nan", "none", "null", "未知", "其他"}
+MIN_PREDICT_LOOKBACK_DAYS = 2
+DEFAULT_PREDICT_LOOKBACK_DAYS = 25
+MAX_PREDICT_LOOKBACK_DAYS = 60
+
+
+def normalize_predict_lookback(value: Any) -> int:
+    try:
+        raw = int(value if value not in (None, "") else DEFAULT_PREDICT_LOOKBACK_DAYS)
+    except (TypeError, ValueError):
+        raw = DEFAULT_PREDICT_LOOKBACK_DAYS
+    return max(MIN_PREDICT_LOOKBACK_DAYS, min(raw, MAX_PREDICT_LOOKBACK_DAYS))
 
 
 def _count_missing_industries(df: Optional[pd.DataFrame]) -> int:
@@ -133,8 +144,9 @@ def build_compare_market_context(
 ) -> Dict[str, Any]:
     """从最近几组涨停对比中提炼市场环境。
 
-    迁自 StockFilter._build_compare_market_context；行为零变化。
+    迁自 StockFilter._build_compare_market_context；回溯窗口统一按预测合同标准化。
     """
+    lookback_days = normalize_predict_lookback(lookback_days)
     window_days = max(2, int(lookback_days or 2) + 1)
     trade_dates = fetcher._recent_trade_dates(trade_date, window_days)
     pair_stats: List[Dict[str, Any]] = []
@@ -676,7 +688,7 @@ def _check_prerequisites(
 
 def predict_limit_up_candidates(
     trade_date: str,
-    lookback_days: int = 5,
+    lookback_days: int = DEFAULT_PREDICT_LOOKBACK_DAYS,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     historical_mode: bool = False,
     *,
@@ -705,8 +717,9 @@ def predict_limit_up_candidates(
     get_limit_up_pool（其本身有 SQLite 缓存）。仅在需要"对任意历史日期回放
     预测"的批量回测场景下使用。
 
-    迁自 StockFilter.predict_limit_up_candidates；行为零变化。
+    迁自 StockFilter.predict_limit_up_candidates；回溯窗口统一按预测合同标准化。
     """
+    lookback_days = normalize_predict_lookback(lookback_days)
     # 这里 import 是为了避免顶层 import 循环（stock_store / llm_theme_clustering 等老模块）
     from stock_store import (
         load_all_limit_up_industries,
@@ -1549,6 +1562,17 @@ def predict_limit_up_candidates(
             },
         }
 
+    category_counts = {
+        "cont": len(continuation_candidates),
+        "first": len(first_board_candidates),
+        "fresh": len(fresh_first_board_candidates),
+        "wrap": len(broken_board_wrap_candidates),
+        "trend": len(trend_limit_up_candidates),
+    }
+    market_focus_advice = build_market_focus_advice(compare_context, category_counts)
+    if market_focus_advice:
+        compare_context["market_focus_advice"] = market_focus_advice
+
     # 摘要
     summary_lines = [
         f"预测日期：基于 {trade_date} 数据预测次日涨停候选",
@@ -1578,13 +1602,15 @@ def predict_limit_up_candidates(
                 theme_cycle_text += f"，实际{theme_days}日"
             theme_cycle_text += "）"
         summary_lines.append(f"题材判断周期：{theme_cycle_text}")
+    if market_focus_advice:
+        summary_lines.extend(format_market_focus_advice_lines(market_focus_advice))
     state_label = str(compare_context.get("market_state_label") or "").strip()
     if state_label:
         strategy_label = str(
             (compare_context.get("market_state_strategy") or {}).get("label") or ""
         ).strip()
         rotation_score = (compare_context.get("market_rotation") or {}).get("rotation_score")
-        state_line = f"市场状态：{state_label}"
+        state_line = f"基础环境判断：{state_label}"
         if strategy_label:
             state_line += f" → {strategy_label}"
         if isinstance(rotation_score, (int, float)):
@@ -1635,18 +1661,6 @@ def predict_limit_up_candidates(
         summary_lines.append(
             f"强势板块 TOP5：{'、'.join(f'{k}({v:+.1f}%)' for k, v in top_boards)}"
         )
-
-    category_counts = {
-        "cont": len(continuation_candidates),
-        "first": len(first_board_candidates),
-        "fresh": len(fresh_first_board_candidates),
-        "wrap": len(broken_board_wrap_candidates),
-        "trend": len(trend_limit_up_candidates),
-    }
-    market_focus_advice = build_market_focus_advice(compare_context, category_counts)
-    if market_focus_advice:
-        compare_context["market_focus_advice"] = market_focus_advice
-        summary_lines.extend(format_market_focus_advice_lines(market_focus_advice))
 
     result = {
         "trade_date": trade_date,

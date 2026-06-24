@@ -76,6 +76,56 @@ def test_predict_today_command_calls_predictor(monkeypatch):
     assert calls["historical_mode"] is False
 
 
+def test_predict_today_command_defaults_to_25_day_environment(monkeypatch):
+    calls = {}
+
+    class FakeStockFilter:
+        def predict_limit_up_candidates(self, trade_date, **kwargs):
+            calls.update(kwargs)
+            return {
+                "trade_date": trade_date,
+                "continuation_candidates": [],
+                "first_board_candidates": [],
+                "fresh_first_board_candidates": [],
+                "broken_board_wrap_candidates": [],
+                "trend_limit_up_candidates": [],
+            }
+
+    monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
+    monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
+    monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+
+    rc = main.main(["predict-today"])
+
+    assert rc == 0
+    assert calls["lookback_days"] == 25
+
+
+def test_predict_today_command_caps_environment_lookback_at_60(monkeypatch):
+    calls = {}
+
+    class FakeStockFilter:
+        def predict_limit_up_candidates(self, trade_date, **kwargs):
+            calls.update(kwargs)
+            return {
+                "trade_date": trade_date,
+                "continuation_candidates": [],
+                "first_board_candidates": [],
+                "fresh_first_board_candidates": [],
+                "broken_board_wrap_candidates": [],
+                "trend_limit_up_candidates": [],
+            }
+
+    monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
+    monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
+    monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+
+    rc = main.main(["predict-today", "--lookback", "120"])
+
+    assert rc == 0
+    assert calls["lookback_days"] == 60
+
+
 def test_sentiment_command_prints_summary_on_success(monkeypatch, capsys):
     import src.services.market_sentiment_service as mss
 

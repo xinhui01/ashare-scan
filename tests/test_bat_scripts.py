@@ -32,7 +32,7 @@ def test_predict_today_bat_runs_predict_today_command():
 
     assert 'cd /d "%~dp0"' in text
     assert 'if exist "%~dp0.venv\\Scripts\\python.exe"' in text
-    assert 'set "PREDICT_ARGS=--lookback 5"' in text
+    assert 'set "PREDICT_ARGS=--lookback 25"' in text
     assert '"%PYTHON_EXE%" main.py predict-today %PREDICT_ARGS% %*' in text
     assert 'if "%~1"=="" pause' in text
 
@@ -43,7 +43,7 @@ def test_update_and_predict_bat_runs_combined_command():
     assert 'cd /d "%~dp0"' in text
     assert 'if exist "%~dp0.venv\\Scripts\\python.exe"' in text
     assert 'set "CACHE_ARGS=--max-stocks 0 --days 60 --workers 3 --source auto"' in text
-    assert 'set "PREDICT_ARGS=--lookback 5"' in text
+    assert 'set "PREDICT_ARGS=--lookback 25"' in text
     assert '"%PYTHON_EXE%" main.py update-and-predict %CACHE_ARGS% %PREDICT_ARGS% %*' in text
     assert 'if "%~1"=="" pause' in text
 

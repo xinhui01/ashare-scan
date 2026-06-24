@@ -46,6 +46,11 @@ from src.services.market_focus_advice_service import (
     resolve_market_focus_advice,
 )
 from src.services.prediction_excel_export_service import export_prediction_to_excel
+from src.services.scoring.predict import (
+    DEFAULT_PREDICT_LOOKBACK_DAYS,
+    MAX_PREDICT_LOOKBACK_DAYS,
+    normalize_predict_lookback,
+)
 from src.utils.cancel_token import CancelToken
 from src.utils.trade_calendar import (
     _get_trade_calendar,
@@ -243,9 +248,12 @@ class PredictTab:
             command=lambda: self.date_var.set(datetime.now().strftime("%Y%m%d")),
         ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action_bar, text="回溯天数:").pack(side=tk.LEFT, padx=(10, 2))
-        self.lookback_var = tk.StringVar(value="5")
+        self.lookback_var = tk.StringVar(value=str(DEFAULT_PREDICT_LOOKBACK_DAYS))
         ttk.Entry(action_bar, textvariable=self.lookback_var, width=4).pack(side=tk.LEFT)
-        ttk.Label(action_bar, text="(回看N日涨停对比环境 + 识别二波接力)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(
+            action_bar,
+            text=f"(默认{DEFAULT_PREDICT_LOOKBACK_DAYS}日，最多{MAX_PREDICT_LOOKBACK_DAYS}日；回看涨停对比环境 + 识别二波接力)",
+        ).pack(side=tk.LEFT, padx=6)
 
         history_bar = ttk.Frame(predict_frame)
         history_bar.pack(fill=tk.X, pady=(0, 6))
@@ -795,7 +803,7 @@ class PredictTab:
         ttk.Label(action, text="回看交易日:").pack(side=tk.LEFT, padx=(10, 2))
         self.concept_hype_lookback_var = tk.StringVar(value="0")
         ttk.Spinbox(
-            action, from_=0, to=60, width=5,
+            action, from_=0, to=120, width=5,
             textvariable=self.concept_hype_lookback_var,
         ).pack(side=tk.LEFT)
         ttk.Label(
@@ -1706,10 +1714,7 @@ class PredictTab:
         except ValueError:
             pass
         self.date_var.set(trade_date)
-        try:
-            lookback = max(2, min(int(self.lookback_var.get().strip() or "5"), 15))
-        except ValueError:
-            lookback = 5
+        lookback = normalize_predict_lookback(self.lookback_var.get().strip())
         self.lookback_var.set(str(lookback))
 
         self.summary_text.config(state=tk.NORMAL)
@@ -2145,7 +2150,7 @@ class PredictTab:
             self.app._log("概念炒作分析已在运行中，请稍候")
             return
         try:
-            lookback = max(0, min(60, int(self.concept_hype_lookback_var.get() or "0")))
+            lookback = max(0, min(120, int(self.concept_hype_lookback_var.get() or "0")))
         except ValueError:
             lookback = 0
         self.concept_hype_lookback_var.set(str(lookback))
@@ -3039,7 +3044,7 @@ class PredictTab:
         ttk.Label(form, text="结束日期:").grid(row=0, column=2, sticky=tk.W, padx=(0, 4))
         ttk.Entry(form, textvariable=to_var, width=12).grid(row=0, column=3, padx=(0, 8))
         ttk.Label(form, text="回溯天数:").grid(row=0, column=4, sticky=tk.W, padx=(0, 4))
-        lookback_var = tk.StringVar(value="5")
+        lookback_var = tk.StringVar(value=str(DEFAULT_PREDICT_LOOKBACK_DAYS))
         ttk.Entry(form, textvariable=lookback_var, width=4).grid(row=0, column=5)
 
         status_var = tk.StringVar(value="")
@@ -3158,10 +3163,7 @@ class PredictTab:
             self.app._post_to_ui(_show_done)
 
         def _on_start():
-            try:
-                lookback = max(2, min(int(lookback_var.get().strip() or "5"), 15))
-            except ValueError:
-                lookback = 5
+            lookback = normalize_predict_lookback(lookback_var.get().strip())
             lookback_var.set(str(lookback))
             ds = _check_feasible_dates()
             if not ds:
@@ -3654,9 +3656,9 @@ class PredictTab:
         if not codes:
             return
         try:
-            lookback = max(1, min(int(self.lookback_var.get().strip() or "5"), 5))
-        except (ValueError, AttributeError, tk.TclError):
-            lookback = 5
+            lookback = normalize_predict_lookback(self.lookback_var.get().strip())
+        except (AttributeError, tk.TclError):
+            lookback = DEFAULT_PREDICT_LOOKBACK_DAYS
         codes_list = sorted(codes)
         # 按分数降序取 top-N 做上层 payload 预热，N 与 LRU 上限对齐避免互相挤掉
         top_codes_for_payload = [
@@ -3691,9 +3693,11 @@ class PredictTab:
             self.app._post_to_ui(
                 lambda: self.app.status_var.set(f"预热缓存启动：分时 0/{total}")
             )
+            # 分时预热只用于候选详情秒开，最多 5 日是分时缓存策略，不参与题材/预测判断。
+            intraday_cache_days = max(1, min(int(lookback or DEFAULT_PREDICT_LOOKBACK_DAYS), 5))
             intraday_stat = fetcher.prewarm_intraday_for_codes(
                 codes,
-                ndays=max(1, min(int(lookback), 5)),
+                ndays=intraday_cache_days,
                 max_workers=4,
                 cancel_check=lambda: cancel_token.is_cancelled(),
                 progress_cb=_report_intraday,

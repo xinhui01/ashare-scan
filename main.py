@@ -10,6 +10,12 @@ import tkinter as tk
 from datetime import datetime
 from typing import Optional, Sequence
 
+from src.services.scoring.predict import (
+    DEFAULT_PREDICT_LOOKBACK_DAYS,
+    MAX_PREDICT_LOOKBACK_DAYS,
+    MIN_PREDICT_LOOKBACK_DAYS,
+    normalize_predict_lookback,
+)
 from stock_filter import StockFilter
 from stock_store import ensure_store_ready
 
@@ -77,7 +83,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     predict_today = subparsers.add_parser("predict-today", help="开始预测当天或最近交易日数据。")
     predict_today.add_argument("--date", default="", help="预测日期，支持 YYYYMMDD / YYYY-MM-DD / M/D。")
-    predict_today.add_argument("--lookback", type=int, default=5, help="回溯天数，范围 2-15，默认 5。")
+    predict_today.add_argument(
+        "--lookback",
+        type=int,
+        default=DEFAULT_PREDICT_LOOKBACK_DAYS,
+        help=(
+            f"回溯天数，范围 {MIN_PREDICT_LOOKBACK_DAYS}-{MAX_PREDICT_LOOKBACK_DAYS}，"
+            f"默认 {DEFAULT_PREDICT_LOOKBACK_DAYS}。"
+        ),
+    )
     predict_today.add_argument("--historical", action="store_true", help="按历史模式预测指定日期。")
 
     update_and_predict = subparsers.add_parser(
@@ -86,7 +100,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     add_cache_options(update_and_predict)
     update_and_predict.add_argument("--date", default="", help="预测日期，支持 YYYYMMDD / YYYY-MM-DD / M/D。")
-    update_and_predict.add_argument("--lookback", type=int, default=5, help="回溯天数，范围 2-15，默认 5。")
+    update_and_predict.add_argument(
+        "--lookback",
+        type=int,
+        default=DEFAULT_PREDICT_LOOKBACK_DAYS,
+        help=(
+            f"回溯天数，范围 {MIN_PREDICT_LOOKBACK_DAYS}-{MAX_PREDICT_LOOKBACK_DAYS}，"
+            f"默认 {DEFAULT_PREDICT_LOOKBACK_DAYS}。"
+        ),
+    )
     update_and_predict.add_argument("--historical", action="store_true", help="按历史模式预测指定日期。")
 
     sentiment = subparsers.add_parser(
@@ -161,7 +183,7 @@ def _run_update_cache(args: argparse.Namespace) -> int:
 def _run_predict_today(args: argparse.Namespace) -> int:
     ensure_store_ready()
     trade_date = _resolve_predict_trade_date(str(args.date or ""))
-    lookback = max(2, min(int(args.lookback), 15))
+    lookback = normalize_predict_lookback(args.lookback)
     stock_filter = StockFilter()
 
     def progress_callback(current: int, total: int, info: str) -> None:

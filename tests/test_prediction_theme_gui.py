@@ -156,6 +156,18 @@ def test_prediction_summary_renders_market_focus_advice():
     assert '"market_focus_advice": market_focus_advice' in predict_src
 
 
+def test_prediction_summary_prioritizes_final_advice_before_base_environment():
+    predict_src = inspect.getsource(scoring_predict.predict_limit_up_candidates)
+
+    assert "基础环境判断：" in predict_src
+    advice_idx = predict_src.index(
+        "summary_lines.extend(format_market_focus_advice_lines(market_focus_advice))"
+    )
+    base_idx = predict_src.index('state_line = f"基础环境判断：{state_label}"')
+
+    assert advice_idx < base_idx
+
+
 def test_prediction_accuracy_text_is_compact_for_header_label():
     text = PredictTab._accuracy_header_text(
         "首板涨停",
@@ -205,10 +217,27 @@ def test_concept_hype_ui_defaults_to_auto_theme_cycle_window():
 
     assert 'self.concept_hype_lookback_var = tk.StringVar(value="0")' in setup_src
     assert "0=自动题材周期(25日)" in setup_src
-    assert "to=60" in setup_src
+    assert "to=120" in setup_src
     assert "lookback=10" not in backfill_src
     assert 'or "0"' in run_src
-    assert "min(60" in run_src
+    assert "min(120" in run_src
+
+
+def test_prediction_lookback_defaults_to_theme_cycle_and_caps_at_60():
+    build_src = inspect.getsource(PredictTab._build)
+    start_src = inspect.getsource(PredictTab.start)
+    backtest_src = inspect.getsource(PredictTab.open_backtest_dialog)
+    prewarm_src = inspect.getsource(PredictTab._start_prewarm)
+
+    assert scoring_predict.DEFAULT_PREDICT_LOOKBACK_DAYS == 25
+    assert scoring_predict.MAX_PREDICT_LOOKBACK_DAYS == 60
+    assert "DEFAULT_PREDICT_LOOKBACK_DAYS" in build_src
+    assert "MAX_PREDICT_LOOKBACK_DAYS" in build_src
+    assert "normalize_predict_lookback(self.lookback_var.get().strip())" in start_src
+    assert "normalize_predict_lookback(lookback_var.get().strip())" in backtest_src
+    assert "normalize_predict_lookback(self.lookback_var.get().strip())" in prewarm_src
+    assert "15" not in start_src
+    assert 'or "5"' not in prewarm_src
 
 
 def test_concept_hype_backfill_rebuilds_candidate_theme_groups():

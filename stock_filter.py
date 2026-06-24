@@ -807,7 +807,7 @@ class StockFilter:
     def predict_limit_up_candidates(
         self,
         trade_date: str,
-        lookback_days: int = 5,
+        lookback_days: int = _scoring_predict.DEFAULT_PREDICT_LOOKBACK_DAYS,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         historical_mode: bool = False,
     ) -> Dict[str, Any]:
