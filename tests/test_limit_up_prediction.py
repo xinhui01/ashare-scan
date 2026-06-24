@@ -410,6 +410,26 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertTrue(any("603435" in item for item in logs))
 
+    def test_prereq_allows_industry_main_line_when_fine_theme_tags_are_missing(self):
+        class _Fetcher:
+            def get_history_data(self, *args, **kwargs):
+                return None
+
+        missing = _check_prerequisites(
+            historical_mode=False,
+            pool_source="cache_db",
+            concept_themes_count=0,
+            industry_groups_count=12,
+            board_strength={"半导体": 3.5},
+            sentiment_degraded=False,
+            zt_codes=set(),
+            fetcher=_Fetcher(),
+            build_local_cache_history_plan_fn=lambda **kwargs: object(),
+            log_fn=lambda *_: None,
+        )
+
+        self.assertFalse(any("概念炒作分析未识别出题材" in item for item in missing))
+
     def test_prereq_prefetches_uncached_new_stock_then_exempts(self):
         """0 缓存的新涨停股：前置校验先定向补拉一次，再按新股豁免放过，不硬中止整批。"""
         state = {"fetched": False, "force_calls": []}

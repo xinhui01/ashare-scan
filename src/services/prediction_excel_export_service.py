@@ -135,6 +135,37 @@ def _build_operation_hint(prediction: Dict[str, Any]) -> str:
     return "\n".join(hints)
 
 
+def _theme_cycle_text(prediction: Dict[str, Any]) -> str:
+    themes = (prediction.get("data_quality") or {}).get("themes") or {}
+    hype = prediction.get("concept_hype_result") or {}
+    stats = hype.get("stats") or {}
+    label = str(
+        themes.get("lookback_label")
+        or hype.get("lookback_label")
+        or stats.get("lookback_label")
+        or ""
+    ).strip()
+    if not label:
+        return ""
+    start = str(themes.get("start_date") or hype.get("start_date") or "").strip()
+    end = str(themes.get("end_date") or hype.get("end_date") or "").strip()
+    try:
+        days = int(
+            themes.get("lookback_days")
+            or hype.get("lookback_days")
+            or stats.get("lookback_days")
+            or 0
+        )
+    except (TypeError, ValueError):
+        days = 0
+    if start and end:
+        text = f"{label}（{start}~{end}"
+        if days:
+            text += f"，实际{days}日"
+        return f"{text}）"
+    return label
+
+
 def _theme_for_record(record: Dict[str, Any], compare_context: Dict[str, Any]) -> str:
     theme = str(record.get("theme") or record.get("theme_name") or "").strip()
     if theme:
@@ -199,6 +230,7 @@ def _write_summary(wb: Workbook, prediction: Dict[str, Any]) -> None:
     rows = [
         ["交易日", prediction.get("trade_date", "")],
         ["回溯天数", prediction.get("lookback_days", "")],
+        ["题材周期", _theme_cycle_text(prediction)],
         ["生成时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["市场情绪分", ctx.get("sentiment_score", "")],
         ["基础情绪分", ctx.get("sentiment_base_score", "")],

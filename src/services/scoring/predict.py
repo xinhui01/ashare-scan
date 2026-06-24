@@ -308,6 +308,45 @@ def _valid_spot_codes(spot_df: Optional[pd.DataFrame]) -> set[str]:
     }
 
 
+def _select_strong_main_line(concepts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pick a sustained line for regime advice, allowing industry fallback."""
+    for raw in concepts or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        phase = str(raw.get("phase") or "").strip()
+        if not name or phase != "主升":
+            continue
+        try:
+            today_count = int(raw.get("today_count") or 0)
+        except (TypeError, ValueError):
+            today_count = 0
+        try:
+            active_days = int(raw.get("active_days") or 0)
+        except (TypeError, ValueError):
+            active_days = 0
+        try:
+            opportunity_score = int(raw.get("opportunity_score") or 0)
+        except (TypeError, ValueError):
+            opportunity_score = 0
+        if today_count < 2:
+            continue
+        if active_days < 3 and opportunity_score < 60:
+            continue
+        return {
+            "name": name,
+            "source": str(raw.get("source") or "").strip(),
+            "phase": phase,
+            "trend": str(raw.get("trend") or "").strip(),
+            "today_count": today_count,
+            "active_days": active_days,
+            "duration": int(raw.get("duration") or 0),
+            "opportunity_score": opportunity_score,
+            "total_limit_ups": int(raw.get("total_limit_ups") or 0),
+        }
+    return {}
+
+
 def _universe_codes_for_history_fill(fetcher: Any, log_fn: Optional[Callable[[str], None]]) -> List[str]:
     try:
         universe = fetcher.get_all_stocks(force_refresh=False)
@@ -518,6 +557,7 @@ def _check_prerequisites(
     historical_mode: bool,
     pool_source: str,
     concept_themes_count: int,
+    industry_groups_count: int = 0,
     board_strength: Dict[str, Any],
     sentiment_degraded: bool,
     zt_codes: set,
@@ -545,11 +585,12 @@ def _check_prerequisites(
             f"请检查东财涨停池接口 / 网络 / 清缓存重试"
         )
 
-    # 2. 概念炒作分析必须识别出题材
-    if concept_themes_count <= 0:
+    # 2. 概念炒作分析必须至少识别出细题材或行业主线。
+    # 细题材缺失时不把行业伪装成题材，但行业主线仍可作为兜底参与预测。
+    if concept_themes_count <= 0 and industry_groups_count <= 0:
         missing.append(
             "❌ 概念炒作分析未识别出题材 → "
-            "可能原因：最近 10 个交易日的涨停池数据不足 / 概念库未刷新。"
+            "可能原因：本地已缓存交易日的涨停池数据不足 / 概念库未刷新。"
             "请到「概念炒作」tab 检查是否能看到题材列表，"
             "若题材列表为空请先补足涨停池历史 + 刷新概念库"
         )
@@ -960,7 +1001,7 @@ def predict_limit_up_candidates(
     # 不再单独调 llm_theme_clustering（涨停对比 tab 已下线，那条入口已 dead）。
     try:
         from src.services.concept_hype_service import analyze_concept_hype
-        hype = analyze_concept_hype(trade_date, lookback=10, log=log_fn)
+        hype = analyze_concept_hype(trade_date, log=log_fn)
     except Exception as exc:
         logger.debug("加载概念炒作分析失败: %s", exc)
         hype = {}
@@ -1018,6 +1059,9 @@ def predict_limit_up_candidates(
     compare_context["code_theme_map"] = code_theme_map
     compare_context["theme_size_map"] = theme_size_map
     compare_context["code_to_concept_phase"] = code_to_phase
+    strong_main_line = _select_strong_main_line(concepts)
+    if strong_main_line:
+        compare_context["strong_main_line"] = strong_main_line
 
     try:
         from src.services.theme_fund_service import build_theme_fund_context
@@ -1038,11 +1082,33 @@ def predict_limit_up_candidates(
     ]
     industry_concepts_count = max(0, len(concepts) - len(real_concepts))
     hype_stats = hype.get("stats") or {}
+    theme_lookback_label = str(
+        hype.get("lookback_label") or hype_stats.get("lookback_label") or ""
+    ).strip()
+    try:
+        theme_lookback_days = int(
+            hype.get("lookback_days")
+            or hype_stats.get("lookback_days")
+            or len(hype.get("trade_dates") or [])
+            or 0
+        )
+    except (TypeError, ValueError):
+        theme_lookback_days = 0
+    theme_window_start = str(hype.get("start_date") or "").strip()
+    theme_window_end = str(hype.get("end_date") or "").strip()
+    theme_lookback_mode = str(
+        hype.get("lookback_mode") or hype_stats.get("lookback_mode") or ""
+    ).strip()
     data_quality["themes"]["loaded"] = bool(real_concepts)
     data_quality["themes"]["themes"] = len(real_concepts)
     data_quality["themes"]["industry_groups"] = industry_concepts_count
     data_quality["themes"]["covered_codes"] = len(code_theme_map)
     data_quality["themes"]["source"] = "concept_hype"
+    data_quality["themes"]["lookback_label"] = theme_lookback_label
+    data_quality["themes"]["lookback_days"] = theme_lookback_days
+    data_quality["themes"]["lookback_mode"] = theme_lookback_mode
+    data_quality["themes"]["start_date"] = theme_window_start
+    data_quality["themes"]["end_date"] = theme_window_end
     data_quality["themes"]["concept_pairs"] = int(hype_stats.get("concept_pairs") or 0)
     data_quality["themes"]["concept_covered_codes"] = int(
         hype_stats.get("concept_covered_codes") or 0
@@ -1054,8 +1120,28 @@ def predict_limit_up_candidates(
     data_quality["themes"]["sentiment_delta"] = int(
         theme_fund_context.get("theme_sentiment_delta") or 0
     )
+    data_quality["themes"]["industry_fallback"] = (
+        not bool(real_concepts) and industry_concepts_count > 0
+    )
+    if theme_lookback_label:
+        compare_context["theme_lookback_label"] = theme_lookback_label
+        compare_context["theme_lookback_days"] = theme_lookback_days
+        compare_context["theme_window_start"] = theme_window_start
+        compare_context["theme_window_end"] = theme_window_end
+        compare_context["theme_lookback_mode"] = theme_lookback_mode
+    if data_quality["themes"]["industry_fallback"]:
+        data_quality["warnings"].append(
+            "概念库/LLM细题材缺失，当前仅使用行业主线兜底；题材列不会把行业伪装成细题材。"
+        )
 
     if log_fn:
+        if theme_lookback_label:
+            window_text = (
+                f"，窗口 {theme_window_start}~{theme_window_end}"
+                if theme_window_start and theme_window_end
+                else ""
+            )
+            log_fn(f"涨停预测：题材判断周期 {theme_lookback_label}{window_text}")
         if real_concepts:
             log_fn(
                 f"涨停预测：概念炒作识别 {len(real_concepts)} 个真实题材，"
@@ -1069,13 +1155,21 @@ def predict_limit_up_candidates(
             )
         elif concepts:
             log_fn(
-                f"涨停预测：概念炒作仅识别到 {industry_concepts_count} 个行业来源，"
-                "未命中概念库/LLM题材；题材列不会用行业名填充"
+                f"涨停预测：概念炒作仅识别到 {industry_concepts_count} 个行业主线，"
+                "未命中概念库/LLM细题材；预测将使用行业主线兜底，题材列不会用行业名填充"
             )
         else:
             log_fn(
                 "涨停预测：概念炒作分析未识别出题材"
-                "（最近 10 日 limit_up_pool 数据可能不足）"
+                "（本地已缓存 limit_up_pool 数据可能不足）"
+            )
+        if strong_main_line:
+            log_fn(
+                "涨停预测：持续主线 "
+                f"{strong_main_line.get('name')}({strong_main_line.get('source')}) "
+                f"{strong_main_line.get('phase')}，今日 "
+                f"{strong_main_line.get('today_count')} 只，活跃 "
+                f"{strong_main_line.get('active_days')} 日"
             )
 
     # 阶段2.6：加载板块强度（失败不影响预测）
@@ -1190,6 +1284,7 @@ def predict_limit_up_candidates(
         historical_mode=historical_mode,
         pool_source=data_quality["limit_up_pool"].get("source", "unknown"),
         concept_themes_count=int(data_quality["themes"].get("themes") or 0),
+        industry_groups_count=int(data_quality["themes"].get("industry_groups") or 0),
         board_strength=board_strength,
         sentiment_degraded=bool(data_quality["sentiment"].get("degraded")),
         zt_codes=zt_codes,
@@ -1471,6 +1566,18 @@ def predict_limit_up_candidates(
         summary_lines.append(f"昨日首板最新晋级率：{latest_cont_rate:.1f}%")
     if avg_cont_rate is not None:
         summary_lines.append(f"近{compare_context.get('pair_count', 0)}组平均晋级率：{avg_cont_rate:.1f}%")
+    theme_cycle_label = str(data_quality["themes"].get("lookback_label") or "").strip()
+    if theme_cycle_label:
+        theme_cycle_text = theme_cycle_label
+        theme_start = str(data_quality["themes"].get("start_date") or "").strip()
+        theme_end = str(data_quality["themes"].get("end_date") or "").strip()
+        theme_days = int(data_quality["themes"].get("lookback_days") or 0)
+        if theme_start and theme_end:
+            theme_cycle_text += f"（{theme_start}~{theme_end}"
+            if theme_days:
+                theme_cycle_text += f"，实际{theme_days}日"
+            theme_cycle_text += "）"
+        summary_lines.append(f"题材判断周期：{theme_cycle_text}")
     state_label = str(compare_context.get("market_state_label") or "").strip()
     if state_label:
         strategy_label = str(
@@ -1499,6 +1606,15 @@ def predict_limit_up_candidates(
         summary_lines.append(
             "题材资金："
             + "、".join(f"{name}({int(score)})" for name, score in top_fund_themes)
+        )
+    strong_main_line = compare_context.get("strong_main_line") or {}
+    if strong_main_line and not theme_size_map:
+        summary_lines.append(
+            "行业主线："
+            f"{strong_main_line.get('name')}("
+            f"{strong_main_line.get('phase')}，"
+            f"今{int(strong_main_line.get('today_count') or 0)}只，"
+            f"活跃{int(strong_main_line.get('active_days') or 0)}日)"
         )
     theme_groups = theme_prediction.get("groups") or []
     if theme_groups:

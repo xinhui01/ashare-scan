@@ -145,6 +145,31 @@ def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str])
     return rules
 
 
+def _qualified_strong_main_line(compare_context: Mapping[str, Any]) -> Dict[str, Any]:
+    line = compare_context.get("strong_main_line") or {}
+    if not isinstance(line, Mapping):
+        return {}
+    name = str(line.get("name") or "").strip()
+    phase = str(line.get("phase") or "").strip()
+    try:
+        today_count = int(line.get("today_count") or 0)
+    except (TypeError, ValueError):
+        today_count = 0
+    try:
+        active_days = int(line.get("active_days") or 0)
+    except (TypeError, ValueError):
+        active_days = 0
+    try:
+        opportunity_score = int(line.get("opportunity_score") or 0)
+    except (TypeError, ValueError):
+        opportunity_score = 0
+    if not name or phase != "主升" or today_count < 2:
+        return {}
+    if active_days < 3 and opportunity_score < 60:
+        return {}
+    return dict(line)
+
+
 def prediction_category_counts(prediction: Mapping[str, Any]) -> Dict[str, int]:
     """Return candidate counts in the five scoring categories."""
     counts: Dict[str, int] = {}
@@ -191,6 +216,21 @@ def build_market_focus_advice(
         reason = str(spec.get("reason") or "")
         wait_text = str(spec.get("wait_text") or "")
 
+    strong_line = _qualified_strong_main_line(compare_context)
+    if strong_line and state_label in {"轮动日", "过渡日"}:
+        primary = ["first", "trend"]
+        secondary = ["fresh", "cont"]
+        avoid = ["wrap"]
+        name = str(strong_line.get("name") or "").strip()
+        source = str(strong_line.get("source") or "").strip() or "主线"
+        active_days = int(strong_line.get("active_days") or 0)
+        today_count = int(strong_line.get("today_count") or 0)
+        reason = (
+            f"已有持续主线{name}（{source}，{active_days}个活跃日，今日{today_count}只），"
+            "优先做主线内二波/趋势和补涨；偏离主线的新首板不作为主策略。"
+        )
+        wait_text = ""
+
     primary_items = _items(primary, counts)
     secondary_items = _items(secondary, counts)
     avoid_items = _items(avoid, counts)
@@ -209,6 +249,12 @@ def build_market_focus_advice(
     avoid_text = _format_items(avoid_items)
     state_text = state_label or str((strategy or {}).get("label") or "市场状态")
     execution_rules = _execution_rules(compare_context, primary)
+    if strong_line and state_label in {"轮动日", "过渡日"}:
+        line_name = str(strong_line.get("name") or "").strip()
+        execution_rules.insert(
+            0,
+            f"执行规则：先看{line_name}主线内是否继续强于大盘；不在主线内、也没有板块共振的新首板不做。",
+        )
 
     return {
         "state_label": state_label,

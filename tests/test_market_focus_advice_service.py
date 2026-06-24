@@ -53,6 +53,30 @@ def test_market_focus_advice_formats_summary_lines_for_ui_and_excel():
     assert "谨慎/回避池：保留涨停/连板(3只)、趋势涨停(0只)" in lines
 
 
+def test_market_focus_advice_prefers_established_main_line_over_new_theme_rotation():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "strong_main_line": {
+                "name": "半导体",
+                "source": "行业",
+                "phase": "主升",
+                "today_count": 4,
+                "active_days": 8,
+                "opportunity_score": 72,
+            },
+        },
+        {"cont": 2, "first": 5, "fresh": 12, "wrap": 1, "trend": 3},
+    )
+
+    assert "半导体" in advice["reason"]
+    assert "首板新题材优先" not in advice["reason"]
+    assert [item["category"] for item in advice["primary"]] == ["first", "trend"]
+    assert "二波接力(5只)" in advice["focus_text"]
+    assert "趋势涨停(3只)" in advice["focus_text"]
+
+
 def test_weak_rotation_day_formats_confirmation_execution_rules():
     advice = build_market_focus_advice(
         {

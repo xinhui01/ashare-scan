@@ -42,6 +42,8 @@ MIN_TOTAL_FOR_LIST = 4
 MIN_ACTIVE_DAYS_FOR_LIST = 2
 # 主线候选数（呈现 top N）
 TOP_LEADERS_PER_CONCEPT = 5
+# 自动题材周期窗口：约一个自然月交易日。避免 10 日过短，也避免长周期老题材污染当前主线。
+DEFAULT_THEME_LOOKBACK_DAYS = 25
 TREND_LABELS = {
     "rising": "上升",
     "flat": "走平",
@@ -66,6 +68,9 @@ def compute_opportunity_score(record: Dict[str, Any]) -> int:
     trend = str(record.get("trend") or "")
     today = int(record.get("today_count") or 0)
     duration = int(record.get("duration") or 0)
+    active_days = int(record.get("active_days") or 0)
+    total = int(record.get("total_limit_ups") or 0)
+    peak = int(record.get("peak_count") or 0)
     leaders = record.get("leaders") or []
     max_boards = max(
         (int(m.get("boards", 1)) for m in leaders if isinstance(m, dict)),
@@ -73,7 +78,7 @@ def compute_opportunity_score(record: Dict[str, Any]) -> int:
     )
 
     score = 0
-    score += {"萌芽": 30, "主升": 20, "末期": 5, "退潮": 0}.get(phase, 0)
+    score += {"萌芽": 28, "主升": 30, "末期": 8, "退潮": 0}.get(phase, 0)
     score += {"rising": 15, "flat": 0, "declining": -10}.get(trend, 0)
     if today >= 5:
         score += 15
@@ -84,11 +89,30 @@ def compute_opportunity_score(record: Dict[str, Any]) -> int:
     else:
         score -= 5
     if 2 <= duration <= 5:
-        score += 10
+        score += 8
     elif duration == 1:
-        score += 5
+        score += 4
     elif duration >= 8:
-        score -= 5
+        if phase == "主升" and active_days >= 5 and today >= MIN_DAILY_ACTIVE:
+            score += 14
+        elif trend == "declining":
+            score -= 8
+        elif today < MIN_DAILY_ACTIVE:
+            score -= 5
+    if active_days >= 8:
+        score += 12
+    elif active_days >= 5:
+        score += 8
+    elif active_days >= 3:
+        score += 4
+    if total >= 30:
+        score += 10
+    elif total >= 15:
+        score += 6
+    elif total >= 8:
+        score += 3
+    if peak >= 8 and today >= MIN_DAILY_ACTIVE and trend != "declining":
+        score += 4
     if max_boards >= 5:
         score += 12
     elif max_boards >= 4:
@@ -122,8 +146,27 @@ def _normalize_code(c: Any) -> str:
     return str(c or "").strip().zfill(6)
 
 
-def _select_window_dates(end_date: str, lookback: int) -> List[str]:
-    """从 limit_up_pool 已缓存的交易日里，截取 end_date 及之前的 lookback 天。"""
+def _resolve_lookback_limit(lookback: Optional[int]) -> Tuple[int, str]:
+    try:
+        limit = int(lookback or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return DEFAULT_THEME_LOOKBACK_DAYS, "auto"
+    return max(1, limit), "manual"
+
+
+def _lookback_label(mode: str, requested_days: int) -> str:
+    if mode == "auto":
+        return f"自动题材周期({requested_days}日)"
+    return f"手动回看({requested_days}日)"
+
+
+def _select_window_dates(end_date: str, lookback: Optional[int]) -> List[str]:
+    """从 limit_up_pool 已缓存的交易日里，截取 end_date 及之前的日期。
+
+    lookback <= 0 表示使用自动题材周期窗口。
+    """
     end = _normalize_date(end_date)
     all_dates = stock_store.list_limit_up_pool_trade_dates() or []
     if not all_dates:
@@ -134,7 +177,8 @@ def _select_window_dates(end_date: str, lookback: int) -> List[str]:
         candidate = list(all_dates)
     if not candidate:
         return []
-    return candidate[-int(max(1, lookback)):]
+    limit, _mode = _resolve_lookback_limit(lookback)
+    return candidate[-limit:]
 
 
 def _load_pool_by_date(date_key: str) -> List[Dict[str, Any]]:
@@ -257,8 +301,13 @@ def _classify_phase(
         else:
             phase = "主升"
     else:
-        if trend == "declining" or today == 0:
+        sustained_recent = recent >= MIN_DAILY_ACTIVE
+        if today == 0:
             phase = "退潮"
+        elif trend != "declining" and today >= MIN_DAILY_ACTIVE and sustained_recent:
+            phase = "主升"
+        elif trend == "declining":
+            phase = "末期"
         else:
             phase = "末期"
     if today == 0 and duration > 0:
@@ -437,14 +486,14 @@ def _empty_stats() -> Dict[str, Any]:
 def analyze_concept_hype(
     end_date: Optional[str] = None,
     *,
-    lookback: int = 10,
+    lookback: int = 0,
     log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """识别正在被炒作的概念/行业。
 
     Args:
         end_date: 结束交易日（YYYYMMDD，默认取 limit_up_pool 最新日）
-        lookback: 回看天数（按 limit_up_pool 已缓存的交易日切片）
+        lookback: 回看天数；<=0 表示使用自动题材周期窗口
         log: 可选日志回调（用于在 GUI 状态栏打信息）
 
     Returns:
@@ -458,15 +507,27 @@ def analyze_concept_hype(
                 pass
         logger.info(msg)
 
+    requested_lookback_days, lookback_mode = _resolve_lookback_limit(lookback)
+    lookback_label = _lookback_label(lookback_mode, requested_lookback_days)
     window_dates = _select_window_dates(end_date or "", lookback)
     if not window_dates:
         return {
             "end_date": end_date or "",
             "start_date": "",
             "trade_dates": [],
+            "lookback_mode": lookback_mode,
+            "requested_lookback_days": requested_lookback_days,
+            "lookback_days": 0,
+            "lookback_label": lookback_label,
             "concepts": [],
             "main_line": {"name": "", "summary": "本地无 limit_up_pool 缓存，无法分析。"},
-            "stats": _empty_stats(),
+            "stats": {
+                **_empty_stats(),
+                "lookback_mode": lookback_mode,
+                "requested_lookback_days": requested_lookback_days,
+                "lookback_days": 0,
+                "lookback_label": lookback_label,
+            },
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -488,8 +549,18 @@ def analyze_concept_hype(
         return {
             "end_date": actual_end, "start_date": actual_start,
             "trade_dates": window_dates, "concepts": [],
+            "lookback_mode": lookback_mode,
+            "requested_lookback_days": requested_lookback_days,
+            "lookback_days": len(window_dates),
+            "lookback_label": lookback_label,
             "main_line": {"name": "", "summary": "窗口内涨停池均为空。"},
-            "stats": _empty_stats(),
+            "stats": {
+                **_empty_stats(),
+                "lookback_mode": lookback_mode,
+                "requested_lookback_days": requested_lookback_days,
+                "lookback_days": len(window_dates),
+                "lookback_label": lookback_label,
+            },
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
@@ -577,6 +648,10 @@ def analyze_concept_hype(
         "end_date": actual_end,
         "start_date": actual_start,
         "trade_dates": window_dates,
+        "lookback_mode": lookback_mode,
+        "requested_lookback_days": requested_lookback_days,
+        "lookback_days": len(window_dates),
+        "lookback_label": lookback_label,
         "concepts": ranked,
         "main_line": main_line,
         "stats": {
@@ -588,6 +663,10 @@ def analyze_concept_hype(
             "concept_pairs": concept_pairs,
             "concept_covered_codes": len(code_to_concepts),
             "llm_cache_days": len(llm_themes_per_day),
+            "lookback_mode": lookback_mode,
+            "requested_lookback_days": requested_lookback_days,
+            "lookback_days": len(window_dates),
+            "lookback_label": lookback_label,
         },
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }

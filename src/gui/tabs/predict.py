@@ -793,13 +793,13 @@ class PredictTab:
             ),
         ).pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(action, text="回看交易日:").pack(side=tk.LEFT, padx=(10, 2))
-        self.concept_hype_lookback_var = tk.StringVar(value="10")
+        self.concept_hype_lookback_var = tk.StringVar(value="0")
         ttk.Spinbox(
-            action, from_=3, to=30, width=4,
+            action, from_=0, to=60, width=5,
             textvariable=self.concept_hype_lookback_var,
         ).pack(side=tk.LEFT)
         ttk.Label(
-            action, text="(按 limit_up_pool 已缓存日切片，不在缓存内的日期会自动取最近可用日)",
+            action, text="(0=自动题材周期(25日)；指定天数时按 limit_up_pool 缓存切片)",
             foreground="#888",
         ).pack(side=tk.LEFT, padx=(8, 0))
         self.concept_hype_status = ttk.Label(action, text="尚未分析", foreground="#666")
@@ -2112,7 +2112,6 @@ class PredictTab:
             try:
                 hype_result = concept_hype_service.analyze_concept_hype(
                     end_date=current_date,
-                    lookback=10,
                     log=lambda s: self.app._post_to_ui(
                         lambda m=s: self.app._log(m)
                     ),
@@ -2146,9 +2145,10 @@ class PredictTab:
             self.app._log("概念炒作分析已在运行中，请稍候")
             return
         try:
-            lookback = max(3, min(30, int(self.concept_hype_lookback_var.get() or "10")))
+            lookback = max(0, min(60, int(self.concept_hype_lookback_var.get() or "0")))
         except ValueError:
-            lookback = 10
+            lookback = 0
+        self.concept_hype_lookback_var.set(str(lookback))
         end_date = (self.concept_hype_end_date_var.get() or "").strip().replace("-", "")
         self.concept_hype_status.config(text="分析中...", foreground="#1565c0")
 
@@ -3318,11 +3318,32 @@ class PredictTab:
             lup = dq.get("limit_up_pool") or {}
             txt.insert(tk.END, f"  涨停池: {lup.get('rows', 0)} 只 ({lup.get('source', '-')})\n")
             th = dq.get("themes") or {}
-            th_state = "已加载" if th.get("loaded") else "未加载"
+            th_state = (
+                "已加载"
+                if th.get("loaded")
+                else "行业兜底"
+                if th.get("industry_fallback")
+                else "未加载"
+            )
             txt.insert(tk.END,
                 f"  题材识别: {th_state}（{th.get('themes', 0)} 个题材 / "
                 f"覆盖 {th.get('covered_codes', 0)} 只涨停股）\n"
             )
+            theme_cycle_label = str(th.get("lookback_label") or "").strip()
+            if theme_cycle_label:
+                theme_cycle_text = theme_cycle_label
+                theme_start = str(th.get("start_date") or "").strip()
+                theme_end = str(th.get("end_date") or "").strip()
+                try:
+                    theme_days = int(th.get("lookback_days") or 0)
+                except (TypeError, ValueError):
+                    theme_days = 0
+                if theme_start and theme_end:
+                    theme_cycle_text += f"（{theme_start}~{theme_end}"
+                    if theme_days:
+                        theme_cycle_text += f"，实际{theme_days}日"
+                    theme_cycle_text += "）"
+                txt.insert(tk.END, f"  题材周期: {theme_cycle_text}\n")
             industry_groups = int(th.get("industry_groups") or 0)
             if industry_groups:
                 txt.insert(tk.END, f"  行业兜底: {industry_groups} 个行业分组（不填入题材列）\n")

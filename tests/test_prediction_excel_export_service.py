@@ -25,6 +25,14 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
             "theme_fund_accumulation_map": {"机器人": 18},
             "theme_breakout_map": {"机器人": 34},
         },
+        "data_quality": {
+            "themes": {
+                "lookback_label": "自动题材周期(25日)",
+                "lookback_days": 25,
+                "start_date": "20260520",
+                "end_date": "20260624",
+            },
+        },
         "continuation_candidates": [
             {
                 "code": "300001",
@@ -74,6 +82,8 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
     assert "轮动日" in summary_values
     assert "首板新题材 / 避开老主线" in summary_values
     assert 42 in summary_values
+    assert any("自动题材周期(25日)" in str(value) for value in summary_values)
+    assert any("20260520~20260624" in str(value) for value in summary_values)
     assert any("首板涨停(0只" in str(value) for value in summary_values)
     assert any("保留涨停/连板(1只)" in str(value) for value in summary_values)
     assert any("候选仅为观察池" in str(value) for value in summary_values)

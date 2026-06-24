@@ -19,6 +19,15 @@ def test_prediction_result_persists_concept_hype_payload():
     assert '"concept_hype_result": hype' in predict_src
 
 
+def test_prediction_result_marks_theme_cycle_in_payload_summary_and_gui():
+    predict_src = inspect.getsource(scoring_predict.predict_limit_up_candidates)
+    apply_src = inspect.getsource(PredictTab._apply_result)
+
+    assert 'data_quality["themes"]["lookback_label"]' in predict_src
+    assert "题材判断周期：" in predict_src
+    assert "题材周期:" in apply_src
+
+
 def test_prediction_result_uses_concept_hype_payload_for_candidate_themes():
     apply_src = inspect.getsource(PredictTab._apply_result)
 
@@ -180,6 +189,26 @@ def test_prediction_filter_bar_shows_theme_data_status_label():
     assert "theme_data_status_label" in build_src
     assert "_refresh_theme_data_status_label" in apply_src
     assert "_refresh_theme_data_status_label" in concept_src
+
+
+def test_prediction_summary_marks_industry_fallback_theme_health_state():
+    apply_src = inspect.getsource(PredictTab._apply_result)
+
+    assert "industry_fallback" in apply_src
+    assert "行业兜底" in apply_src
+
+
+def test_concept_hype_ui_defaults_to_auto_theme_cycle_window():
+    setup_src = inspect.getsource(PredictTab._setup_concept_hype_subtab)
+    backfill_src = inspect.getsource(PredictTab._sync_concept_hype_for_result)
+    run_src = inspect.getsource(PredictTab._start_concept_hype_analysis)
+
+    assert 'self.concept_hype_lookback_var = tk.StringVar(value="0")' in setup_src
+    assert "0=自动题材周期(25日)" in setup_src
+    assert "to=60" in setup_src
+    assert "lookback=10" not in backfill_src
+    assert 'or "0"' in run_src
+    assert "min(60" in run_src
 
 
 def test_concept_hype_backfill_rebuilds_candidate_theme_groups():

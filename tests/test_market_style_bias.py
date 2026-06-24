@@ -70,6 +70,30 @@ def test_market_style_bias_prefers_new_theme_first_board_on_rotation_day():
     assert any("轮动日老主线接力降权" in reason for reason in cont_reasons)
 
 
+def test_market_style_bias_does_not_treat_confirmed_strong_line_as_old_rotation_risk():
+    context = _rotation_context()
+    context["strong_main_line"] = {
+        "name": "半导体",
+        "source": "行业",
+        "phase": "主升",
+        "today_count": 4,
+        "active_days": 8,
+        "opportunity_score": 72,
+    }
+
+    first_bonus, first_reasons = shared_scoring.market_style_bias(
+        "first", "600010", "半导体", context
+    )
+    cont_bonus, cont_reasons = shared_scoring.market_style_bias(
+        "cont", "600011", "半导体", context, boards=3
+    )
+
+    assert first_bonus > 0
+    assert any("主线" in reason for reason in first_reasons)
+    assert cont_bonus > -10
+    assert any("主线" in reason for reason in cont_reasons)
+
+
 def test_continuation_scoring_is_cut_on_rotation_day_old_mainline():
     rec = {
         "code": "600001",

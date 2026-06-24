@@ -179,6 +179,17 @@ def market_style_bias(
         or _matches_any_name(industry, new_names)
         or _matches_any_name(theme_name, new_names)
     )
+    strong_line = compare_context.get("strong_main_line") or {}
+    strong_line_name = ""
+    if isinstance(strong_line, dict) and str(strong_line.get("phase") or "").strip() == "主升":
+        strong_line_name = str(strong_line.get("name") or "").strip()
+    is_confirmed_main_line = bool(
+        strong_line_name
+        and (
+            _matches_any_name(industry, {strong_line_name})
+            or _matches_any_name(theme_name, {strong_line_name})
+        )
+    )
 
     cat = str(category or "").strip().lower()
     is_cont = cat in {"cont", "continuation"}
@@ -188,6 +199,17 @@ def market_style_bias(
     is_trend = cat in {"trend", "trend_limit_up", "trend-limit-up"}
 
     if label == "轮动日":
+        if is_confirmed_main_line:
+            if is_fresh:
+                return 6.0, [f"轮动日{strong_line_name}主线补涨+6"]
+            if is_first:
+                return 4.0, [f"轮动日{strong_line_name}主线二波+4"]
+            if is_trend:
+                return 4.0, [f"轮动日{strong_line_name}主线趋势+4"]
+            if is_cont:
+                if boards >= 3:
+                    return -4.0, [f"轮动日{strong_line_name}高位主线谨慎-4"]
+                return 2.0, [f"轮动日{strong_line_name}主线延续+2"]
         if is_fresh:
             if is_new_direction:
                 return 10.0, ["轮动日首板新题材+10"]
