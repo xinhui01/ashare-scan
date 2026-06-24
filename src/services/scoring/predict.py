@@ -14,7 +14,7 @@ import logging
 from concurrent.futures import TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -40,6 +40,32 @@ MIN_PREDICT_LOOKBACK_DAYS = 2
 DEFAULT_PREDICT_LOOKBACK_DAYS = 25
 MAX_PREDICT_LOOKBACK_DAYS = 60
 
+_PREDICTION_CANDIDATE_KEYS: Dict[str, str] = {
+    "cont": "continuation_candidates",
+    "first": "first_board_candidates",
+    "fresh": "fresh_first_board_candidates",
+    "wrap": "broken_board_wrap_candidates",
+    "trend": "trend_limit_up_candidates",
+}
+
+_RETREAT_LIMITS = {
+    "cont": 1,
+    "first": 1,
+    "fresh": 2,
+    "wrap": 8,
+    "trend": 4,
+}
+_RETREAT_TOTAL_LIMIT = 15
+
+_ICE_POINT_LIMITS = {
+    "cont": 0,
+    "first": 0,
+    "fresh": 1,
+    "wrap": 4,
+    "trend": 1,
+}
+_ICE_POINT_TOTAL_LIMIT = 5
+
 
 def normalize_predict_lookback(value: Any) -> int:
     try:
@@ -47,6 +73,84 @@ def normalize_predict_lookback(value: Any) -> int:
     except (TypeError, ValueError):
         raw = DEFAULT_PREDICT_LOOKBACK_DAYS
     return max(MIN_PREDICT_LOOKBACK_DAYS, min(raw, MAX_PREDICT_LOOKBACK_DAYS))
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value if value not in (None, "") else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text_matches_name(value: Any, name: str) -> bool:
+    left = str(value or "").strip()
+    right = str(name or "").strip()
+    if not left or not right:
+        return False
+    return left == right or left in right or right in left
+
+
+def _concept_strength_score(raw: Dict[str, Any]) -> int:
+    today_count = _safe_int(raw.get("today_count"))
+    active_days = _safe_int(raw.get("active_days"))
+    opportunity_score = _safe_int(raw.get("opportunity_score"))
+    total_limit_ups = _safe_int(raw.get("total_limit_ups") or raw.get("member_count"))
+    duration = _safe_int(raw.get("duration"))
+    source = str(raw.get("source") or "").strip()
+    source_bonus = 8 if source and source != "行业" else 0
+    return (
+        opportunity_score
+        + today_count * 8
+        + min(active_days, 20) * 4
+        + min(total_limit_ups, 80)
+        + min(duration, 30)
+        + source_bonus
+    )
+
+
+def _build_theme_data_quality(
+    *,
+    hype_stats: Dict[str, Any],
+    real_concepts: List[Dict[str, Any]],
+    industry_concepts_count: int,
+    code_theme_map: Dict[str, str],
+) -> Dict[str, Any]:
+    concept_pairs = _safe_int(hype_stats.get("concept_pairs"))
+    concept_covered_codes = _safe_int(hype_stats.get("concept_covered_codes"))
+    llm_cache_days = _safe_int(hype_stats.get("llm_cache_days"))
+    real_theme_count = len(real_concepts or [])
+    direct_code_count = len(code_theme_map or {})
+    fine_theme_available = bool(
+        real_theme_count > 0
+        and (concept_pairs > 0 or concept_covered_codes > 0 or llm_cache_days > 0 or direct_code_count > 0)
+    )
+    if fine_theme_available:
+        level = "fine_theme"
+        warning = ""
+    elif industry_concepts_count > 0:
+        level = "industry_fallback"
+        warning = "细题材覆盖不足，当前主要使用行业主线兜底；非主线候选不会因为行业名被伪装成题材而加分。"
+    else:
+        level = "missing"
+        warning = "细题材和行业主线都缺失，本次题材因子只做显式跳过。"
+    return {
+        "quality_level": level,
+        "fine_theme_available": fine_theme_available,
+        "real_theme_count": real_theme_count,
+        "industry_theme_count": int(industry_concepts_count or 0),
+        "direct_code_count": direct_code_count,
+        "concept_pairs": concept_pairs,
+        "concept_covered_codes": concept_covered_codes,
+        "llm_cache_days": llm_cache_days,
+        "warning": warning,
+    }
 
 
 def _count_missing_industries(df: Optional[pd.DataFrame]) -> int:
@@ -321,13 +425,17 @@ def _valid_spot_codes(spot_df: Optional[pd.DataFrame]) -> set[str]:
 
 
 def _select_strong_main_line(concepts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pick a sustained line for regime advice, allowing industry fallback."""
+    """Pick the strongest sustained line for regime advice, allowing industry fallback."""
+    candidates: List[Dict[str, Any]] = []
     for raw in concepts or []:
         if not isinstance(raw, dict):
             continue
         name = str(raw.get("name") or "").strip()
         phase = str(raw.get("phase") or "").strip()
+        trend = str(raw.get("trend") or "").strip()
         if not name or phase != "主升":
+            continue
+        if trend == "declining":
             continue
         try:
             today_count = int(raw.get("today_count") or 0)
@@ -345,18 +453,350 @@ def _select_strong_main_line(concepts: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         if active_days < 3 and opportunity_score < 60:
             continue
-        return {
+        line = {
             "name": name,
             "source": str(raw.get("source") or "").strip(),
             "phase": phase,
-            "trend": str(raw.get("trend") or "").strip(),
+            "trend": trend,
             "today_count": today_count,
             "active_days": active_days,
             "duration": int(raw.get("duration") or 0),
             "opportunity_score": opportunity_score,
             "total_limit_ups": int(raw.get("total_limit_ups") or 0),
         }
+        line["strength_score"] = _concept_strength_score(line)
+        candidates.append(line)
+    if not candidates:
+        return {}
+    candidates.sort(
+        key=lambda item: (
+            -int(item.get("strength_score") or 0),
+            -int(item.get("opportunity_score") or 0),
+            -int(item.get("today_count") or 0),
+            -int(item.get("active_days") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+    return candidates[0]
+
+
+def _declining_line_decay_score(raw: Dict[str, Any]) -> int:
+    phase = str(raw.get("phase") or "").strip()
+    trend = str(raw.get("trend") or "").strip()
+    today_count = _safe_int(raw.get("today_count"))
+    active_days = _safe_int(raw.get("active_days"))
+    total_limit_ups = _safe_int(raw.get("total_limit_ups") or raw.get("member_count"))
+    peak_count = _safe_int(raw.get("peak_count"))
+    score = min(active_days, 20) * 4 + min(total_limit_ups, 80) + min(peak_count, 20) * 4
+    if trend == "declining":
+        score += 30
+    if phase == "末期":
+        score += 20
+    elif phase == "退潮":
+        score += 32
+    score -= min(today_count, 10) * 2
+    return max(0, score)
+
+
+def _select_declining_main_lines(concepts: List[Dict[str, Any]], *, limit: int = 3) -> List[Dict[str, Any]]:
+    """Return formerly-active lines that are no longer suitable for mainline chasing."""
+    out: List[Dict[str, Any]] = []
+    for raw in concepts or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        phase = str(raw.get("phase") or "").strip()
+        trend = str(raw.get("trend") or "").strip()
+        if not name:
+            continue
+        if phase not in {"末期", "退潮"} and trend != "declining":
+            continue
+        today_count = _safe_int(raw.get("today_count"))
+        active_days = _safe_int(raw.get("active_days"))
+        total_limit_ups = _safe_int(raw.get("total_limit_ups") or raw.get("member_count"))
+        peak_count = _safe_int(raw.get("peak_count"))
+        if active_days < 3 and total_limit_ups < 8 and peak_count < 3:
+            continue
+        item = {
+            "name": name,
+            "source": str(raw.get("source") or "").strip(),
+            "phase": phase,
+            "trend": trend,
+            "today_count": today_count,
+            "active_days": active_days,
+            "duration": _safe_int(raw.get("duration")),
+            "opportunity_score": _safe_int(raw.get("opportunity_score")),
+            "total_limit_ups": total_limit_ups,
+            "peak_count": peak_count,
+            "decay_score": _declining_line_decay_score(raw),
+        }
+        out.append(item)
+    out.sort(
+        key=lambda item: (
+            -int(item.get("decay_score") or 0),
+            -int(item.get("active_days") or 0),
+            -int(item.get("total_limit_ups") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+    return out[: max(1, int(limit or 1))]
+
+
+def _candidate_score(rec: Dict[str, Any]) -> float:
+    for key in ("calibrated_score", "score", "total_score", "final_score"):
+        if key in rec:
+            return _safe_float(rec.get(key))
+    return 0.0
+
+
+def _candidate_matches_strong_line(
+    category: str,
+    rec: Dict[str, Any],
+    compare_context: Dict[str, Any],
+) -> bool:
+    strong_line = compare_context.get("strong_main_line") or {}
+    if not isinstance(strong_line, dict):
+        return False
+    name = str(strong_line.get("name") or "").strip()
+    phase = str(strong_line.get("phase") or "").strip()
+    if not name or phase != "主升":
+        return False
+    code = str(rec.get("code") or "").strip().zfill(6)
+    theme_name = str(
+        rec.get("theme")
+        or rec.get("theme_name")
+        or (compare_context.get("code_theme_map") or {}).get(code)
+        or ""
+    ).strip()
+    industry = str(rec.get("industry") or "").strip()
+    return _text_matches_name(theme_name, name) or _text_matches_name(industry, name)
+
+
+def _candidate_declining_line(
+    rec: Dict[str, Any],
+    compare_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    code = str(rec.get("code") or "").strip().zfill(6)
+    theme_name = str(
+        rec.get("theme")
+        or rec.get("theme_name")
+        or (compare_context.get("code_theme_map") or {}).get(code)
+        or ""
+    ).strip()
+    industry = str(rec.get("industry") or "").strip()
+    for raw in compare_context.get("declining_main_lines") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if name and (_text_matches_name(theme_name, name) or _text_matches_name(industry, name)):
+            return raw
     return {}
+
+
+def _candidate_has_fine_theme(rec: Dict[str, Any], compare_context: Dict[str, Any]) -> bool:
+    code = str(rec.get("code") or "").strip().zfill(6)
+    theme_name = str(
+        rec.get("theme")
+        or rec.get("theme_name")
+        or (compare_context.get("code_theme_map") or {}).get(code)
+        or ""
+    ).strip()
+    return bool(theme_name)
+
+
+def _priority_adjustment(
+    category: str,
+    rec: Dict[str, Any],
+    compare_context: Dict[str, Any],
+    theme_quality: Dict[str, Any],
+) -> Tuple[float, List[str]]:
+    state_label = str(compare_context.get("market_state_label") or "").strip()
+    strong_line = compare_context.get("strong_main_line") or {}
+    strong_line_name = str(strong_line.get("name") or "").strip() if isinstance(strong_line, dict) else ""
+    is_main_line = _candidate_matches_strong_line(category, rec, compare_context)
+    fine_theme_available = bool((theme_quality or {}).get("fine_theme_available"))
+    cat = str(category or "").strip()
+    delta = 0.0
+    reasons: List[str] = []
+    declining_line = _candidate_declining_line(rec, compare_context)
+
+    if is_main_line:
+        if cat in {"first", "trend", "fresh"}:
+            delta += 28.0
+        elif cat == "wrap":
+            delta += 18.0
+        elif cat == "cont":
+            delta += 8.0
+        reasons.append(f"强主线{strong_line_name}+{int(delta)}")
+    elif not fine_theme_available and strong_line_name:
+        delta -= 3.0
+        reasons.append("细题材不足，非强主线-3")
+
+    if fine_theme_available and _candidate_has_fine_theme(rec, compare_context):
+        delta += 6.0
+        reasons.append("细题材命中+6")
+
+    if declining_line:
+        line_name = str(declining_line.get("name") or "").strip()
+        phase = str(declining_line.get("phase") or "").strip()
+        trend = str(declining_line.get("trend") or "").strip()
+        penalty = -30.0
+        if cat in {"cont", "first", "trend"}:
+            penalty = -36.0
+        elif cat == "fresh":
+            penalty = -24.0
+        elif cat == "wrap":
+            penalty = -12.0
+        delta += penalty
+        detail = phase or trend or "转弱"
+        reasons.append(f"衰退主线{line_name}({detail}){int(penalty)}")
+
+    if state_label == "退潮日":
+        if cat == "wrap":
+            delta += 18.0
+            reasons.append("退潮日反包修复优先+18")
+        elif cat == "trend":
+            penalty = -10.0 if is_main_line else -20.0
+            delta += penalty
+            reasons.append(f"退潮日趋势收缩{int(penalty)}")
+        elif cat in {"cont", "first"}:
+            penalty = -10.0 if is_main_line else -18.0
+            delta += penalty
+            reasons.append(f"退潮日接力收缩{int(penalty)}")
+        elif cat == "fresh":
+            penalty = -6.0 if is_main_line else -12.0
+            delta += penalty
+            reasons.append(f"退潮日首板试错收缩{int(penalty)}")
+    elif state_label == "冰点日":
+        if cat == "wrap":
+            delta += 12.0
+            reasons.append("冰点日只保留超跌修复+12")
+        else:
+            delta -= 24.0
+            reasons.append("冰点日非修复大幅降权-24")
+    elif state_label == "轮动日" and strong_line_name:
+        if not is_main_line and cat in {"first", "trend", "cont"}:
+            delta -= 8.0
+            reasons.append("轮动日偏离强主线-8")
+        elif not is_main_line and cat == "fresh":
+            delta -= 4.0
+            reasons.append("轮动日非主线首板降权-4")
+    elif state_label == "过渡日" and strong_line_name:
+        if is_main_line and cat in {"first", "trend", "fresh", "wrap"}:
+            delta += 8.0
+            reasons.append(f"过渡日强主线{strong_line_name}+8")
+
+    hit_rate = rec.get("calibrated_hit_rate")
+    if isinstance(hit_rate, (int, float)):
+        if hit_rate >= 30:
+            delta += 6.0
+            reasons.append(f"历史命中段{hit_rate:.0f}%+6")
+        elif hit_rate < 12:
+            delta -= 6.0
+            reasons.append(f"历史命中段{hit_rate:.0f}%-6")
+
+    return delta, reasons
+
+
+def _limit_candidates_for_state(
+    ranked: Dict[str, List[Dict[str, Any]]],
+    compare_context: Dict[str, Any],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    state_label = str(compare_context.get("market_state_label") or "").strip()
+    if state_label == "退潮日":
+        limits = dict(_RETREAT_LIMITS)
+        total_limit = _RETREAT_TOTAL_LIMIT
+        reason = f"退潮日缩量：只保留反包修复、强主线低位机会和少量试错，最多{total_limit}只"
+    elif state_label == "冰点日":
+        limits = dict(_ICE_POINT_LIMITS)
+        total_limit = _ICE_POINT_TOTAL_LIMIT
+        reason = f"冰点日缩量：原则空仓，仅保留极少修复观察，最多{total_limit}只"
+    else:
+        return ranked, {"limited": False, "limit_reason": ""}
+
+    per_category = {
+        cat: list(ranked.get(cat, []))[: limits.get(cat, len(ranked.get(cat, [])))]
+        for cat in _PREDICTION_CANDIDATE_KEYS
+    }
+    flat: List[Dict[str, Any]] = []
+    for cat, rows in per_category.items():
+        for rec in rows:
+            flat.append({**rec, "rank_category": cat})
+    flat.sort(
+        key=lambda rec: (
+            -_safe_float(rec.get("final_rank_score")),
+            -_candidate_score(rec),
+            str(rec.get("code") or ""),
+        )
+    )
+    keep_keys = {
+        (str(rec.get("rank_category") or ""), str(rec.get("code") or "").zfill(6))
+        for rec in flat[:total_limit]
+    }
+    limited = {
+        cat: [
+            rec for rec in rows
+            if (cat, str(rec.get("code") or "").zfill(6)) in keep_keys
+        ]
+        for cat, rows in per_category.items()
+    }
+    return limited, {"limited": True, "limit_reason": reason}
+
+
+def _rank_and_limit_prediction_candidates(
+    candidates_by_category: Dict[str, List[Dict[str, Any]]],
+    compare_context: Dict[str, Any],
+    *,
+    theme_quality: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    theme_quality = theme_quality or {}
+    ranked: Dict[str, List[Dict[str, Any]]] = {}
+    before_counts: Dict[str, int] = {}
+    for cat in _PREDICTION_CANDIDATE_KEYS:
+        rows = list((candidates_by_category or {}).get(cat) or [])
+        before_counts[cat] = len(rows)
+        enriched: List[Dict[str, Any]] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            rec = raw
+            base = _candidate_score(rec)
+            delta, reasons = _priority_adjustment(cat, rec, compare_context or {}, theme_quality)
+            rec["final_rank_score"] = round(base + delta, 2)
+            rec["final_rank_reasons"] = reasons
+            rec["rank_category"] = cat
+            enriched.append(rec)
+        enriched.sort(
+            key=lambda rec: (
+                -_safe_float(rec.get("final_rank_score")),
+                -_candidate_score(rec),
+                str(rec.get("code") or ""),
+            )
+        )
+        ranked[cat] = enriched
+
+    ranked, limit_stats = _limit_candidates_for_state(ranked, compare_context or {})
+    flat: List[Dict[str, Any]] = []
+    for cat, rows in ranked.items():
+        for rec in rows:
+            flat.append(rec)
+    flat.sort(
+        key=lambda rec: (
+            -_safe_float(rec.get("final_rank_score")),
+            -_candidate_score(rec),
+            str(rec.get("code") or ""),
+        )
+    )
+    after_counts = {cat: len(ranked.get(cat, [])) for cat in _PREDICTION_CANDIDATE_KEYS}
+    stats = {
+        "before_counts": before_counts,
+        "after_counts": after_counts,
+        "before_total": sum(before_counts.values()),
+        "after_total": sum(after_counts.values()),
+        "top_priority_candidates": flat[:5],
+        **limit_stats,
+    }
+    return ranked, stats
 
 
 def _universe_codes_for_history_fill(fetcher: Any, log_fn: Optional[Callable[[str], None]]) -> List[str]:
@@ -1075,6 +1515,9 @@ def predict_limit_up_candidates(
     strong_main_line = _select_strong_main_line(concepts)
     if strong_main_line:
         compare_context["strong_main_line"] = strong_main_line
+    declining_main_lines = _select_declining_main_lines(concepts)
+    if declining_main_lines:
+        compare_context["declining_main_lines"] = declining_main_lines
 
     try:
         from src.services.theme_fund_service import build_theme_fund_context
@@ -1127,6 +1570,14 @@ def predict_limit_up_candidates(
         hype_stats.get("concept_covered_codes") or 0
     )
     data_quality["themes"]["llm_cache_days"] = int(hype_stats.get("llm_cache_days") or 0)
+    theme_quality = _build_theme_data_quality(
+        hype_stats=hype_stats,
+        real_concepts=real_concepts,
+        industry_concepts_count=industry_concepts_count,
+        code_theme_map=code_theme_map,
+    )
+    data_quality["themes"].update(theme_quality)
+    compare_context["theme_data_quality"] = theme_quality
     data_quality["themes"]["fund_themes"] = len(
         theme_fund_context.get("theme_fund_score_map") or {}
     )
@@ -1134,18 +1585,17 @@ def predict_limit_up_candidates(
         theme_fund_context.get("theme_sentiment_delta") or 0
     )
     data_quality["themes"]["industry_fallback"] = (
-        not bool(real_concepts) and industry_concepts_count > 0
+        theme_quality.get("quality_level") == "industry_fallback"
     )
+    data_quality["themes"]["declining_main_lines"] = len(declining_main_lines)
     if theme_lookback_label:
         compare_context["theme_lookback_label"] = theme_lookback_label
         compare_context["theme_lookback_days"] = theme_lookback_days
         compare_context["theme_window_start"] = theme_window_start
         compare_context["theme_window_end"] = theme_window_end
         compare_context["theme_lookback_mode"] = theme_lookback_mode
-    if data_quality["themes"]["industry_fallback"]:
-        data_quality["warnings"].append(
-            "概念库/LLM细题材缺失，当前仅使用行业主线兜底；题材列不会把行业伪装成细题材。"
-        )
+    if theme_quality.get("warning"):
+        data_quality["warnings"].append(str(theme_quality["warning"]))
 
     if log_fn:
         if theme_lookback_label:
@@ -1184,6 +1634,12 @@ def predict_limit_up_candidates(
                 f"{strong_main_line.get('today_count')} 只，活跃 "
                 f"{strong_main_line.get('active_days')} 日"
             )
+        if declining_main_lines:
+            preview = "、".join(
+                f"{x.get('name')}({x.get('phase') or x.get('trend')})"
+                for x in declining_main_lines[:3]
+            )
+            log_fn(f"涨停预测：衰退主线警示 {preview}")
 
     # 阶段2.6：加载板块强度（失败不影响预测）
     # 板块强度 fallback 链：
@@ -1534,6 +1990,32 @@ def predict_limit_up_candidates(
         filter_ma5_pullback_stocks_fn=_first_board.filter_ma5_pullback_stocks,
     )
 
+    ranked_candidates, candidate_priority = _rank_and_limit_prediction_candidates(
+        {
+            "cont": continuation_candidates,
+            "first": first_board_candidates,
+            "fresh": fresh_first_board_candidates,
+            "wrap": broken_board_wrap_candidates,
+            "trend": trend_limit_up_candidates,
+        },
+        compare_context,
+        theme_quality=data_quality["themes"],
+    )
+    continuation_candidates = ranked_candidates["cont"]
+    first_board_candidates = ranked_candidates["first"]
+    fresh_first_board_candidates = ranked_candidates["fresh"]
+    broken_board_wrap_candidates = ranked_candidates["wrap"]
+    trend_limit_up_candidates = ranked_candidates["trend"]
+    compare_context["candidate_priority"] = candidate_priority
+    data_quality["candidate_priority"] = {
+        "limited": bool(candidate_priority.get("limited")),
+        "limit_reason": str(candidate_priority.get("limit_reason") or ""),
+        "before_total": int(candidate_priority.get("before_total") or 0),
+        "after_total": int(candidate_priority.get("after_total") or 0),
+        "before_counts": dict(candidate_priority.get("before_counts") or {}),
+        "after_counts": dict(candidate_priority.get("after_counts") or {}),
+    }
+
     try:
         from src.services.prediction_theme_service import build_theme_prediction_groups
         theme_prediction = build_theme_prediction_groups(
@@ -1584,6 +2066,21 @@ def predict_limit_up_candidates(
         f"反包候选：{len(broken_board_wrap_candidates)} 只（≥2 板涨停被打掉，T0 在 -10.5%~+3% 区间，得分>=70）",
         f"趋势涨停候选：{len(trend_limit_up_candidates)} 只（多头排列稳健上行，得分>=65）",
     ]
+    if candidate_priority.get("limited"):
+        summary_lines.append(
+            f"候选缩量：{candidate_priority.get('limit_reason')}，"
+            f"{int(candidate_priority.get('before_total') or 0)} → "
+            f"{int(candidate_priority.get('after_total') or 0)} 只"
+        )
+    top_priority = candidate_priority.get("top_priority_candidates") or []
+    if top_priority:
+        parts = []
+        for rec in top_priority[:5]:
+            code = str(rec.get("code") or "").strip()
+            name = str(rec.get("name") or "").strip()
+            rank_score = _safe_float(rec.get("final_rank_score"))
+            parts.append(f"{code}{name}({rank_score:.0f})")
+        summary_lines.append(f"前排重点：{'、'.join(parts)}")
     latest_cont_rate = compare_context.get("latest_continuation_rate")
     avg_cont_rate = compare_context.get("avg_continuation_rate")
     if latest_cont_rate is not None:
@@ -1602,6 +2099,21 @@ def predict_limit_up_candidates(
                 theme_cycle_text += f"，实际{theme_days}日"
             theme_cycle_text += "）"
         summary_lines.append(f"题材判断周期：{theme_cycle_text}")
+    theme_quality_warning = str(data_quality["themes"].get("warning") or "").strip()
+    if theme_quality_warning:
+        summary_lines.append(f"题材数据质量：{theme_quality_warning}")
+    declining_main_lines = compare_context.get("declining_main_lines") or []
+    if declining_main_lines:
+        parts = []
+        for item in declining_main_lines[:3]:
+            name = str(item.get("name") or "").strip()
+            phase = str(item.get("phase") or item.get("trend") or "转弱").strip()
+            today_count = int(item.get("today_count") or 0)
+            active_days = int(item.get("active_days") or 0)
+            if name:
+                parts.append(f"{name}({phase}，今{today_count}只，活跃{active_days}日)")
+        if parts:
+            summary_lines.append(f"主线衰退警示：{'、'.join(parts)}")
     if market_focus_advice:
         summary_lines.extend(format_market_focus_advice_lines(market_focus_advice))
     state_label = str(compare_context.get("market_state_label") or "").strip()

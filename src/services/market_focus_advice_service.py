@@ -151,6 +151,7 @@ def _qualified_strong_main_line(compare_context: Mapping[str, Any]) -> Dict[str,
         return {}
     name = str(line.get("name") or "").strip()
     phase = str(line.get("phase") or "").strip()
+    trend = str(line.get("trend") or "").strip()
     try:
         today_count = int(line.get("today_count") or 0)
     except (TypeError, ValueError):
@@ -163,7 +164,7 @@ def _qualified_strong_main_line(compare_context: Mapping[str, Any]) -> Dict[str,
         opportunity_score = int(line.get("opportunity_score") or 0)
     except (TypeError, ValueError):
         opportunity_score = 0
-    if not name or phase != "主升" or today_count < 2:
+    if not name or phase != "主升" or trend == "declining" or today_count < 2:
         return {}
     if active_days < 3 and opportunity_score < 60:
         return {}

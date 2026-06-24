@@ -77,6 +77,29 @@ def test_market_focus_advice_prefers_established_main_line_over_new_theme_rotati
     assert "趋势涨停(3只)" in advice["focus_text"]
 
 
+def test_market_focus_advice_does_not_promote_declining_main_line():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "strong_main_line": {
+                "name": "机器人",
+                "source": "概念",
+                "phase": "主升",
+                "trend": "declining",
+                "today_count": 5,
+                "active_days": 10,
+                "opportunity_score": 82,
+            },
+        },
+        {"cont": 2, "first": 5, "fresh": 12, "wrap": 1, "trend": 3},
+    )
+
+    assert [item["category"] for item in advice["primary"]] == ["fresh"]
+    assert "首板新题材优先" in advice["reason"]
+    assert "机器人" not in advice["reason"]
+
+
 def test_weak_rotation_day_formats_confirmation_execution_rules():
     advice = build_market_focus_advice(
         {

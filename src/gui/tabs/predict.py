@@ -1389,7 +1389,10 @@ class PredictTab:
             "seal_time": record.get("first_board_time"),
             "breaks": record.get("break_count"),
             "turnover": record.get("turnover"),
-            "score": record.get("calibrated_score", record.get("score")),
+            "score": record.get(
+                "final_rank_score",
+                record.get("calibrated_score", record.get("score")),
+            ),
             "calibrated_score": record.get("calibrated_score"),
             "calibrated_hit_rate": record.get("calibrated_hit_rate"),
             "reasons": record.get("reasons"),
