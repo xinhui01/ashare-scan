@@ -14,6 +14,20 @@ CATEGORY_LABELS: Dict[str, str] = {
 
 CATEGORY_ORDER = ("cont", "first", "fresh", "wrap", "trend")
 
+SEMICONDUCTOR_THEME_NAME = "芯片/半导体"
+SEMICONDUCTOR_BOARD_NAMES = ("半导体", "电子化学品")
+SEMICONDUCTOR_TOPIC_KEYWORDS = (
+    "半导体",
+    "芯片",
+    "集成电路",
+    "先进封装",
+    "封装",
+    "存储",
+    "光刻",
+    "晶圆",
+    "硅片",
+)
+
 PREDICTION_CATEGORY_KEYS: Dict[str, str] = {
     "cont": "continuation_candidates",
     "first": "first_board_candidates",
@@ -126,6 +140,54 @@ def _sentiment_score(compare_context: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_topic_names(compare_context: Mapping[str, Any]) -> Iterable[str]:
+    for raw in compare_context.get("concept_hype_topics") or []:
+        if isinstance(raw, Mapping):
+            name = str(raw.get("name") or raw.get("theme") or "").strip()
+        else:
+            name = str(raw or "").strip()
+        if name:
+            yield name
+
+
+def _infer_local_theme(compare_context: Mapping[str, Any]) -> Dict[str, Any]:
+    board_strength = compare_context.get("board_strength") or {}
+    if not isinstance(board_strength, Mapping):
+        board_strength = {}
+
+    board_hits: List[Dict[str, Any]] = []
+    for name in SEMICONDUCTOR_BOARD_NAMES:
+        value = _safe_float(board_strength.get(name))
+        if value is not None and value >= 3.0:
+            board_hits.append({"name": name, "value": value})
+
+    topic_hits = [
+        name for name in _iter_topic_names(compare_context)
+        if any(keyword in name for keyword in SEMICONDUCTOR_TOPIC_KEYWORDS)
+    ]
+
+    # Avoid translating broad electronics buckets into "芯片" without narrow
+    # semiconductor evidence from both a board and a theme/topic source.
+    if not board_hits or not topic_hits:
+        return {}
+
+    board_text = "、".join(f"{hit['name']}(+{hit['value']:.1f}%)" for hit in board_hits[:3])
+    topic_text = "、".join(topic_hits[:3])
+    return {
+        "name": SEMICONDUCTOR_THEME_NAME,
+        "board_evidence": board_hits,
+        "topic_evidence": topic_hits[:5],
+        "reason": f"{board_text}，概念证据：{topic_text}",
+    }
+
+
 def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str]) -> List[str]:
     state_label = str(compare_context.get("market_state_label") or "").strip()
     score = _sentiment_score(compare_context)
@@ -218,6 +280,7 @@ def build_market_focus_advice(
         wait_text = str(spec.get("wait_text") or "")
 
     strong_line = _qualified_strong_main_line(compare_context)
+    local_theme = _infer_local_theme(compare_context)
     if strong_line and state_label in {"轮动日", "过渡日"}:
         primary = ["first", "trend"]
         secondary = ["fresh", "cont"]
@@ -251,15 +314,25 @@ def build_market_focus_advice(
     state_text = state_label or str((strategy or {}).get("label") or "市场状态")
     execution_rules = _execution_rules(compare_context, primary)
     if strong_line and state_label in {"轮动日", "过渡日"}:
-        line_name = str(strong_line.get("name") or "").strip()
+        line_name = str((local_theme or {}).get("name") or strong_line.get("name") or "").strip()
         execution_rules.insert(
             0,
             f"执行规则：先看{line_name}主线内是否继续强于大盘；不在主线内、也没有板块共振的新首板不做。",
         )
+    if local_theme:
+        execution_rules.insert(
+            0,
+            f"执行规则：{local_theme['name']}是推断的局部强方向，必须同时看板块强度、题材证据和个股梯队，不能只按粗行业名交易。",
+        )
+
+    summary = f"行情打法建议：{state_text} → {reason}" if reason else f"行情打法建议：{state_text}"
+    if local_theme:
+        summary += f" 局部强方向：{local_theme['name']}（{local_theme['reason']}）。"
 
     return {
         "state_label": state_label,
         "strategy_label": str((strategy or {}).get("label") or ""),
+        "local_theme": local_theme,
         "primary": primary_items,
         "secondary": secondary_items,
         "avoid": avoid_items,
@@ -268,7 +341,7 @@ def build_market_focus_advice(
         "avoid_text": avoid_text,
         "execution_rules": execution_rules,
         "reason": reason,
-        "summary": f"行情打法建议：{state_text} → {reason}" if reason else f"行情打法建议：{state_text}",
+        "summary": summary,
     }
 
 

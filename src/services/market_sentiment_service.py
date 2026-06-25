@@ -27,6 +27,19 @@ logger = get_logger(__name__)
 CACHE_KEY_PREFIX = "market_sentiment_external_"
 _POOL_FETCHER: Optional["stock_data.StockDataFetcher"] = None
 
+SEMICONDUCTOR_FOCUS_NAME = "芯片/半导体"
+SEMICONDUCTOR_FOCUS_KEYWORDS = (
+    "半导体",
+    "芯片",
+    "集成电路",
+    "先进封装",
+    "封装",
+    "存储",
+    "光刻",
+    "晶圆",
+    "硅片",
+)
+
 
 # ============== 工具 ==============
 
@@ -595,6 +608,67 @@ def _compute_rotation_metrics(
     }
 
 
+def _infer_local_focus_from_concepts(concepts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    hits: List[Dict[str, Any]] = []
+    for raw in concepts or []:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or "").strip()
+        if source == "行业":
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name or not any(keyword in name for keyword in SEMICONDUCTOR_FOCUS_KEYWORDS):
+            continue
+        count = _safe_int(raw.get("today_count"), 0)
+        if count < 2:
+            continue
+        hits.append({
+            "name": name,
+            "today_count": count,
+            "phase": str(raw.get("phase") or "").strip(),
+        })
+
+    if len(hits) < 2 and sum(_safe_int(x.get("today_count"), 0) for x in hits) < 4:
+        return {}
+
+    hits.sort(key=lambda item: (-_safe_int(item.get("today_count"), 0), str(item.get("name") or "")))
+    evidence = "、".join(f"{item['name']}({item['today_count']}只)" for item in hits[:3])
+    return {
+        "name": SEMICONDUCTOR_FOCUS_NAME,
+        "reason": f"细题材证据：{evidence}",
+        "evidence": hits[:5],
+    }
+
+
+def _load_local_focus(end: str, log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    try:
+        from src.services.concept_hype_service import analyze_concept_hype
+        hype = analyze_concept_hype(end, log=log)
+    except Exception as exc:
+        logger.debug("加载局部强方向题材失败: %s", exc)
+        return {}
+    return _infer_local_focus_from_concepts(hype.get("concepts") or [])
+
+
+def _apply_local_focus_to_market_state(
+    market_state: Dict[str, Any],
+    local_focus: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not local_focus:
+        return market_state
+    out = dict(market_state)
+    strategy = dict(out.get("strategy") or {})
+    notes = str(strategy.get("notes") or "").strip()
+    focus_note = (
+        f"局部强方向：{local_focus['name']}（{local_focus['reason']}）；"
+        "优先看该方向内二波/趋势核心，首板只做补涨确认。"
+    )
+    strategy["notes"] = f"{notes} {focus_note}".strip()
+    out["strategy"] = strategy
+    out["local_focus"] = local_focus
+    return out
+
+
 # 状态 → 推荐打法的核心规则表。
 # pools 对应 scoring 模块的池子键: cont(连板) / first(首板) / fresh(新晋) / wrap(反包) / first_board(打首板)
 #
@@ -926,6 +1000,8 @@ def analyze_market_sentiment(
         yest_lu=yest_lu,
         today_continued=today_continued,
     )
+    local_focus = _load_local_focus(end, log=_l)
+    market_state = _apply_local_focus_to_market_state(market_state, local_focus)
 
     # 一句话总结
     parts: List[str] = []
@@ -946,6 +1022,8 @@ def analyze_market_sentiment(
         + f"。综合 {score} 分 → 建议 {advice['label']}。"
         + f" 状态：{market_state['label']} → {market_state['strategy']['label']}。"
     )
+    if local_focus:
+        summary += f" 局部强方向：{local_focus['name']}（{local_focus['reason']}）。"
 
     _l(
         f"市场情绪 {end}: 综合 {score}/100 → {advice['label']} | "
@@ -994,6 +1072,7 @@ def analyze_market_sentiment(
             "required_pool_dates": required_dates,
             "external": external,
             "rotation": rotation,
+            "local_focus": local_focus,
         },
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }

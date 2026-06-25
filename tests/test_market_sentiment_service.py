@@ -165,3 +165,34 @@ def test_market_index_signal_uses_shenzhen_composite_when_available(monkeypatch)
     assert "上证 -2.00%" in market_signal["note"]
     assert "深成指 +2.00%" in market_signal["note"]
     assert "大盘 +0.00%" in result["summary"]
+
+
+def test_local_focus_infers_semiconductor_only_from_fine_theme_evidence():
+    focus = svc._infer_local_focus_from_concepts([
+        {"name": "先进封装", "source": "概念", "today_count": 4, "phase": "主升"},
+        {"name": "存储芯片", "source": "概念", "today_count": 3, "phase": "萌芽"},
+        {
+            "name": "计算机、通信和其他电子设备制造业",
+            "source": "行业",
+            "today_count": 18,
+            "phase": "主升",
+        },
+    ])
+
+    assert focus["name"] == "芯片/半导体"
+    assert "先进封装(4只)" in focus["reason"]
+    assert "存储芯片(3只)" in focus["reason"]
+
+
+def test_local_focus_does_not_relabel_broad_electronics_industry_as_chip():
+    focus = svc._infer_local_focus_from_concepts([
+        {
+            "name": "计算机、通信和其他电子设备制造业",
+            "source": "行业",
+            "today_count": 18,
+            "phase": "主升",
+        },
+        {"name": "通信设备", "source": "行业", "today_count": 3, "phase": "萌芽"},
+    ])
+
+    assert focus == {}

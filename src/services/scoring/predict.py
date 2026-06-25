@@ -480,6 +480,34 @@ def _select_strong_main_line(concepts: List[Dict[str, Any]]) -> Dict[str, Any]:
     return candidates[0]
 
 
+def _compact_concept_hype_topics(concepts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep lightweight concept evidence for downstream regime wording."""
+    topics: List[Dict[str, Any]] = []
+    for raw in concepts or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            today_count = int(raw.get("today_count") or 0)
+        except (TypeError, ValueError):
+            today_count = 0
+        try:
+            active_days = int(raw.get("active_days") or 0)
+        except (TypeError, ValueError):
+            active_days = 0
+        topics.append({
+            "name": name,
+            "source": str(raw.get("source") or "").strip(),
+            "phase": str(raw.get("phase") or "").strip(),
+            "trend": str(raw.get("trend") or "").strip(),
+            "today_count": today_count,
+            "active_days": active_days,
+        })
+    return topics[:80]
+
+
 def _declining_line_decay_score(raw: Dict[str, Any]) -> int:
     phase = str(raw.get("phase") or "").strip()
     trend = str(raw.get("trend") or "").strip()
@@ -1512,6 +1540,7 @@ def predict_limit_up_candidates(
     compare_context["code_theme_map"] = code_theme_map
     compare_context["theme_size_map"] = theme_size_map
     compare_context["code_to_concept_phase"] = code_to_phase
+    compare_context["concept_hype_topics"] = _compact_concept_hype_topics(concepts)
     strong_main_line = _select_strong_main_line(concepts)
     if strong_main_line:
         compare_context["strong_main_line"] = strong_main_line

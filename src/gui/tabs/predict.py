@@ -2616,6 +2616,16 @@ class PredictTab:
                 state_box, text=f"判定理由: {state.get('reason', '-')}",
                 foreground="#444", wraplength=900, justify=tk.LEFT,
             ).pack(anchor=tk.W, pady=(4, 0))
+            local_focus = state.get("local_focus") or {}
+            if local_focus:
+                ttk.Label(
+                    state_box,
+                    text=(
+                        f"局部强方向: {local_focus.get('name', '-')}  "
+                        f"· {local_focus.get('reason', '')}"
+                    ),
+                    foreground=state_color, wraplength=900, justify=tk.LEFT,
+                ).pack(anchor=tk.W, pady=(2, 0))
 
             strat = state.get("strategy") or {}
             if strat:

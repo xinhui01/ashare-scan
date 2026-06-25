@@ -194,6 +194,48 @@ def test_theme_data_quality_marks_industry_only_fallback_as_low_quality():
     assert good["fine_theme_available"] is True
 
 
+def test_compact_concept_hype_topics_keeps_lightweight_theme_evidence():
+    compact = getattr(scoring_predict, "_compact_concept_hype_topics", None)
+    assert callable(compact)
+
+    topics = compact([
+        {
+            "name": "先进封装",
+            "source": "概念",
+            "phase": "主升",
+            "trend": "rising",
+            "today_count": 4,
+            "members": [{"code": "600001"}],
+        },
+        {
+            "name": "计算机、通信和其他电子设备制造业",
+            "source": "行业",
+            "phase": "主升",
+            "today_count": 18,
+            "members": [{"code": "600002"}],
+        },
+    ])
+
+    assert topics == [
+        {
+            "name": "先进封装",
+            "source": "概念",
+            "phase": "主升",
+            "trend": "rising",
+            "today_count": 4,
+            "active_days": 0,
+        },
+        {
+            "name": "计算机、通信和其他电子设备制造业",
+            "source": "行业",
+            "phase": "主升",
+            "trend": "",
+            "today_count": 18,
+            "active_days": 0,
+        },
+    ]
+
+
 def test_gui_score_sort_uses_final_rank_score_when_available():
     assert PredictTab._sort_value(
         {"score": 90, "final_rank_score": 66},

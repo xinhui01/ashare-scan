@@ -114,3 +114,61 @@ def test_weak_rotation_day_formats_confirmation_execution_rules():
 
     assert "执行规则：谁所在板块最强、谁先主动放量上板，优先做谁；没有板块共振，一个都不做。" in lines
     assert "弱情绪过滤：市场情绪低于30分时，首板池只作为观察名单；必须等板块共振 + 个股主动上板确认。" in lines
+
+
+def test_market_focus_advice_names_semiconductor_line_only_with_evidence():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "strong_main_line": {
+                "name": "计算机、通信和其他电子设备制造业",
+                "source": "行业",
+                "phase": "主升",
+                "trend": "rising",
+                "today_count": 18,
+                "active_days": 5,
+                "opportunity_score": 100,
+            },
+            "board_strength": {
+                "半导体": 5.0,
+                "电子化学品": 4.4,
+                "元件": 3.8,
+            },
+            "concept_hype_topics": [
+                {"name": "先进封装", "today_count": 4, "phase": "主升"},
+                {"name": "存储芯片", "today_count": 3, "phase": "萌芽"},
+            ],
+        },
+        {"cont": 2, "first": 8, "fresh": 12, "wrap": 1, "trend": 6},
+    )
+
+    assert advice["local_theme"]["name"] == "芯片/半导体"
+    assert "局部强方向：芯片/半导体" in advice["summary"]
+    assert "半导体(+5.0%)" in advice["summary"]
+    assert "先进封装" in advice["summary"]
+    assert any("芯片/半导体" in rule for rule in advice["execution_rules"])
+
+
+def test_market_focus_advice_keeps_broad_electronics_name_without_theme_evidence():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "strong_main_line": {
+                "name": "计算机、通信和其他电子设备制造业",
+                "source": "行业",
+                "phase": "主升",
+                "trend": "rising",
+                "today_count": 18,
+                "active_days": 5,
+                "opportunity_score": 100,
+            },
+            "board_strength": {"元件": 3.8, "通信设备": 2.0},
+        },
+        {"cont": 2, "first": 8, "fresh": 12, "wrap": 1, "trend": 6},
+    )
+
+    assert advice.get("local_theme") == {}
+    assert "芯片" not in advice["summary"]
+    assert "计算机、通信和其他电子设备制造业" in advice["summary"]
