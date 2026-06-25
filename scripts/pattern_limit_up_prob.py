@@ -19,23 +19,34 @@ DB = "data/stock_store.sqlite3"
 RECENT_TD = 90  # 近窗口（交易日数），用于对比当前市场环境
 
 BIG_BOARD = ("300", "301", "302", "688", "689")  # 20cm
+NUM_COLS = ["open", "close", "high", "low", "volume", "amount", "change_pct"]
+LOAD_CHUNKSIZE = 200_000
+
+
+def _prepare_history_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "")
+    for c in NUM_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    df.dropna(subset=["close", "change_pct"], inplace=True)
+    return df
 
 
 def load() -> pd.DataFrame:
+    query = """
+        SELECT h.code, h.trade_date, h.open, h.close, h.high, h.low,
+               h.volume, h.amount, h.change_pct
+        FROM history AS h
+        LEFT JOIN universe AS u ON u.code = h.code
+        WHERE u.name IS NULL OR upper(u.name) NOT LIKE '%ST%'
+        """
     con = sqlite3.connect(DB)
-    df = pd.read_sql(
-        "SELECT code, trade_date, open, close, high, low, volume, amount, change_pct FROM history",
-        con,
-    )
-    names = pd.read_sql("SELECT code, name FROM universe", con)
+    chunks = []
+    for chunk in pd.read_sql(query, con, chunksize=LOAD_CHUNKSIZE):
+        chunks.append(_prepare_history_chunk(chunk))
     con.close()
-    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "")
-    st = set(names.loc[names["name"].str.contains("ST", case=False, na=False), "code"])
-    df = df[~df["code"].isin(st)].copy()
-    for c in ["open", "close", "high", "low", "volume", "amount", "change_pct"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["close", "change_pct"])
-    df = df.sort_values(["code", "trade_date"]).reset_index(drop=True)
+    df = pd.concat(chunks, ignore_index=True)
+    df.sort_values(["code", "trade_date"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
     return df
 
 
@@ -114,12 +125,23 @@ def rate(sub: pd.DataFrame) -> tuple:
     return n, p
 
 
+def rate_y(s: pd.Series) -> tuple:
+    y = s.dropna()
+    n = len(y)
+    p = y.mean() * 100 if n else float("nan")
+    return n, p
+
+
 def pct_table(df: pd.DataFrame, col: str, bins, labels, base: float) -> str:
     out = [f"  [{col}]"]
     cat = pd.cut(df[col], bins=bins, labels=labels)
+    grouped = df["y"].groupby(cat, observed=False).agg(["count", "mean"])
     for lab in labels:
-        sub = df[cat == lab]
-        n, p = rate(sub)
+        if lab in grouped.index:
+            n = int(grouped.at[lab, "count"])
+            p = grouped.at[lab, "mean"] * 100 if n else float("nan")
+        else:
+            n, p = 0, float("nan")
         if n < 200:
             out.append(f"    {str(lab):>14} : 样本{n:>7}  概率   --  (样本不足)")
             continue
@@ -193,8 +215,8 @@ def report(df: pd.DataFrame, title: str) -> str:
     lines.append("\n--- 命名'图形' → 次日涨停率（按概率排序）---")
     rows = []
     for name, mask in setups(df):
-        sub = valid[mask.reindex(valid.index, fill_value=False)]
-        n, p = rate(sub)
+        aligned = mask.reindex(valid.index, fill_value=False)
+        n, p = rate_y(valid.loc[aligned, "y"])
         if n < 100:
             rows.append((name, n, float("nan"), float("nan")))
         else:
