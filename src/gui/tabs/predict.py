@@ -367,6 +367,14 @@ class PredictTab:
             command=self._on_filter_changed,
         ).pack(side=tk.LEFT, padx=(0, 8))
 
+        # 仅最优分段：只留命中各类历史最优分数段的票（即表中金色高亮那些），
+        # 与 best_bucket 金色高亮同一判定，免去在 5 个 tab 里翻颜色找最优票。
+        self.filter_best_bucket_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_bar, text="仅最优分段", variable=self.filter_best_bucket_only,
+            command=self._on_filter_changed,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         # 按历史命中段排序：以策略分析的"分数段命中率"做主排序键，
         # 把历史高命中的分数段顶到表头（每个 tab 用各自类别的命中率）
         self.sort_by_hit_bucket = tk.BooleanVar(value=False)
@@ -1057,11 +1065,11 @@ class PredictTab:
     def _export_payload_with_current_filters(self) -> Dict[str, Any]:
         payload = dict(self.result or {})
         lists = self.lists or {}
-        payload["continuation_candidates"] = list(self._filter_records(lists.get("cont", [])))
-        payload["first_board_candidates"] = list(self._filter_records(lists.get("first", [])))
-        payload["fresh_first_board_candidates"] = list(self._filter_records(lists.get("fresh", [])))
-        payload["broken_board_wrap_candidates"] = list(self._filter_records(lists.get("wrap", [])))
-        payload["trend_limit_up_candidates"] = list(self._filter_records(lists.get("trend", [])))
+        payload["continuation_candidates"] = list(self._filter_records(lists.get("cont", []), "cont"))
+        payload["first_board_candidates"] = list(self._filter_records(lists.get("first", []), "first"))
+        payload["fresh_first_board_candidates"] = list(self._filter_records(lists.get("fresh", []), "fresh"))
+        payload["broken_board_wrap_candidates"] = list(self._filter_records(lists.get("wrap", []), "wrap"))
+        payload["trend_limit_up_candidates"] = list(self._filter_records(lists.get("trend", []), "trend"))
         return payload
 
     def export_prediction_excel(self) -> None:
@@ -1165,6 +1173,26 @@ class PredictTab:
             if sub_best is not None:
                 return sub_best
         return best_map.get(category)
+
+    def _row_in_best_bucket(
+        self,
+        category: str,
+        rec: Dict[str, Any],
+    ) -> bool:
+        """rec 是否落在该分类历史最优分数段内。
+
+        与 _row_tag 给 best_bucket 金色高亮用的是完全同一套判定：取该类最优段
+        [lo,hi]（cont 优先子类段），用 _bucket_score_for_row 取同源分数 s，
+        lo<=s<=hi 才算"最优股票"。无最优段（样本不足）或分数缺失/非法 → False。
+        """
+        best = self._best_bucket_for_row(category, rec)
+        if best is None:
+            return False
+        try:
+            s = int(self._bucket_score_for_row(category, rec.get("score"), rec))
+        except (TypeError, ValueError):
+            return False
+        return best[0] <= s <= best[1]
 
     @staticmethod
     def _candidate_tab_title(category: str, shown: int, total: int) -> str:
@@ -3822,6 +3850,7 @@ class PredictTab:
         self.filter_keyword.set("")
         self.filter_industry.set("全部")
         self.filter_theme_only.set(False)
+        self.filter_best_bucket_only.set(False)
         self._render_trees()
 
     def _on_filter_changed(self) -> None:
@@ -3835,7 +3864,7 @@ class PredictTab:
         if self.result:
             self._apply_result(self.result)
 
-    def _matches_filters(self, rec: Dict[str, Any]) -> bool:
+    def _matches_filters(self, rec: Dict[str, Any], category: str = "") -> bool:
         """记录是否通过当前筛选条件。"""
         try:
             min_score = int(self.filter_min_score.get() or 0)
@@ -3892,10 +3921,24 @@ class PredictTab:
             if not self._candidate_theme_label(rec):
                 return False
 
+        # 仅最优分段：只留命中该类历史最优分数段的票（与金色高亮同判定）。
+        # category 为空时跳过（无分类上下文无法判定最优段）。
+        try:
+            best_only = bool(self.filter_best_bucket_only.get())
+        except (AttributeError, tk.TclError):
+            best_only = False
+        if best_only and category:
+            if not self._row_in_best_bucket(category, rec):
+                return False
+
         return True
 
-    def _filter_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [r for r in (records or []) if self._matches_filters(r)]
+    def _filter_records(
+        self,
+        records: List[Dict[str, Any]],
+        category: str = "",
+    ) -> List[Dict[str, Any]]:
+        return [r for r in (records or []) if self._matches_filters(r, category)]
 
     def _opening_confirmation_cells(self, rec: Dict[str, Any]) -> Tuple[str, str]:
         confirmation = rec.get("opening_confirmation") or {}
@@ -3929,11 +3972,11 @@ class PredictTab:
         if not self.lists:
             return
 
-        cont_list = self._filter_records(self.lists.get("cont", []))
-        first_list = self._filter_records(self.lists.get("first", []))
-        fresh_list = self._filter_records(self.lists.get("fresh", []))
-        wrap_list = self._filter_records(self.lists.get("wrap", []))
-        trend_list = self._filter_records(self.lists.get("trend", []))
+        cont_list = self._filter_records(self.lists.get("cont", []), "cont")
+        first_list = self._filter_records(self.lists.get("first", []), "first")
+        fresh_list = self._filter_records(self.lists.get("fresh", []), "fresh")
+        wrap_list = self._filter_records(self.lists.get("wrap", []), "wrap")
+        trend_list = self._filter_records(self.lists.get("trend", []), "trend")
 
         # 取本次预测对应日期的命中结果（若已回填）
         results_map = self.results_map or {}
