@@ -116,3 +116,33 @@ def test_report_shows_latest_stocks_that_match_each_setup():
     assert "最新交易日命中股票" in text
     assert "普通中阳(对照)" in text
     assert "000001 平安银行" in text
+
+
+def test_format_stock_matches_defaults_to_one_visible_stock():
+    lookup = {
+        0: "000001 平安银行",
+        1: "000002 万科A",
+    }
+
+    text = pattern_limit_up_prob.format_stock_matches(
+        pd.Series([0, 1]), lookup, pattern_limit_up_prob.DISPLAY_STOCK_LIMIT
+    )
+
+    assert text == "000001 平安银行 ... 共2只"
+
+
+def test_recent_report_title_uses_latest_90_trading_days():
+    df = pd.DataFrame({"trade_date": [20260624, 20260625, 20260626]})
+
+    title, recent = pattern_limit_up_prob.recent_window(df, recent_td=2)
+
+    assert title == "近 2 交易日 (20260625 ~ 20260626) —— 当前市场环境"
+    assert list(recent["trade_date"]) == [20260625, 20260626]
+
+
+def test_feature_window_keeps_warmup_before_recent_days():
+    df = pd.DataFrame({"trade_date": [1, 2, 3, 4, 5]})
+
+    window = pattern_limit_up_prob.feature_window(df, recent_td=2, warmup_td=1)
+
+    assert list(window["trade_date"]) == [3, 4, 5]

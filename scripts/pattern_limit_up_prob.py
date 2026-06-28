@@ -17,11 +17,12 @@ import pandas as pd
 
 DB = "data/stock_store.sqlite3"
 RECENT_TD = 90  # 近窗口（交易日数），用于对比当前市场环境
+FEATURE_WARMUP_TD = 70  # 供60日位置、20日箱体、均线等特征使用
 
 BIG_BOARD = ("300", "301", "302", "688", "689")  # 20cm
 NUM_COLS = ["open", "close", "high", "low", "volume", "amount", "change_pct"]
 LOAD_CHUNKSIZE = 1_000
-DISPLAY_STOCK_LIMIT = 30
+DISPLAY_STOCK_LIMIT = 1
 
 
 FILTERED_SQL = """
@@ -270,6 +271,29 @@ def latest_setup_stock_lines(
     return lines
 
 
+def recent_window(df: pd.DataFrame, recent_td: int = RECENT_TD) -> tuple[str, pd.DataFrame]:
+    dates = sorted(df["trade_date"].unique())
+    if not dates:
+        return f"近 {recent_td} 交易日 (无数据) —— 当前市场环境", df
+    cut = dates[-recent_td] if len(dates) > recent_td else dates[0]
+    recent = df[df["trade_date"] >= cut]
+    title = f"近 {min(recent_td, len(dates))} 交易日 ({cut} ~ {dates[-1]}) —— 当前市场环境"
+    return title, recent
+
+
+def feature_window(
+    df: pd.DataFrame,
+    recent_td: int = RECENT_TD,
+    warmup_td: int = FEATURE_WARMUP_TD,
+) -> pd.DataFrame:
+    dates = sorted(df["trade_date"].unique())
+    keep_days = recent_td + warmup_td
+    if len(dates) <= keep_days:
+        return df
+    cut = dates[-keep_days]
+    return df[df["trade_date"] >= cut].copy()
+
+
 def report(
     df: pd.DataFrame,
     title: str,
@@ -327,22 +351,12 @@ def main():
     df = load()
     code_lookup = load_code_lookup()
     print(f"  原始有效行: {len(df):,}  股票数: {df['code_id'].nunique()}", flush=True)
+    df = feature_window(df)
     print("构建特征 ...", flush=True)
     df = build_features(df)
 
-    # 全周期
-    print(report(df, "全周期 2023-04 ~ 2026-06 (全部 0/3/6 板块，剔除ST)", code_lookup))
-
-    # 近窗口
-    dates = sorted(df["trade_date"].unique())
-    if len(dates) > RECENT_TD:
-        cut = dates[-RECENT_TD]
-        recent = df[df["trade_date"] >= cut]
-        print(report(recent, f"近 {RECENT_TD} 交易日 ({cut} ~ {dates[-1]}) —— 当前市场环境", code_lookup))
-
-    # 分板块（全周期）
-    print(report(df[~df["big"]], "仅主板(10cm) 全周期", code_lookup))
-    print(report(df[df["big"]], "仅创业板/科创板(20cm) 全周期", code_lookup))
+    title, recent = recent_window(df)
+    print(report(recent, title, code_lookup))
 
 
 if __name__ == "__main__":
