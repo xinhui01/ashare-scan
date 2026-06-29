@@ -8,7 +8,13 @@ if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_EXE=%~dp0.venv\Scripts\pyth
 
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
-set "OUT=%~dp0data\run_logs\pattern_limit_up_prob_report.txt"
+
+rem Timestamp via PowerShell (locale-independent); each run is saved to its own file.
+set "TS="
+for /f "usebackq delims=" %%i in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"`) do set "TS=%%i"
+if not defined TS set "TS=latest"
+if not exist "%~dp0data\run_logs" mkdir "%~dp0data\run_logs"
+set "OUT=%~dp0data\run_logs\pattern_limit_up_prob_report_%TS%.txt"
 
 echo [pattern-prob] Computing P(next-day limit-up ^| today's K-line shape)...
 echo [pattern-prob] This scans the full history table, takes ~1-2 min.
