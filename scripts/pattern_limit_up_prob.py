@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 import sqlite3
+from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -242,7 +243,6 @@ def setups(df: pd.DataFrame):
          d["is_lu"] & (d["vol_ratio"] < 0.7)),
     ]
 
-
 def format_stock_matches(code_ids: pd.Series, code_lookup: dict[int, str], limit: int) -> str:
     ids = [int(code_id) for code_id in code_ids]
     if not ids:
@@ -294,6 +294,27 @@ def feature_window(
     return df[df["trade_date"] >= cut].copy()
 
 
+def _fmt_date(d: str) -> str:
+    d = str(d)
+    return f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
+
+
+def example_line(sub: pd.DataFrame, code_lookup: dict[int, str], n: int = 5) -> str:
+    """从命中该形态的样本里，挑最近 n 只不同股票作为真实例子（带次日结果）。"""
+    if sub.empty:
+        return ""
+    ex = (sub.sort_values("trade_date", ascending=False)
+             .drop_duplicates("code_id")
+             .head(n))
+    parts = []
+    for _, r in ex.iterrows():
+        stock = code_lookup.get(int(r["code_id"]), str(int(r["code_id"])))
+        out = "涨停" if r["y"] == 1 else "未涨"
+        parts.append(f"{stock} {_fmt_date(r['trade_date'])} "
+                     f"{r['change_pct']:+.1f}% [次日{out}]")
+    return "       近期实例: " + "  |  ".join(parts)
+
+
 def report(
     df: pd.DataFrame,
     title: str,
@@ -326,10 +347,14 @@ def report(
 
     # 命名图形排名
     lines.append("\n--- 命名'图形' → 次日涨停率（按概率排序）---")
+    lines.append("  （近期实例格式：代码 名称 日期 当日涨幅 → 次日是否涨停；取最近5只不同股票）")
     rows = []
+    examples = {}
     for name, mask in setups(df):
         aligned = mask.reindex(valid.index, fill_value=False)
-        n, p = rate_y(valid.loc[aligned, "y"])
+        sub = valid.loc[aligned]
+        examples[name] = sub
+        n, p = rate_y(sub["y"])
         if n < 100:
             rows.append((name, n, float("nan"), float("nan")))
         else:
@@ -341,12 +366,17 @@ def report(
             lines.append(f"  {name:<28}{n:>9}{'  --':>9}{'  (少)':>8}")
         else:
             lines.append(f"  {name:<28}{n:>9,}{p:>8.2f}%{lift:>7.2f}x")
+        if code_lookup:
+            ex = example_line(examples[name], code_lookup)
+            if ex:
+                lines.append(ex)
     if code_lookup:
         lines.extend(latest_setup_stock_lines(df, code_lookup, stock_limit))
     return "\n".join(lines)
 
 
 def main():
+    print(f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
     print("加载 history ...", flush=True)
     df = load()
     code_lookup = load_code_lookup()
