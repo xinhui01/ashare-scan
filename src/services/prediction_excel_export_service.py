@@ -239,6 +239,7 @@ def _write_summary(wb: Workbook, prediction: Dict[str, Any]) -> None:
         ["情绪打法", (ctx.get("market_state_strategy") or {}).get("label", "")],
         ["轮动分", (ctx.get("market_rotation") or {}).get("rotation_score", "")],
         ["行情打法建议", "\n".join(market_focus_lines)],
+        ["明日题材方向", market_focus_advice.get("next_theme_text", "") if market_focus_advice else ""],
         ["今日重点池", market_focus_advice.get("focus_text", "") if market_focus_advice else ""],
         ["备选观察", market_focus_advice.get("secondary_text", "") if market_focus_advice else ""],
         ["谨慎/回避池", market_focus_advice.get("avoid_text", "") if market_focus_advice else ""],

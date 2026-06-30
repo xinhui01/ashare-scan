@@ -36,6 +36,17 @@ PREDICTION_CATEGORY_KEYS: Dict[str, str] = {
     "trend": "trend_limit_up_candidates",
 }
 
+THEME_SOURCE_PRIORITY = {
+    "概念": 0,
+    "LLM题材": 1,
+    "题材": 1,
+}
+
+THEME_PHASE_PRIORITY = {
+    "主升": 0,
+    "萌芽": 1,
+}
+
 _CATEGORY_ALIASES = {
     "continuation": "cont",
     "relay": "first",
@@ -63,10 +74,12 @@ _STATE_FOCUS: Dict[str, Dict[str, Any]] = {
         "reason": "首板新题材优先，反包只做修复，老主线接力降权。",
     },
     "退潮日": {
-        "primary": ["wrap"],
-        "secondary": ["fresh"],
-        "avoid": ["cont", "first", "trend"],
-        "reason": "不追高位接力，优先反包修复，首板仅轻仓试错。",
+        "primary": [],
+        "secondary": ["wrap"],
+        "avoid": ["cont", "first", "fresh", "trend"],
+        "reason": "退潮日以防守为先，原则不操作；不追高、不低吸、不做新方向试错，等情绪修复再出手。",
+        "wait_text": "空仓观望",
+        "no_trade": True,
     },
     "冰点日": {
         "primary": [],
@@ -140,6 +153,14 @@ def _sentiment_score(compare_context: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _source_priority(source: Any) -> int:
+    return THEME_SOURCE_PRIORITY.get(str(source or "").strip(), 9)
+
+
+def _phase_priority(phase: Any) -> int:
+    return THEME_PHASE_PRIORITY.get(str(phase or "").strip(), 9)
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         return float(value)
@@ -188,8 +209,118 @@ def _infer_local_theme(compare_context: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _theme_item(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    name = str(raw.get("name") or raw.get("theme") or "").strip()
+    source = str(raw.get("source") or "").strip() or "题材"
+    phase = str(raw.get("phase") or "").strip()
+    trend = str(raw.get("trend") or "").strip()
+    return {
+        "name": name,
+        "source": source,
+        "phase": phase,
+        "trend": trend,
+        "today_count": _safe_count(raw.get("today_count")),
+        "candidate_count": _safe_count(raw.get("candidate_count")),
+        "opportunity_score": _safe_count(raw.get("opportunity_score")),
+    }
+
+
+def _usable_next_theme(item: Mapping[str, Any]) -> bool:
+    name = str(item.get("name") or "").strip()
+    source = str(item.get("source") or "").strip()
+    phase = str(item.get("phase") or "").strip()
+    trend = str(item.get("trend") or "").strip()
+    if not name or source == "行业":
+        return False
+    if trend == "declining" or phase in {"末期", "退潮"}:
+        return False
+    if phase and phase not in THEME_PHASE_PRIORITY:
+        return False
+    return True
+
+
+def _format_theme_item(item: Mapping[str, Any]) -> str:
+    name = str(item.get("name") or "").strip()
+    phase = str(item.get("phase") or "").strip()
+    today_count = _safe_count(item.get("today_count"))
+    candidate_count = _safe_count(item.get("candidate_count"))
+    details: List[str] = []
+    if phase:
+        details.append(phase)
+    if today_count:
+        details.append(f"今{today_count}只")
+    elif candidate_count:
+        details.append(f"候选{candidate_count}只")
+    if not details:
+        return name
+    return f"{name}({'，'.join(details)})"
+
+
+def _next_theme_text(
+    compare_context: Mapping[str, Any],
+    *,
+    state_label: str,
+    local_theme: Mapping[str, Any] | None = None,
+    theme_prediction: Mapping[str, Any] | None = None,
+) -> str:
+    if state_label == "退潮日":
+        return "退潮观望，不新增题材操作"
+    if state_label == "冰点日":
+        return "冰点观望，不新增题材操作"
+
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(raw: Mapping[str, Any]) -> None:
+        item = _theme_item(raw)
+        name = str(item.get("name") or "").strip()
+        if not name or name in seen or not _usable_next_theme(item):
+            return
+        candidates.append(item)
+        seen.add(name)
+
+    if isinstance(local_theme, Mapping) and local_theme.get("name"):
+        add({
+            "name": local_theme.get("name"),
+            "source": "题材",
+            "phase": "主升",
+        })
+
+    if isinstance(theme_prediction, Mapping):
+        for group in theme_prediction.get("groups") or []:
+            if isinstance(group, Mapping):
+                add(group)
+
+    strong_line = compare_context.get("strong_main_line") or {}
+    if isinstance(strong_line, Mapping):
+        add(strong_line)
+
+    for raw in compare_context.get("concept_hype_topics") or []:
+        if isinstance(raw, Mapping):
+            add(raw)
+
+    if not candidates:
+        return "暂无明确细题材，等次日板块共振确认"
+
+    candidates.sort(
+        key=lambda item: (
+            _source_priority(item.get("source")),
+            _phase_priority(item.get("phase")),
+            -_safe_count(item.get("opportunity_score")),
+            -_safe_count(item.get("candidate_count")),
+            -_safe_count(item.get("today_count")),
+            str(item.get("name") or ""),
+        )
+    )
+    return "、".join(_format_theme_item(item) for item in candidates[:2])
+
+
 def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str]) -> List[str]:
     state_label = str(compare_context.get("market_state_label") or "").strip()
+    if state_label == "退潮日":
+        return [
+            "执行规则：退潮日不操作；不追高、不低吸、不做预测型试错，等情绪修复后再重新选择题材。"
+        ]
     score = _sentiment_score(compare_context)
     has_fresh_focus = "fresh" in primary
     if not has_fresh_focus:
@@ -248,6 +379,7 @@ def prediction_category_counts(prediction: Mapping[str, Any]) -> Dict[str, int]:
 def build_market_focus_advice(
     compare_context: Mapping[str, Any],
     category_counts: Mapping[str, Any] | None = None,
+    theme_prediction: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Translate market state into category focus advice.
 
@@ -272,12 +404,14 @@ def build_market_focus_advice(
         avoid = [cat for cat in CATEGORY_ORDER if cat not in pools]
         reason = str((strategy or {}).get("notes") or (strategy or {}).get("label") or "按市场情绪推荐池优先观察。")
         wait_text = ""
+        no_trade = False
     else:
         primary = _unique_categories(spec.get("primary") or [])
         secondary = _unique_categories(spec.get("secondary") or [])
         avoid = _unique_categories(spec.get("avoid") or [])
         reason = str(spec.get("reason") or "")
         wait_text = str(spec.get("wait_text") or "")
+        no_trade = bool(spec.get("no_trade"))
 
     strong_line = _qualified_strong_main_line(compare_context)
     local_theme = _infer_local_theme(compare_context)
@@ -301,7 +435,9 @@ def build_market_focus_advice(
 
     primary_text = _format_items(primary_items, warn_zero=True)
     secondary_text = _format_items(secondary_items, warn_zero=True)
-    if not primary_text and wait_text:
+    if no_trade and wait_text:
+        focus_text = wait_text
+    elif not primary_text and wait_text:
         focus_text = wait_text
         if secondary_text:
             focus_text = f"{focus_text}；极少试探：{secondary_text}"
@@ -320,25 +456,42 @@ def build_market_focus_advice(
             f"执行规则：先看{line_name}主线内是否继续强于大盘；不在主线内、也没有板块共振的新首板不做。",
         )
     if local_theme:
-        execution_rules.insert(
-            0,
-            f"执行规则：{local_theme['name']}是推断的局部强方向，必须同时看板块强度、题材证据和个股梯队，不能只按粗行业名交易。",
-        )
+        if no_trade:
+            execution_rules.insert(
+                0,
+                f"执行规则：{local_theme['name']}仅作观察，不作为买入方向；等市场情绪修复后再重新评估。",
+            )
+        else:
+            execution_rules.insert(
+                0,
+                f"执行规则：{local_theme['name']}是推断的局部强方向，必须同时看板块强度、题材证据和个股梯队，不能只按粗行业名交易。",
+            )
 
     summary = f"行情打法建议：{state_text} → {reason}" if reason else f"行情打法建议：{state_text}"
     if local_theme:
-        summary += f" 局部强方向：{local_theme['name']}（{local_theme['reason']}）。"
+        if no_trade:
+            summary += f" 局部强方向：{local_theme['name']}（{local_theme['reason']}），仅作观察。"
+        else:
+            summary += f" 局部强方向：{local_theme['name']}（{local_theme['reason']}）。"
+    next_theme_text = _next_theme_text(
+        compare_context,
+        state_label=state_label,
+        local_theme=local_theme,
+        theme_prediction=theme_prediction,
+    )
 
     return {
         "state_label": state_label,
         "strategy_label": str((strategy or {}).get("label") or ""),
         "local_theme": local_theme,
+        "no_trade": no_trade,
         "primary": primary_items,
         "secondary": secondary_items,
         "avoid": avoid_items,
         "focus_text": focus_text,
         "secondary_text": secondary_text,
         "avoid_text": avoid_text,
+        "next_theme_text": next_theme_text,
         "execution_rules": execution_rules,
         "reason": reason,
         "summary": summary,
@@ -349,15 +502,25 @@ def resolve_market_focus_advice(prediction: Mapping[str, Any]) -> Dict[str, Any]
     """Use precomputed advice when present, otherwise build it from prediction."""
     if not isinstance(prediction, Mapping):
         return {}
+    legacy_advice: Dict[str, Any] = {}
     advice = prediction.get("market_focus_advice")
     if isinstance(advice, dict) and advice:
-        return advice
+        if advice.get("next_theme_text"):
+            return advice
+        legacy_advice = advice
     ctx = prediction.get("compare_context") or {}
     if isinstance(ctx, Mapping):
         advice = ctx.get("market_focus_advice")
         if isinstance(advice, dict) and advice:
-            return advice
-    return build_market_focus_advice(ctx, prediction_category_counts(prediction))
+            if advice.get("next_theme_text"):
+                return advice
+            legacy_advice = legacy_advice or advice
+    rebuilt = build_market_focus_advice(
+        ctx,
+        prediction_category_counts(prediction),
+        prediction.get("theme_prediction") or {},
+    )
+    return rebuilt or legacy_advice
 
 
 def format_market_focus_advice_lines(advice: Mapping[str, Any]) -> List[str]:
@@ -368,13 +531,20 @@ def format_market_focus_advice_lines(advice: Mapping[str, Any]) -> List[str]:
     focus_text = str(advice.get("focus_text") or "").strip()
     secondary_text = str(advice.get("secondary_text") or "").strip()
     avoid_text = str(advice.get("avoid_text") or "").strip()
+    next_theme_text = str(advice.get("next_theme_text") or "").strip()
+    no_trade = bool(advice.get("no_trade"))
+    if next_theme_text:
+        lines.append(f"明日题材方向：{next_theme_text}")
     if focus_text:
         lines.append(f"今日重点池：{focus_text}")
     execution_rules = advice.get("execution_rules") or []
     if isinstance(execution_rules, Sequence) and not isinstance(execution_rules, (str, bytes)):
         lines.extend(str(rule).strip() for rule in execution_rules if str(rule).strip())
     if secondary_text:
-        lines.append(f"备选观察：{secondary_text}")
+        if no_trade:
+            lines.append(f"仅观察池：{secondary_text}（不作为买入建议）")
+        else:
+            lines.append(f"备选观察：{secondary_text}")
     if avoid_text:
         lines.append(f"谨慎/回避池：{avoid_text}")
     return [line for line in lines if line]

@@ -246,7 +246,7 @@ def market_style_bias(
         if is_cont or is_first:
             return -15.0, ["退潮日接力降权-15"]
         if is_wrap:
-            return 8.0, ["退潮日反包修复+8"]
+            return 8.0, ["退潮日反包观察+8"]
         if is_fresh:
             return -4.0, ["退潮日首板控仓-4"]
         if is_trend:

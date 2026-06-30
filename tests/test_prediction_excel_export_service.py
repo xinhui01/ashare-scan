@@ -85,6 +85,7 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
     assert any("自动题材周期(25日)" in str(value) for value in summary_values)
     assert any("20260520~20260624" in str(value) for value in summary_values)
     assert any("首板涨停(0只" in str(value) for value in summary_values)
+    assert "机器人(主升，候选1只)" in summary_values
     assert any("保留涨停/连板(1只)" in str(value) for value in summary_values)
     assert any("候选仅为观察池" in str(value) for value in summary_values)
     assert any("平均晋级率仅10.8%" in str(value) for value in summary_values)

@@ -3,6 +3,36 @@ from __future__ import annotations
 from src.services import market_sentiment_service as svc
 
 
+def test_retreat_state_strategy_is_no_trade():
+    strategy = svc._STATE_STRATEGIES["退潮日"]["strategy"]
+
+    assert strategy["label"] == "空仓观望 / 不操作"
+    assert strategy["pools"] == []
+    assert strategy["position_cap"] == 0.0
+    assert "不操作" in strategy["notes"]
+
+
+def test_retreat_state_local_focus_stays_observation_only():
+    state = {
+        "label": "退潮日",
+        "strategy": {
+            "label": "空仓观望 / 不操作",
+            "pools": [],
+            "position_cap": 0.0,
+            "notes": "退潮日不操作。",
+        },
+    }
+
+    out = svc._apply_local_focus_to_market_state(
+        state,
+        {"name": "芯片/半导体", "reason": "细题材证据：先进封装(4只)"},
+    )
+
+    notes = out["strategy"]["notes"]
+    assert "仅作观察" in notes
+    assert "优先看该方向内二波/趋势核心" not in notes
+
+
 def test_explicit_date_does_not_silently_fallback(monkeypatch):
     state = {"calls": 0}
 

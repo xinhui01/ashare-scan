@@ -659,10 +659,17 @@ def _apply_local_focus_to_market_state(
     out = dict(market_state)
     strategy = dict(out.get("strategy") or {})
     notes = str(strategy.get("notes") or "").strip()
-    focus_note = (
-        f"局部强方向：{local_focus['name']}（{local_focus['reason']}）；"
-        "优先看该方向内二波/趋势核心，首板只做补涨确认。"
-    )
+    state_label = str(out.get("label") or "").strip()
+    if state_label in {"退潮日", "冰点日"}:
+        focus_note = (
+            f"局部强方向：{local_focus['name']}（{local_focus['reason']}）；"
+            "仅作观察，不作为买入方向，继续等待情绪修复确认。"
+        )
+    else:
+        focus_note = (
+            f"局部强方向：{local_focus['name']}（{local_focus['reason']}）；"
+            "优先看该方向内二波/趋势核心，首板只做补涨确认。"
+        )
     strategy["notes"] = f"{notes} {focus_note}".strip()
     out["strategy"] = strategy
     out["local_focus"] = local_focus
@@ -684,7 +691,7 @@ def _apply_local_focus_to_market_state(
 # 建议修正方向（未应用）：
 # - 接力日: "连板接力+高度龙头(0.8)"  → "减仓兑现/避免追高(0.4)"
 # - 轮动日: "首板新题材(0.6)"          → "反包炸板+新方向首板(0.6)"，反包优先
-# - 退潮日: "反包/低吸(0.3)"           → 维持
+# - 退潮日: "反包/低吸(0.3)"           → "空仓观望/不操作(0.0)"
 # - 冰点日: "空仓+试探(0.1)"           → 维持
 # - 过渡日: "首板谨慎接力(0.5)"        → "反包优先，控仓(0.4)"
 #
@@ -713,10 +720,10 @@ _STATE_STRATEGIES = {
     "退潮日": {
         "color": "#d84315",
         "strategy": {
-            "label": "反包/低吸为主，轻仓",
-            "pools": ["wrap", "fresh"],
-            "position_cap": 0.3,
-            "notes": "不打高位接力；优先昨日炸板/前期强势股回踩反包；新首板谨慎，控制单股仓位。",
+            "label": "空仓观望 / 不操作",
+            "pools": [],
+            "position_cap": 0.0,
+            "notes": "退潮日不操作；不打高位接力，不做反包低吸，不试错新首板。等次日情绪修复和板块共振确认后再出手。",
         },
     },
     "冰点日": {

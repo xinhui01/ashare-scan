@@ -1,6 +1,7 @@
 from src.services.market_focus_advice_service import (
     build_market_focus_advice,
     format_market_focus_advice_lines,
+    resolve_market_focus_advice,
 )
 
 
@@ -39,6 +40,43 @@ def test_ice_point_focus_prefers_waiting_over_forced_candidates():
     assert "保留涨停/连板(1只)" in advice["avoid_text"]
 
 
+def test_retreat_day_focuses_waiting_and_formats_no_trade_rule():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "退潮日",
+            "market_state_strategy": {"label": "空仓观望 / 不操作"},
+        },
+        {"cont": 3, "first": 2, "fresh": 4, "wrap": 8, "trend": 1},
+    )
+
+    lines = format_market_focus_advice_lines(advice)
+
+    assert advice["primary"] == []
+    assert [item["category"] for item in advice["secondary"]] == ["wrap"]
+    assert "空仓观望" in advice["focus_text"]
+    assert advice["next_theme_text"] == "退潮观望，不新增题材操作"
+    assert "明日题材方向：退潮观望，不新增题材操作" in lines
+    assert "今日重点池：空仓观望" in lines
+    assert any("退潮日不操作" in line for line in lines)
+
+
+def test_retreat_day_local_theme_is_observation_only():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "退潮日",
+            "board_strength": {"半导体": 5.0},
+            "concept_hype_topics": [
+                {"name": "先进封装", "source": "概念", "phase": "主升", "today_count": 4},
+            ],
+        },
+        {"cont": 1, "first": 1, "fresh": 1, "wrap": 2, "trend": 1},
+    )
+
+    assert "局部强方向：芯片/半导体" in advice["summary"]
+    assert "仅作观察" in advice["summary"]
+    assert "优先看" not in advice["summary"]
+
+
 def test_market_focus_advice_formats_summary_lines_for_ui_and_excel():
     advice = build_market_focus_advice(
         {"market_state_label": "过渡日"},
@@ -51,6 +89,107 @@ def test_market_focus_advice_formats_summary_lines_for_ui_and_excel():
     assert "今日重点池：首板涨停(5只)" in lines
     assert "备选观察：二波接力(2只)、反包(1只)" in lines
     assert "谨慎/回避池：保留涨停/连板(3只)、趋势涨停(0只)" in lines
+
+
+def test_market_focus_advice_formats_next_day_theme_from_active_topics():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+            "concept_hype_topics": [
+                {
+                    "name": "机器人",
+                    "source": "概念",
+                    "phase": "主升",
+                    "today_count": 4,
+                    "opportunity_score": 82,
+                },
+                {
+                    "name": "固态电池",
+                    "source": "LLM题材",
+                    "phase": "萌芽",
+                    "today_count": 3,
+                    "opportunity_score": 76,
+                },
+                {
+                    "name": "专用设备制造业",
+                    "source": "行业",
+                    "phase": "主升",
+                    "today_count": 11,
+                    "opportunity_score": 91,
+                },
+            ],
+        },
+        {"cont": 1, "first": 2, "fresh": 6, "wrap": 1, "trend": 0},
+    )
+
+    lines = format_market_focus_advice_lines(advice)
+
+    assert advice["next_theme_text"] == "机器人(主升，今4只)、固态电池(萌芽，今3只)"
+    assert "明日题材方向：机器人(主升，今4只)、固态电池(萌芽，今3只)" in lines
+
+
+def test_market_focus_advice_uses_theme_prediction_groups_for_next_day_theme():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "过渡日",
+            "market_state_strategy": {"label": "首板为主，谨慎接力"},
+        },
+        {"cont": 1, "first": 2, "fresh": 6, "wrap": 1, "trend": 0},
+        {
+            "groups": [
+                {
+                    "name": "机器人",
+                    "source": "概念",
+                    "phase": "主升",
+                    "today_count": 4,
+                    "candidate_count": 5,
+                },
+                {
+                    "name": "汽车制造业",
+                    "source": "行业",
+                    "phase": "主升",
+                    "today_count": 9,
+                    "candidate_count": 8,
+                },
+                {
+                    "name": "固态电池",
+                    "source": "LLM题材",
+                    "phase": "萌芽",
+                    "today_count": 2,
+                    "candidate_count": 3,
+                },
+            ]
+        },
+    )
+
+    assert advice["next_theme_text"] == "机器人(主升，今4只)、固态电池(萌芽，今2只)"
+
+
+def test_resolve_market_focus_advice_refreshes_old_payload_without_next_theme():
+    advice = resolve_market_focus_advice({
+        "market_focus_advice": {
+            "state_label": "轮动日",
+            "summary": "行情打法建议：轮动日",
+        },
+        "compare_context": {
+            "market_state_label": "轮动日",
+            "market_state_strategy": {"label": "首板新题材 / 避开老主线"},
+        },
+        "fresh_first_board_candidates": [{"code": "300001"}],
+        "theme_prediction": {
+            "groups": [
+                {
+                    "name": "机器人",
+                    "source": "概念",
+                    "phase": "主升",
+                    "candidate_count": 1,
+                }
+            ]
+        },
+    })
+
+    assert advice["next_theme_text"] == "机器人(主升，候选1只)"
 
 
 def test_market_focus_advice_prefers_established_main_line_over_new_theme_rotation():

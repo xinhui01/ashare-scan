@@ -682,7 +682,7 @@ def _priority_adjustment(
     if state_label == "退潮日":
         if cat == "wrap":
             delta += 18.0
-            reasons.append("退潮日反包修复优先+18")
+            reasons.append("退潮日反包观察+18")
         elif cat == "trend":
             penalty = -10.0 if is_main_line else -20.0
             delta += penalty
@@ -694,7 +694,7 @@ def _priority_adjustment(
         elif cat == "fresh":
             penalty = -6.0 if is_main_line else -12.0
             delta += penalty
-            reasons.append(f"退潮日首板试错收缩{int(penalty)}")
+            reasons.append(f"退潮日首板观察收缩{int(penalty)}")
     elif state_label == "冰点日":
         if cat == "wrap":
             delta += 12.0
@@ -734,7 +734,7 @@ def _limit_candidates_for_state(
     if state_label == "退潮日":
         limits = dict(_RETREAT_LIMITS)
         total_limit = _RETREAT_TOTAL_LIMIT
-        reason = f"退潮日缩量：只保留反包修复、强主线低位机会和少量试错，最多{total_limit}只"
+        reason = f"退潮日缩量：仅保留观察池用于复盘和次日确认，不作为买入建议，最多{total_limit}只"
     elif state_label == "冰点日":
         limits = dict(_ICE_POINT_LIMITS)
         total_limit = _ICE_POINT_TOTAL_LIMIT
@@ -2080,7 +2080,11 @@ def predict_limit_up_candidates(
         "wrap": len(broken_board_wrap_candidates),
         "trend": len(trend_limit_up_candidates),
     }
-    market_focus_advice = build_market_focus_advice(compare_context, category_counts)
+    market_focus_advice = build_market_focus_advice(
+        compare_context,
+        category_counts,
+        theme_prediction,
+    )
     if market_focus_advice:
         compare_context["market_focus_advice"] = market_focus_advice
 

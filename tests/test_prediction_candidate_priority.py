@@ -154,7 +154,7 @@ def test_retreat_day_limits_candidate_count_and_prefers_repair_pool():
     }
     context = {
         "market_state_label": "退潮日",
-        "market_state_strategy": {"label": "反包/低吸为主，轻仓"},
+        "market_state_strategy": {"label": "空仓观望 / 不操作"},
         "sentiment_score": 21,
     }
 
@@ -162,11 +162,14 @@ def test_retreat_day_limits_candidate_count_and_prefers_repair_pool():
 
     assert stats["limited"] is True
     assert stats["limit_reason"].startswith("退潮日")
+    assert "观察池" in stats["limit_reason"]
+    assert "只保留反包修复" not in stats["limit_reason"]
     assert sum(len(rows) for rows in ranked.values()) <= 15
     assert len(ranked["wrap"]) <= 8
     assert len(ranked["trend"]) <= 4
     assert len(ranked["first"]) <= 1
     assert ranked["wrap"][0]["final_rank_score"] > ranked["trend"][0]["final_rank_score"]
+    assert any("退潮日反包观察" in reason for reason in ranked["wrap"][0]["final_rank_reasons"])
 
 
 def test_theme_data_quality_marks_industry_only_fallback_as_low_quality():
