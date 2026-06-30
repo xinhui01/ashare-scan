@@ -47,6 +47,7 @@ _PREDICTION_CANDIDATE_KEYS: Dict[str, str] = {
     "wrap": "broken_board_wrap_candidates",
     "trend": "trend_limit_up_candidates",
 }
+_RECENT_THEME_REQUIRED_CATEGORIES = {"cont", "first", "wrap"}
 
 _RETREAT_LIMITS = {
     "cont": 1,
@@ -629,7 +630,10 @@ def _candidate_has_fine_theme(rec: Dict[str, Any], compare_context: Dict[str, An
         or (compare_context.get("code_theme_map") or {}).get(code)
         or ""
     ).strip()
-    return bool(theme_name)
+    industry = str(rec.get("industry") or "").strip()
+    if not theme_name:
+        return False
+    return not (industry and theme_name == industry)
 
 
 def _priority_adjustment(
@@ -771,6 +775,56 @@ def _limit_candidates_for_state(
     return limited, {"limited": True, "limit_reason": reason}
 
 
+def _filter_recent_theme_candidates(
+    candidates_by_category: Dict[str, List[Dict[str, Any]]],
+    compare_context: Dict[str, Any],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    filtered: Dict[str, List[Dict[str, Any]]] = {}
+    before_counts: Dict[str, int] = {}
+    after_counts: Dict[str, int] = {}
+    removed_counts: Dict[str, int] = {}
+    for cat in _PREDICTION_CANDIDATE_KEYS:
+        rows = list((candidates_by_category or {}).get(cat) or [])
+        before_counts[cat] = len(rows)
+        kept = _filter_recent_theme_rows(cat, rows, compare_context or {})
+        filtered[cat] = kept
+        after_counts[cat] = len(kept)
+        removed_counts[cat] = max(0, before_counts[cat] - after_counts[cat])
+    removed_total = sum(removed_counts.values())
+    return filtered, {
+        "enabled": True,
+        "required_categories": sorted(_RECENT_THEME_REQUIRED_CATEGORIES),
+        "exempt_categories": [
+            cat for cat in _PREDICTION_CANDIDATE_KEYS
+            if cat not in _RECENT_THEME_REQUIRED_CATEGORIES
+        ],
+        "before_counts": before_counts,
+        "after_counts": after_counts,
+        "removed_counts": removed_counts,
+        "removed_total": removed_total,
+        "reason": (
+            "除首板和趋势外，仅保留命中近期题材的候选"
+            if removed_total
+            else ""
+        ),
+    }
+
+
+def _filter_recent_theme_rows(
+    category: str,
+    rows: List[Dict[str, Any]],
+    compare_context: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    cat = str(category or "").strip()
+    if cat not in _RECENT_THEME_REQUIRED_CATEGORIES:
+        return list(rows or [])
+    return [
+        rec for rec in rows or []
+        if isinstance(rec, dict)
+        and _candidate_has_fine_theme(rec, compare_context or {})
+    ]
+
+
 def _rank_and_limit_prediction_candidates(
     candidates_by_category: Dict[str, List[Dict[str, Any]]],
     compare_context: Dict[str, Any],
@@ -778,6 +832,10 @@ def _rank_and_limit_prediction_candidates(
     theme_quality: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     theme_quality = theme_quality or {}
+    candidates_by_category, theme_filter_stats = _filter_recent_theme_candidates(
+        candidates_by_category or {},
+        compare_context or {},
+    )
     ranked: Dict[str, List[Dict[str, Any]]] = {}
     before_counts: Dict[str, int] = {}
     for cat in _PREDICTION_CANDIDATE_KEYS:
@@ -821,6 +879,7 @@ def _rank_and_limit_prediction_candidates(
         "after_counts": after_counts,
         "before_total": sum(before_counts.values()),
         "after_total": sum(after_counts.values()),
+        "theme_filter": theme_filter_stats,
         "top_priority_candidates": flat[:5],
         **limit_stats,
     }
@@ -1938,6 +1997,11 @@ def predict_limit_up_candidates(
             progress_callback(idx + 1, len(all_pool_records),
                               f"保留涨停分析 {rec['code']} {rec.get('name', '')}")
     continuation_candidates.sort(key=lambda x: -x["score"])
+    continuation_candidates = _filter_recent_theme_rows(
+        "cont",
+        continuation_candidates,
+        compare_context,
+    )
 
     # 阶段5：二波接力候选（历史数据 + 行情都已缓存）
     if log_fn:
@@ -1951,6 +2015,11 @@ def predict_limit_up_candidates(
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         filter_strong_stocks_fn=_first_board.filter_strong_stocks,
+    )
+    first_board_candidates = _filter_recent_theme_rows(
+        "first",
+        first_board_candidates,
+        compare_context,
     )
 
     # 阶段6：首板涨停候选（最近 N 日未涨停、今日量价启动）
@@ -1995,6 +2064,11 @@ def predict_limit_up_candidates(
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         filter_wrap_candidate_stocks_fn=_first_board.filter_wrap_candidate_stocks,
+    )
+    broken_board_wrap_candidates = _filter_recent_theme_rows(
+        "wrap",
+        broken_board_wrap_candidates,
+        compare_context,
     )
     popularity_stats = _popularity_rank_service.enrich_wrap_candidates_with_popularity(
         broken_board_wrap_candidates, trade_date, log_fn=log_fn,
@@ -2043,6 +2117,7 @@ def predict_limit_up_candidates(
         "after_total": int(candidate_priority.get("after_total") or 0),
         "before_counts": dict(candidate_priority.get("before_counts") or {}),
         "after_counts": dict(candidate_priority.get("after_counts") or {}),
+        "theme_filter": dict(candidate_priority.get("theme_filter") or {}),
     }
 
     try:

@@ -149,7 +149,10 @@ def test_retreat_day_limits_candidate_count_and_prefers_repair_pool():
         "cont": [_candidate(f"60010{i}", 80 - i, "保留涨停") for i in range(3)],
         "first": [_candidate(f"60020{i}", 82 - i, "二波接力") for i in range(5)],
         "fresh": [_candidate(f"60030{i}", 78 - i, "首板涨停") for i in range(4)],
-        "wrap": [_candidate(f"60040{i}", 88 - i, "断板反包") for i in range(12)],
+        "wrap": [
+            _candidate(f"60040{i}", 88 - i, "断板反包", theme="机器人")
+            for i in range(12)
+        ],
         "trend": [_candidate(f"60050{i}", 95 - i, "趋势涨停") for i in range(12)],
     }
     context = {
@@ -170,6 +173,51 @@ def test_retreat_day_limits_candidate_count_and_prefers_repair_pool():
     assert len(ranked["first"]) <= 1
     assert ranked["wrap"][0]["final_rank_score"] > ranked["trend"][0]["final_rank_score"]
     assert any("退潮日反包观察" in reason for reason in ranked["wrap"][0]["final_rank_reasons"])
+
+
+def test_non_fresh_non_trend_candidates_must_match_recent_theme():
+    ranker = getattr(scoring_predict, "_rank_and_limit_prediction_candidates", None)
+    assert callable(ranker)
+    buckets = {
+        "cont": [
+            _candidate("600101", 90, "保留涨停", theme="机器人"),
+            _candidate("600102", 99, "保留涨停", industry="银行"),
+            _candidate("600103", 98, "保留涨停", industry="银行", theme="银行"),
+        ],
+        "first": [
+            _candidate("600201", 88, "二波接力"),
+            _candidate("600202", 92, "二波接力", industry="煤炭"),
+        ],
+        "wrap": [
+            _candidate("600301", 87, "断板反包", theme_name="固态电池"),
+            _candidate("600302", 94, "断板反包", industry="地产"),
+        ],
+        "fresh": [
+            _candidate("600401", 71, "首板涨停", industry="家电"),
+        ],
+        "trend": [
+            _candidate("600501", 73, "趋势涨停", industry="食品饮料"),
+        ],
+    }
+    context = {
+        "market_state_label": "轮动日",
+        "code_theme_map": {"600201": "机器人"},
+    }
+
+    ranked, stats = ranker(buckets, context, theme_quality={"quality_level": "fine_theme"})
+
+    assert [row["code"] for row in ranked["cont"]] == ["600101"]
+    assert [row["code"] for row in ranked["first"]] == ["600201"]
+    assert [row["code"] for row in ranked["wrap"]] == ["600301"]
+    assert [row["code"] for row in ranked["fresh"]] == ["600401"]
+    assert [row["code"] for row in ranked["trend"]] == ["600501"]
+    assert stats["theme_filter"]["removed_counts"] == {
+        "cont": 2,
+        "first": 1,
+        "fresh": 0,
+        "wrap": 1,
+        "trend": 0,
+    }
 
 
 def test_theme_data_quality_marks_industry_only_fallback_as_low_quality():

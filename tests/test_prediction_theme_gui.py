@@ -168,6 +168,12 @@ def test_prediction_summary_prioritizes_final_advice_before_base_environment():
     assert advice_idx < base_idx
 
 
+def test_prediction_result_keeps_recent_theme_filter_stats():
+    predict_src = inspect.getsource(scoring_predict.predict_limit_up_candidates)
+
+    assert '"theme_filter": dict(candidate_priority.get("theme_filter") or {})' in predict_src
+
+
 def test_prediction_accuracy_text_is_compact_for_header_label():
     text = PredictTab._accuracy_header_text(
         "首板涨停",
