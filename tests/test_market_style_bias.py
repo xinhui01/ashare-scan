@@ -177,3 +177,34 @@ def test_sentiment_context_propagates_market_state_and_rotation_to_compare_conte
     assert data_quality["sentiment"]["market_state"] == "轮动日"
     assert data_quality["sentiment"]["strategy_label"] == "首板新题材 / 避开老主线"
     assert data_quality["sentiment"]["rotation_score"] == 42
+
+
+def test_retreat_stage_controls_wrap_style_bias():
+    early_context = {
+        "market_state_label": "退潮日",
+        "market_retreat_stage": {
+            "code": "early_retreat",
+            "label": "退潮初期",
+            "allow_wrap": False,
+        },
+    }
+    repair_context = {
+        "market_state_label": "退潮日",
+        "market_retreat_stage": {
+            "code": "repair_watch",
+            "label": "退潮修复",
+            "allow_wrap": True,
+        },
+    }
+
+    early_bonus, early_reasons = shared_scoring.market_style_bias(
+        "wrap", "600001", "机器人", early_context
+    )
+    repair_bonus, repair_reasons = shared_scoring.market_style_bias(
+        "wrap", "600001", "机器人", repair_context
+    )
+
+    assert early_bonus < 0
+    assert any("反包禁做" in reason for reason in early_reasons)
+    assert repair_bonus > 0
+    assert any("确认型反包" in reason for reason in repair_reasons)

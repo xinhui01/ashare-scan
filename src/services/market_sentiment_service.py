@@ -747,6 +747,117 @@ _STATE_STRATEGIES = {
 }
 
 
+_RETREAT_STAGE_STRATEGIES = {
+    "early_retreat": {
+        "code": "early_retreat",
+        "label": "退潮初期",
+        "allow_wrap": False,
+        "trade_level": "no_trade",
+        "notes": "高度断档且晋级塌陷，反包最容易从观察变成补跌；不做反包、不低吸、不试错新题材。",
+    },
+    "retreat_observe": {
+        "code": "retreat_observe",
+        "label": "退潮延续",
+        "allow_wrap": False,
+        "trade_level": "observe_only",
+        "notes": "仍处在退潮延续，只复盘观察，不把反包观察池升级成买入池。",
+    },
+    "repair_watch": {
+        "code": "repair_watch",
+        "label": "退潮修复",
+        "allow_wrap": True,
+        "trade_level": "confirmed_wrap_only",
+        "notes": "只允许确认型反包：必须等竞价/开盘转强、题材共振和个股主动性确认，仓位极小。",
+    },
+    "ice_repair": {
+        "code": "ice_repair",
+        "label": "冰点修复",
+        "allow_wrap": True,
+        "trade_level": "confirmed_wrap_only",
+        "notes": "冰点后只看确认型超跌反包，未出现情绪修复确认前仍以空仓为主。",
+    },
+}
+
+
+def _classify_retreat_stage(
+    *,
+    label: str,
+    score: int,
+    lu: int,
+    max_boards: int,
+    high_board_4plus: int,
+    continuation_rate: float,
+    rotation_score: int,
+    main_line_status: str,
+) -> Dict[str, Any]:
+    if label == "冰点日":
+        return dict(_RETREAT_STAGE_STRATEGIES["ice_repair"])
+    if label != "退潮日":
+        return {}
+
+    main_broken = main_line_status in {"broken", "weakened"}
+    if (
+        continuation_rate < 0.08
+        or (score < 35 and max_boards <= 3 and high_board_4plus == 0)
+        or (main_broken and rotation_score >= 30)
+    ):
+        return dict(_RETREAT_STAGE_STRATEGIES["early_retreat"])
+
+    if (
+        score >= 45
+        and lu >= 25
+        and continuation_rate >= 0.12
+        and not (main_line_status == "broken" and rotation_score >= 30)
+    ):
+        return dict(_RETREAT_STAGE_STRATEGIES["repair_watch"])
+
+    return dict(_RETREAT_STAGE_STRATEGIES["retreat_observe"])
+
+
+def _strategy_for_retreat_stage(
+    base_strategy: Dict[str, Any],
+    retreat_stage: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not retreat_stage:
+        return base_strategy
+
+    stage_code = str(retreat_stage.get("code") or "").strip()
+    stage_label = str(retreat_stage.get("label") or "").strip()
+    stage_notes = str(retreat_stage.get("notes") or "").strip()
+    strategy = dict(base_strategy)
+
+    if stage_code == "repair_watch":
+        strategy.update({
+            "label": f"{stage_label} / 确认型反包",
+            "pools": ["wrap"],
+            "position_cap": 0.1,
+            "notes": stage_notes,
+        })
+    elif stage_code == "ice_repair":
+        strategy.update({
+            "label": "空仓观望 / 极少确认型反包",
+            "pools": ["wrap"],
+            "position_cap": 0.1,
+            "notes": stage_notes,
+        })
+    elif stage_code == "early_retreat":
+        strategy.update({
+            "label": f"{stage_label} / 空仓不操作",
+            "pools": [],
+            "position_cap": 0.0,
+            "notes": stage_notes,
+        })
+    elif stage_code == "retreat_observe":
+        strategy.update({
+            "label": f"{stage_label} / 反包仅观察",
+            "pools": [],
+            "position_cap": 0.0,
+            "notes": stage_notes,
+        })
+
+    return strategy
+
+
 def _classify_market_state(
     *,
     score: int,
@@ -802,13 +913,27 @@ def _classify_market_state(
         confidence = 0.6
 
     spec = _STATE_STRATEGIES[label]
-    return {
+    retreat_stage = _classify_retreat_stage(
+        label=label,
+        score=score,
+        lu=lu,
+        max_boards=max_b,
+        high_board_4plus=n4,
+        continuation_rate=cont_rate,
+        rotation_score=rot,
+        main_line_status=str(main_status),
+    )
+    strategy = _strategy_for_retreat_stage(dict(spec["strategy"]), retreat_stage)
+    result = {
         "label": label,
         "color": spec["color"],
         "confidence": confidence,
         "reason": reason,
-        "strategy": spec["strategy"],
+        "strategy": strategy,
     }
+    if retreat_stage:
+        result["retreat_stage"] = retreat_stage
+    return result
 
 
 # ============== 仓位映射 ==============

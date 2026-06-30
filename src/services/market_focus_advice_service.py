@@ -153,6 +153,28 @@ def _sentiment_score(compare_context: Mapping[str, Any]) -> int | None:
         return None
 
 
+def _retreat_stage_info(compare_context: Mapping[str, Any]) -> Dict[str, Any]:
+    stage = compare_context.get("market_retreat_stage")
+    if not isinstance(stage, Mapping):
+        market_state = compare_context.get("market_state") or {}
+        if isinstance(market_state, Mapping):
+            stage = market_state.get("retreat_stage")
+    return dict(stage) if isinstance(stage, Mapping) else {}
+
+
+def _retreat_stage_label(
+    compare_context: Mapping[str, Any],
+    *,
+    default: str = "退潮",
+) -> str:
+    stage = _retreat_stage_info(compare_context)
+    return str(stage.get("label") or default).strip() or default
+
+
+def _retreat_stage_allows_wrap(compare_context: Mapping[str, Any]) -> bool:
+    return bool(_retreat_stage_info(compare_context).get("allow_wrap"))
+
+
 def _source_priority(source: Any) -> int:
     return THEME_SOURCE_PRIORITY.get(str(source or "").strip(), 9)
 
@@ -264,7 +286,9 @@ def _next_theme_text(
     theme_prediction: Mapping[str, Any] | None = None,
 ) -> str:
     if state_label == "退潮日":
-        return "退潮观望，不新增题材操作"
+        stage_label = _retreat_stage_label(compare_context)
+        if not _retreat_stage_allows_wrap(compare_context):
+            return f"{stage_label}观望，不新增题材操作"
     if state_label == "冰点日":
         return "冰点观望，不新增题材操作"
 
@@ -300,6 +324,9 @@ def _next_theme_text(
             add(raw)
 
     if not candidates:
+        if state_label == "退潮日":
+            stage_label = _retreat_stage_label(compare_context)
+            return f"{stage_label}只看最先共振的近期主线，未确认不操作"
         return "暂无明确细题材，等次日板块共振确认"
 
     candidates.sort(
@@ -312,14 +339,24 @@ def _next_theme_text(
             str(item.get("name") or ""),
         )
     )
-    return "、".join(_format_theme_item(item) for item in candidates[:2])
+    theme_text = "、".join(_format_theme_item(item) for item in candidates[:2])
+    if state_label == "退潮日":
+        stage_label = _retreat_stage_label(compare_context)
+        return f"{stage_label}只看确认型反包：{theme_text}"
+    return theme_text
 
 
 def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str]) -> List[str]:
     state_label = str(compare_context.get("market_state_label") or "").strip()
     if state_label == "退潮日":
+        if _retreat_stage_allows_wrap(compare_context):
+            stage_label = _retreat_stage_label(compare_context)
+            return [
+                f"执行规则：{stage_label}只做确认型反包；必须等竞价/开盘确认、题材共振和个股主动转强，不确认就空仓。"
+            ]
+        stage_label = _retreat_stage_label(compare_context, default="退潮日")
         return [
-            "执行规则：退潮日不操作；不追高、不低吸、不做预测型试错，等情绪修复后再重新选择题材。"
+            f"执行规则：{stage_label}不操作；不追高、不低吸、不做反包、不做预测型试错，等情绪修复后再重新选择题材。"
         ]
     score = _sentiment_score(compare_context)
     has_fresh_focus = "fresh" in primary
@@ -413,6 +450,30 @@ def build_market_focus_advice(
         wait_text = str(spec.get("wait_text") or "")
         no_trade = bool(spec.get("no_trade"))
 
+    retreat_stage = _retreat_stage_info(compare_context)
+    if state_label == "退潮日":
+        stage_label = str(retreat_stage.get("label") or "退潮").strip()
+        if _retreat_stage_allows_wrap(compare_context):
+            primary = []
+            secondary = ["wrap"]
+            avoid = ["cont", "first", "fresh", "trend"]
+            reason = (
+                f"{stage_label}不是全面进攻，只允许确认型反包；"
+                "没有竞价/开盘转强和题材共振就继续空仓。"
+            )
+            wait_text = "空仓等确认"
+            no_trade = False
+        else:
+            primary = []
+            secondary = ["wrap"]
+            avoid = ["cont", "first", "fresh", "trend"]
+            reason = (
+                f"{stage_label}以防守为先，原则不操作；"
+                "反包只作复盘观察，不作为买入建议。"
+            )
+            wait_text = "空仓观望"
+            no_trade = True
+
     strong_line = _qualified_strong_main_line(compare_context)
     local_theme = _infer_local_theme(compare_context)
     if strong_line and state_label in {"轮动日", "过渡日"}:
@@ -435,7 +496,11 @@ def build_market_focus_advice(
 
     primary_text = _format_items(primary_items, warn_zero=True)
     secondary_text = _format_items(secondary_items, warn_zero=True)
-    if no_trade and wait_text:
+    if state_label == "退潮日" and _retreat_stage_allows_wrap(compare_context):
+        focus_text = wait_text or "空仓等确认"
+        if secondary_text:
+            focus_text = f"{focus_text}；确认型{secondary_text}（需竞价/开盘确认）"
+    elif no_trade and wait_text:
         focus_text = wait_text
     elif not primary_text and wait_text:
         focus_text = wait_text
@@ -483,6 +548,7 @@ def build_market_focus_advice(
     return {
         "state_label": state_label,
         "strategy_label": str((strategy or {}).get("label") or ""),
+        "retreat_stage": retreat_stage,
         "local_theme": local_theme,
         "no_trade": no_trade,
         "primary": primary_items,

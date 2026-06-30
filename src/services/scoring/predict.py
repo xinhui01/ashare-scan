@@ -49,14 +49,21 @@ _PREDICTION_CANDIDATE_KEYS: Dict[str, str] = {
 }
 _RECENT_THEME_REQUIRED_CATEGORIES = {"cont", "first", "wrap"}
 
-_RETREAT_LIMITS = {
-    "cont": 1,
-    "first": 1,
-    "fresh": 2,
-    "wrap": 8,
-    "trend": 4,
+_RETREAT_NO_TRADE_LIMITS = {
+    "cont": 0,
+    "first": 0,
+    "fresh": 0,
+    "wrap": 0,
+    "trend": 0,
 }
-_RETREAT_TOTAL_LIMIT = 15
+_RETREAT_REPAIR_LIMITS = {
+    "cont": 0,
+    "first": 0,
+    "fresh": 0,
+    "wrap": 4,
+    "trend": 0,
+}
+_RETREAT_REPAIR_TOTAL_LIMIT = 4
 
 _ICE_POINT_LIMITS = {
     "cont": 0,
@@ -317,6 +324,7 @@ def _apply_market_sentiment_context(
     compare_context["market_state"] = market_state
     compare_context["market_state_label"] = str(market_state.get("label") or "")
     compare_context["market_state_strategy"] = market_strategy
+    compare_context["market_retreat_stage"] = market_state.get("retreat_stage") or {}
     compare_context["market_rotation"] = rotation
 
     sentiment_quality = data_quality.setdefault("sentiment", {})
@@ -327,6 +335,9 @@ def _apply_market_sentiment_context(
     sentiment_quality["label"] = compare_context.get("sentiment_label", "")
     sentiment_quality["market_state"] = compare_context.get("market_state_label", "")
     sentiment_quality["strategy_label"] = market_strategy.get("label", "")
+    sentiment_quality["retreat_stage"] = (
+        (compare_context.get("market_retreat_stage") or {}).get("label", "")
+    )
     sentiment_quality["rotation_score"] = rotation.get("rotation_score", "")
 
     sent_external = (raw.get("external") or {})
@@ -636,6 +647,24 @@ def _candidate_has_fine_theme(rec: Dict[str, Any], compare_context: Dict[str, An
     return not (industry and theme_name == industry)
 
 
+def _retreat_stage_info(compare_context: Dict[str, Any]) -> Dict[str, Any]:
+    stage = compare_context.get("market_retreat_stage")
+    if not isinstance(stage, dict):
+        market_state = compare_context.get("market_state") or {}
+        if isinstance(market_state, dict):
+            stage = market_state.get("retreat_stage")
+    return dict(stage) if isinstance(stage, dict) else {}
+
+
+def _retreat_stage_label(compare_context: Dict[str, Any], default: str = "退潮日") -> str:
+    stage = _retreat_stage_info(compare_context)
+    return str(stage.get("label") or default).strip() or default
+
+
+def _retreat_stage_allows_wrap(compare_context: Dict[str, Any]) -> bool:
+    return bool(_retreat_stage_info(compare_context).get("allow_wrap"))
+
+
 def _priority_adjustment(
     category: str,
     rec: Dict[str, Any],
@@ -685,8 +714,12 @@ def _priority_adjustment(
 
     if state_label == "退潮日":
         if cat == "wrap":
-            delta += 18.0
-            reasons.append("退潮日反包观察+18")
+            if _retreat_stage_allows_wrap(compare_context):
+                delta += 10.0
+                reasons.append(f"{_retreat_stage_label(compare_context)}确认型反包观察+10")
+            else:
+                delta -= 24.0
+                reasons.append(f"{_retreat_stage_label(compare_context)}反包禁做-24")
         elif cat == "trend":
             penalty = -10.0 if is_main_line else -20.0
             delta += penalty
@@ -736,9 +769,15 @@ def _limit_candidates_for_state(
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
     state_label = str(compare_context.get("market_state_label") or "").strip()
     if state_label == "退潮日":
-        limits = dict(_RETREAT_LIMITS)
-        total_limit = _RETREAT_TOTAL_LIMIT
-        reason = f"退潮日缩量：仅保留观察池用于复盘和次日确认，不作为买入建议，最多{total_limit}只"
+        stage_label = _retreat_stage_label(compare_context)
+        if _retreat_stage_allows_wrap(compare_context):
+            limits = dict(_RETREAT_REPAIR_LIMITS)
+            total_limit = _RETREAT_REPAIR_TOTAL_LIMIT
+            reason = f"{stage_label}缩量：只保留确认型反包观察，最多{total_limit}只；未确认不操作"
+        else:
+            limits = dict(_RETREAT_NO_TRADE_LIMITS)
+            total_limit = 0
+            reason = f"{stage_label}缩量：不输出可操作候选；反包、首板、趋势都只复盘观察"
     elif state_label == "冰点日":
         limits = dict(_ICE_POINT_LIMITS)
         total_limit = _ICE_POINT_TOTAL_LIMIT

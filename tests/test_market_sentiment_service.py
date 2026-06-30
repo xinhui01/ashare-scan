@@ -33,6 +33,52 @@ def test_retreat_state_local_focus_stays_observation_only():
     assert "优先看该方向内二波/趋势核心" not in notes
 
 
+def test_early_retreat_stage_forbids_wrap_operation():
+    state = svc._classify_market_state(
+        score=28,
+        today_agg={
+            "lu_count": 38,
+            "max_boards": 3,
+            "high_board_count_4plus": 0,
+        },
+        rotation={"main_line_status": "broken", "rotation_score": 42},
+        yest_lu=60,
+        today_continued=3,
+    )
+
+    stage = state["retreat_stage"]
+    assert state["label"] == "退潮日"
+    assert stage["code"] == "early_retreat"
+    assert stage["allow_wrap"] is False
+    assert state["strategy"]["pools"] == []
+    assert state["strategy"]["position_cap"] == 0.0
+    assert "退潮初期" in state["strategy"]["label"]
+    assert "不做反包" in state["strategy"]["notes"]
+
+
+def test_retreat_repair_stage_allows_only_confirmed_wrap():
+    state = svc._classify_market_state(
+        score=48,
+        today_agg={
+            "lu_count": 36,
+            "max_boards": 3,
+            "high_board_count_4plus": 0,
+        },
+        rotation={"main_line_status": "continued", "rotation_score": 8},
+        yest_lu=40,
+        today_continued=6,
+    )
+
+    stage = state["retreat_stage"]
+    assert state["label"] == "退潮日"
+    assert stage["code"] == "repair_watch"
+    assert stage["allow_wrap"] is True
+    assert state["strategy"]["pools"] == ["wrap"]
+    assert state["strategy"]["position_cap"] <= 0.15
+    assert "确认型反包" in state["strategy"]["label"]
+    assert "确认型反包" in state["strategy"]["notes"]
+
+
 def test_explicit_date_does_not_silently_fallback(monkeypatch):
     state = {"calls": 0}
 

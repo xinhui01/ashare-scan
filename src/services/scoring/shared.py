@@ -144,6 +144,17 @@ def _matches_any_name(value: str, names: set[str]) -> bool:
     return any(text == name or text in name or name in text for name in names if name)
 
 
+def _retreat_stage_info(compare_context: Dict[str, Any], market_state: Dict[str, Any]) -> Dict[str, Any]:
+    stage = compare_context.get("market_retreat_stage")
+    if not isinstance(stage, dict):
+        stage = market_state.get("retreat_stage")
+    return dict(stage) if isinstance(stage, dict) else {}
+
+
+def _retreat_stage_label(retreat_stage: Dict[str, Any], default: str = "退潮日") -> str:
+    return str(retreat_stage.get("label") or default).strip() or default
+
+
 def market_style_bias(
     category: str,
     code: str,
@@ -243,10 +254,13 @@ def market_style_bias(
             return -5.0, ["过渡日高位接力谨慎-5"]
 
     if label == "退潮日":
+        retreat_stage = _retreat_stage_info(compare_context, market_state)
         if is_cont or is_first:
             return -15.0, ["退潮日接力降权-15"]
         if is_wrap:
-            return 8.0, ["退潮日反包观察+8"]
+            if retreat_stage.get("allow_wrap"):
+                return 4.0, [f"{_retreat_stage_label(retreat_stage)}确认型反包+4"]
+            return -12.0, [f"{_retreat_stage_label(retreat_stage)}反包禁做-12"]
         if is_fresh:
             return -4.0, ["退潮日首板控仓-4"]
         if is_trend:

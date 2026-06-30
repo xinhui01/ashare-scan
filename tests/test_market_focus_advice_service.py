@@ -60,6 +60,74 @@ def test_retreat_day_focuses_waiting_and_formats_no_trade_rule():
     assert any("退潮日不操作" in line for line in lines)
 
 
+def test_early_retreat_focus_forbids_wrap_and_new_themes():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "退潮日",
+            "market_state_strategy": {"label": "退潮初期 / 空仓不操作"},
+            "market_retreat_stage": {
+                "code": "early_retreat",
+                "label": "退潮初期",
+                "allow_wrap": False,
+            },
+            "concept_hype_topics": [
+                {"name": "机器人", "source": "概念", "phase": "主升", "today_count": 5},
+            ],
+        },
+        {"cont": 2, "first": 2, "fresh": 3, "wrap": 6, "trend": 1},
+    )
+
+    lines = format_market_focus_advice_lines(advice)
+
+    assert advice["no_trade"] is True
+    assert advice["next_theme_text"] == "退潮初期观望，不新增题材操作"
+    assert "今日重点池：空仓观望" in lines
+    assert any("不做反包" in line for line in lines)
+    assert all("机器人" not in line or "局部强方向" in line for line in lines)
+
+
+def test_retreat_repair_focus_names_confirmed_wrap_theme():
+    advice = build_market_focus_advice(
+        {
+            "market_state_label": "退潮日",
+            "market_state_strategy": {"label": "退潮修复 / 确认型反包"},
+            "market_retreat_stage": {
+                "code": "repair_watch",
+                "label": "退潮修复",
+                "allow_wrap": True,
+            },
+        },
+        {"cont": 0, "first": 0, "fresh": 1, "wrap": 4, "trend": 0},
+        {
+            "groups": [
+                {
+                    "name": "机器人",
+                    "source": "概念",
+                    "phase": "主升",
+                    "today_count": 4,
+                    "candidate_count": 2,
+                    "opportunity_score": 88,
+                },
+                {
+                    "name": "固态电池",
+                    "source": "概念",
+                    "phase": "萌芽",
+                    "today_count": 2,
+                    "candidate_count": 1,
+                    "opportunity_score": 65,
+                },
+            ],
+        },
+    )
+
+    lines = format_market_focus_advice_lines(advice)
+
+    assert advice["no_trade"] is False
+    assert "确认型反包" in advice["focus_text"]
+    assert advice["next_theme_text"].startswith("退潮修复只看确认型反包：机器人")
+    assert any("必须等竞价/开盘确认" in line for line in lines)
+
+
 def test_retreat_day_local_theme_is_observation_only():
     advice = build_market_focus_advice(
         {
