@@ -56,6 +56,25 @@ def test_early_retreat_stage_forbids_wrap_operation():
     assert "不做反包" in state["strategy"]["notes"]
 
 
+def test_broad_low_height_rotation_is_not_early_retreat():
+    state = svc._classify_market_state(
+        score=50,
+        today_agg={
+            "lu_count": 151,
+            "max_boards": 3,
+            "high_board_count_4plus": 0,
+        },
+        rotation={"main_line_status": "broken", "rotation_score": 80},
+        yest_lu=140,
+        today_continued=23,
+    )
+
+    assert state["label"] == "轮动日"
+    assert "低位扩散" in state["reason"]
+    assert "retreat_stage" not in state
+    assert state["strategy"]["position_cap"] > 0
+
+
 def test_retreat_repair_stage_allows_only_confirmed_wrap():
     state = svc._classify_market_state(
         score=48,

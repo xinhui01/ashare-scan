@@ -355,6 +355,10 @@ def _execution_rules(compare_context: Mapping[str, Any], primary: Sequence[str])
                 f"执行规则：{stage_label}只做确认型反包；必须等竞价/开盘确认、题材共振和个股主动转强，不确认就空仓。"
             ]
         stage_label = _retreat_stage_label(compare_context, default="退潮日")
+        if str(_retreat_stage_info(compare_context).get("code") or "").strip() == "early_retreat":
+            return [
+                f"执行规则：{stage_label}主操作池为空；候选只作观察，必须等板块共振、竞价/开盘转强和个股主动确认。"
+            ]
         return [
             f"执行规则：{stage_label}不操作；不追高、不低吸、不做反包、不做预测型试错，等情绪修复后再重新选择题材。"
         ]
@@ -463,6 +467,16 @@ def build_market_focus_advice(
             )
             wait_text = "空仓等确认"
             no_trade = False
+        elif str(retreat_stage.get("code") or "").strip() == "early_retreat":
+            primary = []
+            secondary = ["fresh", "trend", "wrap", "first", "cont"]
+            avoid = []
+            reason = (
+                f"{stage_label}主操作池为空；"
+                "候选只作观察名单，用于次日竞价/开盘确认。"
+            )
+            wait_text = "主操作池为空"
+            no_trade = True
         else:
             primary = []
             secondary = ["wrap"]

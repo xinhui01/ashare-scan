@@ -81,8 +81,10 @@ def test_early_retreat_focus_forbids_wrap_and_new_themes():
 
     assert advice["no_trade"] is True
     assert advice["next_theme_text"] == "退潮初期观望，不新增题材操作"
-    assert "今日重点池：空仓观望" in lines
-    assert any("不做反包" in line for line in lines)
+    assert "今日重点池：主操作池为空" in lines
+    assert any(line.startswith("仅观察池：") and "首板涨停(3只)" in line for line in lines)
+    assert any(line.startswith("仅观察池：") and "趋势涨停(1只)" in line for line in lines)
+    assert any("只作观察" in line for line in lines)
     assert all("机器人" not in line or "局部强方向" in line for line in lines)
 
 

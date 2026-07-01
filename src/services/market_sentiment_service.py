@@ -879,6 +879,13 @@ def _classify_market_state(
         label = "冰点日"
         reason = f"涨停 {lu} 只 + 最高 {max_b} 板，赚钱效应崩塌"
         confidence = 0.9
+    elif lu >= 80 and main_status in ("broken", "weakened") and rot >= 50:
+        label = "轮动日"
+        reason = (
+            f"高标断层但涨停 {lu} 只 + 轮动分 {rot:+d}，"
+            "低位扩散，新方向涌现"
+        )
+        confidence = 0.78
     elif max_b <= 3 and n4 == 0 and cont_rate < 0.20:
         label = "退潮日"
         reason = (

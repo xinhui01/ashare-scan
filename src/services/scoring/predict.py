@@ -50,12 +50,13 @@ _PREDICTION_CANDIDATE_KEYS: Dict[str, str] = {
 _RECENT_THEME_REQUIRED_CATEGORIES = {"cont", "first", "wrap"}
 
 _RETREAT_NO_TRADE_LIMITS = {
-    "cont": 0,
-    "first": 0,
-    "fresh": 0,
-    "wrap": 0,
-    "trend": 0,
+    "cont": 3,
+    "first": 5,
+    "fresh": 10,
+    "wrap": 5,
+    "trend": 20,
 }
+_RETREAT_NO_TRADE_TOTAL_LIMIT = 43
 _RETREAT_REPAIR_LIMITS = {
     "cont": 0,
     "first": 0,
@@ -776,8 +777,11 @@ def _limit_candidates_for_state(
             reason = f"{stage_label}缩量：只保留确认型反包观察，最多{total_limit}只；未确认不操作"
         else:
             limits = dict(_RETREAT_NO_TRADE_LIMITS)
-            total_limit = 0
-            reason = f"{stage_label}缩量：不输出可操作候选；反包、首板、趋势都只复盘观察"
+            total_limit = _RETREAT_NO_TRADE_TOTAL_LIMIT
+            reason = (
+                f"{stage_label}缩量：保留观察池，最多{total_limit}只；"
+                "主操作池为空，高位接力/首板/反包/趋势均需次日确认"
+            )
     elif state_label == "冰点日":
         limits = dict(_ICE_POINT_LIMITS)
         total_limit = _ICE_POINT_TOTAL_LIMIT

@@ -16,6 +16,13 @@ def _candidate(code, score, category, industry="", theme="", **extra):
     return row
 
 
+def _candidates(prefix, count, score_start, category, **extra):
+    return [
+        _candidate(f"{prefix}{i:02d}", score_start - i, category, **extra)
+        for i in range(count)
+    ]
+
+
 def test_strong_main_line_selects_best_sustained_line_not_first_match():
     concepts = [
         {
@@ -180,7 +187,7 @@ def test_retreat_repair_limits_to_confirmed_wrap_pool():
     assert any("退潮修复确认型反包" in reason for reason in ranked["wrap"][0]["final_rank_reasons"])
 
 
-def test_early_retreat_drops_all_actionable_candidates():
+def test_early_retreat_keeps_limited_observation_watchlist():
     ranker = getattr(scoring_predict, "_rank_and_limit_prediction_candidates", None)
     assert callable(ranker)
     buckets = {
@@ -188,7 +195,10 @@ def test_early_retreat_drops_all_actionable_candidates():
         "first": [_candidate("600201", 84, "二波接力", theme="机器人")],
         "fresh": [_candidate("600301", 82, "首板涨停", theme="机器人")],
         "wrap": [_candidate("600401", 90, "断板反包", theme="机器人")],
-        "trend": [_candidate("600501", 88, "趋势涨停", theme="机器人")],
+        "trend": [
+            _candidate(f"6005{i:02d}", 95 - i, "趋势涨停", theme="机器人")
+            for i in range(25)
+        ],
     }
     context = {
         "market_state_label": "退潮日",
@@ -205,8 +215,46 @@ def test_early_retreat_drops_all_actionable_candidates():
 
     assert stats["limited"] is True
     assert stats["limit_reason"].startswith("退潮初期")
-    assert "不输出可操作候选" in stats["limit_reason"]
-    assert sum(len(rows) for rows in ranked.values()) == 0
+    assert "观察池" in stats["limit_reason"]
+    assert len(ranked["cont"]) == 1
+    assert len(ranked["first"]) == 1
+    assert len(ranked["fresh"]) == 1
+    assert len(ranked["wrap"]) == 1
+    assert len(ranked["trend"]) == 20
+    assert ranked["trend"][0]["code"] == "600500"
+    assert ranked["trend"][-1]["code"] == "600519"
+
+
+def test_early_retreat_keeps_limited_observation_pools_for_all_categories():
+    ranker = getattr(scoring_predict, "_rank_and_limit_prediction_candidates", None)
+    assert callable(ranker)
+    buckets = {
+        "cont": _candidates("6101", 8, 90, "保留涨停", theme="机器人"),
+        "first": _candidates("6201", 8, 88, "二波接力", theme="机器人"),
+        "fresh": _candidates("6301", 15, 86, "首板涨停", theme="机器人"),
+        "wrap": _candidates("6401", 8, 92, "断板反包", theme="机器人"),
+        "trend": _candidates("6501", 25, 95, "趋势涨停", theme="机器人"),
+    }
+    context = {
+        "market_state_label": "退潮日",
+        "market_state_strategy": {"label": "退潮初期 / 空仓不操作"},
+        "market_retreat_stage": {
+            "code": "early_retreat",
+            "label": "退潮初期",
+            "allow_wrap": False,
+        },
+        "sentiment_score": 18,
+    }
+
+    ranked, stats = ranker(buckets, context, theme_quality={"quality_level": "fine_theme"})
+
+    assert stats["limited"] is True
+    assert "观察池" in stats["limit_reason"]
+    assert len(ranked["cont"]) == 3
+    assert len(ranked["first"]) == 5
+    assert len(ranked["fresh"]) == 10
+    assert len(ranked["wrap"]) == 5
+    assert len(ranked["trend"]) == 20
 
 
 def test_non_fresh_non_trend_candidates_must_match_recent_theme():
