@@ -26,13 +26,14 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.ticker import FuncFormatter
 
+from src.services.holding_analysis_service import analyze_holding
 from src.utils.cancel_token import CancelToken
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class DetailTab:
         self.chart_loaded_days: int = 0
         self.summary_expanded: bool = False
         self.chart_expanded: bool = True
+        self.current_detail_payload: Dict[str, Any] = {}
         self.payload_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
         self.last_revalidate_ts: Dict[str, float] = {}
         self._build(notebook)
@@ -93,6 +95,12 @@ class DetailTab:
             command=self.toggle_summary_section,
         )
         self.summary_toggle_btn.pack(side=tk.LEFT)
+        self.holding_analysis_btn = ttk.Button(
+            info_header,
+            text="持有分析",
+            command=self.show_holding_analysis,
+        )
+        self.holding_analysis_btn.pack(side=tk.LEFT, padx=(8, 0))
         self.summary_status_var = tk.StringVar(value="历史摘要已收起")
         ttk.Label(info_header, textvariable=self.summary_status_var).pack(side=tk.LEFT, padx=10)
 
@@ -389,6 +397,7 @@ class DetailTab:
         self.chart_dates = []
         self.chart_history = None
         self.chart_analysis = {}
+        self.current_detail_payload = {}
         self.chart_window_start = 0
         self.chart_loaded_days = 0
         self.chart_loading_more = False
@@ -423,6 +432,7 @@ class DetailTab:
         self.chart_dates = []
         self.chart_history = None
         self.chart_analysis = {}
+        self.current_detail_payload = {}
         self.chart_window_start = 0
         self.chart_loaded_days = 0
         self.chart_loading_more = False
@@ -449,6 +459,7 @@ class DetailTab:
         analysis = detail.get("analysis") or {}
         history = detail.get("history")
         self.current_code = str(detail.get("code", "") or "").strip().zfill(6)
+        self.current_detail_payload = dict(detail)
         self.chart_loading_more = False
         self.refresh_metric_labels()
         self.app._set_top_header_for_code(self.current_code, str(detail.get("name", "") or ""))
@@ -519,6 +530,69 @@ class DetailTab:
         self.labels["summary"].config(text=analysis.get("summary", "-"))
 
         self._draw_chart(history, analysis)
+
+    # ======================== 持有分析 ========================
+
+    @staticmethod
+    def _format_holding_analysis_message(result: Dict[str, Any]) -> str:
+        key_levels = result.get("key_levels") or {}
+        lines = [
+            f"建议：{result.get('advice', '-')}",
+            f"风险：{result.get('risk_level', '-')}    评分：{result.get('score', 0)}/100",
+            "",
+            "关键位：",
+        ]
+        labels = {
+            "latest_close": "最新收盘",
+            "ma5": "MA5",
+            "ma10": "MA10",
+            "five_day_return_pct": "近5日涨幅%",
+        }
+        has_level = False
+        for key, label in labels.items():
+            value = key_levels.get(key)
+            if value is None:
+                continue
+            suffix = "%" if key == "five_day_return_pct" else ""
+            lines.append(f"- {label}: {value}{suffix}")
+            has_level = True
+        if not has_level:
+            lines.append("- 暂无可用关键位")
+
+        lines.extend(["", "理由："])
+        reasons = result.get("reasons") or []
+        if reasons:
+            lines.extend(f"- {reason}" for reason in reasons)
+        else:
+            lines.append("- 暂无明确理由")
+
+        summary = str(result.get("summary") or "").strip()
+        if summary:
+            lines.extend(["", summary])
+        return "\n".join(lines)
+
+    def show_holding_analysis(self) -> None:
+        payload = self.current_detail_payload or {}
+        code = str(payload.get("code") or self.current_code or self.request_code or "").strip().zfill(6)
+        history = payload.get("history")
+        if not code or history is None or getattr(history, "empty", True):
+            messagebox.showwarning(
+                "持有分析",
+                "请先查询股票，等待详情和K线加载完成后再分析。",
+                parent=self.app.root,
+            )
+            return
+
+        result = analyze_holding(history, payload.get("analysis") or {})
+        title_name = str(payload.get("name") or "").strip()
+        title = f"持有分析 - {code}"
+        if title_name:
+            title += f" {title_name}"
+        messagebox.showinfo(
+            title,
+            self._format_holding_analysis_message(result),
+            parent=self.app.root,
+        )
 
     # ======================== chart 绘制 ========================
 
