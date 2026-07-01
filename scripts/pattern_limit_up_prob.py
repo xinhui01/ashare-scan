@@ -18,103 +18,160 @@ import pandas as pd
 
 DB = "data/stock_store.sqlite3"
 RECENT_TD = 90  # 近窗口（交易日数），用于对比当前市场环境
+FEATURE_WARMUP_TD = 70  # 供60日位置、20日箱体、均线等特征使用
 
 BIG_BOARD = ("300", "301", "302", "688", "689")  # 20cm
 NUM_COLS = ["open", "close", "high", "low", "volume", "amount", "change_pct"]
-LOAD_CHUNKSIZE = 200_000
+LOAD_CHUNKSIZE = 1_000
+DISPLAY_STOCK_LIMIT = 1
+
+
+FILTERED_SQL = """
+    FROM history AS h
+    LEFT JOIN universe AS u ON u.code = h.code
+    WHERE u.name IS NULL OR upper(u.name) NOT LIKE '%ST%'
+"""
 
 
 def _prepare_history_chunk(df: pd.DataFrame) -> pd.DataFrame:
-    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "")
+    df["code_id"] = pd.to_numeric(df["code_id"], errors="coerce").astype("int32")
+    df["trade_date"] = pd.to_numeric(df["trade_date"], errors="coerce").astype("int32")
+    df["big"] = df["big"].astype("bool")
     for c in NUM_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
     df.dropna(subset=["close", "change_pct"], inplace=True)
     return df
 
 
+def as_float32(s: pd.Series) -> pd.Series:
+    return s.astype("float32")
+
+
+def shift_by_code(values: pd.Series, codes: pd.Series, periods: int) -> pd.Series:
+    """Groupwise shift for data already sorted by code, without pandas groupby indexers."""
+    if periods == 0:
+        return values.astype("float32")
+
+    n = len(values)
+    out = np.full(n, np.nan, dtype="float32")
+    src = values.to_numpy(dtype="float32", copy=False)
+    code_values = codes.to_numpy(copy=False)
+
+    if periods > 0:
+        same_code = code_values[periods:] == code_values[:-periods]
+        target = out[periods:]
+        target[same_code] = src[:-periods][same_code]
+    else:
+        p = -periods
+        same_code = code_values[:-p] == code_values[p:]
+        target = out[:-p]
+        target[same_code] = src[p:][same_code]
+
+    return pd.Series(out, index=values.index, name=values.name)
+
+
 def load() -> pd.DataFrame:
     query = """
-        SELECT h.code, u.name, h.trade_date, h.open, h.close, h.high, h.low,
-               h.volume, h.amount, h.change_pct
-        FROM history AS h
-        LEFT JOIN universe AS u ON u.code = h.code
-        WHERE u.name IS NULL OR upper(u.name) NOT LIKE '%ST%'
-        """
+        WITH filtered AS (
+            SELECT h.code, h.trade_date, h.open, h.close, h.high, h.low,
+                   h.volume, h.amount, h.change_pct
+            {filtered_sql}
+        ),
+        codes AS (
+            SELECT code, row_number() OVER (ORDER BY code) - 1 AS code_id
+            FROM (SELECT DISTINCT code FROM filtered)
+        )
+        SELECT c.code_id,
+               CAST(REPLACE(f.trade_date, '-', '') AS INTEGER) AS trade_date,
+               CASE
+                   WHEN substr(f.code, 1, 3) IN ('300', '301', '302', '688', '689') THEN 1
+                   ELSE 0
+               END AS big,
+               f.open, f.close, f.high, f.low, f.volume, f.amount, f.change_pct
+        FROM filtered AS f
+        JOIN codes AS c ON c.code = f.code
+        ORDER BY c.code_id, trade_date
+        """.format(filtered_sql=FILTERED_SQL)
     con = sqlite3.connect(DB)
     chunks = []
     for chunk in pd.read_sql(query, con, chunksize=LOAD_CHUNKSIZE):
         chunks.append(_prepare_history_chunk(chunk))
     con.close()
     df = pd.concat(chunks, ignore_index=True)
-    df.sort_values(["code", "trade_date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
 
+def load_code_lookup() -> dict[int, str]:
+    query = """
+        SELECT h.code, COALESCE(MAX(u.name), '') AS name
+        {filtered_sql}
+        GROUP BY h.code
+        ORDER BY h.code
+        """.format(filtered_sql=FILTERED_SQL)
+    con = sqlite3.connect(DB)
+    codes = pd.read_sql(query, con)
+    con.close()
+    lookup = {}
+    for code_id, row in enumerate(codes.itertuples(index=False)):
+        name = str(row.name).strip()
+        lookup[code_id] = f"{row.code} {name}".strip()
+    return lookup
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    pre3 = df["code"].str[:3]
-    df["thr"] = np.where(pre3.isin(BIG_BOARD), 19.5, 9.8)
-    df["big"] = pre3.isin(BIG_BOARD)
+    df["thr"] = np.where(df["big"], 19.5, 9.8).astype("float32")
     df["is_lu"] = df["change_pct"] >= df["thr"]
 
-    g = df.groupby("code", sort=False)
+    g = df.groupby("code_id", sort=False)
     c = df["close"]
+    code = df["code_id"]
 
     # 标签：次日涨停
-    df["y"] = g["is_lu"].shift(-1).astype("float")
+    df["y"] = shift_by_code(df["is_lu"], code, -1)
 
     # 均线
-    df["ma5"] = g["close"].transform(lambda s: s.rolling(5, min_periods=5).mean())
-    df["ma10"] = g["close"].transform(lambda s: s.rolling(10, min_periods=10).mean())
-    df["ma20"] = g["close"].transform(lambda s: s.rolling(20, min_periods=20).mean())
+    ma5 = as_float32(g["close"].transform(lambda s: s.rolling(5, min_periods=5).mean()))
+    ma10 = as_float32(g["close"].transform(lambda s: s.rolling(10, min_periods=10).mean()))
+    ma20 = as_float32(g["close"].transform(lambda s: s.rolling(20, min_periods=20).mean()))
 
     # 量比：今日量 / 前5日均量（不含今日）
-    vmean5_prev = g["volume"].transform(lambda s: s.rolling(5, min_periods=3).mean().shift(1))
-    df["vol_ratio"] = df["volume"] / vmean5_prev
+    vmean5_prev = as_float32(g["volume"].transform(lambda s: s.rolling(5, min_periods=3).mean().shift(1)))
+    df["vol_ratio"] = as_float32(df["volume"] / vmean5_prev)
     # 蓄势缩量：前3日均量 / 前5日均量
-    v3 = g["volume"].transform(lambda s: s.rolling(3, min_periods=2).mean())
-    v5 = g["volume"].transform(lambda s: s.rolling(5, min_periods=3).mean())
-    df["vol_shrink"] = v3 / v5
-
-    # 实体 / 振幅
-    prev_close = g["close"].shift(1)
-    df["body_pct"] = (df["close"] - df["open"]) / df["open"] * 100
-    df["amp_pct"] = (df["high"] - df["low"]) / prev_close * 100
+    v3 = as_float32(g["volume"].transform(lambda s: s.rolling(3, min_periods=2).mean()))
+    v5 = as_float32(g["volume"].transform(lambda s: s.rolling(5, min_periods=3).mean()))
+    df["vol_shrink"] = as_float32(v3 / v5)
 
     # 均线关系
-    df["ma_bullish"] = (df["ma5"] > df["ma10"]) & (df["ma10"] > df["ma20"])
-    df["above_ma5"] = df["close"] > df["ma5"]
-    df["dist_ma5"] = (df["close"] / df["ma5"] - 1) * 100
-    df["dist_ma20"] = (df["close"] / df["ma20"] - 1) * 100
+    df["ma_bullish"] = (ma5 > ma10) & (ma10 > ma20)
+    df["dist_ma5"] = as_float32((df["close"] / ma5 - 1) * 100)
 
     # 趋势
-    df["trend5"] = (c / g["close"].shift(5) - 1) * 100
-    df["trend10"] = (c / g["close"].shift(10) - 1) * 100
-    df["trend20"] = (c / g["close"].shift(20) - 1) * 100
+    df["trend10"] = as_float32((c / shift_by_code(df["close"], code, 10) - 1) * 100)
 
     # 60日位置（0=区间底 100=区间顶）
-    min60 = g["low"].transform(lambda s: s.rolling(60, min_periods=20).min())
-    max60 = g["high"].transform(lambda s: s.rolling(60, min_periods=20).max())
+    min60 = as_float32(g["low"].transform(lambda s: s.rolling(60, min_periods=20).min()))
+    max60 = as_float32(g["high"].transform(lambda s: s.rolling(60, min_periods=20).max()))
     rng = (max60 - min60).replace(0, np.nan)
-    df["pos60"] = (df["close"] - min60) / rng * 100
+    df["pos60"] = as_float32((df["close"] - min60) / rng * 100)
 
     # 突破：今日收盘 >= 前20日最高（不含今日）
-    high20_prev = g["high"].transform(lambda s: s.rolling(20, min_periods=10).max().shift(1))
+    high20_prev = as_float32(g["high"].transform(lambda s: s.rolling(20, min_periods=10).max().shift(1)))
     df["new_high20"] = df["close"] >= high20_prev * 0.995
     # 平台紧凑度：前20日箱体振幅（不含今日）
-    h20p = g["high"].transform(lambda s: s.rolling(20, min_periods=10).max().shift(1))
-    l20p = g["low"].transform(lambda s: s.rolling(20, min_periods=10).min().shift(1))
-    df["box20_pct"] = (h20p - l20p) / l20p * 100
+    h20p = high20_prev
+    l20p = as_float32(g["low"].transform(lambda s: s.rolling(20, min_periods=10).min().shift(1)))
+    df["box20_pct"] = as_float32((h20p - l20p) / l20p * 100)
 
     # 股性：前20日涨停次数（不含今日）
-    df["lu20_prev"] = g["is_lu"].transform(lambda s: s.rolling(20, min_periods=1).sum().shift(1))
-    df["lu60_prev"] = g["is_lu"].transform(lambda s: s.rolling(60, min_periods=1).sum().shift(1))
+    df["lu20_prev"] = as_float32(g["is_lu"].transform(lambda s: s.rolling(20, min_periods=1).sum().shift(1)))
 
     # 连续上涨天数（今日含）
     up = (df["change_pct"] > 0).astype(int)
     # 组内连续计数
-    grp_id = (up == 0).groupby(df["code"]).cumsum()
-    df["up_streak"] = up.groupby([df["code"], grp_id]).cumsum()
+    grp_id = (up == 0).groupby(df["code_id"]).cumsum()
+    df["up_streak"] = up.groupby([df["code_id"], grp_id]).cumsum()
 
     return df
 
@@ -186,29 +243,84 @@ def setups(df: pd.DataFrame):
          d["is_lu"] & (d["vol_ratio"] < 0.7)),
     ]
 
+def format_stock_matches(code_ids: pd.Series, code_lookup: dict[int, str], limit: int) -> str:
+    ids = [int(code_id) for code_id in code_ids]
+    if not ids:
+        return "无"
+    shown = [code_lookup.get(code_id, str(code_id)) for code_id in ids[:limit]]
+    text = "、".join(shown)
+    if len(ids) > limit:
+        text += f" ... 共{len(ids)}只"
+    return text
+
+
+def latest_setup_stock_lines(
+    df: pd.DataFrame,
+    code_lookup: dict[int, str],
+    stock_limit: int = DISPLAY_STOCK_LIMIT,
+) -> list[str]:
+    if df.empty:
+        return []
+
+    latest_date = int(df["trade_date"].max())
+    current = df[df["trade_date"] == latest_date]
+    lines = [f"\n--- 最新交易日命中股票（{latest_date}，每类最多显示{stock_limit}只）---"]
+    for name, mask in setups(current):
+        code_ids = current.loc[mask.fillna(False), "code_id"]
+        lines.append(f"  {name:<28}: {format_stock_matches(code_ids, code_lookup, stock_limit)}")
+    return lines
+
+
+def recent_window(df: pd.DataFrame, recent_td: int = RECENT_TD) -> tuple[str, pd.DataFrame]:
+    dates = sorted(df["trade_date"].unique())
+    if not dates:
+        return f"近 {recent_td} 交易日 (无数据) —— 当前市场环境", df
+    cut = dates[-recent_td] if len(dates) > recent_td else dates[0]
+    recent = df[df["trade_date"] >= cut]
+    title = f"近 {min(recent_td, len(dates))} 交易日 ({cut} ~ {dates[-1]}) —— 当前市场环境"
+    return title, recent
+
+
+def feature_window(
+    df: pd.DataFrame,
+    recent_td: int = RECENT_TD,
+    warmup_td: int = FEATURE_WARMUP_TD,
+) -> pd.DataFrame:
+    dates = sorted(df["trade_date"].unique())
+    keep_days = recent_td + warmup_td
+    if len(dates) <= keep_days:
+        return df
+    cut = dates[-keep_days]
+    return df[df["trade_date"] >= cut].copy()
+
 
 def _fmt_date(d: str) -> str:
     d = str(d)
     return f"{d[:4]}-{d[4:6]}-{d[6:]}" if len(d) == 8 else d
 
 
-def example_line(sub: pd.DataFrame, n: int = 5) -> str:
+def example_line(sub: pd.DataFrame, code_lookup: dict[int, str], n: int = 5) -> str:
     """从命中该形态的样本里，挑最近 n 只不同股票作为真实例子（带次日结果）。"""
     if sub.empty:
         return ""
     ex = (sub.sort_values("trade_date", ascending=False)
-             .drop_duplicates("code")
+             .drop_duplicates("code_id")
              .head(n))
     parts = []
     for _, r in ex.iterrows():
-        nm = r["name"] if isinstance(r["name"], str) and r["name"] else "?"
+        stock = code_lookup.get(int(r["code_id"]), str(int(r["code_id"])))
         out = "涨停" if r["y"] == 1 else "未涨"
-        parts.append(f"{r['code']} {nm} {_fmt_date(r['trade_date'])} "
+        parts.append(f"{stock} {_fmt_date(r['trade_date'])} "
                      f"{r['change_pct']:+.1f}% [次日{out}]")
     return "       近期实例: " + "  |  ".join(parts)
 
 
-def report(df: pd.DataFrame, title: str) -> str:
+def report(
+    df: pd.DataFrame,
+    title: str,
+    code_lookup: dict[int, str] | None = None,
+    stock_limit: int = DISPLAY_STOCK_LIMIT,
+) -> str:
     valid = df.dropna(subset=["y"])
     base = valid["y"].mean() * 100
     lines = [f"\n{'='*72}", f"【{title}】", f"{'='*72}"]
@@ -254,9 +366,12 @@ def report(df: pd.DataFrame, title: str) -> str:
             lines.append(f"  {name:<28}{n:>9}{'  --':>9}{'  (少)':>8}")
         else:
             lines.append(f"  {name:<28}{n:>9,}{p:>8.2f}%{lift:>7.2f}x")
-        ex = example_line(examples[name])
-        if ex:
-            lines.append(ex)
+        if code_lookup:
+            ex = example_line(examples[name], code_lookup)
+            if ex:
+                lines.append(ex)
+    if code_lookup:
+        lines.extend(latest_setup_stock_lines(df, code_lookup, stock_limit))
     return "\n".join(lines)
 
 
@@ -264,23 +379,14 @@ def main():
     print(f"生成时间: {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
     print("加载 history ...", flush=True)
     df = load()
-    print(f"  原始有效行: {len(df):,}  股票数: {df['code'].nunique()}", flush=True)
+    code_lookup = load_code_lookup()
+    print(f"  原始有效行: {len(df):,}  股票数: {df['code_id'].nunique()}", flush=True)
+    df = feature_window(df)
     print("构建特征 ...", flush=True)
     df = build_features(df)
 
-    # 全周期
-    print(report(df, "全周期 2023-04 ~ 2026-06 (全部 0/3/6 板块，剔除ST)"))
-
-    # 近窗口
-    dates = sorted(df["trade_date"].unique())
-    if len(dates) > RECENT_TD:
-        cut = dates[-RECENT_TD]
-        recent = df[df["trade_date"] >= cut]
-        print(report(recent, f"近 {RECENT_TD} 交易日 ({cut} ~ {dates[-1]}) —— 当前市场环境"))
-
-    # 分板块（全周期）
-    print(report(df[~df["big"]], "仅主板(10cm) 全周期"))
-    print(report(df[df["big"]], "仅创业板/科创板(20cm) 全周期"))
+    title, recent = recent_window(df)
+    print(report(recent, title, code_lookup))
 
 
 if __name__ == "__main__":
