@@ -46,6 +46,10 @@ from src.services.market_focus_advice_service import (
     resolve_market_focus_advice,
 )
 from src.services.prediction_excel_export_service import export_prediction_to_excel
+from src.services.simulated_buy_service import (
+    build_simulated_buy_picks,
+    summarize_simulated_buy_picks,
+)
 from src.services.scoring.predict import (
     DEFAULT_PREDICT_LOOKBACK_DAYS,
     MAX_PREDICT_LOOKBACK_DAYS,
@@ -172,6 +176,7 @@ class PredictTab:
         self.thread: Optional[threading.Thread] = None
         self.result: Optional[Dict[str, Any]] = None
         self.results_map: Dict = {}
+        self.simulated_buy_picks: List[Dict[str, Any]] = []
         self.candidate_theme_by_code: Dict[str, str] = {}
         self.candidate_theme_by_industry: Dict[str, str] = {}
         self.candidate_real_theme_names: set = set()
@@ -758,6 +763,55 @@ class PredictTab:
         self.trend_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self.trend_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
         self.trend_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
+
+        # 模拟买入 Tab（每次预测自动挑 2 只，后续用 T+1 回填统计胜率/收益）
+        simulated_tab = ttk.Frame(self.table_nb)
+        self.table_nb.add(simulated_tab, text="模拟买入")
+        self.simulated_buy_summary_label = ttk.Label(
+            simulated_tab,
+            text="预测完成后自动选出 2 只模拟买入",
+            foreground="#444",
+            anchor=tk.W,
+            padding=(6, 4),
+            wraplength=900,
+            justify=tk.LEFT,
+        )
+        self.simulated_buy_summary_label.pack(side=tk.TOP, fill=tk.X)
+        sim_cols = (
+            "trade_date", "code", "name", "category", "score",
+            "buy_status", "result", "profit", "reasons",
+        )
+        self.simulated_buy_tree = ttk.Treeview(
+            simulated_tab, columns=sim_cols, show="headings", height=22,
+            style="PredictCandidate.Treeview",
+        )
+        for col, (heading, w) in {
+            "trade_date": ("预测日", 85),
+            "code": ("代码", 70),
+            "name": ("名称", 85),
+            "category": ("来源", 75),
+            "score": ("预测分", 65),
+            "buy_status": ("买点", 70),
+            "result": ("结果", 70),
+            "profit": ("盈亏", 70),
+            "reasons": ("入选依据", 320),
+        }.items():
+            self.simulated_buy_tree.heading(col, text=heading)
+            self.simulated_buy_tree.column(
+                col, width=w, minwidth=w,
+                anchor=tk.CENTER if col not in ("reasons",) else tk.W,
+                stretch=False,
+            )
+        sb_sim = ttk.Scrollbar(simulated_tab, orient=tk.VERTICAL, command=self.simulated_buy_tree.yview)
+        xsb_sim = ttk.Scrollbar(simulated_tab, orient=tk.HORIZONTAL, command=self.simulated_buy_tree.xview)
+        self.simulated_buy_tree.configure(yscrollcommand=sb_sim.set, xscrollcommand=xsb_sim.set)
+        sb_sim.pack(side=tk.RIGHT, fill=tk.Y)
+        xsb_sim.pack(side=tk.BOTTOM, fill=tk.X)
+        self.simulated_buy_tree.pack(fill=tk.BOTH, expand=True)
+        self.simulated_buy_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
+        self.simulated_buy_tree.bind("<Double-1>", self._on_stock_double_click)
+        self.simulated_buy_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
+        self.simulated_buy_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
 
         # 概念炒作 Tab（按"题材"维度看：哪些概念在被炒、持续多久、主线/龙头/潜伏）
         self._setup_concept_hype_subtab(self.table_nb)
@@ -3619,6 +3673,13 @@ class PredictTab:
         # 刷新行业下拉选项
         self._refresh_industry_options()
 
+        self.simulated_buy_picks = build_simulated_buy_picks(
+            result,
+            best_buckets=self.best_buckets,
+            limit=2,
+        )
+        self._render_simulated_buy_picks()
+
         # 渲染 5 个候选表（应用当前筛选）
         self._render_trees()
 
@@ -3976,6 +4037,59 @@ class PredictTab:
             reason = str(confirmation.get("reason") or "").strip()
             parts.append(reason[:18] if reason else "—")
         return status, " ".join(parts)
+
+    def _render_simulated_buy_picks(self) -> None:
+        """Render the auto-selected two simulated buys and their T+1 stats."""
+        if not hasattr(self, "simulated_buy_tree"):
+            return
+        summary = summarize_simulated_buy_picks(
+            self.simulated_buy_picks or [],
+            self.results_map or {},
+        )
+        total = int(summary.get("total") or 0)
+        evaluated = int(summary.get("evaluated") or 0)
+        wins = int(summary.get("wins") or 0)
+        win_rate = float(summary.get("win_rate") or 0.0)
+        total_profit = float(summary.get("total_profit_pct") or 0.0)
+        avg_profit = float(summary.get("avg_profit_pct") or 0.0)
+        if total <= 0:
+            text = "模拟买入: 暂无候选"
+        elif evaluated <= 0:
+            text = f"模拟买入: {total} 只，等待 T+1 数据回填"
+        else:
+            text = (
+                f"模拟买入: {total} 只 · 已评估 {evaluated} 只 · "
+                f"胜率 {win_rate:.1f}% ({wins}/{evaluated}) · "
+                f"总盈利 {total_profit:+.1f}% · 平均 {avg_profit:+.1f}%"
+            )
+        try:
+            self.simulated_buy_summary_label.configure(text=text)
+        except Exception:
+            pass
+
+        self.simulated_buy_tree.delete(*self.simulated_buy_tree.get_children())
+        self._clear_full_cell_texts(self.simulated_buy_tree)
+        for pick in summary.get("picks") or []:
+            profit = pick.get("profit_pct")
+            profit_text = "—" if profit is None else f"{float(profit):+.1f}%"
+            result_text = str(pick.get("result_text") or "待回填")
+            tag = "hit" if result_text == "命中" else "miss" if result_text == "未中" else ""
+            reasons = str(pick.get("reasons") or "")
+            vals = (
+                pick.get("trade_date") or "",
+                pick.get("code") or "",
+                pick.get("name") or "",
+                pick.get("category_label") or pick.get("category") or "",
+                f"{float(pick.get('score') or 0):.0f}",
+                pick.get("buy_status") or "待确认",
+                result_text,
+                profit_text,
+                self._reason_cell_text(self.simulated_buy_tree, reasons),
+            )
+            iid = self.simulated_buy_tree.insert(
+                "", tk.END, values=vals, tags=(tag,) if tag else (),
+            )
+            self._set_full_cell_text(self.simulated_buy_tree, iid, "reasons", reasons)
 
     def _render_trees(self) -> None:
         """根据当前筛选条件渲染 5 个候选表。"""
@@ -4374,9 +4488,28 @@ class PredictTab:
         # 计算 5 个 cont 子类别各自的"最优分数段"并刷新（含颜色编码）
         self._refresh_subcategory_best_buckets()
 
+        if self.result:
+            try:
+                self.simulated_buy_picks = build_simulated_buy_picks(
+                    self.result,
+                    best_buckets=self.best_buckets,
+                    limit=2,
+                )
+            except Exception:
+                pass
+
+        try:
+            self._render_simulated_buy_picks()
+        except Exception:
+            pass
+
         # 当前日期的逐行结果（用于 result 列着色）
         if results_map:
             self.results_map = results_map
+            try:
+                self._render_simulated_buy_picks()
+            except Exception:
+                pass
             try:
                 self._render_trees()
             except Exception:

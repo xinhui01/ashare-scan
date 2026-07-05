@@ -64,3 +64,14 @@ def test_prediction_tab_has_excel_export_action():
 
     assert 'text="导出Excel"' in build_src
     assert "export_prediction_to_excel" in export_src
+
+
+def test_prediction_tab_wires_simulated_buy_subtab():
+    build_src = inspect.getsource(PredictTab._build)
+    apply_src = inspect.getsource(PredictTab._apply_result)
+    accuracy_src = inspect.getsource(PredictTab._apply_accuracy)
+
+    assert "模拟买入" in build_src
+    assert "build_simulated_buy_picks" in apply_src
+    assert "_render_simulated_buy_picks" in apply_src
+    assert "_render_simulated_buy_picks" in accuracy_src
