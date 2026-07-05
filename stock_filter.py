@@ -249,10 +249,10 @@ class StockFilter:
             volume_expand_factor=volume_expand_factor,
         )
 
-    def _limit_up_threshold(self, board: str = "", stock_name: str = "") -> float:
+    def _limit_up_threshold(self, board: str = "", stock_name: str = "", trade_date: str = "") -> float:
         """thin delegate → scoring/filter.limit_up_threshold"""
         return _scoring_filter.limit_up_threshold(
-            self.get_settings(), board=board, stock_name=stock_name,
+            self.get_settings(), board=board, stock_name=stock_name, trade_date=trade_date,
         )
 
     @staticmethod
@@ -944,8 +944,17 @@ class StockFilter:
         )
 
     @staticmethod
-    def _limit_up_threshold_pct(code: str) -> float:
-        """A股各板块涨停阈值（百分比）。ST/退市单独处理，本预测已排除 ST。"""
+    def _limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
+        """A股各板块涨停阈值（百分比）。
+
+        2026-07-06 起 ST 股涨跌幅限制按 10% 处理；此前仍按 5%。
+        """
+        normalized_name = str(stock_name or "").upper().strip()
+        if "ST" in normalized_name:
+            digits = str(trade_date or "").strip().replace("-", "").replace("/", "")[:8]
+            if digits and digits >= "20260706":
+                return 9.5
+            return 4.8
         c = (code or "").strip()
         if c.startswith(("30", "68")):
             return 19.5
@@ -1119,21 +1128,21 @@ class StockFilter:
         return _scoring_first_board.fetch_spot_snapshot(log_fn=self._log)
 
     @staticmethod
-    def _parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
+    def _parse_spot_record(row, exclude_codes: set, trade_date: str = "") -> Optional[Dict[str, Any]]:
         """从实时行情行中解析基础记录（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.parse_spot_record(row, exclude_codes)
+        return _scoring_first_board.parse_spot_record(row, exclude_codes, trade_date=trade_date)
 
     def _filter_strong_stocks(
-        self, spot_df: pd.DataFrame, exclude_codes: set
+        self, spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
     ) -> List[Dict[str, Any]]:
         """从行情快照筛选 +3%~+9.95% 强势股（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.filter_strong_stocks(spot_df, exclude_codes)
+        return _scoring_first_board.filter_strong_stocks(spot_df, exclude_codes, trade_date=trade_date)
 
     def _filter_ma5_pullback_stocks(
-        self, spot_df: pd.DataFrame, exclude_codes: set
+        self, spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
     ) -> List[Dict[str, Any]]:
         """从行情快照筛选 -5%~+3% 回踩MA5 候选（thin delegate -> scoring/first_board.py）。"""
-        return _scoring_first_board.filter_ma5_pullback_stocks(spot_df, exclude_codes)
+        return _scoring_first_board.filter_ma5_pullback_stocks(spot_df, exclude_codes, trade_date=trade_date)
 
     def _score_first_board_by_profile(
         self,

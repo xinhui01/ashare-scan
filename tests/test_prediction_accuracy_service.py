@@ -118,6 +118,40 @@ class TestEvaluateCandidateOpenCloseCriteria(unittest.TestCase):
         self.assertFalse(r["hit_strict"])
         self.assertFalse(r["hit_loose"])
 
+    def test_st_uses_five_percent_before_20260706(self):
+        df = pd.DataFrame({
+            "date": ["2026-07-02", "2026-07-03"],
+            "open": [10.0, 10.2],
+            "high": [10.0, 10.5],
+            "low": [10.0, 10.1],
+            "close": [10.0, 10.5],
+            "change_pct": [0.0, 5.0],
+        })
+
+        r = svc._evaluate_candidate(
+            code="000100", name="ST测试", history_df=df,
+            trade_date_dash="2026-07-02", verify_date_dash="2026-07-03",
+        )
+
+        self.assertTrue(r["hit_strict"])
+
+    def test_st_uses_ten_percent_from_20260706(self):
+        df = pd.DataFrame({
+            "date": ["2026-07-03", "2026-07-06"],
+            "open": [10.0, 10.2],
+            "high": [10.0, 10.5],
+            "low": [10.0, 10.1],
+            "close": [10.0, 10.5],
+            "change_pct": [0.0, 5.0],
+        })
+
+        r = svc._evaluate_candidate(
+            code="000100", name="ST测试", history_df=df,
+            trade_date_dash="2026-07-03", verify_date_dash="2026-07-06",
+        )
+
+        self.assertFalse(r["hit_strict"])
+
 
 class TestLoadSpotSnapshotAt(unittest.TestCase):
     """历史模式合成 spot 快照 —— 列名兼容、code 补 0、industry 容空。"""

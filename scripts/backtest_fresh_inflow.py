@@ -2,7 +2,8 @@
 
 方法（无前视偏差）：
   对最近 N 个交易日 D（每个都有 T+1）：
-   1. 候选池 = history 中当日 chg ∈ [-4%,+5%]、成交额 ≥ 5000万、非 ST/北交所、
+   1. 候选池 = history 中当日 chg ∈ [-4%,+5%]、成交额 ≥ 5000万、
+      2026-07-06 前排除 ST、排除北交所、
       不在 D 当日涨停池(zt_codes) 的全部股票（= filter_capital_inflow_candidates 口径）。
    2. 对每只候选用 as-of 截到 D 的历史调 score_fresh_first_board 打分；
       hot_industries = D 当日涨停池按 所属行业 计数（复盘时已知，无前视）。
@@ -27,6 +28,7 @@ from src.services.scoring.fresh import score_fresh_first_board
 DB = "data/stock_store.sqlite3"
 N_DAYS = 20
 THRESHOLD = 45  # 对齐生产 scan_fresh 的出表门槛(fresh.py: score>=45)
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
 
 con = sqlite3.connect(DB)
 con.row_factory = sqlite3.Row
@@ -37,7 +39,15 @@ def is_bse(code):
     return code[:1] in ("4", "8") or code[:2] == "92"
 
 
-def lu_threshold(code):
+def _date_key(value):
+    text = str(value or "").replace("-", "").replace("/", "")
+    return text[:8]
+
+
+def lu_threshold(code, name="", trade_date=""):
+    digits = _date_key(trade_date)
+    if "ST" in str(name or "").upper():
+        return 9.7 if digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE else 4.7
     return 19.5 if code.startswith(("30", "68")) else 9.7
 
 
@@ -135,7 +145,7 @@ for D in test_dates:
         if amt is None or amt < 5000_0000:
             continue
         name = uni_name.get(code, "")
-        if "ST" in name.upper():
+        if "ST" in name.upper() and D < ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
             continue
         industry = uni_ind.get(code, "")
         link_industry = meta_ind.get(code) or industry  # 板块联动用东财命名(meta)优先
@@ -158,7 +168,7 @@ for D in test_dates:
         nclose, nopen, npct = nxt["close"], nxt["open"], nxt["change_pct"]
         if nopen is None or nopen <= 0 or nclose is None or nclose <= 0:
             continue
-        boarded = npct is not None and npct >= lu_threshold(code)
+        boarded = npct is not None and npct >= lu_threshold(code, name, nxt["date"])
         oc = (nclose - nopen) / nopen * 100
 
         rec = {"code": code, "name": name, "change_pct": chg,

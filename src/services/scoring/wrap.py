@@ -16,20 +16,19 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring import shared as _shared
-from src.services.scoring.helpers import _count_historical_wrap
+from src.services.scoring.helpers import (
+    _call_limit_up_threshold,
+    _count_historical_wrap,
+    default_limit_up_threshold_pct,
+)
 from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
 
-def _default_limit_up_threshold_pct(code: str) -> float:
+def _default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
     """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
-    c = (code or "").strip()
-    if c.startswith(("30", "68")):
-        return 19.5
-    if c.startswith(("43", "83", "87", "88", "92")):
-        return 29.5
-    return 9.5
+    return default_limit_up_threshold_pct(code, stock_name=stock_name, trade_date=trade_date)
 
 
 def scan_broken_board_wrap_candidates_cached(
@@ -141,8 +140,6 @@ def score_broken_board_wrap(
         return None
     latest_low = float(low.iloc[t]) if not low.empty and not pd.isna(low.iloc[t]) else None
 
-    threshold = threshold_fn(code)
-
     # 1) 在更合理的历史窗口里找“最近一次满足前置连板条件的涨停”。
     # lookback_days 仍保留为对“近期性”的偏好参数，但实际反包前置涨停
     # 可能比 5 日更早；如果把窗口卡死，会漏掉典型的中期断板反包。
@@ -154,6 +151,12 @@ def score_broken_board_wrap(
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        threshold = _call_limit_up_threshold(
+            threshold_fn,
+            code,
+            stock_name=name,
+            trade_date=str(df.iloc[i].get("date", "") or ""),
+        )
         if chg_i >= threshold - 0.3:
             streak = 1
             j = i - 1
@@ -161,7 +164,13 @@ def score_broken_board_wrap(
                 if pd.isna(close.iloc[j]) or pd.isna(close.iloc[j - 1]) or float(close.iloc[j - 1]) <= 0:
                     break
                 chg_j = (float(close.iloc[j]) / float(close.iloc[j - 1]) - 1) * 100
-                if chg_j < threshold - 0.3:
+                threshold_j = _call_limit_up_threshold(
+                    threshold_fn,
+                    code,
+                    stock_name=name,
+                    trade_date=str(df.iloc[j].get("date", "") or ""),
+                )
+                if chg_j < threshold_j - 0.3:
                     break
                 streak += 1
                 j -= 1
@@ -438,7 +447,7 @@ def score_broken_board_wrap(
     # === 历史同类形态加分：近 90 日内的反包成功次数 ===
     occ_count, last_hit_days = _count_historical_wrap(
         history, code, lookback_days=90, window=5, drop_threshold=-3.0,
-        threshold_fn=threshold_fn,
+        threshold_fn=threshold_fn, stock_name=name,
     )
     if occ_count >= 3:
         bonus = 8

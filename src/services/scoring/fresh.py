@@ -21,7 +21,9 @@ import pandas as pd
 from src.services.scoring import shared as _shared
 from src.services.scoring import fresh_calibration as _fresh_calibration
 from src.services.scoring.helpers import (
+    _call_limit_up_threshold,
     _count_historical_any_limit_up,
+    default_limit_up_threshold_pct,
     detect_stop_falling,
     detect_volume_ignition,
 )
@@ -30,14 +32,9 @@ from src.services.scoring.trend import _score_accumulation_signal
 logger = logging.getLogger(__name__)
 
 
-def _default_limit_up_threshold_pct(code: str) -> float:
+def _default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
     """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
-    c = (code or "").strip()
-    if c.startswith(("30", "68")):
-        return 19.5
-    if c.startswith(("43", "83", "87", "88", "92")):
-        return 29.5
-    return 9.5
+    return default_limit_up_threshold_pct(code, stock_name=stock_name, trade_date=trade_date)
 
 
 def scan_fresh_first_board_candidates_cached(
@@ -182,13 +179,18 @@ def score_fresh_first_board(
     latest_close = float(close.iloc[t]) if not pd.isna(close.iloc[t]) else rec.get("close")
 
     # ---- 冷却期判定：最近 cooldown_days 交易日内不能有涨停 ----
-    threshold = threshold_fn(code)
     cooldown_start = max(1, t - cooldown_days + 1)
     last_zt_offset: Optional[int] = None
     for i in range(cooldown_start, t + 1):
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        threshold = _call_limit_up_threshold(
+            threshold_fn,
+            code,
+            stock_name=name,
+            trade_date=str(df.iloc[i].get("date", "") or ""),
+        )
         if chg_i >= threshold - 0.3:
             last_zt_offset = t - i
             break
@@ -312,7 +314,7 @@ def score_fresh_first_board(
 
     # === 次加权：股性（曾涨停加分；不再对僵尸冷票惩罚——资金接入型常是冷票）===
     occ_count, last_hit_days = _count_historical_any_limit_up(
-        history, code, lookback_days=60, threshold_fn=threshold_fn,
+        history, code, lookback_days=60, threshold_fn=threshold_fn, stock_name=name,
     )
     if occ_count >= 3:
         stock_bonus, label = 8, "股性活跃"

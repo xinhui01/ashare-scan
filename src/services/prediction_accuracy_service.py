@@ -162,7 +162,10 @@ def _infer_verify_date_from_history(
     return sorted(counter.items(), key=lambda item: (-item[1], item[0]))[0][0]
 
 
-def _limit_up_threshold(code: str, name: str = "") -> float:
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
+
+
+def _limit_up_threshold(code: str, name: str = "", trade_date: str = "") -> float:
     """根据代码前缀和股票名称推断涨停阈值（百分比）。
 
     标准涨停常因价格四舍五入触及 9.93%~10.00%，因此预留 0.3% 容忍。
@@ -171,6 +174,9 @@ def _limit_up_threshold(code: str, name: str = "") -> float:
     name = str(name or "")
     is_st = "ST" in name.upper()
     if is_st:
+        digits = _normalize_date_yyyymmdd(trade_date)
+        if digits and digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
+            return 9.7
         return 4.7  # ST: 5%
     # 创业板 / 科创板：20%
     if code.startswith("30") or code.startswith("68"):
@@ -257,7 +263,7 @@ def _evaluate_candidate(
     else:
         t1_open_t2_open_pct = None
 
-    threshold = _limit_up_threshold(code, name)
+    threshold = _limit_up_threshold(code, name, verify_date_dash)
     is_lu = (t1_pct is not None and t1_pct >= threshold)
     one_word = is_lu and _is_one_word(t1_open, t1_high, t1_low, t1_close)
     buyable = not one_word  # 一字板买不到

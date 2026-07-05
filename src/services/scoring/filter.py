@@ -78,10 +78,12 @@ def limit_up_threshold(
     settings: FilterSettings,
     board: str = "",
     stock_name: str = "",
+    trade_date: str = "",
 ) -> float:
     return build_analysis_service(settings).limit_up_threshold(
         board=board,
         stock_name=stock_name,
+        trade_date=trade_date,
     )
 
 

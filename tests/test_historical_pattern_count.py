@@ -35,6 +35,13 @@ def _threshold_growth_board(_code: str) -> float:
     return 20.0
 
 
+def _threshold_st_date_aware(_code: str, stock_name: str = "", trade_date: str = "") -> float:
+    digits = str(trade_date or "").replace("-", "").replace("/", "")[:8]
+    if "ST" in str(stock_name or "").upper():
+        return 10.0 if digits >= "20260706" else 5.0
+    return 10.0
+
+
 # ============== _count_historical_continuation ==============
 
 class TestHistoricalContinuation:
@@ -361,6 +368,25 @@ class TestHistoricalAnyLimitUp:
             df, "300001", lookback_days=60, threshold_fn=_threshold_growth_board,
         )
         assert cnt == 0
+
+    def test_st_threshold_uses_each_trade_date(self):
+        df = _make_df([
+            ("2026-07-02", 10.0),
+            ("2026-07-03", 10.5),    # +5%: 7/6 前 ST 涨停
+            ("2026-07-06", 11.025),  # +5%: 7/6 起 ST 不再算涨停
+            ("2026-07-07", 11.0),    # today 跳过
+        ])
+
+        cnt, last = _count_historical_any_limit_up(
+            df,
+            "300001",
+            lookback_days=60,
+            threshold_fn=_threshold_st_date_aware,
+            stock_name="ST测试",
+        )
+
+        assert cnt == 1
+        assert last == 2
 
     def test_lookback_filter(self):
         # 80 日前的涨停不计入（超出 lookback=60）

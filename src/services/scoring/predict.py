@@ -1955,6 +1955,28 @@ def predict_limit_up_candidates(
     compare_context["industry_top_codes"] = industry_top_codes
     compare_context["market_max_boards"] = market_max_boards
     compare_context["market_top_codes"] = market_top_codes
+    compare_context["trade_date"] = trade_date
+
+    filter_strong_for_trade_date = (
+        lambda spot, exclude: _first_board.filter_strong_stocks(
+            spot, exclude, trade_date=trade_date
+        )
+    )
+    filter_ma5_pullback_for_trade_date = (
+        lambda spot, exclude: _first_board.filter_ma5_pullback_stocks(
+            spot, exclude, trade_date=trade_date
+        )
+    )
+    filter_capital_inflow_for_trade_date = (
+        lambda spot, exclude: _first_board.filter_capital_inflow_candidates(
+            spot, exclude, trade_date=trade_date
+        )
+    )
+    filter_wrap_for_trade_date = (
+        lambda spot, exclude: _first_board.filter_wrap_candidate_stocks(
+            spot, exclude, trade_date=trade_date
+        )
+    )
 
     # 资金接入型首板的板块联动：候选 spot 行业是 universe（证监会粗命名），跟涨停池
     # （东财窄命名）0% 对得上；limit_up_stock_meta 的 industry 与涨停池 100% 同命名，
@@ -1977,10 +1999,10 @@ def predict_limit_up_candidates(
     if spot_df is not None and not spot_df.empty:
         if log_fn:
             log_fn(f"涨停预测：开始筛选强势股（全市场 {len(spot_df)} 只）...")
-        strong = _first_board.filter_strong_stocks(spot_df, zt_codes)
+        strong = filter_strong_for_trade_date(spot_df, zt_codes)
         if log_fn:
             log_fn(f"涨停预测：筛选强势股完成，共 {len(strong)} 只")
-        pullback = _first_board.filter_ma5_pullback_stocks(spot_df, zt_codes)
+        pullback = filter_ma5_pullback_for_trade_date(spot_df, zt_codes)
         if log_fn:
             log_fn(f"涨停预测：筛选回踩MA5完成，共 {len(pullback)} 只")
         seen = set()
@@ -2057,7 +2079,7 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_strong_stocks_fn=_first_board.filter_strong_stocks,
+        filter_strong_stocks_fn=filter_strong_for_trade_date,
     )
     first_board_candidates = _filter_recent_theme_rows(
         "first",
@@ -2094,7 +2116,7 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_candidates_fn=_first_board.filter_capital_inflow_candidates,
+        filter_candidates_fn=filter_capital_inflow_for_trade_date,
     )
 
     # 阶段7：断板反包候选（近期涨停被打掉，今日逼近反包）
@@ -2106,7 +2128,7 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_wrap_candidate_stocks_fn=_first_board.filter_wrap_candidate_stocks,
+        filter_wrap_candidate_stocks_fn=filter_wrap_for_trade_date,
     )
     broken_board_wrap_candidates = _filter_recent_theme_rows(
         "wrap",
@@ -2132,8 +2154,8 @@ def predict_limit_up_candidates(
         log_fn=log_fn,
         limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
         build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
-        filter_strong_stocks_fn=_first_board.filter_strong_stocks,
-        filter_ma5_pullback_stocks_fn=_first_board.filter_ma5_pullback_stocks,
+        filter_strong_stocks_fn=filter_strong_for_trade_date,
+        filter_ma5_pullback_stocks_fn=filter_ma5_pullback_for_trade_date,
     )
 
     ranked_candidates, candidate_priority = _rank_and_limit_prediction_candidates(

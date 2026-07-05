@@ -8,6 +8,7 @@ from src.models.analysis_models import HistoryAnalysisConfig
 
 GROWTH_BOARDS = {"创业板", "科创板"}
 SPECIAL_TREATMENT_PREFIXES = ("ST", "*ST")
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
 LIMIT_UP_TOLERANCE = 0.2
 
 
@@ -39,13 +40,36 @@ class HistoryAnalysisService:
             return False
         return bool((recent_close.values > recent_ma.values).all())
 
-    def limit_up_threshold(self, board: str = "", stock_name: str = "") -> float:
+    @staticmethod
+    def _trade_date_digits(value: Any) -> str:
+        text = str(value or "").strip().replace("-", "").replace("/", "")
+        return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+    def limit_up_threshold(self, board: str = "", stock_name: str = "", trade_date: str = "") -> float:
         normalized_name = str(stock_name or "").upper().strip()
         if any(normalized_name.startswith(prefix) for prefix in SPECIAL_TREATMENT_PREFIXES):
+            digits = self._trade_date_digits(trade_date)
+            if digits and digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
+                return 10.0
             return 5.0
         if str(board or "").strip() in GROWTH_BOARDS:
             return 20.0
         return 10.0
+
+    def _limit_up_thresholds_for_dates(
+        self,
+        dates: pd.Series,
+        *,
+        board: str = "",
+        stock_name: str = "",
+    ) -> pd.Series:
+        return dates.astype(str).map(
+            lambda trade_date: self.limit_up_threshold(
+                board=board,
+                stock_name=stock_name,
+                trade_date=trade_date,
+            )
+        )
 
     def analyze_history(
         self,
@@ -122,7 +146,9 @@ class HistoryAnalysisService:
         if len(df) < 2:
             return empty
 
-        threshold = self.limit_up_threshold(board=board, stock_name=stock_name)
+        threshold_by_date = self._limit_up_thresholds_for_dates(
+            df["date"], board=board, stock_name=stock_name
+        )
         change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
         close = pd.to_numeric(df["close"], errors="coerce")
         low = pd.to_numeric(df["low"], errors="coerce")
@@ -141,6 +167,7 @@ class HistoryAnalysisService:
             pct = change_pct.iloc[i]
             if pd.isna(pct):
                 continue
+            threshold = float(threshold_by_date.iloc[i])
             if float(pct) >= (threshold - LIMIT_UP_TOLERANCE):
                 t_idx = i
                 break
@@ -148,7 +175,8 @@ class HistoryAnalysisService:
             # 特例:最后一天刚涨停,T+1 还没来。上层需要这个信号来区分
             # "没有涨停过" 和 "涨停了但还没法判断承接"。
             last_pct = change_pct.iloc[-1]
-            if not pd.isna(last_pct) and float(last_pct) >= (threshold - LIMIT_UP_TOLERANCE):
+            last_threshold = float(threshold_by_date.iloc[-1])
+            if not pd.isna(last_pct) and float(last_pct) >= (last_threshold - LIMIT_UP_TOLERANCE):
                 empty_with_hint = dict(empty)
                 empty_with_hint["limit_up_is_today"] = True
                 empty_with_hint["limit_up_date"] = dates[-1]
@@ -430,20 +458,25 @@ class HistoryAnalysisService:
         stock_name: str,
         volume: Optional[pd.Series],
     ) -> None:
-        threshold = self.limit_up_threshold(board=board, stock_name=stock_name)
+        latest_date = str(df["date"].iloc[-1]) if "date" in df.columns and not df.empty else ""
+        threshold = self.limit_up_threshold(board=board, stock_name=stock_name, trade_date=latest_date)
         result["limit_up_threshold"] = threshold
         if "change_pct" not in df.columns:
             return
 
         change_pct = pd.to_numeric(df["change_pct"], errors="coerce")
-        full_limit_up_mask = (change_pct >= (threshold - LIMIT_UP_TOLERANCE)).fillna(False)
+        threshold_by_date = self._limit_up_thresholds_for_dates(
+            df["date"], board=board, stock_name=stock_name
+        )
+        full_limit_up_mask = (change_pct >= (threshold_by_date - LIMIT_UP_TOLERANCE)).fillna(False)
         recent_change_pct = change_pct.tail(max(self.config.limit_up_lookback_days, 1))
+        recent_thresholds = threshold_by_date.tail(max(self.config.limit_up_lookback_days, 1))
         recent_dates = df.tail(max(self.config.limit_up_lookback_days, 1))["date"].astype(str).tolist()
         hit_dates = [
             trade_date
             for trade_date, hit in zip(
                 recent_dates,
-                (recent_change_pct >= (threshold - LIMIT_UP_TOLERANCE)).tolist(),
+                (recent_change_pct >= (recent_thresholds - LIMIT_UP_TOLERANCE)).tolist(),
             )
             if bool(hit)
         ]

@@ -13,6 +13,7 @@ from src.services.scoring.predict import (
     _count_missing_industries,
     _ensure_historical_spot_snapshot,
 )
+from src.services.scoring.profile import analyze_pre_limit_up_profile
 
 
 class _CompareFetcher:
@@ -146,6 +147,88 @@ class TestLimitUpPredictionHelpers(unittest.TestCase):
 
         self.assertIsNotNone(rec)
         self.assertEqual(rec["industry"], "银行")
+
+    def test_parse_spot_record_filters_st_before_20260706(self):
+        row = pd.Series({
+            "代码": "000001",
+            "名称": "ST测试",
+            "最新价": 12.3,
+            "涨跌幅": 4.2,
+            "成交额": 80_000_000,
+            "成交量": 1_500_000,
+            "换手率": 5.6,
+            "所属行业": "测试行业",
+        })
+
+        rec = _first_board.parse_spot_record(row, set(), trade_date="20260703")
+
+        self.assertIsNone(rec)
+
+    def test_parse_spot_record_allows_st_from_20260706(self):
+        row = pd.Series({
+            "代码": "000001",
+            "名称": "ST测试",
+            "最新价": 12.3,
+            "涨跌幅": 4.2,
+            "成交额": 80_000_000,
+            "成交量": 1_500_000,
+            "换手率": 5.6,
+            "所属行业": "测试行业",
+        })
+
+        rec = _first_board.parse_spot_record(row, set(), trade_date="20260706")
+
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["name"], "ST测试")
+
+    def test_prediction_limit_up_threshold_treats_st_as_main_board_from_20260706(self):
+        sf = self._build_filter()
+
+        self.assertAlmostEqual(
+            sf._limit_up_threshold_pct("000001", stock_name="ST测试", trade_date="20260703"),
+            4.8,
+        )
+        self.assertAlmostEqual(
+            sf._limit_up_threshold_pct("000001", stock_name="ST测试", trade_date="20260706"),
+            9.5,
+        )
+        self.assertAlmostEqual(
+            sf._limit_up_threshold_pct("300001", stock_name="ST测试", trade_date="20260706"),
+            9.5,
+        )
+
+    def test_limit_up_pattern_passes_latest_history_date_to_threshold_fn(self):
+        from src.services.scoring.classifiers import classify_limit_up_pattern
+
+        class _Fetcher:
+            def get_history_data(self, code, days=65):
+                return pd.DataFrame({
+                    "date": [
+                        "2026-06-23", "2026-06-24", "2026-06-25", "2026-06-26", "2026-06-29",
+                        "2026-06-30", "2026-07-01", "2026-07-02", "2026-07-03", "2026-07-06",
+                    ],
+                    "close": [10.0, 10.1, 10.0, 10.2, 10.3, 10.2, 10.1, 10.0, 10.0, 10.5],
+                    "change_pct": [0.0, 1.0, -1.0, 2.0, 1.0, -1.0, -1.0, -1.0, 0.0, 5.0],
+                    "volume": [1_000_000] * 10,
+                    "amount": [10_000_000] * 10,
+                })
+
+        seen_dates = []
+
+        def threshold_fn(*, board="", stock_name="", trade_date=""):
+            seen_dates.append(trade_date)
+            digits = str(trade_date or "").replace("-", "").replace("/", "")[:8]
+            return 10.0 if digits >= "20260706" else 5.0
+
+        result = classify_limit_up_pattern(
+            _Fetcher(),
+            "300001",
+            stock_name="ST测试",
+            limit_up_threshold_fn=threshold_fn,
+        )
+
+        self.assertEqual(seen_dates, ["2026-07-06"])
+        self.assertEqual(result["consecutive_boards"], 0)
 
     def test_score_followthrough_candidate_hits_relay_breakout(self):
         """二波接力：今日放量启动 +5.5% 且收盘强势，距前涨停 5 日。"""
@@ -555,6 +638,87 @@ def test_count_missing_industries_treats_placeholder_values_as_blank():
     df = pd.DataFrame({"所属行业": ["银行", "", None, " nan ", "-", "未知"]})
 
     assert _count_missing_industries(df) == 5
+
+
+def test_pre_limit_up_profile_includes_st_from_20260706():
+    class _Fetcher:
+        def _recent_trade_dates(self, trade_date, count):
+            return ["20260706"]
+
+        def get_limit_up_pool(self, trade_date):
+            return pd.DataFrame([{
+                "代码": "000001",
+                "名称": "ST测试",
+                "所属行业": "测试行业",
+                "连板数": 1,
+            }])
+
+        def get_history_data(self, code, days=65, force_refresh=False, request_plan=None):
+            return pd.DataFrame({
+                "date": [
+                    "2026-06-23", "2026-06-24", "2026-06-25", "2026-06-26", "2026-06-29",
+                    "2026-06-30", "2026-07-01", "2026-07-02", "2026-07-03", "2026-07-06",
+                ],
+                "close": [9.0, 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 9.7, 9.8, 10.78],
+                "volume": [1_000_000, 1_050_000, 1_100_000, 1_150_000, 1_200_000,
+                           1_250_000, 1_300_000, 1_350_000, 1_400_000, 4_000_000],
+                "amount": [9_000_000, 9_555_000, 10_120_000, 10_695_000, 11_280_000,
+                           11_875_000, 12_480_000, 13_095_000, 13_720_000, 43_120_000],
+                "change_pct": [0.0, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 10.0],
+            })
+
+    result = analyze_pre_limit_up_profile(
+        _Fetcher(),
+        lookback_days=1,
+        trade_date="20260706",
+        prefetch_history_for_pool_fn=lambda *args, **kwargs: None,
+        build_local_cache_history_plan_fn=lambda **kwargs: object(),
+    )
+
+    assert result["sample_count"] == 1
+    assert result["feature_samples"][0]["name"] == "ST测试"
+
+
+def test_fresh_score_cooldown_treats_st_as_ten_percent_from_20260706():
+    from src.services.scoring.fresh import score_fresh_first_board
+
+    class _Fetcher:
+        def get_history_data(self, code, days=120, force_refresh=False, request_plan=None):
+            dates = [
+                "2026-06-23", "2026-06-24", "2026-06-25", "2026-06-26",
+                "2026-06-29", "2026-06-30", "2026-07-01", "2026-07-02",
+                "2026-07-03", "2026-07-06", "2026-07-07",
+            ]
+            close = [9.0, 9.05, 9.1, 9.05, 9.0, 8.95, 8.9, 8.95, 9.1, 10.01, 10.10]
+            return pd.DataFrame({
+                "date": dates,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "volume": [1_000_000] * len(close),
+                "amount": [10_000_000] * len(close),
+            })
+
+    rec = {
+        "code": "300001",
+        "name": "ST测试",
+        "industry": "测试行业",
+        "close": 10.10,
+        "change_pct": 0.9,
+        "turnover": 5.0,
+    }
+
+    result = score_fresh_first_board(
+        rec,
+        {},
+        {},
+        fetcher=_Fetcher(),
+        cooldown_days=5,
+        limit_up_threshold_pct_fn=StockFilter._limit_up_threshold_pct,
+    )
+
+    assert result is None
 
 
 def test_historical_spot_snapshot_online_fills_missing_target_rows(monkeypatch):

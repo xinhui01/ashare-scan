@@ -40,15 +40,17 @@ def test_pct_table_aggregates_y_without_boolean_slicing_full_dataframe():
     assert "样本不足" in text
 
 
-def test_load_filters_st_in_sql_and_reads_history_in_chunks(monkeypatch):
+def test_load_filters_pre_rule_st_in_sql_and_reads_history_in_chunks(monkeypatch):
     def fake_read_sql(sql, con, chunksize=None):
         assert "NOT LIKE '%ST%'" in sql.upper()
+        assert "20260706" in sql
         assert chunksize == pattern_limit_up_prob.LOAD_CHUNKSIZE
         yield NoBooleanSliceDataFrame(
             {
                 "code_id": [0, 1],
                 "trade_date": [20260624, 20260625],
                 "big": [0, 0],
+                "special": [0, 0],
                 "open": [10, 11],
                 "close": [10.5, 11.5],
                 "high": [10.6, 11.6],
@@ -70,6 +72,7 @@ def test_load_filters_st_in_sql_and_reads_history_in_chunks(monkeypatch):
 
     assert list(df["code_id"]) == [0, 1]
     assert str(df["code_id"].dtype) == "int32"
+    assert str(df["special"].dtype) == "bool"
 
 
 def test_shift_by_code_matches_groupby_shift_without_groupby_indexer():
@@ -86,6 +89,29 @@ def test_shift_by_code_matches_groupby_shift_without_groupby_indexer():
 
     pd.testing.assert_series_equal(prev, df.groupby("code_id")["close"].shift(1).astype("float32"))
     pd.testing.assert_series_equal(nxt, df.groupby("code_id")["close"].shift(-1).astype("float32"))
+
+
+def test_build_features_uses_st_ten_percent_threshold_from_20260706():
+    df = pd.DataFrame(
+        {
+            "code_id": [0],
+            "trade_date": [20260706],
+            "big": [True],
+            "special": [True],
+            "open": [10.0],
+            "close": [11.0],
+            "high": [11.0],
+            "low": [10.0],
+            "volume": [1000.0],
+            "amount": [11000.0],
+            "change_pct": [10.0],
+        }
+    )
+
+    out = pattern_limit_up_prob.build_features(df)
+
+    assert out.loc[0, "thr"] == pytest.approx(9.7)
+    assert bool(out.loc[0, "is_lu"])
 
 
 def test_report_shows_latest_stocks_that_match_each_setup():

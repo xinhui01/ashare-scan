@@ -145,6 +145,27 @@ class TestLimitUpThreshold(unittest.TestCase):
         self.assertAlmostEqual(sf._limit_up_threshold(board="主板", stock_name="ST测试"), 5.0)
         self.assertAlmostEqual(sf._limit_up_threshold(board="主板", stock_name="*ST测试"), 5.0)
 
+    def test_st_stock_history_threshold_changes_from_20260706(self):
+        sf = _build_filter()
+        before = pd.DataFrame({
+            "date": ["2026-07-03"],
+            "close": [10.0],
+            "change_pct": [5.0],
+        })
+        after = pd.DataFrame({
+            "date": ["2026-07-06"],
+            "close": [10.0],
+            "change_pct": [5.0],
+        })
+
+        before_result = sf.analyze_history(before, stock_name="ST测试")
+        after_result = sf.analyze_history(after, stock_name="ST测试")
+
+        self.assertAlmostEqual(before_result["limit_up_threshold"], 5.0)
+        self.assertTrue(before_result["limit_up"])
+        self.assertAlmostEqual(after_result["limit_up_threshold"], 10.0)
+        self.assertFalse(after_result["limit_up"])
+
     def test_gem_star_threshold(self):
         sf = _build_filter()
         self.assertAlmostEqual(sf._limit_up_threshold(board="创业板"), 20.0)

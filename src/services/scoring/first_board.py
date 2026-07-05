@@ -32,10 +32,32 @@ from src.sources.limit_up_pool_service import (
 from src.utils.codes import is_bse_code
 
 logger = logging.getLogger(__name__)
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
 
 
-def _default_limit_up_threshold_pct(code: str) -> float:
+def _trade_date_digits(value: Any) -> str:
+    text = str(value or "").strip().replace("-", "").replace("/", "")
+    return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+
+def _is_st_name(value: Any) -> bool:
+    return "ST" in str(value or "").upper()
+
+
+def _should_filter_st_name(stock_name: Any, trade_date: Any = "") -> bool:
+    if not _is_st_name(stock_name):
+        return False
+    digits = _trade_date_digits(trade_date)
+    return not digits or digits < ST_LIMIT_UP_10PCT_EFFECTIVE_DATE
+
+
+def _default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
     """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
+    if _is_st_name(stock_name):
+        digits = _trade_date_digits(trade_date)
+        if digits and digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
+            return 9.5
+        return 4.8
     c = (code or "").strip()
     if c.startswith(("30", "68")):
         return 19.5
@@ -610,7 +632,7 @@ def fetch_spot_snapshot(
     return None
 
 
-def parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
+def parse_spot_record(row, exclude_codes: set, trade_date: str = "") -> Optional[Dict[str, Any]]:
     """从实时行情行中解析基础记录，返回 None 表示需跳过。
 
     迁自 StockFilter._parse_spot_record；行为零变化。
@@ -621,7 +643,7 @@ def parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
     if code in exclude_codes:
         return None
     name = str(row.get("名称", ""))
-    if "ST" in name.upper():
+    if _should_filter_st_name(name, trade_date):
         return None
     close = float(row["最新价"]) if pd.notna(row.get("最新价")) else None
     if close is None or close <= 0:
@@ -643,7 +665,7 @@ def parse_spot_record(row, exclude_codes: set) -> Optional[Dict[str, Any]]:
 
 
 def filter_strong_stocks(
-    spot_df: pd.DataFrame, exclude_codes: set
+    spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
 ) -> List[Dict[str, Any]]:
     """从行情快照中筛选涨幅 3%~9.95% 的强势股（含擦边没封板的 9.x% 票）。
 
@@ -653,7 +675,7 @@ def filter_strong_stocks(
     """
     records = []
     for _, row in spot_df.iterrows():
-        rec = parse_spot_record(row, exclude_codes)
+        rec = parse_spot_record(row, exclude_codes, trade_date=trade_date)
         if rec is None:
             continue
         chg = rec.get("change_pct")
@@ -665,7 +687,7 @@ def filter_strong_stocks(
 
 
 def filter_ma5_pullback_stocks(
-    spot_df: pd.DataFrame, exclude_codes: set
+    spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
 ) -> List[Dict[str, Any]]:
     """从行情快照中筛选涨跌幅 -5%~+3% 的回踩MA5候选。
 
@@ -675,7 +697,7 @@ def filter_ma5_pullback_stocks(
     """
     records = []
     for _, row in spot_df.iterrows():
-        rec = parse_spot_record(row, exclude_codes)
+        rec = parse_spot_record(row, exclude_codes, trade_date=trade_date)
         if rec is None:
             continue
         chg = rec.get("change_pct")
@@ -687,7 +709,7 @@ def filter_ma5_pullback_stocks(
 
 
 def filter_wrap_candidate_stocks(
-    spot_df: pd.DataFrame, exclude_codes: set
+    spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
 ) -> List[Dict[str, Any]]:
     """筛选"断板反包"候选 T0 形态池（chg ∈ [-10.5%, +3%)），专供反包评分。
 
@@ -703,7 +725,7 @@ def filter_wrap_candidate_stocks(
     """
     records = []
     for _, row in spot_df.iterrows():
-        rec = parse_spot_record(row, exclude_codes)
+        rec = parse_spot_record(row, exclude_codes, trade_date=trade_date)
         if rec is None:
             continue
         chg = rec.get("change_pct")
@@ -715,7 +737,7 @@ def filter_wrap_candidate_stocks(
 
 
 def filter_capital_inflow_candidates(
-    spot_df: pd.DataFrame, exclude_codes: set
+    spot_df: pd.DataFrame, exclude_codes: set, trade_date: str = ""
 ) -> List[Dict[str, Any]]:
     """筛选"资金接入型首板"入口池：当日涨幅 ∈ [-4%, +5%]（止跌/微启动区）。
 
@@ -724,11 +746,11 @@ def filter_capital_inflow_candidates(
     资金进场"判定，不靠"今日已强势"，所以入口放宽到 [-4%, +5%]，覆盖被强势
     口径漏掉的大多数首板。额外带回流通市值（float_mcap）供"流通盘适中"加权。
 
-    沿用 parse_spot_record 的基础过滤（排除 ST / 北交所 / 停牌 / 成交额 < 5000万）。
+    沿用 parse_spot_record 的基础过滤（2026-07-06 前排除 ST / 北交所 / 停牌 / 成交额 < 5000万）。
     """
     records = []
     for _, row in spot_df.iterrows():
-        rec = parse_spot_record(row, exclude_codes)
+        rec = parse_spot_record(row, exclude_codes, trade_date=trade_date)
         if rec is None:
             continue
         chg = rec.get("change_pct")
@@ -963,7 +985,7 @@ def score_first_board_by_profile(
     # 股性活跃度（近 60 日任意涨停次数）：有涨停记录的股更易再次涨停，僵尸股惩罚
     if history is not None and not history.empty:
         occ_count, last_hit_days = _count_historical_any_limit_up(
-            history, code, lookback_days=60, threshold_fn=threshold_fn,
+            history, code, lookback_days=60, threshold_fn=threshold_fn, stock_name=name,
         )
         if occ_count >= 5:
             stock_bonus, label = 6, "妖股性"

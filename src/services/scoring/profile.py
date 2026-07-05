@@ -16,6 +16,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
+
+
+def _trade_date_digits(value: Any) -> str:
+    text = str(value or "").strip().replace("-", "").replace("/", "")
+    return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+
+def _should_skip_st_for_profile(stock_name: Any, trade_date: Any) -> bool:
+    if "ST" not in str(stock_name or "").upper():
+        return False
+    digits = _trade_date_digits(trade_date)
+    return not digits or digits < ST_LIMIT_UP_10PCT_EFFECTIVE_DATE
 
 
 def extract_pre_limit_up_features(
@@ -213,7 +226,7 @@ def analyze_pre_limit_up_profile(
             code = str(row.get("代码", "")).strip().zfill(6)
             name = str(row.get("名称", ""))
             industry = str(row.get("所属行业", ""))
-            if "ST" in name.upper():
+            if _should_skip_st_for_profile(name, d):
                 continue
             all_first_board.append({
                 "code": code, "name": name, "industry": industry,

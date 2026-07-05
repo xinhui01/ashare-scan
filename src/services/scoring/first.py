@@ -16,20 +16,19 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring import shared as _shared
-from src.services.scoring.helpers import _count_historical_followthrough
+from src.services.scoring.helpers import (
+    _call_limit_up_threshold,
+    _count_historical_followthrough,
+    default_limit_up_threshold_pct,
+)
 from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
 
-def _default_limit_up_threshold_pct(code: str) -> float:
+def _default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
     """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
-    c = (code or "").strip()
-    if c.startswith(("30", "68")):
-        return 19.5
-    if c.startswith(("43", "83", "87", "88", "92")):
-        return 29.5
-    return 9.5
+    return default_limit_up_threshold_pct(code, stock_name=stock_name, trade_date=trade_date)
 
 
 def scan_followthrough_candidates_cached(
@@ -213,7 +212,6 @@ def score_followthrough_candidate(
                 position_60d = round((latest_close - lo60) / (hi60 - lo60) * 100, 1)
 
         # 近 7 日内最近一次收盘涨停（用作"前涨停日"，决定接力窗口）
-        zt_threshold = threshold_fn(code)
         scan_start = max(1, t - 7)
         for i in range(t - 1, scan_start - 1, -1):
             if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
@@ -222,6 +220,12 @@ def score_followthrough_candidate(
             if prev_c <= 0:
                 continue
             chg_i = (float(close.iloc[i]) / prev_c - 1) * 100
+            zt_threshold = _call_limit_up_threshold(
+                threshold_fn,
+                code,
+                stock_name=name,
+                trade_date=str(df.iloc[i].get("date", "") or ""),
+            )
             if chg_i >= zt_threshold - 0.3:
                 prior_lu_idx = i
                 days_since_prior_lu = t - i
@@ -240,6 +244,12 @@ def score_followthrough_candidate(
                 if prev_c <= 0:
                     continue
                 chg_i = (float(close.iloc[i]) / prev_c - 1) * 100
+                zt_threshold = _call_limit_up_threshold(
+                    threshold_fn,
+                    code,
+                    stock_name=name,
+                    trade_date=str(df.iloc[i].get("date", "") or ""),
+                )
                 if chg_i >= zt_threshold - 0.3:
                     had_limit_up_60d = True
                     break
@@ -255,6 +265,12 @@ def score_followthrough_candidate(
                 if prev_c <= 0:
                     break
                 chg = (float(close.iloc[j]) / prev_c - 1) * 100
+                zt_threshold = _call_limit_up_threshold(
+                    threshold_fn,
+                    code,
+                    stock_name=name,
+                    trade_date=str(df.iloc[j].get("date", "") or ""),
+                )
                 if chg >= zt_threshold - 0.3:
                     prior_wave_boards += 1
                 else:
@@ -293,6 +309,12 @@ def score_followthrough_candidate(
             if prev_c <= 0:
                 continue
             chg = (float(close.iloc[j]) / prev_c - 1) * 100
+            zt_threshold = _call_limit_up_threshold(
+                threshold_fn,
+                code,
+                stock_name=name,
+                trade_date=str(df.iloc[j].get("date", "") or ""),
+            )
             if chg >= zt_threshold - 0.3:
                 window_lu_count += 1
 
@@ -399,7 +421,15 @@ def score_followthrough_candidate(
     #   - 4-6%: hit 12.0% (n=283) ← 反指 -5.6%，归零
     #   - 6-8%: 样本里更弱，归零
     # 真正可达涨停才有意义，4% 以外的距离已经是"远"。
-    lu_threshold = threshold_fn(code)
+    latest_trade_date = ""
+    if history is not None and not history.empty and "date" in history.columns:
+        latest_trade_date = str(history.sort_values("date").iloc[-1].get("date", "") or "")
+    lu_threshold = _call_limit_up_threshold(
+        threshold_fn,
+        code,
+        stock_name=name,
+        trade_date=latest_trade_date,
+    )
     room_to_lu = lu_threshold - change_pct
     if room_to_lu <= 4.0:
         score += 15
@@ -558,7 +588,7 @@ def score_followthrough_candidate(
     # === 历史同类形态加分：近 90 日内的二波接力成功次数 ===
     occ_count, last_hit_days = _count_historical_followthrough(
         history, code, lookback_days=90, window=5,
-        threshold_fn=threshold_fn,
+        threshold_fn=threshold_fn, stock_name=name,
     )
     if occ_count >= 3:
         bonus = 8

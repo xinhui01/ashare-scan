@@ -2,7 +2,7 @@
 
 派生规则：
 - 严格过滤：close == high (封板) + 按板块阈值过滤 change_pct
-- ST 股按 5% 限幅
+- ST 股 2026-07-06 前按 5% 限幅，之后按 10% 限幅
 - JOIN universe 取 name + industry
 - 连板数：递推查找 D-1 pool（先按时间顺序回填，保证递推可用）
 
@@ -38,10 +38,16 @@ LEFT JOIN universe u ON u.code = h.code
 WHERE h.trade_date = ?
   AND h.close = h.high
   AND (
-       (INSTR(COALESCE(u.name, ''), 'ST') > 0 AND h.change_pct >= 4.7) OR
-       (INSTR(COALESCE(u.name, ''), 'ST') = 0 AND substr(h.code,1,2) IN ('30','68') AND h.change_pct >= 19.5) OR
-       (INSTR(COALESCE(u.name, ''), 'ST') = 0 AND substr(h.code,1,1) IN ('4','8') AND h.change_pct >= 29.5) OR
-       (INSTR(COALESCE(u.name, ''), 'ST') = 0 AND substr(h.code,1,1) IN ('6','0') AND h.change_pct >= 9.7)
+       (
+           INSTR(upper(COALESCE(u.name, '')), 'ST') > 0
+           AND (
+               (REPLACE(h.trade_date, '-', '') < '20260706' AND h.change_pct >= 4.7) OR
+               (REPLACE(h.trade_date, '-', '') >= '20260706' AND h.change_pct >= 9.7)
+           )
+       ) OR
+       (INSTR(upper(COALESCE(u.name, '')), 'ST') = 0 AND substr(h.code,1,2) IN ('30','68') AND h.change_pct >= 19.5) OR
+       (INSTR(upper(COALESCE(u.name, '')), 'ST') = 0 AND substr(h.code,1,1) IN ('4','8') AND h.change_pct >= 29.5) OR
+       (INSTR(upper(COALESCE(u.name, '')), 'ST') = 0 AND substr(h.code,1,1) IN ('6','0') AND h.change_pct >= 9.7)
   )
 ORDER BY h.change_pct DESC, h.code
 """

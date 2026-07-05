@@ -76,6 +76,21 @@ def test_marks_risk_when_main_board_auction_is_too_close_to_limit_up():
     assert "接近涨停" in confirmation["reason"]
 
 
+def test_st_uses_confirmation_date_for_limit_up_risk_after_20260706():
+    fetcher = FakeFetcher(
+        auctions={"300001": {"price": 10.60, "amount": 50_000_000}}
+    )
+    candidate_lists = {
+        "fresh": [{"code": "300001", "name": "ST测试", "close": 10.0, "score": 80}]
+    }
+
+    confirm_candidate_lists(candidate_lists, fetcher=fetcher, now=datetime(2026, 7, 6, 9, 26))
+
+    confirmation = candidate_lists["fresh"][0]["opening_confirmation"]
+    assert confirmation["status"] == "观察"
+    assert "高开偏多" in confirmation["reason"]
+
+
 def test_abandons_when_auction_opens_too_weak():
     fetcher = FakeFetcher(
         auctions={"600000": {"price": 9.60, "amount": 15_000_000}}

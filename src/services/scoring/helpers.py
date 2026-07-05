@@ -7,9 +7,57 @@
 """
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import pandas as pd
+
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
+
+
+def _trade_date_digits(value: Any) -> str:
+    text = str(value or "").strip().replace("-", "").replace("/", "")
+    return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+
+def default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: Any = "") -> float:
+    if "ST" in str(stock_name or "").upper():
+        digits = _trade_date_digits(trade_date)
+        if digits and digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
+            return 9.5
+        return 4.8
+    c = (code or "").strip()
+    if c.startswith(("30", "68")):
+        return 19.5
+    if c.startswith(("43", "83", "87", "88", "92")):
+        return 29.5
+    return 9.5
+
+
+def _row_trade_date(df: "pd.DataFrame", index: int) -> str:
+    if "date" not in df.columns:
+        return ""
+    try:
+        return str(df["date"].iloc[index] or "").strip()
+    except Exception:
+        return ""
+
+
+def _call_limit_up_threshold(
+    threshold_fn: Optional[Callable[..., float]],
+    code: str,
+    *,
+    stock_name: str = "",
+    trade_date: Any = "",
+) -> float:
+    if threshold_fn is None:
+        return 10.0
+    try:
+        return float(threshold_fn(code, stock_name=stock_name, trade_date=trade_date))
+    except TypeError:
+        try:
+            return float(threshold_fn(code, stock_name, trade_date))
+        except TypeError:
+            return float(threshold_fn(code))
 
 
 def _count_historical_continuation(
@@ -17,6 +65,7 @@ def _count_historical_continuation(
     code: str,
     lookback_days: int = 90,
     threshold_fn=None,
+    stock_name: str = "",
 ):
     """扫历史 K 线统计成功连板次数（涨停 → T+1 继续涨停）。
 
@@ -33,7 +82,6 @@ def _count_historical_continuation(
     close = pd.to_numeric(df["close"], errors="coerce")
     n = len(df)
     t = n - 1  # today index (skip)
-    threshold = float(threshold_fn(code))
     cutoff_idx = max(1, t - int(lookback_days))
     occ = 0
     last_hit_idx = None
@@ -44,12 +92,18 @@ def _count_historical_continuation(
         if float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
-        if chg_i < threshold - 0.3:
+        threshold_i = _call_limit_up_threshold(
+            threshold_fn, code, stock_name=stock_name, trade_date=_row_trade_date(df, i)
+        )
+        if chg_i < threshold_i - 0.3:
             continue
         if pd.isna(close.iloc[i + 1]) or float(close.iloc[i]) <= 0:
             continue
         chg_next = (float(close.iloc[i + 1]) / float(close.iloc[i]) - 1) * 100
-        if chg_next >= threshold - 0.3:
+        threshold_next = _call_limit_up_threshold(
+            threshold_fn, code, stock_name=stock_name, trade_date=_row_trade_date(df, i + 1)
+        )
+        if chg_next >= threshold_next - 0.3:
             occ += 1
             last_hit_idx = i + 1
     last_days = (t - last_hit_idx) if last_hit_idx is not None else None
@@ -61,6 +115,7 @@ def _count_historical_any_limit_up(
     code: str,
     lookback_days: int = 60,
     threshold_fn=None,
+    stock_name: str = "",
 ):
     """扫历史 K 线统计近 N 日内任意涨停次数（不要求 T+1 连板），作为"股性活跃度"代理。
 
@@ -80,7 +135,6 @@ def _count_historical_any_limit_up(
     close = pd.to_numeric(df["close"], errors="coerce")
     n = len(df)
     t = n - 1  # today index (skip)
-    threshold = float(threshold_fn(code))
     cutoff_idx = max(1, t - int(lookback_days))
     occ = 0
     last_hit_idx = None
@@ -90,6 +144,9 @@ def _count_historical_any_limit_up(
         if float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        threshold = _call_limit_up_threshold(
+            threshold_fn, code, stock_name=stock_name, trade_date=_row_trade_date(df, i)
+        )
         if chg_i >= threshold - 0.3:
             occ += 1
             last_hit_idx = i
@@ -103,6 +160,7 @@ def _count_historical_followthrough(
     lookback_days: int = 90,
     window: int = 5,
     threshold_fn=None,
+    stock_name: str = "",
 ):
     """扫历史 K 线统计成功二波接力次数（涨停 → window 日内另一次涨停）。
 
@@ -117,7 +175,6 @@ def _count_historical_followthrough(
     close = pd.to_numeric(df["close"], errors="coerce")
     n = len(df)
     t = n - 1
-    threshold = float(threshold_fn(code))
     cutoff_idx = max(1, t - int(lookback_days))
     # 找出所有涨停日 idx
     lu_indices = []
@@ -125,6 +182,9 @@ def _count_historical_followthrough(
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        threshold = _call_limit_up_threshold(
+            threshold_fn, code, stock_name=stock_name, trade_date=_row_trade_date(df, i)
+        )
         if chg_i >= threshold - 0.3:
             lu_indices.append(i)
     # 对每个涨停日 i，看 [i+1, min(i+window, t-1)] 内是否有再次涨停（i 之外的）
@@ -148,6 +208,7 @@ def _count_historical_wrap(
     window: int = 5,
     drop_threshold: float = -3.0,
     threshold_fn=None,
+    stock_name: str = "",
 ):
     """扫历史 K 线统计成功反包次数（涨停 → window 日内 ≤drop 阴线 → 再涨停）。
 
@@ -162,7 +223,6 @@ def _count_historical_wrap(
     close = pd.to_numeric(df["close"], errors="coerce")
     n = len(df)
     t = n - 1
-    threshold = float(threshold_fn(code))
     cutoff_idx = max(1, t - int(lookback_days))
     # 找出所有涨停日 idx
     lu_indices = []
@@ -170,6 +230,9 @@ def _count_historical_wrap(
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]) or float(close.iloc[i - 1]) <= 0:
             continue
         chg_i = (float(close.iloc[i]) / float(close.iloc[i - 1]) - 1) * 100
+        threshold = _call_limit_up_threshold(
+            threshold_fn, code, stock_name=stock_name, trade_date=_row_trade_date(df, i)
+        )
         if chg_i >= threshold - 0.3:
             lu_indices.append(i)
     if len(lu_indices) < 2:

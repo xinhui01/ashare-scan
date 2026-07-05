@@ -5,7 +5,7 @@
 - 对全市场每个交易日 T，用截至 T 收盘的数据提取形态特征（EOD 可判定，符合复盘语境）。
 - 标签 y = 次日 T+1 是否涨停（同一只股票的紧邻下一交易日）。
 - 涨停阈值：主板 change_pct>=9.8；创业板/科创板(300/301/302/688/689) >=19.5。
-- 排除 ST（universe.name 含 ST）。库里只有 0/3/6 开头，无北交所。
+- ST：2026-07-06 前排除；2026-07-06 起纳入，change_pct>=9.7 视为涨停。
 - turnover_rate 绝大多数为空 -> 不用换手率。
 
 输出：基准涨停率、单因子概率表、命名"图形"概率排名（全周期 + 近窗口对比）。
@@ -29,7 +29,9 @@ DISPLAY_STOCK_LIMIT = 1
 FILTERED_SQL = """
     FROM history AS h
     LEFT JOIN universe AS u ON u.code = h.code
-    WHERE u.name IS NULL OR upper(u.name) NOT LIKE '%ST%'
+    WHERE u.name IS NULL
+       OR upper(u.name) NOT LIKE '%ST%'
+       OR CAST(REPLACE(h.trade_date, '-', '') AS INTEGER) >= 20260706
 """
 
 
@@ -37,6 +39,7 @@ def _prepare_history_chunk(df: pd.DataFrame) -> pd.DataFrame:
     df["code_id"] = pd.to_numeric(df["code_id"], errors="coerce").astype("int32")
     df["trade_date"] = pd.to_numeric(df["trade_date"], errors="coerce").astype("int32")
     df["big"] = df["big"].astype("bool")
+    df["special"] = df["special"].astype("bool")
     for c in NUM_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
     df.dropna(subset=["close", "change_pct"], inplace=True)
@@ -74,7 +77,8 @@ def load() -> pd.DataFrame:
     query = """
         WITH filtered AS (
             SELECT h.code, h.trade_date, h.open, h.close, h.high, h.low,
-                   h.volume, h.amount, h.change_pct
+                   h.volume, h.amount, h.change_pct,
+                   COALESCE(u.name, '') AS name
             {filtered_sql}
         ),
         codes AS (
@@ -87,6 +91,10 @@ def load() -> pd.DataFrame:
                    WHEN substr(f.code, 1, 3) IN ('300', '301', '302', '688', '689') THEN 1
                    ELSE 0
                END AS big,
+               CASE
+                   WHEN upper(COALESCE(f.name, '')) LIKE '%ST%' THEN 1
+                   ELSE 0
+               END AS special,
                f.open, f.close, f.high, f.low, f.volume, f.amount, f.change_pct
         FROM filtered AS f
         JOIN codes AS c ON c.code = f.code
@@ -120,7 +128,9 @@ def load_code_lookup() -> dict[int, str]:
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["thr"] = np.where(df["big"], 19.5, 9.8).astype("float32")
+    normal_thr = np.where(df["big"], 19.5, 9.8)
+    st_thr = np.where(df["trade_date"] >= 20260706, 9.7, 4.7)
+    df["thr"] = np.where(df.get("special", False), st_thr, normal_thr).astype("float32")
     df["is_lu"] = df["change_pct"] >= df["thr"]
 
     g = df.groupby("code_id", sort=False)

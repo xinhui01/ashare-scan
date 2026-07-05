@@ -96,6 +96,9 @@ def classify_limit_up_pattern(
         return result
 
     df = history.sort_values("date").reset_index(drop=True)
+    latest_trade_date = ""
+    if "date" in df.columns and not df.empty:
+        latest_trade_date = str(df["date"].iloc[-1]).strip()
     close = pd.to_numeric(df["close"], errors="coerce")
     change_pct = pd.to_numeric(df.get("change_pct"), errors="coerce") if "change_pct" in df.columns else pd.Series(dtype=float)
     volume = pd.to_numeric(df.get("volume"), errors="coerce") if "volume" in df.columns else pd.Series(dtype=float)
@@ -160,7 +163,14 @@ def classify_limit_up_pattern(
 
     # 连板数
     if limit_up_threshold_fn is not None:
-        threshold = limit_up_threshold_fn(board=board, stock_name=stock_name)
+        try:
+            threshold = limit_up_threshold_fn(
+                board=board,
+                stock_name=stock_name,
+                trade_date=latest_trade_date,
+            )
+        except TypeError:
+            threshold = limit_up_threshold_fn(board=board, stock_name=stock_name)
     else:
         threshold = 10.0
     if not change_pct.empty:

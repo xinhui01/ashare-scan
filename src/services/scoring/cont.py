@@ -16,20 +16,18 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 
 from src.services.scoring import shared as _shared
-from src.services.scoring.helpers import _count_historical_continuation
+from src.services.scoring.helpers import (
+    _count_historical_continuation,
+    default_limit_up_threshold_pct,
+)
 from src.services.scoring.trend import _score_accumulation_signal
 
 logger = logging.getLogger(__name__)
 
 
-def _default_limit_up_threshold_pct(code: str) -> float:
+def _default_limit_up_threshold_pct(code: str, stock_name: str = "", trade_date: str = "") -> float:
     """A股各板块涨停阈值（百分比）。fallback 用，与 stock_filter._limit_up_threshold_pct 同。"""
-    c = (code or "").strip()
-    if c.startswith(("30", "68")):
-        return 19.5
-    if c.startswith(("43", "83", "87", "88", "92")):
-        return 29.5
-    return 9.5
+    return default_limit_up_threshold_pct(code, stock_name=stock_name, trade_date=trade_date)
 
 
 def score_continuation(
@@ -237,7 +235,7 @@ def score_continuation(
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
     occ_count, last_hit_days = _count_historical_continuation(
         history, code, lookback_days=90,
-        threshold_fn=threshold_fn,
+        threshold_fn=threshold_fn, stock_name=name,
     )
     if occ_count >= 3:
         bonus = 8

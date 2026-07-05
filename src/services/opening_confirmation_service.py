@@ -28,7 +28,20 @@ def _safe_float(value: Any) -> Optional[float]:
     return out if pd.notna(out) else None
 
 
-def _limit_up_threshold_pct(code: str) -> float:
+ST_LIMIT_UP_10PCT_EFFECTIVE_DATE = "20260706"
+
+
+def _normalize_date_yyyymmdd(value: Any) -> str:
+    text = str(value or "").strip().replace("-", "").replace("/", "")
+    return text[:8] if len(text) >= 8 and text[:8].isdigit() else ""
+
+
+def _limit_up_threshold_pct(code: str, name: str = "", trade_date: str = "") -> float:
+    if "ST" in str(name or "").upper():
+        digits = _normalize_date_yyyymmdd(trade_date)
+        if digits and digits >= ST_LIMIT_UP_10PCT_EFFECTIVE_DATE:
+            return 10.0
+        return 5.0
     c = str(code or "").strip().zfill(6)
     if c.startswith(("300", "301", "688")):
         return 20.0
@@ -109,11 +122,23 @@ def evaluate_candidate_opening(
     category: str,
     auction: Optional[Dict[str, Any]] = None,
     open_price: Optional[float] = None,
+    trade_date: str = "",
 ) -> Dict[str, Any]:
     code = str(rec.get("code") or "").strip().zfill(6)
     prev_close = _safe_float(rec.get("close"))
     score = _safe_float(rec.get("calibrated_score")) or _safe_float(rec.get("score")) or 0.0
-    limit_pct = _limit_up_threshold_pct(code)
+    threshold_date = (
+        _normalize_date_yyyymmdd((auction or {}).get("trade_date"))
+        or _normalize_date_yyyymmdd(trade_date)
+        or _normalize_date_yyyymmdd(rec.get("trade_date"))
+        or _normalize_date_yyyymmdd(rec.get("prediction_date"))
+        or datetime.now().strftime("%Y%m%d")
+    )
+    limit_pct = _limit_up_threshold_pct(
+        code,
+        name=str(rec.get("name") or ""),
+        trade_date=threshold_date,
+    )
 
     auction_price = _safe_float((auction or {}).get("price")) if auction else None
     auction_amount = _safe_float((auction or {}).get("amount")) if auction else None
@@ -311,6 +336,7 @@ def confirm_candidate_lists(
                 progress_callback(done, total, code)
 
     status_counts: Dict[str, int] = {}
+    confirmation_date = (now or datetime.now()).strftime("%Y%m%d")
     for code, entries in grouped.items():
         auction, open_price = snapshots.get(code, (None, None))
         for category, rec in entries:
@@ -319,6 +345,7 @@ def confirm_candidate_lists(
                 category=category,
                 auction=auction,
                 open_price=open_price,
+                trade_date=confirmation_date,
             )
             rec["opening_confirmation"] = confirmation
             status = confirmation.get("status", "观察")
