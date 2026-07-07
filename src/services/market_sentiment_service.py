@@ -865,6 +865,7 @@ def _classify_market_state(
     rotation: Dict[str, Any],
     yest_lu: int,
     today_continued: int,
+    down_limit_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """基于综合分 + 高度结构 + 轮动指标判定当日市场状态。"""
     lu = int(today_agg.get("lu_count", 0))
@@ -879,6 +880,13 @@ def _classify_market_state(
         label = "冰点日"
         reason = f"涨停 {lu} 只 + 最高 {max_b} 板，赚钱效应崩塌"
         confidence = 0.9
+    elif down_limit_count is not None and down_limit_count >= 25 and score < 25:
+        label = "退潮日"
+        reason = (
+            f"跌停 {down_limit_count} 只 + 综合 {score} 分，亏钱效应扩散；"
+            f"即使主线 {main_status}、轮动分 {rot:+d}，也按退潮防守"
+        )
+        confidence = 0.88
     elif lu >= 80 and main_status in ("broken", "weakened") and rot >= 50:
         label = "轮动日"
         reason = (
@@ -1138,6 +1146,7 @@ def analyze_market_sentiment(
         rotation=rotation,
         yest_lu=yest_lu,
         today_continued=today_continued,
+        down_limit_count=external.get("down_limit_count"),
     )
     local_focus = _load_local_focus(end, log=_l)
     market_state = _apply_local_focus_to_market_state(market_state, local_focus)

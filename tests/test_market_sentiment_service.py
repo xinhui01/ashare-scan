@@ -75,6 +75,27 @@ def test_broad_low_height_rotation_is_not_early_retreat():
     assert state["strategy"]["position_cap"] > 0
 
 
+def test_panic_down_limits_override_rotation_to_retreat():
+    state = svc._classify_market_state(
+        score=10,
+        today_agg={
+            "lu_count": 34,
+            "max_boards": 6,
+            "high_board_count_4plus": 2,
+        },
+        rotation={"main_line_status": "broken", "rotation_score": 60},
+        yest_lu=64,
+        today_continued=5,
+        down_limit_count=30,
+    )
+
+    assert state["label"] == "退潮日"
+    assert state["retreat_stage"]["code"] == "early_retreat"
+    assert state["strategy"]["pools"] == []
+    assert state["strategy"]["position_cap"] == 0.0
+    assert "跌停 30 只" in state["reason"]
+
+
 def test_retreat_repair_stage_allows_only_confirmed_wrap():
     state = svc._classify_market_state(
         score=48,
