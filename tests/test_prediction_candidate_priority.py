@@ -220,9 +220,7 @@ def test_early_retreat_keeps_limited_observation_watchlist():
     assert len(ranked["first"]) == 1
     assert len(ranked["fresh"]) == 1
     assert len(ranked["wrap"]) == 1
-    assert len(ranked["trend"]) == 20
-    assert ranked["trend"][0]["code"] == "600500"
-    assert ranked["trend"][-1]["code"] == "600519"
+    assert ranked["trend"] == []
 
 
 def test_early_retreat_keeps_limited_observation_pools_for_all_categories():
@@ -254,7 +252,30 @@ def test_early_retreat_keeps_limited_observation_pools_for_all_categories():
     assert len(ranked["first"]) == 5
     assert len(ranked["fresh"]) == 10
     assert len(ranked["wrap"]) == 5
-    assert len(ranked["trend"]) == 20
+    assert ranked["trend"] == []
+
+
+def test_transition_state_caps_trend_candidates_to_actionable_front_row():
+    ranker = getattr(scoring_predict, "_rank_and_limit_prediction_candidates", None)
+    assert callable(ranker)
+    buckets = {
+        "trend": _candidates("6601", 20, 100, "趋势涨停"),
+    }
+    context = {
+        "market_state_label": "过渡日",
+        "market_state_strategy": {"label": "首板为主，谨慎接力"},
+    }
+
+    ranked, stats = ranker(buckets, context, theme_quality={"quality_level": "fine_theme"})
+
+    assert len(ranked["trend"]) == 8
+    assert [row["code"] for row in ranked["trend"]] == [f"6601{i:02d}" for i in range(8)]
+    assert stats["trend_limit"]["limited"] is True
+    assert stats["trend_limit"]["limit"] == 8
+    assert stats["trend_limit"]["before"] == 20
+    assert stats["trend_limit"]["after"] == 8
+    assert stats["limited"] is True
+    assert "趋势缩量" in stats["limit_reason"]
 
 
 def test_non_fresh_non_trend_candidates_must_match_recent_theme():

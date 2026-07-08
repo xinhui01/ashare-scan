@@ -54,9 +54,9 @@ _RETREAT_NO_TRADE_LIMITS = {
     "first": 5,
     "fresh": 10,
     "wrap": 5,
-    "trend": 20,
+    "trend": 0,
 }
-_RETREAT_NO_TRADE_TOTAL_LIMIT = 43
+_RETREAT_NO_TRADE_TOTAL_LIMIT = 23
 _RETREAT_REPAIR_LIMITS = {
     "cont": 0,
     "first": 0,
@@ -74,6 +74,13 @@ _ICE_POINT_LIMITS = {
     "trend": 1,
 }
 _ICE_POINT_TOTAL_LIMIT = 5
+
+_TREND_STATE_LIMITS = {
+    "接力日": 15,
+    "轮动日": 10,
+    "过渡日": 8,
+}
+_DEFAULT_TREND_LIMIT = 12
 
 
 def normalize_predict_lookback(value: Any) -> int:
@@ -818,6 +825,50 @@ def _limit_candidates_for_state(
     return limited, {"limited": True, "limit_reason": reason}
 
 
+def _trend_limit_for_state(compare_context: Dict[str, Any]) -> Optional[int]:
+    state_label = str(compare_context.get("market_state_label") or "").strip()
+    if state_label in {"退潮日", "冰点日"}:
+        return None
+    return _TREND_STATE_LIMITS.get(state_label, _DEFAULT_TREND_LIMIT)
+
+
+def _limit_trend_candidates(
+    ranked: Dict[str, List[Dict[str, Any]]],
+    compare_context: Dict[str, Any],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    limit = _trend_limit_for_state(compare_context)
+    trend_rows = list(ranked.get("trend", []) or [])
+    before = len(trend_rows)
+    if limit is None:
+        return ranked, {
+            "limited": False,
+            "limit": None,
+            "before": before,
+            "after": before,
+            "state": str(compare_context.get("market_state_label") or "").strip(),
+        }
+
+    limited_rows = trend_rows[:limit]
+    if len(limited_rows) == before:
+        return ranked, {
+            "limited": False,
+            "limit": limit,
+            "before": before,
+            "after": before,
+            "state": str(compare_context.get("market_state_label") or "").strip(),
+        }
+
+    out = dict(ranked)
+    out["trend"] = limited_rows
+    return out, {
+        "limited": True,
+        "limit": limit,
+        "before": before,
+        "after": len(limited_rows),
+        "state": str(compare_context.get("market_state_label") or "").strip(),
+    }
+
+
 def _filter_recent_theme_candidates(
     candidates_by_category: Dict[str, List[Dict[str, Any]]],
     compare_context: Dict[str, Any],
@@ -905,6 +956,7 @@ def _rank_and_limit_prediction_candidates(
         ranked[cat] = enriched
 
     ranked, limit_stats = _limit_candidates_for_state(ranked, compare_context or {})
+    ranked, trend_limit_stats = _limit_trend_candidates(ranked, compare_context or {})
     flat: List[Dict[str, Any]] = []
     for cat, rows in ranked.items():
         for rec in rows:
@@ -917,6 +969,15 @@ def _rank_and_limit_prediction_candidates(
         )
     )
     after_counts = {cat: len(ranked.get(cat, [])) for cat in _PREDICTION_CANDIDATE_KEYS}
+    limit_reason = str(limit_stats.get("limit_reason") or "").strip()
+    if trend_limit_stats.get("limited"):
+        state_label = str(trend_limit_stats.get("state") or "默认环境").strip()
+        trend_reason = (
+            f"趋势缩量：{state_label}仅显示前{int(trend_limit_stats.get('limit') or 0)}只，"
+            f"{int(trend_limit_stats.get('before') or 0)} → "
+            f"{int(trend_limit_stats.get('after') or 0)} 只"
+        )
+        limit_reason = f"{limit_reason}；{trend_reason}" if limit_reason else trend_reason
     stats = {
         "before_counts": before_counts,
         "after_counts": after_counts,
@@ -924,8 +985,11 @@ def _rank_and_limit_prediction_candidates(
         "after_total": sum(after_counts.values()),
         "theme_filter": theme_filter_stats,
         "top_priority_candidates": flat[:5],
+        "trend_limit": trend_limit_stats,
         **limit_stats,
     }
+    stats["limited"] = bool(limit_stats.get("limited") or trend_limit_stats.get("limited"))
+    stats["limit_reason"] = limit_reason
     return ranked, stats
 
 

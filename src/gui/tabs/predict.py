@@ -498,14 +498,14 @@ class PredictTab:
             # 兼容旧 stat_labels：让 sub_key 指向 recent_lbl（"近20d"列），
             # 这样 _apply_accuracy 现有 sub_key 分支的 fallback 仍能工作
             self.stat_labels[sub_key] = recent_lbl
-        cont_cols = ("code", "name", "industry", "theme", "boards", "change_pct",
+        cont_cols = ("code", "name", "close", "industry", "theme", "boards", "change_pct",
                      "seal_time", "accumulation", "relative_strength", "score",
                      "confirm", "auction", "result", "reasons")
         self.cont_tree = ttk.Treeview(
             cont_tab, columns=cont_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85),
+            "code": ("代码", 70), "name": ("名称", 85), "close": ("价格", 65),
             "industry": ("行业", 85), "theme": ("题材", 110),
             "boards": ("连板数", 60), "change_pct": ("涨跌幅%", 70),
             "seal_time": ("首封时间", 80), "score": ("预测分", 65),
@@ -553,14 +553,14 @@ class PredictTab:
                                wraplength=900, justify=tk.LEFT)
         first_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["first"] = first_best
-        first_cols = ("code", "name", "industry", "theme", "change_pct",
+        first_cols = ("code", "name", "close", "industry", "theme", "change_pct",
                       "burst_ratio", "dist_ma5", "accumulation", "relative_strength", "score",
                       "confirm", "auction", "result", "reasons")
         self.first_tree = ttk.Treeview(
             first_tab, columns=first_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85),
+            "code": ("代码", 70), "name": ("名称", 85), "close": ("价格", 65),
             "industry": ("行业", 85), "theme": ("题材", 110),
             "change_pct": ("今日涨幅%", 75), "burst_ratio": ("爆量倍数", 70),
             "dist_ma5": ("距MA5%", 65),
@@ -607,7 +607,7 @@ class PredictTab:
                                wraplength=900, justify=tk.LEFT)
         fresh_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["fresh"] = fresh_best
-        fresh_cols = ("code", "name", "industry", "theme", "change_pct",
+        fresh_cols = ("code", "name", "close", "industry", "theme", "change_pct",
                       "volume_ratio", "dist_ma5", "trend_5d",
                       "accumulation", "relative_strength", "score",
                       "confirm", "auction", "result", "reasons")
@@ -615,7 +615,7 @@ class PredictTab:
             fresh_tab, columns=fresh_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85),
+            "code": ("代码", 70), "name": ("名称", 85), "close": ("价格", 65),
             "industry": ("行业", 85), "theme": ("题材", 110),
             "change_pct": ("今日涨幅%", 75),
             "volume_ratio": ("量比", 60), "dist_ma5": ("距MA5%", 65),
@@ -663,7 +663,7 @@ class PredictTab:
                               wraplength=900, justify=tk.LEFT)
         wrap_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["wrap"] = wrap_best
-        wrap_cols = ("code", "name", "industry", "theme", "pattern_kind", "change_pct",
+        wrap_cols = ("code", "name", "close", "industry", "theme", "pattern_kind", "change_pct",
                      "prior_lu_date", "wrap_gap", "days_since_lu",
                      "accumulation", "relative_strength", "score",
                      "confirm", "auction", "result", "reasons")
@@ -671,7 +671,7 @@ class PredictTab:
             wrap_tab, columns=wrap_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85),
+            "code": ("代码", 70), "name": ("名称", 85), "close": ("价格", 65),
             "industry": ("行业", 85), "theme": ("题材", 110),
             "pattern_kind": ("形态", 70),
             "change_pct": ("今日涨幅%", 75),
@@ -720,7 +720,7 @@ class PredictTab:
                                wraplength=900, justify=tk.LEFT)
         trend_best.pack(side=tk.TOP, fill=tk.X)
         self.best_bucket_labels["trend"] = trend_best
-        trend_cols = ("code", "name", "industry", "theme", "change_pct",
+        trend_cols = ("code", "name", "close", "industry", "theme", "change_pct",
                       "ma_spread", "ma20_slope", "trend_5d",
                       "volume_ratio", "accumulation", "relative_strength", "score",
                       "confirm", "auction", "result", "reasons")
@@ -728,7 +728,7 @@ class PredictTab:
             trend_tab, columns=trend_cols, show="headings", height=22, style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "code": ("代码", 70), "name": ("名称", 85),
+            "code": ("代码", 70), "name": ("名称", 85), "close": ("价格", 65),
             "industry": ("行业", 85), "theme": ("题材", 110),
             "change_pct": ("今日涨幅%", 75),
             "ma_spread": ("均线差%", 70), "ma20_slope": ("MA20斜率%", 80),
@@ -1456,6 +1456,23 @@ class PredictTab:
             pass
 
     @staticmethod
+    def _price_value(record: Dict[str, Any]) -> Optional[float]:
+        for key in ("close", "price", "latest_close"):
+            value = record.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @classmethod
+    def _price_cell_text(cls, record: Dict[str, Any]) -> str:
+        value = cls._price_value(record)
+        return f"{value:.2f}" if value is not None else "-"
+
+    @staticmethod
     def _sort_value(record: Dict[str, Any], column: str):
         opening_confirmation = record.get("opening_confirmation") or {}
         confirm_status = str(opening_confirmation.get("status") or "")
@@ -1467,7 +1484,7 @@ class PredictTab:
             "industry": record.get("industry"),
             "boards": record.get("consecutive_boards"),
             "change_pct": record.get("change_pct"),
-            "close": record.get("close"),
+            "close": PredictTab._price_value(record),
             "seal_time": record.get("first_board_time"),
             "breaks": record.get("break_count"),
             "turnover": record.get("turnover"),
@@ -4145,6 +4162,7 @@ class PredictTab:
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
+                self._price_cell_text(rec),
                 rec.get("industry", ""),
                 self._candidate_theme_label(rec),
                 str(rec.get("consecutive_boards", 1)),
@@ -4171,6 +4189,7 @@ class PredictTab:
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
+                self._price_cell_text(rec),
                 rec.get("industry", ""),
                 self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
@@ -4212,6 +4231,7 @@ class PredictTab:
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
+                self._price_cell_text(rec),
                 rec.get("industry", ""),
                 self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",
@@ -4240,6 +4260,7 @@ class PredictTab:
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
+                self._price_cell_text(rec),
                 rec.get("industry", ""),
                 self._candidate_theme_label(rec),
                 _PATTERN_LABELS.get(rec.get("pattern_kind", ""), rec.get("predict_type", "-")),
@@ -4268,6 +4289,7 @@ class PredictTab:
             vals = (
                 rec.get("code", ""),
                 rec.get("name", ""),
+                self._price_cell_text(rec),
                 rec.get("industry", ""),
                 self._candidate_theme_label(rec),
                 f"{rec['change_pct']:.2f}" if rec.get("change_pct") is not None else "-",

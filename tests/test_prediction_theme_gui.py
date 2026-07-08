@@ -66,6 +66,19 @@ def test_prediction_candidate_tables_show_industry_and_theme_columns():
     assert "_candidate_theme_label" in render_src
 
 
+def test_prediction_candidate_tables_show_price_column():
+    build_src = inspect.getsource(PredictTab._build)
+    render_src = inspect.getsource(PredictTab._render_trees)
+
+    assert '"close"' in build_src
+    assert '"close": ("价格"' in build_src
+    assert "_price_cell_text(rec)" in render_src
+    assert PredictTab._price_cell_text({"close": 12.345}) == "12.35"
+    assert PredictTab._price_cell_text({"price": "8.6"}) == "8.60"
+    assert PredictTab._price_cell_text({"latest_close": 7}) == "7.00"
+    assert PredictTab._price_cell_text({}) == "-"
+
+
 def test_prediction_reason_cell_text_wraps_at_readable_boundaries():
     text = "4连板+30 / 4板开盘溢价偏大-10 / 未炸板+15 / 竞价高开+8"
 
