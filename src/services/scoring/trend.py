@@ -72,14 +72,16 @@ def _score_accumulation_signal(
 
     ma10 = close_num.rolling(10, min_periods=10).mean()
     if t >= 20 and not pd.isna(ma10.iloc[t]) and not pd.isna(ma10.iloc[t - 10]):
-        ma10_slope_pct = round((float(ma10.iloc[t]) / float(ma10.iloc[t - 10]) - 1) * 100, 1)
-        metrics["accumulation_ma10_slope_pct"] = ma10_slope_pct
-        if ma10_slope_pct >= 3:
-            score += 5
-            reasons.append(f"MA10中期抬升{ma10_slope_pct:+.1f}%+5")
-        elif ma10_slope_pct <= -2:
-            risk_penalty -= 4
-            reasons.append(f"MA10走弱{ma10_slope_pct:+.1f}%-4")
+        ma10_base = float(ma10.iloc[t - 10])
+        if ma10_base > 0:
+            ma10_slope_pct = round((float(ma10.iloc[t]) / ma10_base - 1) * 100, 1)
+            metrics["accumulation_ma10_slope_pct"] = ma10_slope_pct
+            if ma10_slope_pct >= 3:
+                score += 5
+                reasons.append(f"MA10中期抬升{ma10_slope_pct:+.1f}%+5")
+            elif ma10_slope_pct <= -2:
+                risk_penalty -= 4
+                reasons.append(f"MA10走弱{ma10_slope_pct:+.1f}%-4")
 
     if len(window_volume) >= window * 0.8:
         recent_vol = window_volume.iloc[-10:].mean()

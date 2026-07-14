@@ -721,6 +721,27 @@ def test_fresh_score_cooldown_treats_st_as_ten_percent_from_20260706():
     assert result is None
 
 
+def test_accumulation_signal_ignores_zero_ma10_baseline():
+    """坏历史 K 线中间段为 0 时，不应让涨停预测整体除零失败。"""
+    from src.services.scoring.trend import _score_accumulation_signal
+
+    close = pd.Series(
+        [10.0] * 31
+        + [0.0] * 10
+        + [10.2] * 10
+    )
+    volume = pd.Series([1_000_000] * len(close))
+
+    score, penalty, reasons, metrics = _score_accumulation_signal(
+        close, volume, len(close) - 1,
+    )
+
+    assert isinstance(score, int)
+    assert isinstance(penalty, int)
+    assert isinstance(reasons, list)
+    assert "accumulation_ma10_slope_pct" not in metrics
+
+
 def test_historical_spot_snapshot_online_fills_missing_target_rows(monkeypatch):
     first_snapshot = pd.DataFrame([
         {"代码": "000001", "名称": "平安银行", "最新价": 10.0, "涨跌幅": 1.0},
