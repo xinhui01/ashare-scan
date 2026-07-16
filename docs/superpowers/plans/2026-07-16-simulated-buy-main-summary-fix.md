@@ -48,7 +48,7 @@ all_trades = stock_store.load_simulated_buy_trades()
 curve = build_account_curve(all_trades)
 ```
 
-第一行格式为 `模拟买入: ...`，第二行格式为 `历史累计: ...账户累计...`。删除 `_show_simulated_intraday_message`、`_on_simulated_trade_select` 和 `_apply_simulated_intraday`，以及只被这些方法使用的请求状态字段和 `build_intraday_return_curve` 导入。
+第一行格式为 `模拟买入: 2只 · 有效0只 · 等待交易2只`，第二行格式为 `历史累计: 124笔 · 有效118笔 · 胜率25.4% (30/118) · 账户累计+86.5% · 单笔平均+1.2% · 等待交易4笔`。删除 `_show_simulated_intraday_message`、`_on_simulated_trade_select` 和 `_apply_simulated_intraday`，以及只被这些方法使用的请求状态字段和 `build_intraday_return_curve` 导入。
 
 - [ ] **Step 4: 运行聚焦和完整测试**
 
