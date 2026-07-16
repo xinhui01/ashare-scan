@@ -47,6 +47,7 @@ from src.services.market_focus_advice_service import (
 )
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.services.simulated_buy_service import (
+    build_account_curve,
     build_trade_snapshot,
     build_simulated_buy_picks,
     summarize_historical_simulated_buy_picks,
@@ -181,6 +182,7 @@ class PredictTab:
         self.results_map: Dict = {}
         self.simulated_buy_picks: List[Dict[str, Any]] = []
         self.simulated_history_thread: Optional[threading.Thread] = None
+        self.simulated_trade_rows: Dict[str, Dict[str, Any]] = {}
         self.candidate_theme_by_code: Dict[str, str] = {}
         self.candidate_theme_by_industry: Dict[str, str] = {}
         self.candidate_real_theme_names: set = set()
@@ -769,7 +771,7 @@ class PredictTab:
         self.trend_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
         self.trend_tree.tag_configure("best_bucket", background="#ffd54f", foreground="#1f1f1f")
 
-        # 模拟买入 Tab（每次预测自动挑 2 只，后续用 T+1 回填统计胜率/收益）
+        # 模拟买入 Tab：历史流水 + 账户复利曲线 + 单笔分时曲线
         simulated_tab = ttk.Frame(self.table_nb)
         self.table_nb.add(simulated_tab, text="模拟买入")
         self.simulated_buy_summary_label = ttk.Label(
@@ -782,24 +784,44 @@ class PredictTab:
             justify=tk.LEFT,
         )
         self.simulated_buy_summary_label.pack(side=tk.TOP, fill=tk.X)
+
+        simulated_body = ttk.PanedWindow(simulated_tab, orient=tk.VERTICAL)
+        simulated_body.pack(fill=tk.BOTH, expand=True)
+
+        account_frame = ttk.LabelFrame(simulated_body, text="账户累计收益", padding="4")
+        self.simulated_account_figure = Figure(figsize=(8.0, 2.0), dpi=100)
+        self.simulated_account_ax = self.simulated_account_figure.add_subplot(111)
+        self.simulated_account_canvas = FigureCanvasTkAgg(
+            self.simulated_account_figure,
+            master=account_frame,
+        )
+        self.simulated_account_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        simulated_body.add(account_frame, weight=2)
+
+        simulated_lower = ttk.PanedWindow(simulated_body, orient=tk.HORIZONTAL)
+        simulated_body.add(simulated_lower, weight=4)
+
+        history_frame = ttk.LabelFrame(simulated_lower, text="历史模拟交易", padding="4")
         sim_cols = (
-            "trade_date", "code", "name", "category", "score",
-            "buy_status", "result", "profit", "reasons",
+            "prediction_date", "trade_date", "code", "name", "category", "score",
+            "buy_price", "sell_price", "profit", "status", "reasons",
         )
         self.simulated_buy_tree = ttk.Treeview(
-            simulated_tab, columns=sim_cols, show="headings", height=22,
+            history_frame, columns=sim_cols, show="headings", height=16,
             style="PredictCandidate.Treeview",
         )
         for col, (heading, w) in {
-            "trade_date": ("预测日", 85),
+            "prediction_date": ("预测日", 85),
+            "trade_date": ("交易日", 85),
             "code": ("代码", 70),
             "name": ("名称", 85),
             "category": ("来源", 75),
             "score": ("预测分", 65),
-            "buy_status": ("买点", 70),
-            "result": ("结果", 70),
-            "profit": ("盈亏", 70),
-            "reasons": ("入选依据", 320),
+            "buy_price": ("买入价", 72),
+            "sell_price": ("卖出价", 72),
+            "profit": ("单笔盈亏", 78),
+            "status": ("状态", 90),
+            "reasons": ("入选依据", 260),
         }.items():
             self.simulated_buy_tree.heading(col, text=heading)
             self.simulated_buy_tree.column(
@@ -807,16 +829,25 @@ class PredictTab:
                 anchor=tk.CENTER if col not in ("reasons",) else tk.W,
                 stretch=False,
             )
-        sb_sim = ttk.Scrollbar(simulated_tab, orient=tk.VERTICAL, command=self.simulated_buy_tree.yview)
-        xsb_sim = ttk.Scrollbar(simulated_tab, orient=tk.HORIZONTAL, command=self.simulated_buy_tree.xview)
+        sb_sim = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=self.simulated_buy_tree.yview)
+        xsb_sim = ttk.Scrollbar(history_frame, orient=tk.HORIZONTAL, command=self.simulated_buy_tree.xview)
         self.simulated_buy_tree.configure(yscrollcommand=sb_sim.set, xscrollcommand=xsb_sim.set)
         sb_sim.pack(side=tk.RIGHT, fill=tk.Y)
         xsb_sim.pack(side=tk.BOTTOM, fill=tk.X)
         self.simulated_buy_tree.pack(fill=tk.BOTH, expand=True)
-        self.simulated_buy_tree.bind("<<TreeviewSelect>>", self._on_stock_select)
-        self.simulated_buy_tree.bind("<Double-1>", self._on_stock_double_click)
         self.simulated_buy_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self.simulated_buy_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
+        simulated_lower.add(history_frame, weight=5)
+
+        intraday_frame = ttk.LabelFrame(simulated_lower, text="买入当日分时收益", padding="4")
+        self.simulated_intraday_figure = Figure(figsize=(4.0, 3.0), dpi=100)
+        self.simulated_intraday_ax = self.simulated_intraday_figure.add_subplot(111)
+        self.simulated_intraday_canvas = FigureCanvasTkAgg(
+            self.simulated_intraday_figure,
+            master=intraday_frame,
+        )
+        self.simulated_intraday_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        simulated_lower.add(intraday_frame, weight=3)
 
         # 概念炒作 Tab（按"题材"维度看：哪些概念在被炒、持续多久、主线/龙头/潜伏）
         self._setup_concept_hype_subtab(self.table_nb)
@@ -4146,72 +4177,96 @@ class PredictTab:
         self.simulated_history_thread.start()
 
     def _render_simulated_buy_picks(self) -> None:
-        """Render the auto-selected two simulated buys and their T+1 stats."""
+        """Compatibility entry point used by existing prediction refresh paths."""
+        self._render_simulated_buy_history()
+
+    def _render_simulated_buy_history(self) -> None:
+        """Render the persisted trade ledger and its equal-weight equity curve."""
         if not hasattr(self, "simulated_buy_tree"):
             return
-        summary = summarize_simulated_buy_picks(
-            self.simulated_buy_picks or [],
-            self.results_map or {},
+        trades = stock_store.load_simulated_buy_trades()
+        curve = build_account_curve(trades)
+        completed = [
+            row for row in trades
+            if row.get("trade_status") == "completed" and int(row.get("is_buyable") or 0)
+        ]
+        wins = sum(int(row.get("is_hit") or 0) for row in completed)
+        avg_profit = (
+            sum(float(row.get("profit_pct") or 0.0) for row in completed) / len(completed)
+            if completed else 0.0
         )
-        total = int(summary.get("total") or 0)
-        evaluated = int(summary.get("evaluated") or 0)
-        wins = int(summary.get("wins") or 0)
-        win_rate = float(summary.get("win_rate") or 0.0)
-        total_profit = float(summary.get("total_profit_pct") or 0.0)
-        avg_profit = float(summary.get("avg_profit_pct") or 0.0)
-        if total <= 0:
-            text = "模拟买入: 暂无候选"
-        elif evaluated <= 0:
-            text = f"模拟买入: {total} 只，等待 T+1 数据回填"
-        else:
-            text = (
-                f"模拟买入: {total} 只 · 已评估 {evaluated} 只 · "
-                f"胜率 {win_rate:.1f}% ({wins}/{evaluated}) · "
-                f"总盈利 {total_profit:+.1f}% · 平均 {avg_profit:+.1f}%"
-            )
-        historical = self._load_historical_simulated_buy_summary()
-        historical_total = int(historical.get("total") or 0)
-        historical_evaluated = int(historical.get("evaluated") or 0)
-        if historical_total > 0 and historical_evaluated <= 0:
-            text = f"{text}\n历史累计: 等待 T+1 数据回填"
-        elif historical_evaluated > 0:
-            historical_wins = int(historical.get("wins") or 0)
-            historical_win_rate = float(historical.get("win_rate") or 0.0)
-            historical_profit = float(historical.get("total_profit_pct") or 0.0)
-            historical_avg = float(historical.get("avg_profit_pct") or 0.0)
-            text = (
-                f"{text}\n历史累计: 已评估 {historical_evaluated} 只 · "
-                f"胜率 {historical_win_rate:.1f}% ({historical_wins}/{historical_evaluated}) · "
-                f"累计盈亏 {historical_profit:+.1f}% · 单笔平均 {historical_avg:+.1f}%"
-            )
-        try:
-            self.simulated_buy_summary_label.configure(text=text)
-        except Exception:
-            pass
+        win_rate = (wins / len(completed) * 100.0) if completed else 0.0
+        cumulative = float(curve[-1]["cumulative_return_pct"]) if curve else 0.0
+        pending = sum(1 for row in trades if row.get("trade_status") == "pending")
+        text = (
+            f"历史模拟买入: {len(trades)} 笔 · 有效 {len(completed)} 笔 · "
+            f"胜率 {win_rate:.1f}% ({wins}/{len(completed)}) · "
+            f"账户累计 {cumulative:+.1f}% · 单笔平均 {avg_profit:+.1f}%"
+        )
+        if pending:
+            text += f" · 等待交易 {pending} 笔"
+        self.simulated_buy_summary_label.configure(text=text)
 
         self.simulated_buy_tree.delete(*self.simulated_buy_tree.get_children())
         self._clear_full_cell_texts(self.simulated_buy_tree)
-        for pick in summary.get("picks") or []:
-            profit = pick.get("profit_pct")
-            profit_text = "—" if profit is None else f"{float(profit):+.1f}%"
-            result_text = str(pick.get("result_text") or "待回填")
-            tag = "hit" if result_text == "命中" else "miss" if result_text == "未中" else ""
-            reasons = str(pick.get("reasons") or "")
-            vals = (
-                pick.get("trade_date") or "",
-                pick.get("code") or "",
-                pick.get("name") or "",
-                pick.get("category_label") or pick.get("category") or "",
-                f"{float(pick.get('score') or 0):.0f}",
-                pick.get("buy_status") or "待确认",
-                result_text,
-                profit_text,
+        self.simulated_trade_rows = {}
+        status_labels = {
+            "pending": "等待交易",
+            "completed": "已完成",
+            "one_word": "一字板不可买",
+            "suspended": "停牌",
+            "missing_price": "价格缺失",
+            "unbuyable": "不可买",
+        }
+        for trade in trades:
+            profit = trade.get("profit_pct")
+            reasons = str(trade.get("reasons") or "")
+            status = str(trade.get("trade_status") or "pending")
+            tag = "hit" if int(trade.get("is_hit") or 0) else "miss" if status == "completed" else ""
+            buy_price = trade.get("buy_price")
+            sell_price = trade.get("sell_price")
+            values = (
+                trade.get("prediction_date") or "",
+                trade.get("trade_date") or "",
+                trade.get("code") or "",
+                trade.get("name") or "",
+                trade.get("category_label") or trade.get("category") or "",
+                f"{float(trade.get('score') or 0):.0f}",
+                "—" if buy_price is None else f"{float(buy_price):.2f}",
+                "—" if sell_price is None else f"{float(sell_price):.2f}",
+                "—" if profit is None else f"{float(profit):+.1f}%",
+                status_labels.get(status, trade.get("unavailable_reason") or status),
                 self._reason_cell_text(self.simulated_buy_tree, reasons),
             )
             iid = self.simulated_buy_tree.insert(
-                "", tk.END, values=vals, tags=(tag,) if tag else (),
+                "", tk.END, values=values, tags=(tag,) if tag else (),
             )
+            self.simulated_trade_rows[iid] = dict(trade)
             self._set_full_cell_text(self.simulated_buy_tree, iid, "reasons", reasons)
+
+        ax = self.simulated_account_ax
+        ax.clear()
+        ax.axhline(0.0, color="#888888", linewidth=0.8, linestyle="--")
+        if curve:
+            x = list(range(len(curve)))
+            y = [float(point["cumulative_return_pct"]) for point in curve]
+            ax.plot(x, y, color="#2f6fd6", linewidth=1.8)
+            tick_step = max(1, len(x) // 8)
+            ticks = x[::tick_step]
+            ax.set_xticks(ticks)
+            ax.set_xticklabels(
+                [str(curve[index]["trade_date"])[4:] for index in ticks],
+                rotation=30,
+                ha="right",
+            )
+            ax.set_ylabel("累计收益 %")
+            ax.grid(True, alpha=0.2)
+        else:
+            ax.text(0.5, 0.5, "暂无已完成交易", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xticks([])
+            ax.set_yticks([])
+        self.simulated_account_figure.tight_layout()
+        self.simulated_account_canvas.draw_idle()
 
     def _render_trees(self) -> None:
         """根据当前筛选条件渲染 5 个候选表。"""

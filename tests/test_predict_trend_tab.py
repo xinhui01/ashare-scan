@@ -77,7 +77,7 @@ def test_prediction_tab_wires_simulated_buy_subtab():
     assert "build_simulated_buy_picks" in apply_src
     assert "_render_simulated_buy_picks" in apply_src
     assert "_render_simulated_buy_picks" in accuracy_src
-    assert "_load_historical_simulated_buy_summary" in render_src
+    assert "_render_simulated_buy_history" in render_src
     assert "summarize_historical_simulated_buy_picks" in history_src
 
 
@@ -89,3 +89,14 @@ def test_prediction_tab_syncs_trade_ledger_and_saves_new_picks():
     assert "sync_simulated_buy_history" in init_src
     assert "save_simulated_buy_trades" in apply_src
     assert "_start_simulated_buy_history_sync" in accuracy_src
+
+
+def test_simulated_buy_tab_has_history_and_account_curve():
+    build_src = inspect.getsource(PredictTab._build)
+    render_src = inspect.getsource(PredictTab._render_simulated_buy_history)
+
+    assert "simulated_account_canvas" in build_src
+    assert '"buy_price"' in build_src
+    assert '"sell_price"' in build_src
+    assert "build_account_curve" in render_src
+    assert "load_simulated_buy_trades" in render_src
