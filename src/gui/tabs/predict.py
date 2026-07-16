@@ -48,7 +48,6 @@ from src.services.market_focus_advice_service import (
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.services.simulated_buy_service import (
     build_account_curve,
-    build_intraday_return_curve,
     build_trade_snapshot,
     build_simulated_buy_picks,
     summarize_historical_simulated_buy_picks,
@@ -183,9 +182,6 @@ class PredictTab:
         self.results_map: Dict = {}
         self.simulated_buy_picks: List[Dict[str, Any]] = []
         self.simulated_history_thread: Optional[threading.Thread] = None
-        self.simulated_trade_rows: Dict[str, Dict[str, Any]] = {}
-        self.simulated_intraday_request_id: int = 0
-        self.simulated_intraday_selected_key: Tuple[str, str] = ("", "")
         self.simulated_history_window = None
         self.simulated_returns_window = None
         self.candidate_theme_by_code: Dict[str, str] = {}
@@ -802,10 +798,8 @@ class PredictTab:
             command=self.open_simulated_buy_history,
         ).pack(side=tk.RIGHT, padx=4, pady=3)
 
-        simulated_lower = ttk.PanedWindow(simulated_tab, orient=tk.HORIZONTAL)
-        simulated_lower.pack(fill=tk.BOTH, expand=True)
-
-        history_frame = ttk.LabelFrame(simulated_lower, text="当日模拟买入", padding="4")
+        history_frame = ttk.LabelFrame(simulated_tab, text="当日模拟买入", padding="4")
+        history_frame.pack(fill=tk.BOTH, expand=True)
         sim_cols = (
             "prediction_date", "trade_date", "code", "name", "category", "score",
             "buy_price", "sell_price", "profit", "status", "reasons",
@@ -839,20 +833,8 @@ class PredictTab:
         sb_sim.pack(side=tk.RIGHT, fill=tk.Y)
         xsb_sim.pack(side=tk.BOTTOM, fill=tk.X)
         self.simulated_buy_tree.pack(fill=tk.BOTH, expand=True)
-        self.simulated_buy_tree.bind("<<TreeviewSelect>>", self._on_simulated_trade_select)
         self.simulated_buy_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self.simulated_buy_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
-        simulated_lower.add(history_frame, weight=5)
-
-        intraday_frame = ttk.LabelFrame(simulated_lower, text="买入当日分时收益", padding="4")
-        self.simulated_intraday_figure = Figure(figsize=(4.0, 3.0), dpi=100)
-        self.simulated_intraday_ax = self.simulated_intraday_figure.add_subplot(111)
-        self.simulated_intraday_canvas = FigureCanvasTkAgg(
-            self.simulated_intraday_figure,
-            master=intraday_frame,
-        )
-        self.simulated_intraday_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        simulated_lower.add(intraday_frame, weight=3)
 
         # 概念炒作 Tab（按"题材"维度看：哪些概念在被炒、持续多久、主线/龙头/潜伏）
         self._setup_concept_hype_subtab(self.table_nb)
@@ -4218,22 +4200,54 @@ class PredictTab:
         win_rate = (wins / len(completed) * 100.0) if completed else 0.0
         pending = sum(1 for row in trades if row.get("trade_status") == "pending")
         if not trades:
-            text = "模拟买入: 当前预测日暂无候选"
+            current_text = "模拟买入: 当前预测日暂无候选"
         elif not completed:
-            text = f"模拟买入: {len(trades)} 只 · 等待交易 {pending} 只"
+            current_text = f"模拟买入: {len(trades)} 只 · 等待交易 {pending} 只"
         else:
-            text = (
+            current_text = (
                 f"模拟买入: {len(trades)} 只 · 有效 {len(completed)} 只 · "
                 f"胜率 {win_rate:.1f}% ({wins}/{len(completed)}) · "
                 f"单笔平均 {avg_profit:+.1f}%"
             )
             if pending:
-                text += f" · 等待交易 {pending} 只"
-        self.simulated_buy_summary_label.configure(text=text)
+                current_text += f" · 等待交易 {pending} 只"
+
+        all_trades = stock_store.load_simulated_buy_trades()
+        historical_completed = [
+            row for row in all_trades
+            if row.get("trade_status") == "completed" and int(row.get("is_buyable") or 0)
+        ]
+        historical_wins = sum(int(row.get("is_hit") or 0) for row in historical_completed)
+        historical_win_rate = (
+            historical_wins / len(historical_completed) * 100.0
+            if historical_completed else 0.0
+        )
+        historical_avg = (
+            sum(float(row.get("profit_pct") or 0.0) for row in historical_completed)
+            / len(historical_completed)
+            if historical_completed else 0.0
+        )
+        historical_pending = sum(
+            1 for row in all_trades if row.get("trade_status") == "pending"
+        )
+        historical_curve = build_account_curve(all_trades)
+        historical_cumulative = (
+            float(historical_curve[-1]["cumulative_return_pct"])
+            if historical_curve else 0.0
+        )
+        historical_text = (
+            f"历史累计: {len(all_trades)} 笔 · 有效 {len(historical_completed)} 笔 · "
+            f"胜率 {historical_win_rate:.1f}% "
+            f"({historical_wins}/{len(historical_completed)}) · "
+            f"账户累计 {historical_cumulative:+.1f}% · "
+            f"单笔平均 {historical_avg:+.1f}% · 等待交易 {historical_pending} 笔"
+        )
+        self.simulated_buy_summary_label.configure(
+            text=f"{current_text}\n{historical_text}"
+        )
 
         self.simulated_buy_tree.delete(*self.simulated_buy_tree.get_children())
         self._clear_full_cell_texts(self.simulated_buy_tree)
-        self.simulated_trade_rows = {}
         status_labels = {
             "pending": "等待交易",
             "completed": "已完成",
@@ -4265,7 +4279,6 @@ class PredictTab:
             iid = self.simulated_buy_tree.insert(
                 "", tk.END, values=values, tags=(tag,) if tag else (),
             )
-            self.simulated_trade_rows[iid] = dict(trade)
             self._set_full_cell_text(self.simulated_buy_tree, iid, "reasons", reasons)
 
     @staticmethod
@@ -4439,98 +4452,6 @@ class PredictTab:
                 self.simulated_returns_canvas = None
 
         win.protocol("WM_DELETE_WINDOW", _close)
-
-    def _show_simulated_intraday_message(self, message: str) -> None:
-        ax = self.simulated_intraday_ax
-        ax.clear()
-        ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        self.simulated_intraday_canvas.draw_idle()
-
-    def _on_simulated_trade_select(self, event=None) -> None:
-        """Load the selected trade day's intraday prices in a background thread."""
-        tree = self.simulated_buy_tree if event is None else event.widget
-        selection = tree.selection()
-        if not selection:
-            return
-        trade = self.simulated_trade_rows.get(selection[0])
-        if not trade:
-            return
-        code = str(trade.get("code") or "").strip().zfill(6)
-        trade_date = str(trade.get("trade_date") or "").strip()
-        buy_price = trade.get("buy_price")
-        self.simulated_intraday_request_id += 1
-        request_id = self.simulated_intraday_request_id
-        self.simulated_intraday_selected_key = (code, trade_date)
-        if not trade_date or buy_price is None:
-            self._show_simulated_intraday_message("该记录尚无可绘制的交易数据")
-            return
-        self._show_simulated_intraday_message("分时数据加载中…")
-
-        def _worker() -> None:
-            try:
-                payload = self.app.stock_filter.get_stock_intraday(
-                    code,
-                    day_offset=0,
-                    target_trade_date=trade_date,
-                )
-            except Exception as exc:
-                payload = {"error": str(exc), "intraday": None}
-            self.app._post_to_ui(
-                lambda: self._apply_simulated_intraday(request_id, trade, payload)
-            )
-
-        threading.Thread(
-            target=_worker,
-            name=f"simulated-intraday-{code}",
-            daemon=True,
-        ).start()
-
-    def _apply_simulated_intraday(
-        self,
-        request_id: int,
-        trade: Mapping[str, Any],
-        payload: Mapping[str, Any],
-    ) -> None:
-        """Draw an intraday return only if it still matches the current selection."""
-        if request_id != self.simulated_intraday_request_id:
-            return
-        code = str(trade.get("code") or "").strip().zfill(6)
-        trade_date = str(trade.get("trade_date") or "").strip()
-        if (code, trade_date) != self.simulated_intraday_selected_key:
-            return
-        intraday_df = payload.get("intraday") if isinstance(payload, Mapping) else None
-        points = build_intraday_return_curve(
-            intraday_df,
-            buy_price=float(trade.get("buy_price") or 0.0),
-        )
-        returns = points.get("returns_pct") or []
-        times = points.get("times") or []
-        if not returns:
-            self._show_simulated_intraday_message("暂无该交易日分时数据")
-            return
-
-        ax = self.simulated_intraday_ax
-        ax.clear()
-        x = list(range(len(returns)))
-        ax.plot(x, returns, color="#2f6fd6", linewidth=1.6)
-        ax.axhline(0.0, color="#888888", linewidth=0.8, linestyle="--")
-        ax.scatter([x[0]], [returns[0]], color="#2e7d32", s=28, zorder=3)
-        ax.annotate("买入", (x[0], returns[0]), xytext=(4, 7), textcoords="offset points")
-        ax.scatter([x[-1]], [returns[-1]], color="#c62828", s=28, zorder=3)
-        ax.annotate("卖出", (x[-1], returns[-1]), xytext=(-30, 7), textcoords="offset points")
-        tick_step = max(1, len(x) // 5)
-        ticks = x[::tick_step]
-        if ticks[-1] != x[-1]:
-            ticks.append(x[-1])
-        ax.set_xticks(ticks)
-        ax.set_xticklabels([str(times[index])[-5:] for index in ticks], rotation=30, ha="right")
-        ax.set_ylabel("相对买入价 %")
-        ax.set_title(f"{code} · {trade_date} 开盘买入 / 收盘卖出")
-        ax.grid(True, alpha=0.2)
-        self.simulated_intraday_figure.tight_layout()
-        self.simulated_intraday_canvas.draw_idle()
 
     def _render_trees(self) -> None:
         """根据当前筛选条件渲染 5 个候选表。"""
