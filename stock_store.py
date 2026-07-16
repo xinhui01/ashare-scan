@@ -328,6 +328,32 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (trade_date, code, category)
         );
 
+        CREATE TABLE IF NOT EXISTS simulated_buy_trades (
+            prediction_date TEXT NOT NULL,
+            trade_date TEXT NOT NULL DEFAULT '',
+            code TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
+            theme TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            category_label TEXT NOT NULL DEFAULT '',
+            score REAL NOT NULL DEFAULT 0,
+            buy_status TEXT NOT NULL DEFAULT '',
+            reasons TEXT NOT NULL DEFAULT '',
+            buy_price REAL,
+            sell_price REAL,
+            profit_pct REAL,
+            is_buyable INTEGER NOT NULL DEFAULT 0,
+            trade_status TEXT NOT NULL DEFAULT 'pending',
+            unavailable_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (prediction_date, code)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_simulated_buy_trade_date
+            ON simulated_buy_trades(trade_date);
+
         CREATE INDEX IF NOT EXISTS idx_lup_accuracy_date
             ON limit_up_prediction_accuracy(trade_date);
         CREATE INDEX IF NOT EXISTS idx_lup_accuracy_category
@@ -1281,6 +1307,140 @@ def load_limit_up_compare_by_date(today_date: str) -> Optional[Dict[str, Any]]:
 
 
 # ============== 涨停预测准确率（limit_up_prediction_accuracy） ==============
+
+_SIMULATED_BUY_SNAPSHOT_FIELDS = (
+    "prediction_date", "trade_date", "code", "name", "industry", "theme",
+    "category", "category_label", "score", "buy_status", "reasons",
+    "buy_price", "sell_price", "profit_pct", "is_buyable", "trade_status",
+    "unavailable_reason", "created_at", "updated_at",
+)
+
+
+def save_simulated_buy_trades(records: List[Dict[str, Any]]) -> int:
+    """Insert immutable simulated-buy snapshots and return the inserted count."""
+    if not records:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows: List[Tuple[Any, ...]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        prediction_date = str(rec.get("prediction_date") or "").strip()
+        code = str(rec.get("code") or "").strip().zfill(6)
+        if not prediction_date or not code or code == "000000":
+            continue
+        rows.append((
+            prediction_date,
+            str(rec.get("trade_date") or "").strip(),
+            code,
+            str(rec.get("name") or ""),
+            str(rec.get("industry") or ""),
+            str(rec.get("theme") or ""),
+            str(rec.get("category") or ""),
+            str(rec.get("category_label") or ""),
+            float(rec.get("score") or 0.0),
+            str(rec.get("buy_status") or ""),
+            str(rec.get("reasons") or ""),
+            _to_float(rec.get("buy_price")),
+            _to_float(rec.get("sell_price")),
+            _to_float(rec.get("profit_pct")),
+            int(bool(rec.get("is_buyable"))),
+            str(rec.get("trade_status") or "pending"),
+            str(rec.get("unavailable_reason") or ""),
+            str(rec.get("created_at") or now),
+            str(rec.get("updated_at") or now),
+        ))
+    if not rows:
+        return 0
+
+    def _write() -> int:
+        with _connect() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO simulated_buy_trades(
+                    prediction_date, trade_date, code, name, industry, theme,
+                    category, category_label, score, buy_status, reasons,
+                    buy_price, sell_price, profit_pct, is_buyable, trade_status,
+                    unavailable_reason, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            return conn.total_changes - before
+
+    try:
+        with _DB_WRITE_LOCK:
+            return int(_retry_locked(_write) or 0)
+    except Exception:
+        logger.exception("保存模拟买入流水失败")
+        return 0
+
+
+def update_simulated_buy_trade_result(
+    prediction_date: str,
+    code: str,
+    *,
+    trade_date: str,
+    buy_price: Optional[float],
+    sell_price: Optional[float],
+    profit_pct: Optional[float],
+    is_buyable: bool,
+    trade_status: str,
+    unavailable_reason: str,
+) -> bool:
+    """Update only the mutable T+1 result fields of a simulated trade."""
+    prediction_date = str(prediction_date or "").strip()
+    normalized_code = str(code or "").strip().zfill(6)
+    if not prediction_date or normalized_code == "000000":
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write() -> int:
+        with _connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE simulated_buy_trades
+                SET trade_date = ?, buy_price = ?, sell_price = ?, profit_pct = ?,
+                    is_buyable = ?, trade_status = ?, unavailable_reason = ?, updated_at = ?
+                WHERE prediction_date = ? AND code = ?
+                """,
+                (
+                    str(trade_date or "").strip(), _to_float(buy_price),
+                    _to_float(sell_price), _to_float(profit_pct), int(bool(is_buyable)),
+                    str(trade_status or "pending"), str(unavailable_reason or ""), now,
+                    prediction_date, normalized_code,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    try:
+        with _DB_WRITE_LOCK:
+            return bool(_retry_locked(_write))
+    except Exception:
+        logger.exception("回填模拟买入流水失败")
+        return False
+
+
+def load_simulated_buy_trades(*, descending: bool = True) -> List[Dict[str, Any]]:
+    """Load simulated trades ordered by prediction date and stock code."""
+    if not _DB_PATH.is_file():
+        return []
+    direction = "DESC" if descending else "ASC"
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                f"SELECT * FROM simulated_buy_trades "
+                f"ORDER BY prediction_date {direction}, code ASC"
+            ).fetchall()
+
+    try:
+        rows = _retry_locked(_read)
+    except Exception:
+        logger.exception("读取模拟买入流水失败")
+        return []
+    return [{field: row[field] for field in _SIMULATED_BUY_SNAPSHOT_FIELDS} for row in rows]
 
 _PREDICTION_ACCURACY_FIELDS = (
     "trade_date", "verify_date", "code", "category",

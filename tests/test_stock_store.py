@@ -283,6 +283,61 @@ class TestLimitUpStockMeta(StockStoreTestCase):
         self.assertEqual(meta["last_limit_up_trade_date"], "20260430")
 
 
+class TestSimulatedBuyTrades(StockStoreTestCase):
+    def test_save_load_and_update_simulated_buy_trade(self):
+        from stock_store import (
+            load_simulated_buy_trades,
+            save_simulated_buy_trades,
+            update_simulated_buy_trade_result,
+        )
+
+        row = {
+            "prediction_date": "20260701",
+            "code": "000001",
+            "name": "甲",
+            "industry": "银行",
+            "theme": "金融",
+            "category": "first",
+            "category_label": "二波接力",
+            "score": 88,
+            "buy_status": "可买",
+            "reasons": "测试",
+        }
+
+        self.assertEqual(save_simulated_buy_trades([row]), 1)
+        self.assertEqual(save_simulated_buy_trades([row]), 0)
+        self.assertTrue(update_simulated_buy_trade_result(
+            "20260701",
+            "000001",
+            trade_date="20260702",
+            buy_price=10.0,
+            sell_price=10.5,
+            profit_pct=5.0,
+            is_buyable=True,
+            trade_status="completed",
+            unavailable_reason="",
+        ))
+
+        rows = load_simulated_buy_trades()
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["trade_date"], "20260702")
+        self.assertEqual(rows[0]["profit_pct"], 5.0)
+        self.assertEqual(rows[0]["trade_status"], "completed")
+
+    def test_load_simulated_buy_trades_orders_newest_first(self):
+        from stock_store import load_simulated_buy_trades, save_simulated_buy_trades
+
+        save_simulated_buy_trades([
+            {"prediction_date": "20260701", "code": "000001"},
+            {"prediction_date": "20260703", "code": "000003"},
+        ])
+
+        rows = load_simulated_buy_trades()
+
+        self.assertEqual([row["prediction_date"] for row in rows], ["20260703", "20260701"])
+
+
 class TestClearTables(StockStoreTestCase):
     def test_clear_universe(self):
         from stock_store import save_universe, load_universe, clear_universe
