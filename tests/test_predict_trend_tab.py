@@ -93,15 +93,30 @@ def test_prediction_tab_syncs_trade_ledger_and_saves_new_picks():
     assert "_start_simulated_buy_history_sync" in accuracy_src
 
 
-def test_simulated_buy_tab_has_history_and_account_curve():
+def test_simulated_buy_tab_has_current_trade_table_and_intraday_curve():
     build_src = inspect.getsource(PredictTab._build)
     render_src = inspect.getsource(PredictTab._render_simulated_buy_history)
 
-    assert "simulated_account_canvas" in build_src
+    assert "simulated_intraday_canvas" in build_src
     assert '"buy_price"' in build_src
     assert '"sell_price"' in build_src
-    assert "build_account_curve" in render_src
-    assert "load_simulated_buy_trades" in render_src
+    assert "_current_simulated_buy_trades" in render_src
+
+
+def test_simulated_buy_main_view_filters_current_prediction_date():
+    source = inspect.getsource(PredictTab._current_simulated_buy_trades)
+    render = inspect.getsource(PredictTab._render_simulated_buy_history)
+
+    assert 'row.get("prediction_date")' in source
+    assert "prediction_date" in source
+    assert "_current_simulated_buy_trades" in render
+
+
+def test_simulated_buy_tab_has_history_and_return_buttons():
+    source = inspect.getsource(PredictTab._build)
+
+    assert 'text="历史模拟买入"' in source
+    assert 'text="收益率"' in source
 
 
 def test_simulated_history_selection_loads_target_intraday_safely():
@@ -112,3 +127,12 @@ def test_simulated_history_selection_loads_target_intraday_safely():
     assert "simulated_intraday_request_id" in select_src
     assert "request_id != self.simulated_intraday_request_id" in apply_src
     assert "build_intraday_return_curve" in apply_src
+
+
+def test_simulated_buy_popups_use_all_history():
+    history = inspect.getsource(PredictTab.open_simulated_buy_history)
+    returns = inspect.getsource(PredictTab.open_simulated_buy_returns)
+
+    assert "load_simulated_buy_trades" in history
+    assert "load_simulated_buy_trades" in returns
+    assert "build_account_curve" in returns
