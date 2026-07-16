@@ -344,6 +344,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             sell_price REAL,
             profit_pct REAL,
             is_buyable INTEGER NOT NULL DEFAULT 0,
+            is_hit INTEGER NOT NULL DEFAULT 0,
             trade_status TEXT NOT NULL DEFAULT 'pending',
             unavailable_reason TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT '',
@@ -391,6 +392,14 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t2_open REAL")
     if "t1_open_t2_open_pct" not in accuracy_columns:
         conn.execute("ALTER TABLE limit_up_prediction_accuracy ADD COLUMN t1_open_t2_open_pct REAL")
+
+    simulated_trade_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(simulated_buy_trades)").fetchall()
+    }
+    if "is_hit" not in simulated_trade_columns:
+        conn.execute(
+            "ALTER TABLE simulated_buy_trades ADD COLUMN is_hit INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def db_path() -> Path:
@@ -1311,7 +1320,7 @@ def load_limit_up_compare_by_date(today_date: str) -> Optional[Dict[str, Any]]:
 _SIMULATED_BUY_SNAPSHOT_FIELDS = (
     "prediction_date", "trade_date", "code", "name", "industry", "theme",
     "category", "category_label", "score", "buy_status", "reasons",
-    "buy_price", "sell_price", "profit_pct", "is_buyable", "trade_status",
+    "buy_price", "sell_price", "profit_pct", "is_buyable", "is_hit", "trade_status",
     "unavailable_reason", "created_at", "updated_at",
 )
 
@@ -1345,6 +1354,7 @@ def save_simulated_buy_trades(records: List[Dict[str, Any]]) -> int:
             _to_float(rec.get("sell_price")),
             _to_float(rec.get("profit_pct")),
             int(bool(rec.get("is_buyable"))),
+            int(bool(rec.get("is_hit"))),
             str(rec.get("trade_status") or "pending"),
             str(rec.get("unavailable_reason") or ""),
             str(rec.get("created_at") or now),
@@ -1361,9 +1371,9 @@ def save_simulated_buy_trades(records: List[Dict[str, Any]]) -> int:
                 INSERT OR IGNORE INTO simulated_buy_trades(
                     prediction_date, trade_date, code, name, industry, theme,
                     category, category_label, score, buy_status, reasons,
-                    buy_price, sell_price, profit_pct, is_buyable, trade_status,
+                    buy_price, sell_price, profit_pct, is_buyable, is_hit, trade_status,
                     unavailable_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1386,6 +1396,7 @@ def update_simulated_buy_trade_result(
     sell_price: Optional[float],
     profit_pct: Optional[float],
     is_buyable: bool,
+    is_hit: bool,
     trade_status: str,
     unavailable_reason: str,
 ) -> bool:
@@ -1402,12 +1413,13 @@ def update_simulated_buy_trade_result(
                 """
                 UPDATE simulated_buy_trades
                 SET trade_date = ?, buy_price = ?, sell_price = ?, profit_pct = ?,
-                    is_buyable = ?, trade_status = ?, unavailable_reason = ?, updated_at = ?
+                    is_buyable = ?, is_hit = ?, trade_status = ?, unavailable_reason = ?, updated_at = ?
                 WHERE prediction_date = ? AND code = ?
                 """,
                 (
                     str(trade_date or "").strip(), _to_float(buy_price),
                     _to_float(sell_price), _to_float(profit_pct), int(bool(is_buyable)),
+                    int(bool(is_hit)),
                     str(trade_status or "pending"), str(unavailable_reason or ""), now,
                     prediction_date, normalized_code,
                 ),

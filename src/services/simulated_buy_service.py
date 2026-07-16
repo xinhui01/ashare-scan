@@ -140,6 +140,7 @@ def build_trade_snapshot(pick: Mapping[str, Any]) -> Dict[str, Any]:
         "sell_price": None,
         "profit_pct": None,
         "is_buyable": 0,
+        "is_hit": 0,
         "trade_status": "pending",
         "unavailable_reason": "",
     }
@@ -158,6 +159,7 @@ def apply_accuracy_result(
     item["sell_price"] = result.get("t1_close")
     item["profit_pct"] = result.get("t1_open_close_pct")
     item["is_buyable"] = int(bool(result.get("hit_buyable")))
+    item["is_hit"] = int(_is_hit(str(item.get("category") or ""), result))
     if result.get("t1_one_word"):
         item["trade_status"] = "one_word"
         item["unavailable_reason"] = "一字板不可买"
@@ -273,6 +275,7 @@ def sync_simulated_buy_history(
                 sell_price=evaluated["sell_price"],
                 profit_pct=evaluated["profit_pct"],
                 is_buyable=bool(evaluated["is_buyable"]),
+                is_hit=bool(evaluated["is_hit"]),
                 trade_status=evaluated["trade_status"],
                 unavailable_reason=evaluated["unavailable_reason"],
             )

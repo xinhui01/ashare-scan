@@ -162,12 +162,14 @@ def test_build_trade_snapshot_and_apply_completed_result():
         "t1_close": 10.5,
         "t1_open_close_pct": 5.0,
         "hit_buyable": 1,
+        "hit_loose": 1,
     })
 
     assert updated["prediction_date"] == "20260701"
     assert updated["trade_status"] == "completed"
     assert updated["profit_pct"] == 5.0
     assert updated["is_buyable"] == 1
+    assert updated["is_hit"] == 1
 
 
 @pytest.mark.parametrize(

@@ -314,6 +314,7 @@ class TestSimulatedBuyTrades(StockStoreTestCase):
             sell_price=10.5,
             profit_pct=5.0,
             is_buyable=True,
+            is_hit=True,
             trade_status="completed",
             unavailable_reason="",
         ))
@@ -323,6 +324,7 @@ class TestSimulatedBuyTrades(StockStoreTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["trade_date"], "20260702")
         self.assertEqual(rows[0]["profit_pct"], 5.0)
+        self.assertEqual(rows[0]["is_hit"], 1)
         self.assertEqual(rows[0]["trade_status"], "completed")
 
     def test_load_simulated_buy_trades_orders_newest_first(self):
