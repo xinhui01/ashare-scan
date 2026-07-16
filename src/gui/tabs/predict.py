@@ -48,6 +48,7 @@ from src.services.market_focus_advice_service import (
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.services.simulated_buy_service import (
     build_simulated_buy_picks,
+    summarize_historical_simulated_buy_picks,
     summarize_simulated_buy_picks,
 )
 from src.services.scoring.predict import (
@@ -4055,6 +4056,37 @@ class PredictTab:
             parts.append(reason[:18] if reason else "—")
         return status, " ".join(parts)
 
+    def _load_historical_simulated_buy_summary(self) -> Dict[str, Any]:
+        """Load saved predictions and summarize reconstructed simulated buys."""
+        predictions: List[Dict[str, Any]] = []
+        results_by_date: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+        try:
+            dates = list_limit_up_prediction_dates()
+        except Exception:
+            dates = []
+        for trade_date in dates:
+            td = str(trade_date or "").strip()
+            if not td:
+                continue
+            try:
+                payload = load_limit_up_prediction_by_date(td)
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                continue
+            predictions.append(payload)
+            try:
+                results_by_date[td] = prediction_accuracy_service.get_per_code_results(td)
+            except Exception:
+                results_by_date[td] = {}
+        if not predictions:
+            return {}
+        return summarize_historical_simulated_buy_picks(
+            predictions,
+            results_by_date,
+            limit=2,
+        )
+
     def _render_simulated_buy_picks(self) -> None:
         """Render the auto-selected two simulated buys and their T+1 stats."""
         if not hasattr(self, "simulated_buy_tree"):
@@ -4078,6 +4110,21 @@ class PredictTab:
                 f"模拟买入: {total} 只 · 已评估 {evaluated} 只 · "
                 f"胜率 {win_rate:.1f}% ({wins}/{evaluated}) · "
                 f"总盈利 {total_profit:+.1f}% · 平均 {avg_profit:+.1f}%"
+            )
+        historical = self._load_historical_simulated_buy_summary()
+        historical_total = int(historical.get("total") or 0)
+        historical_evaluated = int(historical.get("evaluated") or 0)
+        if historical_total > 0 and historical_evaluated <= 0:
+            text = f"{text}\n历史累计: 等待 T+1 数据回填"
+        elif historical_evaluated > 0:
+            historical_wins = int(historical.get("wins") or 0)
+            historical_win_rate = float(historical.get("win_rate") or 0.0)
+            historical_profit = float(historical.get("total_profit_pct") or 0.0)
+            historical_avg = float(historical.get("avg_profit_pct") or 0.0)
+            text = (
+                f"{text}\n历史累计: 已评估 {historical_evaluated} 只 · "
+                f"胜率 {historical_win_rate:.1f}% ({historical_wins}/{historical_evaluated}) · "
+                f"累计盈亏 {historical_profit:+.1f}% · 单笔平均 {historical_avg:+.1f}%"
             )
         try:
             self.simulated_buy_summary_label.configure(text=text)

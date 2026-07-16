@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 CATEGORY_CONFIG: Tuple[Tuple[str, str, str], ...] = (
@@ -175,6 +175,51 @@ def summarize_simulated_buy_picks(
         "picks": enriched,
         "total": len(enriched),
         "evaluated": evaluated,
+        "wins": wins,
+        "win_rate": win_rate,
+        "total_profit_pct": total_profit,
+        "avg_profit_pct": avg_profit,
+    }
+
+
+def summarize_historical_simulated_buy_picks(
+    prediction_results: Iterable[Mapping[str, Any]],
+    results_maps_by_date: Mapping[str, Mapping[Tuple[str, str], Mapping[str, Any]]],
+    *,
+    limit: int = 2,
+) -> Dict[str, Any]:
+    """Rebuild daily simulated buys from saved predictions and total their results."""
+    total = 0
+    evaluated = 0
+    wins = 0
+    total_profit = 0.0
+    pending = 0
+
+    for prediction in prediction_results or []:
+        if not isinstance(prediction, Mapping):
+            continue
+        trade_date = str(prediction.get("trade_date") or "").strip()
+        picks = build_simulated_buy_picks(prediction, limit=limit)
+        if not picks:
+            continue
+        daily_summary = summarize_simulated_buy_picks(
+            picks,
+            results_maps_by_date.get(trade_date, {}),
+        )
+        daily_total = int(daily_summary.get("total") or 0)
+        daily_evaluated = int(daily_summary.get("evaluated") or 0)
+        total += daily_total
+        evaluated += daily_evaluated
+        wins += int(daily_summary.get("wins") or 0)
+        total_profit += float(daily_summary.get("total_profit_pct") or 0.0)
+        pending += max(0, daily_total - daily_evaluated)
+
+    win_rate = (wins / evaluated * 100.0) if evaluated else 0.0
+    avg_profit = (total_profit / evaluated) if evaluated else 0.0
+    return {
+        "total": total,
+        "evaluated": evaluated,
+        "pending": pending,
         "wins": wins,
         "win_rate": win_rate,
         "total_profit_pct": total_profit,

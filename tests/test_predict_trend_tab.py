@@ -70,8 +70,12 @@ def test_prediction_tab_wires_simulated_buy_subtab():
     build_src = inspect.getsource(PredictTab._build)
     apply_src = inspect.getsource(PredictTab._apply_result)
     accuracy_src = inspect.getsource(PredictTab._apply_accuracy)
+    render_src = inspect.getsource(PredictTab._render_simulated_buy_picks)
+    history_src = inspect.getsource(PredictTab._load_historical_simulated_buy_summary)
 
     assert "模拟买入" in build_src
     assert "build_simulated_buy_picks" in apply_src
     assert "_render_simulated_buy_picks" in apply_src
     assert "_render_simulated_buy_picks" in accuracy_src
+    assert "_load_historical_simulated_buy_summary" in render_src
+    assert "summarize_historical_simulated_buy_picks" in history_src
