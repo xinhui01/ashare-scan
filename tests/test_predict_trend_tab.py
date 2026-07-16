@@ -100,3 +100,13 @@ def test_simulated_buy_tab_has_history_and_account_curve():
     assert '"sell_price"' in build_src
     assert "build_account_curve" in render_src
     assert "load_simulated_buy_trades" in render_src
+
+
+def test_simulated_history_selection_loads_target_intraday_safely():
+    select_src = inspect.getsource(PredictTab._on_simulated_trade_select)
+    apply_src = inspect.getsource(PredictTab._apply_simulated_intraday)
+
+    assert "target_trade_date=trade_date" in select_src
+    assert "simulated_intraday_request_id" in select_src
+    assert "request_id != self.simulated_intraday_request_id" in apply_src
+    assert "build_intraday_return_curve" in apply_src

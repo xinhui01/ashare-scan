@@ -48,6 +48,7 @@ from src.services.market_focus_advice_service import (
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.services.simulated_buy_service import (
     build_account_curve,
+    build_intraday_return_curve,
     build_trade_snapshot,
     build_simulated_buy_picks,
     summarize_historical_simulated_buy_picks,
@@ -183,6 +184,8 @@ class PredictTab:
         self.simulated_buy_picks: List[Dict[str, Any]] = []
         self.simulated_history_thread: Optional[threading.Thread] = None
         self.simulated_trade_rows: Dict[str, Dict[str, Any]] = {}
+        self.simulated_intraday_request_id: int = 0
+        self.simulated_intraday_selected_key: Tuple[str, str] = ("", "")
         self.candidate_theme_by_code: Dict[str, str] = {}
         self.candidate_theme_by_industry: Dict[str, str] = {}
         self.candidate_real_theme_names: set = set()
@@ -835,6 +838,7 @@ class PredictTab:
         sb_sim.pack(side=tk.RIGHT, fill=tk.Y)
         xsb_sim.pack(side=tk.BOTTOM, fill=tk.X)
         self.simulated_buy_tree.pack(fill=tk.BOTH, expand=True)
+        self.simulated_buy_tree.bind("<<TreeviewSelect>>", self._on_simulated_trade_select)
         self.simulated_buy_tree.tag_configure("hit", background="#a5d6a7", foreground="#1f1f1f")
         self.simulated_buy_tree.tag_configure("miss", background="#ffcdd2", foreground="#1f1f1f")
         simulated_lower.add(history_frame, weight=5)
@@ -4267,6 +4271,98 @@ class PredictTab:
             ax.set_yticks([])
         self.simulated_account_figure.tight_layout()
         self.simulated_account_canvas.draw_idle()
+
+    def _show_simulated_intraday_message(self, message: str) -> None:
+        ax = self.simulated_intraday_ax
+        ax.clear()
+        ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self.simulated_intraday_canvas.draw_idle()
+
+    def _on_simulated_trade_select(self, event=None) -> None:
+        """Load the selected trade day's intraday prices in a background thread."""
+        tree = self.simulated_buy_tree if event is None else event.widget
+        selection = tree.selection()
+        if not selection:
+            return
+        trade = self.simulated_trade_rows.get(selection[0])
+        if not trade:
+            return
+        code = str(trade.get("code") or "").strip().zfill(6)
+        trade_date = str(trade.get("trade_date") or "").strip()
+        buy_price = trade.get("buy_price")
+        self.simulated_intraday_request_id += 1
+        request_id = self.simulated_intraday_request_id
+        self.simulated_intraday_selected_key = (code, trade_date)
+        if not trade_date or buy_price is None:
+            self._show_simulated_intraday_message("该记录尚无可绘制的交易数据")
+            return
+        self._show_simulated_intraday_message("分时数据加载中…")
+
+        def _worker() -> None:
+            try:
+                payload = self.app.stock_filter.get_stock_intraday(
+                    code,
+                    day_offset=0,
+                    target_trade_date=trade_date,
+                )
+            except Exception as exc:
+                payload = {"error": str(exc), "intraday": None}
+            self.app._post_to_ui(
+                lambda: self._apply_simulated_intraday(request_id, trade, payload)
+            )
+
+        threading.Thread(
+            target=_worker,
+            name=f"simulated-intraday-{code}",
+            daemon=True,
+        ).start()
+
+    def _apply_simulated_intraday(
+        self,
+        request_id: int,
+        trade: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Draw an intraday return only if it still matches the current selection."""
+        if request_id != self.simulated_intraday_request_id:
+            return
+        code = str(trade.get("code") or "").strip().zfill(6)
+        trade_date = str(trade.get("trade_date") or "").strip()
+        if (code, trade_date) != self.simulated_intraday_selected_key:
+            return
+        intraday_df = payload.get("intraday") if isinstance(payload, Mapping) else None
+        points = build_intraday_return_curve(
+            intraday_df,
+            buy_price=float(trade.get("buy_price") or 0.0),
+        )
+        returns = points.get("returns_pct") or []
+        times = points.get("times") or []
+        if not returns:
+            self._show_simulated_intraday_message("暂无该交易日分时数据")
+            return
+
+        ax = self.simulated_intraday_ax
+        ax.clear()
+        x = list(range(len(returns)))
+        ax.plot(x, returns, color="#2f6fd6", linewidth=1.6)
+        ax.axhline(0.0, color="#888888", linewidth=0.8, linestyle="--")
+        ax.scatter([x[0]], [returns[0]], color="#2e7d32", s=28, zorder=3)
+        ax.annotate("买入", (x[0], returns[0]), xytext=(4, 7), textcoords="offset points")
+        ax.scatter([x[-1]], [returns[-1]], color="#c62828", s=28, zorder=3)
+        ax.annotate("卖出", (x[-1], returns[-1]), xytext=(-30, 7), textcoords="offset points")
+        tick_step = max(1, len(x) // 5)
+        ticks = x[::tick_step]
+        if ticks[-1] != x[-1]:
+            ticks.append(x[-1])
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([str(times[index])[-5:] for index in ticks], rotation=30, ha="right")
+        ax.set_ylabel("相对买入价 %")
+        ax.set_title(f"{code} · {trade_date} 开盘买入 / 收盘卖出")
+        ax.grid(True, alpha=0.2)
+        self.simulated_intraday_figure.tight_layout()
+        self.simulated_intraday_canvas.draw_idle()
 
     def _render_trees(self) -> None:
         """根据当前筛选条件渲染 5 个候选表。"""
