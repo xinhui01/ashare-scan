@@ -1187,9 +1187,15 @@ class PredictTab:
         if not path:
             return
         try:
+            all_trades = stock_store.load_simulated_buy_trades()
+            current_trades = [
+                row for row in all_trades
+                if str(row.get("prediction_date") or "").strip() == trade_date
+            ]
             written = export_prediction_to_excel(
                 self._export_payload_with_current_filters(),
                 path,
+                simulated_buy_trades=current_trades,
             )
         except Exception as exc:
             messagebox.showerror("导出Excel", f"导出失败: {exc}", parent=self.app.root)

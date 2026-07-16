@@ -86,6 +86,29 @@ CANDIDATE_SPECS: List[CandidateSpec] = [
     ),
 ]
 
+SIMULATED_BUY_COLUMNS: List[Tuple[str, str]] = [
+    ("prediction_date", "预测日"),
+    ("trade_date", "交易日"),
+    ("code", "代码"),
+    ("name", "名称"),
+    ("category_label", "来源"),
+    ("score", "预测分"),
+    ("buy_price", "买入价"),
+    ("sell_price", "卖出价"),
+    ("profit_pct", "单笔盈亏%"),
+    ("_status_text", "状态"),
+    ("reasons", "入选依据"),
+]
+
+SIMULATED_BUY_STATUS_LABELS = {
+    "pending": "等待交易",
+    "completed": "已完成",
+    "one_word": "一字板不可买",
+    "suspended": "停牌",
+    "missing_price": "价格缺失",
+    "unbuyable": "不可买",
+}
+
 
 def _safe_sheet_name(name: str) -> str:
     return str(name or "Sheet")[:31]
@@ -308,7 +331,37 @@ def _write_theme_sheet(wb: Workbook, prediction: Dict[str, Any]) -> None:
     _autosize(ws)
 
 
-def export_prediction_to_excel(prediction: Dict[str, Any], path: str | Path) -> Path:
+def _write_simulated_buy_sheet(
+    wb: Workbook,
+    trades: Iterable[Dict[str, Any]],
+) -> None:
+    ws = wb.create_sheet("模拟买入")
+    prepared: List[Dict[str, Any]] = []
+    for raw in trades or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        status = str(row.get("trade_status") or "pending")
+        row["_status_text"] = SIMULATED_BUY_STATUS_LABELS.get(
+            status,
+            str(row.get("unavailable_reason") or status),
+        )
+        prepared.append(row)
+    headers = [label for _field, label in SIMULATED_BUY_COLUMNS]
+    rows = [
+        [_record_value(row, field) for field, _label in SIMULATED_BUY_COLUMNS]
+        for row in prepared
+    ]
+    _write_rows(ws, headers, rows)
+    _autosize(ws)
+
+
+def export_prediction_to_excel(
+    prediction: Dict[str, Any],
+    path: str | Path,
+    *,
+    simulated_buy_trades: Iterable[Dict[str, Any]] | None = None,
+) -> Path:
     """Export a prediction payload to an .xlsx file and return the written path."""
     if not isinstance(prediction, dict) or not prediction:
         raise ValueError("没有可导出的预测结果")
@@ -322,5 +375,6 @@ def export_prediction_to_excel(prediction: Dict[str, Any], path: str | Path) -> 
     for sheet_name, key, columns in CANDIDATE_SPECS:
         _write_candidate_sheet(wb, prediction, sheet_name, key, columns)
     _write_theme_sheet(wb, prediction)
+    _write_simulated_buy_sheet(wb, simulated_buy_trades or [])
     wb.save(out_path)
     return out_path

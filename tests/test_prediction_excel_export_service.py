@@ -69,7 +69,12 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
     export_prediction_to_excel(prediction, out)
 
     wb = load_workbook(out)
-    assert wb.sheetnames == ["汇总", "保留涨停", "二波接力", "首板涨停", "反包", "趋势涨停", "题材资金"]
+    assert wb.sheetnames == [
+        "汇总", "保留涨停", "二波接力", "首板涨停", "反包", "趋势涨停",
+        "题材资金", "模拟买入",
+    ]
+    assert wb["模拟买入"]["A1"].value == "预测日"
+    assert wb["模拟买入"]["A2"].value is None
     assert wb["汇总"]["A1"].value == "交易日"
     assert wb["汇总"]["B1"].value == "20260621"
     headers = [cell.value for cell in wb["保留涨停"][1]]
@@ -91,3 +96,35 @@ def test_export_prediction_to_excel_writes_summary_and_candidate_sheets(tmp_path
     assert any("平均晋级率仅10.8%" in str(value) for value in summary_values)
     assert wb["题材资金"]["A2"].value == "机器人"
     assert wb["题材资金"]["E2"].value == 68
+
+
+def test_export_prediction_to_excel_writes_simulated_buy_sheet(tmp_path: Path):
+    out = tmp_path / "prediction.xlsx"
+    prediction = {
+        "trade_date": "20260716",
+        "continuation_candidates": [],
+        "first_board_candidates": [],
+        "fresh_first_board_candidates": [],
+        "broken_board_wrap_candidates": [],
+        "trend_limit_up_candidates": [],
+    }
+    trades = [{
+        "prediction_date": "20260716",
+        "trade_date": "",
+        "code": "600992",
+        "name": "贵绳股份",
+        "category_label": "反包",
+        "score": 79,
+        "buy_price": None,
+        "sell_price": None,
+        "profit_pct": None,
+        "trade_status": "pending",
+        "reasons": "测试",
+    }]
+
+    export_prediction_to_excel(prediction, out, simulated_buy_trades=trades)
+
+    ws = load_workbook(out)["模拟买入"]
+    assert ws["A2"].value == "20260716"
+    assert ws["C2"].value == "600992"
+    assert ws["J2"].value == "等待交易"

@@ -64,6 +64,8 @@ def test_prediction_tab_has_excel_export_action():
 
     assert 'text="导出Excel"' in build_src
     assert "export_prediction_to_excel" in export_src
+    assert "load_simulated_buy_trades" in export_src
+    assert "simulated_buy_trades=current_trades" in export_src
 
 
 def test_prediction_tab_wires_simulated_buy_subtab():
