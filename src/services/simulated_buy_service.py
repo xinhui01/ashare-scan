@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+import pandas as pd
+
 
 CATEGORY_CONFIG: Tuple[Tuple[str, str, str], ...] = (
     ("cont", "保留涨停", "continuation_candidates"),
@@ -118,6 +120,164 @@ def build_simulated_buy_picks(
         if len(selected) >= max(0, int(limit)):
             break
     return selected
+
+
+def build_trade_snapshot(pick: Mapping[str, Any]) -> Dict[str, Any]:
+    """Convert a selected pick into an immutable pending trade snapshot."""
+    return {
+        "prediction_date": str(pick.get("trade_date") or "").strip(),
+        "trade_date": "",
+        "code": str(pick.get("code") or "").strip().zfill(6),
+        "name": str(pick.get("name") or ""),
+        "industry": str(pick.get("industry") or ""),
+        "theme": str(pick.get("theme") or ""),
+        "category": str(pick.get("category") or ""),
+        "category_label": str(pick.get("category_label") or ""),
+        "score": _score_value(pick),
+        "buy_status": str(pick.get("buy_status") or ""),
+        "reasons": str(pick.get("reasons") or ""),
+        "buy_price": None,
+        "sell_price": None,
+        "profit_pct": None,
+        "is_buyable": 0,
+        "trade_status": "pending",
+        "unavailable_reason": "",
+    }
+
+
+def apply_accuracy_result(
+    trade: Mapping[str, Any],
+    result: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Return a trade copy with its T+1 execution result attached."""
+    item = dict(trade)
+    if not result:
+        return item
+    item["trade_date"] = str(result.get("verify_date") or "").strip()
+    item["buy_price"] = result.get("t1_open")
+    item["sell_price"] = result.get("t1_close")
+    item["profit_pct"] = result.get("t1_open_close_pct")
+    item["is_buyable"] = int(bool(result.get("hit_buyable")))
+    if result.get("t1_one_word"):
+        item["trade_status"] = "one_word"
+        item["unavailable_reason"] = "一字板不可买"
+    elif result.get("t1_suspended"):
+        item["trade_status"] = "suspended"
+        item["unavailable_reason"] = "停牌"
+    elif item["buy_price"] is None or item["sell_price"] is None:
+        item["trade_status"] = "missing_price"
+        item["unavailable_reason"] = "开盘价或收盘价缺失"
+    elif not item["is_buyable"]:
+        item["trade_status"] = "unbuyable"
+        item["unavailable_reason"] = "不可买"
+    else:
+        item["trade_status"] = "completed"
+        item["unavailable_reason"] = ""
+    return item
+
+
+def build_account_curve(
+    trades: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Build an equal-weight daily, continuously compounded equity curve."""
+    daily_returns: Dict[str, List[float]] = {}
+    for trade in trades or []:
+        if str(trade.get("trade_status") or "") != "completed":
+            continue
+        if not int(trade.get("is_buyable") or 0):
+            continue
+        trade_date = str(trade.get("trade_date") or "").strip()
+        profit = trade.get("profit_pct")
+        if not trade_date or profit is None:
+            continue
+        try:
+            daily_returns.setdefault(trade_date, []).append(float(profit))
+        except (TypeError, ValueError):
+            continue
+
+    equity = 1.0
+    curve: List[Dict[str, Any]] = []
+    for trade_date in sorted(daily_returns):
+        values = daily_returns[trade_date]
+        daily_return_pct = sum(values) / len(values)
+        equity *= 1.0 + daily_return_pct / 100.0
+        curve.append({
+            "trade_date": trade_date,
+            "daily_return_pct": daily_return_pct,
+            "equity": equity,
+            "cumulative_return_pct": (equity - 1.0) * 100.0,
+        })
+    return curve
+
+
+def build_intraday_return_curve(
+    intraday_df,
+    *,
+    buy_price: float,
+) -> Dict[str, List[Any]]:
+    """Convert intraday prices to percentage returns from the opening buy."""
+    if intraday_df is None or getattr(intraday_df, "empty", True):
+        return {"times": [], "returns_pct": []}
+    try:
+        normalized_buy_price = float(buy_price)
+    except (TypeError, ValueError):
+        return {"times": [], "returns_pct": []}
+    if normalized_buy_price <= 0:
+        return {"times": [], "returns_pct": []}
+
+    time_col = next((c for c in ("time", "datetime") if c in intraday_df.columns), None)
+    price_col = next((c for c in ("price", "close") if c in intraday_df.columns), None)
+    if not time_col or not price_col:
+        return {"times": [], "returns_pct": []}
+    frame = intraday_df[[time_col, price_col]].copy()
+    frame[price_col] = pd.to_numeric(frame[price_col], errors="coerce")
+    frame = frame.dropna(subset=[price_col]).sort_values(time_col)
+    if frame.empty:
+        return {"times": [], "returns_pct": []}
+    returns = (frame[price_col] / normalized_buy_price - 1.0) * 100.0
+    return {
+        "times": frame[time_col].astype(str).tolist(),
+        "returns_pct": returns.astype(float).tolist(),
+    }
+
+
+def sync_simulated_buy_history(
+    prediction_results: Iterable[Mapping[str, Any]],
+    results_maps_by_date: Mapping[str, Mapping[Tuple[str, str], Mapping[str, Any]]],
+    *,
+    save_trades_fn,
+    update_result_fn,
+    limit: int = 2,
+) -> Dict[str, int]:
+    """Idempotently backfill saved predictions and update their T+1 results."""
+    inserted = 0
+    updated = 0
+    for prediction in prediction_results or []:
+        if not isinstance(prediction, Mapping):
+            continue
+        picks = build_simulated_buy_picks(prediction, limit=limit)
+        snapshots = [build_trade_snapshot(pick) for pick in picks]
+        inserted += int(save_trades_fn(snapshots) or 0)
+        prediction_date = str(prediction.get("trade_date") or "").strip()
+        result_map = results_maps_by_date.get(prediction_date, {})
+        for snapshot in snapshots:
+            result = result_map.get((snapshot["code"], snapshot["category"]))
+            if not result:
+                continue
+            evaluated = apply_accuracy_result(snapshot, result)
+            changed = update_result_fn(
+                snapshot["prediction_date"],
+                snapshot["code"],
+                trade_date=evaluated["trade_date"],
+                buy_price=evaluated["buy_price"],
+                sell_price=evaluated["sell_price"],
+                profit_pct=evaluated["profit_pct"],
+                is_buyable=bool(evaluated["is_buyable"]),
+                trade_status=evaluated["trade_status"],
+                unavailable_reason=evaluated["unavailable_reason"],
+            )
+            updated += int(bool(changed))
+    return {"inserted": inserted, "updated": updated}
 
 
 def _is_hit(category: str, row: Mapping[str, Any]) -> bool:
