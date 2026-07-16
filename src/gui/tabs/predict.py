@@ -47,9 +47,11 @@ from src.services.market_focus_advice_service import (
 )
 from src.services.prediction_excel_export_service import export_prediction_to_excel
 from src.services.simulated_buy_service import (
+    build_trade_snapshot,
     build_simulated_buy_picks,
     summarize_historical_simulated_buy_picks,
     summarize_simulated_buy_picks,
+    sync_simulated_buy_history,
 )
 from src.services.scoring.predict import (
     DEFAULT_PREDICT_LOOKBACK_DAYS,
@@ -178,6 +180,7 @@ class PredictTab:
         self.result: Optional[Dict[str, Any]] = None
         self.results_map: Dict = {}
         self.simulated_buy_picks: List[Dict[str, Any]] = []
+        self.simulated_history_thread: Optional[threading.Thread] = None
         self.candidate_theme_by_code: Dict[str, str] = {}
         self.candidate_theme_by_industry: Dict[str, str] = {}
         self.candidate_real_theme_names: set = set()
@@ -198,6 +201,7 @@ class PredictTab:
         self.concept_hype_sort_reverse: bool = True
 
         self._build(notebook)
+        self._start_simulated_buy_history_sync()
 
     # ============================== UI 构建 ==============================
 
@@ -3696,6 +3700,9 @@ class PredictTab:
             best_buckets=self.best_buckets,
             limit=2,
         )
+        stock_store.save_simulated_buy_trades([
+            build_trade_snapshot(pick) for pick in self.simulated_buy_picks
+        ])
         self._render_simulated_buy_picks()
 
         # 渲染 5 个候选表（应用当前筛选）
@@ -4086,6 +4093,57 @@ class PredictTab:
             results_by_date,
             limit=2,
         )
+
+    def _start_simulated_buy_history_sync(self) -> None:
+        """Backfill the immutable trade ledger without blocking the Tk thread."""
+        if self.simulated_history_thread is not None and self.simulated_history_thread.is_alive():
+            return
+
+        def _worker() -> None:
+            predictions: List[Dict[str, Any]] = []
+            results_by_date: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+            try:
+                dates = list_limit_up_prediction_dates()
+                for value in dates:
+                    prediction_date = str(value or "").strip()
+                    if not prediction_date:
+                        continue
+                    try:
+                        payload = load_limit_up_prediction_by_date(prediction_date)
+                    except Exception:
+                        payload = None
+                    if not isinstance(payload, dict):
+                        continue
+                    predictions.append(payload)
+                    try:
+                        results_by_date[prediction_date] = (
+                            prediction_accuracy_service.get_per_code_results(prediction_date)
+                        )
+                    except Exception:
+                        results_by_date[prediction_date] = {}
+                sync_simulated_buy_history(
+                    predictions,
+                    results_by_date,
+                    save_trades_fn=stock_store.save_simulated_buy_trades,
+                    update_result_fn=stock_store.update_simulated_buy_trade_result,
+                    limit=2,
+                )
+            except Exception as exc:
+                try:
+                    self.app._log_async(f"模拟买入历史同步失败: {exc}")
+                except Exception:
+                    pass
+            finally:
+                render = getattr(self, "_render_simulated_buy_history", None)
+                if callable(render):
+                    self.app._post_to_ui(render)
+
+        self.simulated_history_thread = threading.Thread(
+            target=_worker,
+            name="simulated-buy-history",
+            daemon=True,
+        )
+        self.simulated_history_thread.start()
 
     def _render_simulated_buy_picks(self) -> None:
         """Render the auto-selected two simulated buys and their T+1 stats."""
@@ -4590,6 +4648,8 @@ class PredictTab:
                     self._render_trees()
             except Exception:
                 pass
+
+        self._start_simulated_buy_history_sync()
 
     def _find_best_bucket_for_category(
         self, cat: str,

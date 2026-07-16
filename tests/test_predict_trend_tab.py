@@ -79,3 +79,13 @@ def test_prediction_tab_wires_simulated_buy_subtab():
     assert "_render_simulated_buy_picks" in accuracy_src
     assert "_load_historical_simulated_buy_summary" in render_src
     assert "summarize_historical_simulated_buy_picks" in history_src
+
+
+def test_prediction_tab_syncs_trade_ledger_and_saves_new_picks():
+    init_src = inspect.getsource(PredictTab._start_simulated_buy_history_sync)
+    apply_src = inspect.getsource(PredictTab._apply_result)
+    accuracy_src = inspect.getsource(PredictTab._apply_accuracy)
+
+    assert "sync_simulated_buy_history" in init_src
+    assert "save_simulated_buy_trades" in apply_src
+    assert "_start_simulated_buy_history_sync" in accuracy_src
