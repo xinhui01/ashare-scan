@@ -327,6 +327,59 @@ class TestSimulatedBuyTrades(StockStoreTestCase):
         self.assertEqual(rows[0]["is_hit"], 1)
         self.assertEqual(rows[0]["trade_status"], "completed")
 
+    def test_save_simulated_buy_trades_reconciles_same_date_picks(self):
+        """同一预测日重复保存不同选票时，只保留最新一批，不再累积。"""
+        from stock_store import load_simulated_buy_trades, save_simulated_buy_trades
+
+        save_simulated_buy_trades([
+            {"prediction_date": "20260701", "code": "000001", "score": 80},
+        ])
+        save_simulated_buy_trades([
+            {"prediction_date": "20260701", "code": "000002", "score": 90},
+        ])
+
+        rows = load_simulated_buy_trades()
+
+        self.assertEqual(
+            [(row["prediction_date"], row["code"]) for row in rows],
+            [("20260701", "000002")],
+        )
+
+    def test_save_simulated_buy_trades_keeps_backfilled_result_on_same_code(self):
+        """同码重复保存只刷新快照字段，已回填的 T+1 结果不被覆盖。"""
+        from stock_store import (
+            load_simulated_buy_trades,
+            save_simulated_buy_trades,
+            update_simulated_buy_trade_result,
+        )
+
+        save_simulated_buy_trades([
+            {"prediction_date": "20260701", "code": "000001", "score": 80},
+        ])
+        update_simulated_buy_trade_result(
+            "20260701",
+            "000001",
+            trade_date="20260702",
+            buy_price=10.0,
+            sell_price=10.5,
+            profit_pct=5.0,
+            is_buyable=True,
+            is_hit=True,
+            trade_status="completed",
+            unavailable_reason="",
+        )
+        inserted = save_simulated_buy_trades([
+            {"prediction_date": "20260701", "code": "000001", "score": 92},
+        ])
+
+        rows = load_simulated_buy_trades()
+
+        self.assertEqual(inserted, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["score"], 92)
+        self.assertEqual(rows[0]["profit_pct"], 5.0)
+        self.assertEqual(rows[0]["trade_status"], "completed")
+
     def test_load_simulated_buy_trades_orders_newest_first(self):
         from stock_store import load_simulated_buy_trades, save_simulated_buy_trades
 

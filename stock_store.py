@@ -1326,7 +1326,11 @@ _SIMULATED_BUY_SNAPSHOT_FIELDS = (
 
 
 def save_simulated_buy_trades(records: List[Dict[str, Any]]) -> int:
-    """Insert immutable simulated-buy snapshots and return the inserted count."""
+    """Reconcile each prediction date's rows with the given picks; return new inserts.
+
+    同一预测日重复保存时以最后一次为准：不在本批选票里的旧行会被删除，
+    同票冲突只刷新快照字段，已回填的 T+1 结果字段保持不变。
+    """
     if not records:
         return 0
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1365,19 +1369,44 @@ def save_simulated_buy_trades(records: List[Dict[str, Any]]) -> int:
 
     def _write() -> int:
         with _connect() as conn:
-            before = conn.total_changes
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO simulated_buy_trades(
-                    prediction_date, trade_date, code, name, industry, theme,
-                    category, category_label, score, buy_status, reasons,
-                    buy_price, sell_price, profit_pct, is_buyable, is_hit, trade_status,
-                    unavailable_reason, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                rows,
-            )
-            return conn.total_changes - before
+            inserted = 0
+            by_date: Dict[str, List[Tuple[Any, ...]]] = {}
+            for row in rows:
+                by_date.setdefault(str(row[0]), []).append(row)
+            for prediction_date, date_rows in by_date.items():
+                codes = [row[2] for row in date_rows]
+                placeholders = ",".join("?" for _ in codes)
+                conn.execute(
+                    f"DELETE FROM simulated_buy_trades "
+                    f"WHERE prediction_date = ? AND code NOT IN ({placeholders})",
+                    [prediction_date, *codes],
+                )
+                for row in date_rows:
+                    exists = conn.execute(
+                        "SELECT 1 FROM simulated_buy_trades "
+                        "WHERE prediction_date = ? AND code = ?",
+                        (prediction_date, row[2]),
+                    ).fetchone()
+                    conn.execute(
+                        """
+                        INSERT INTO simulated_buy_trades(
+                            prediction_date, trade_date, code, name, industry, theme,
+                            category, category_label, score, buy_status, reasons,
+                            buy_price, sell_price, profit_pct, is_buyable, is_hit, trade_status,
+                            unavailable_reason, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(prediction_date, code) DO UPDATE SET
+                            name = excluded.name, industry = excluded.industry,
+                            theme = excluded.theme, category = excluded.category,
+                            category_label = excluded.category_label, score = excluded.score,
+                            buy_status = excluded.buy_status, reasons = excluded.reasons,
+                            updated_at = excluded.updated_at
+                        """,
+                        row,
+                    )
+                    if not exists:
+                        inserted += 1
+            return inserted
 
     try:
         with _DB_WRITE_LOCK:

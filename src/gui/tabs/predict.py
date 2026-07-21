@@ -3719,11 +3719,9 @@ class PredictTab:
         # 刷新行业下拉选项
         self._refresh_industry_options()
 
-        self.simulated_buy_picks = build_simulated_buy_picks(
-            result,
-            best_buckets=self.best_buckets,
-            limit=2,
-        )
+        # 不传 best_buckets：后台 sync 重建 picks 时拿不到 best_buckets，
+        # 两条路径排序口径必须一致，否则同一天会反复互换选票
+        self.simulated_buy_picks = build_simulated_buy_picks(result, limit=2)
         stock_store.save_simulated_buy_trades([
             build_trade_snapshot(pick) for pick in self.simulated_buy_picks
         ])
@@ -4859,7 +4857,6 @@ class PredictTab:
             try:
                 self.simulated_buy_picks = build_simulated_buy_picks(
                     self.result,
-                    best_buckets=self.best_buckets,
                     limit=2,
                 )
             except Exception:

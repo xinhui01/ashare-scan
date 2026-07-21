@@ -13,6 +13,21 @@ from src.services.simulated_buy_service import (
 )
 
 
+def test_build_simulated_buy_picks_defaults_to_at_most_two():
+    result = {
+        "trade_date": "20260703",
+        "first_board_candidates": [
+            {"code": "000002", "name": "Beta", "score": 72, "opening_confirmation": {"status": "可买"}},
+            {"code": "000001", "name": "Alpha", "score": 90, "opening_confirmation": {"status": "观察"}},
+            {"code": "000003", "name": "Gamma", "score": 85, "opening_confirmation": {"status": "观察"}},
+        ],
+    }
+
+    picks = build_simulated_buy_picks(result)
+
+    assert [p["code"] for p in picks] == ["000002", "000001"]
+
+
 def test_build_simulated_buy_picks_selects_two_unique_best_candidates():
     result = {
         "trade_date": "20260703",
