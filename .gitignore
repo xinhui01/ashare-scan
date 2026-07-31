@@ -9,5 +9,7 @@ cache/
 .vscode/
 data/
 .claude/
+.workbuddy/
+deliverables/
 docs/
 _diag_wrap.py
