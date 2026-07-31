@@ -88,9 +88,9 @@ def scan_fresh_first_board_candidates_cached(
             limit_up_threshold_pct_fn=limit_up_threshold_pct_fn,
             build_local_cache_history_plan_fn=build_local_cache_history_plan_fn,
         )
-        # 门槛从 50 降到 45：30 天只攒到 13 条样本统计意义不足，
-        # 先放宽吸量积累数据，待样本到位再回收门槛
-        if score_info is not None and score_info["score"] >= 45:
+        # 门槛回收 45 -> 55：A 修复后已接入真资金流信号(主力净占比/超大单净额)，
+        # 评分区分度提升，回收低门槛以减少边缘票混入、提高入选质量
+        if score_info is not None and score_info["score"] >= 55:
             candidates.append(score_info)
         if progress_callback:
             progress_callback(idx + 1, total, f"首板筛选 {rec['code']} {rec.get('name', '')}")
@@ -143,8 +143,9 @@ def score_fresh_first_board(
     - 次加权：股性（曾涨停，不再惩罚僵尸冷票）、流通盘适中、换手健康
     - 降权：高位放量（出货嫌疑）、大盘情绪冰点；位置只用于扣分不做主筛
 
-    注：fund_flow 表覆盖率不足（每日仅 ~8 只、且数据陈旧），资金接入退化为纯量能口径。
-    评估口径见复盘定位——主看"识别形态 vs 当日真实首板形态吻合度"，非 avg_oc PnL。
+    注：2026-07 已接回真资金流（get_fund_flow_data 的主力净占比/超大单净额），
+    仅当资金流缺失/失败时才降级为纯量能口径。评估口径见复盘定位——主看"识别形态
+    vs 当日真实首板形态吻合度"，非 avg_oc PnL。
     """
     threshold_fn = limit_up_threshold_pct_fn or _default_limit_up_threshold_pct
 
@@ -228,25 +229,58 @@ def score_fresh_first_board(
             reasons.append(f"30日潜伏铺垫x0.4+{accumulation_score}")
         reasons.extend(accumulation_reasons)
 
-    # === 主信号①：资金接入（纯量能口径——fund_flow 覆盖率不足已弃用）===
+    # === 真资金流接入（2026-07 接回：用主力净占比/超大单净额替代量比盲猜）===
+    # get_fund_flow_data 有本地缓存，命中不联网；缺失/失败降级为量比口径，不引入回归。
+    ff_main_ratio = None   # 近 3 日主力净占比均值(%)，正=主力净买
+    ff_super_amount = None  # 近 3 日超大单净额均值(元)，正=超大单净买
+    try:
+        ff_df = fetcher.get_fund_flow_data(code, days=5, force_refresh=False)
+        if ff_df is not None and not ff_df.empty:
+            if "main_force_ratio" in ff_df.columns:
+                _mr = pd.to_numeric(ff_df["main_force_ratio"], errors="coerce").dropna()
+                if len(_mr):
+                    ff_main_ratio = float(_mr.tail(3).mean())
+            if "super_big_order_amount" in ff_df.columns:
+                _sa = pd.to_numeric(ff_df["super_big_order_amount"], errors="coerce").dropna()
+                if len(_sa):
+                    ff_super_amount = float(_sa.tail(3).mean())
+    except Exception as exc:
+        logger.debug("首板获取资金流 %s 失败，降级量比口径: %s", code, exc)
+
+    # === 主信号①：资金接入（真资金流为主，量比兜底）===
     vol_ratio, vol_ratio_20 = _shared.vol_ratio_with_baseline(volume, t)
-    if vol_ratio is not None:
-        if vol_ratio >= 2.0:
-            score += 14
-            reasons.append(f"放量资金进{vol_ratio:.1f}x+14")
-        elif vol_ratio >= 1.5:
+    if ff_main_ratio is not None or ff_super_amount is not None:
+        # 真资金流可用：以"主力净占比 + 超大单净额"双确认钱是否真进来
+        true_in = (ff_main_ratio is not None and ff_main_ratio > 0) and \
+                  (ff_super_amount is not None and ff_super_amount > 0)
+        if true_in:
+            score += 16
+            reasons.append(f"真资金进(主净{ff_main_ratio:+.1f}%超单净)+16")
+        elif ff_main_ratio is not None and ff_main_ratio > 0:
             score += 10
-            reasons.append(f"放量资金进{vol_ratio:.1f}x+10")
-        elif vol_ratio >= 1.2:
-            score += 5
-            reasons.append(f"温和资金进{vol_ratio:.1f}x+5")
-        elif vol_ratio < 0.8:
-            score -= 8
-            reasons.append(f"缩量无资金{vol_ratio:.1f}x-8")
-        # 5d 放量但 20d 仍缩 = 相对前 5 天的假放量
-        if vol_ratio >= 1.3 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
-            score -= 6
-            reasons.append(f"5d{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
+            reasons.append(f"主力净进{ff_main_ratio:+.1f}%+10")
+        elif ff_main_ratio is not None and ff_main_ratio < 0 and (vol_ratio is not None and vol_ratio >= 1.3):
+            score -= 10
+            reasons.append(f"量放但主力出{ff_main_ratio:+.1f}%对倒嫌疑-10")
+        # 真资金流存在时量比仅作辅助，不再重复给"放量资金进"高分
+    else:
+        # 资金流缺失：退回原纯量比口径，保持历史行为不回归
+        if vol_ratio is not None:
+            if vol_ratio >= 2.0:
+                score += 14
+                reasons.append(f"放量资金进{vol_ratio:.1f}x+14")
+            elif vol_ratio >= 1.5:
+                score += 10
+                reasons.append(f"放量资金进{vol_ratio:.1f}x+10")
+            elif vol_ratio >= 1.2:
+                score += 5
+                reasons.append(f"温和资金进{vol_ratio:.1f}x+5")
+            elif vol_ratio < 0.8:
+                score -= 8
+                reasons.append(f"缩量无资金{vol_ratio:.1f}x-8")
+            if vol_ratio >= 1.3 and vol_ratio_20 is not None and vol_ratio_20 < 0.9:
+                score -= 6
+                reasons.append(f"5d{vol_ratio:.1f}x但20d仅{vol_ratio_20:.1f}x假放量-6")
 
     ignition = detect_volume_ignition(history)
     if ignition["ignited"]:
