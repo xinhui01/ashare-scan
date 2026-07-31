@@ -1265,6 +1265,29 @@ def load_limit_up_prediction_by_date(trade_date: str) -> Optional[Dict[str, Any]
         return None
 
 
+def get_limit_up_prediction_saved_at(trade_date: str) -> Optional[str]:
+    """返回某交易日预测记录的 saved_at 时间串，无记录返回 None。"""
+    td = str(trade_date or "").strip()
+    if not td or not _DB_PATH.is_file():
+        return None
+
+    def _read():
+        with _connect() as conn:
+            return conn.execute(
+                "SELECT saved_at FROM limit_up_predictions WHERE trade_date = ?",
+                (td,),
+            ).fetchone()
+
+    try:
+        row = _retry_locked(_read)
+    except Exception:
+        logger.exception("读取涨停预测 saved_at 失败")
+        return None
+    if row is None:
+        return None
+    return str(row["saved_at"] or "") or None
+
+
 def list_limit_up_prediction_dates() -> List[str]:
     """列出所有已保存涨停预测的交易日，按日期降序返回。"""
     if not _DB_PATH.is_file():

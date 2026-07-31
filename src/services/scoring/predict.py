@@ -2436,4 +2436,12 @@ def predict_limit_up_candidates(
         save_limit_up_prediction_record(result)
     except Exception:
         pass
+    if not historical_mode:
+        # 导出最新预测快照到 git（跨电脑同步）；历史回放不导出
+        try:
+            from src.services.prediction_snapshot_service import export_snapshot
+
+            export_snapshot(result, log_fn=log_fn)
+        except Exception:
+            logger.exception("导出预测快照失败")
     return result

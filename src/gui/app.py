@@ -112,8 +112,21 @@ class StockMonitorApp:
         self._load_board_filter_layout()
         self.result.apply_display_columns(save=False)
         self.result._load_last_results()
+        self._import_prediction_snapshot()
         self.predict._load_last_prediction()
         self._log_drainer.start()
+
+    def _import_prediction_snapshot(self) -> None:
+        """启动时把 git pull 下来的预测快照导入本地库（比本地新才导入）。
+
+        任何异常只写日志，不影响启动。
+        """
+        try:
+            from src.services.prediction_snapshot_service import import_snapshot_if_newer
+
+            import_snapshot_if_newer(log_fn=self._log_async)
+        except Exception:
+            self._log_async("导入预测快照失败，已跳过")
 
     def _set_initial_window_geometry(self) -> None:
         default_width = 1440
