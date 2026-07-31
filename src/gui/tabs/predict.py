@@ -26,9 +26,13 @@ import time
 import unicodedata
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from collections.abc import Mapping
 
 import tkinter as tk
+from stock_logger import get_logger
 from tkinter import ttk, messagebox, scrolledtext, simpledialog, filedialog
+
+logger = get_logger(__name__)
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure

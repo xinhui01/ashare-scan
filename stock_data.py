@@ -567,6 +567,7 @@ _find_fund_flow_column = _utils_parsing.find_fund_flow_column
 
 
 _safe_float = _utils_parsing.safe_float
+_parse_cn_numeric = _utils_parsing.parse_cn_numeric
 
 
 # 日期 / 缓存新鲜度：实现已迁移到 src/utils/cache_freshness.py
@@ -685,6 +686,7 @@ _count_intraday_breaks = _lup_service.count_intraday_breaks
 class StockDataFetcher:
     def __init__(self):
         self._log: Optional[Callable[[str], None]] = None
+        self._notify: Optional[Callable[[str, str], None]] = None
         self._strong_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
@@ -719,6 +721,17 @@ class StockDataFetcher:
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
+
+    def set_notify_callback(self, cb: Optional[Callable[[str, str], None]]) -> None:
+        """注册用户提示回调，把"数据缺失/获取失败"等需要人注意的情况反馈到 UI（如弹窗）。"""
+        self._notify = cb
+
+    def _notify_user(self, title: str, message: str) -> None:
+        if self._notify:
+            try:
+                self._notify(title, message)
+            except Exception:
+                pass
 
     def history_request_concurrency_limit(self) -> int:
         return _history_request_concurrency()
@@ -2052,11 +2065,14 @@ class StockDataFetcher:
                     last_error = e
                     if self._log:
                         self._log(f"个股资金流 {code} 使用同花顺源失败: {e}")
-        if flow_df is None:
-            return None
         if flow_df is None or flow_df.empty:
             if last_error is not None and self._log:
                 self._log(f"个股资金流 {code} 所有数据源失败: {last_error}")
+            self._notify_user(
+                "资金流数据缺失",
+                f"个股 {code} 资金流获取失败，无法用于主力/大单分析。"
+                + (f"\n原因：{last_error}" if last_error is not None else ""),
+            )
             return None
         source_columns = [str(col) for col in flow_df.columns.tolist()]
         rename_map: Dict[str, str] = {}

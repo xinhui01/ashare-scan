@@ -29,6 +29,7 @@ class _FakeDispatcher:
 
 class TestLogDrainer(unittest.TestCase):
     def _make(self, sink=None):
+        sink_calls = []
         sink_fn = sink or (lambda m: sink_calls.append(m))
         disp = _FakeDispatcher()
         drainer = LogDrainer(

@@ -68,6 +68,7 @@ class StockMonitorApp:
 
         self.stock_filter = StockFilter()
         self.stock_filter.set_log_callback(self._log_async)
+        self.stock_filter.fetcher.set_notify_callback(self._on_fund_flow_missing)
         # 扫描结果 / 过滤后列表 全部迁移到 ResultTab（self.result.all_results / filtered_stocks）
         # 详情 tab 相关状态全部迁移到 DetailTab（self.detail.xxx）
         # 涨停预测 tab 相关状态全部迁移到 PredictTab（self.predict.xxx）
@@ -812,6 +813,13 @@ class StockMonitorApp:
 
     def _log_async(self, message: str) -> None:
         self._log_drainer.enqueue(message)
+
+    def _on_fund_flow_missing(self, title: str, message: str) -> None:
+        """资金流获取失败时由数据层回调：同进程只弹一次提示，避免批量预热/扫描时刷屏。"""
+        if getattr(self, "_fund_flow_alerted", False):
+            return
+        self._fund_flow_alerted = True
+        self._post_to_ui(lambda t=title, m=message: messagebox.showwarning(t, m))
 
     def _drain_log_queue(self) -> None:
         """保留公开方法名以便外部调用；实际转发到 LogDrainer。"""

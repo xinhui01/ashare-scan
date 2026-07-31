@@ -218,8 +218,9 @@ class IntradayTab:
 
             self.app._post_to_ui(_apply)
         except Exception as e:
-            self.app._post_to_ui(lambda: self._draw_error(stock_code, f"分时加载失败: {e}"))
-            self.app._post_to_ui(lambda: self.app._log(f"分时加载失败 {stock_code}: {e}"))
+            err = str(e)
+            self.app._post_to_ui(lambda err=err: self._draw_error(stock_code, f"分时加载失败: {err}"))
+            self.app._post_to_ui(lambda err=err: self.app._log(f"分时加载失败 {stock_code}: {err}"))
         finally:
             self.app._post_to_ui(lambda: self._finish_status(stock_code, day_offset))
 
