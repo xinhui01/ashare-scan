@@ -2,7 +2,6 @@
 
 封装：
 - 自适应间隔等待 + 诊断计数（``throttling``）
-- 代理池 + 黑名单（``src.network.proxy_pool``）
 - 随机化 headers（``src.network.headers``）
 - 限流检测 + 阻塞冷却记录 + ``EastmoneyRateLimitError`` 抛出
 - JSONP 包装剥离 + 双层 JSON 容错解析
@@ -15,7 +14,6 @@ import json as _json
 from typing import Any, Dict, Tuple
 
 from src.network.headers import random_eastmoney_headers
-from src.network.proxy_pool import blacklist_proxy, get_proxy
 from src.sources._jsonp import strip_wrapper as _strip_jsonp_wrapper
 from src.sources.eastmoney import throttling as _throttling
 from src.sources.eastmoney.rate_limit import (
@@ -32,18 +30,15 @@ def get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict
     """
     import requests
     # 延迟 import 避免循环：env-toggle 仍住在 stock_data
-    from stock_data import _use_bypass_proxy, _use_insecure_ssl
+    from stock_data import _use_insecure_ssl
 
     _throttling.wait_for_history_request_slot()
     _throttling.increment_diagnostic("network_requests")
 
-    proxy = get_proxy()
     with requests.Session() as session:
-        if proxy:
-            session.proxies = {"http": proxy, "https": proxy}
-        elif _use_bypass_proxy():
-            session.trust_env = False
-            session.proxies = {"http": None, "https": None}
+        # 全部直连：忽略环境代理，避免 Clash/公司代理对东方财富断开
+        session.trust_env = False
+        session.proxies = {"http": None, "https": None}
         req_kw: Dict[str, Any] = {
             "url": url,
             "params": params,
@@ -55,8 +50,6 @@ def get_json(url: str, params: Dict[str, Any], timeout: Tuple[int, int]) -> Dict
         try:
             response = session.get(**req_kw)
         except Exception:
-            if proxy:
-                blacklist_proxy(proxy)
             raise
         response_text = response.text or ""
         if _looks_like_rate_limit(response.status_code, response_text):

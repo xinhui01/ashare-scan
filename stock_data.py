@@ -35,7 +35,7 @@ def _use_bypass_proxy() -> bool:
 # 须在 import akshare 之前执行：统一为 requests 补头；可选 SSL / 忽略环境代理
 def _apply_network_patches() -> None:
     need_ssl = _use_insecure_ssl()
-    need_no_proxy = _use_bypass_proxy()
+    need_no_proxy = True  # 全部直连：忽略 HTTP(S)_PROXY，避免 Clash/公司代理对东方财富断开
 
     if need_ssl:
         import ssl
@@ -84,6 +84,95 @@ def _apply_network_patches() -> None:
         pass
 
 _apply_network_patches()
+
+# ---- 资金流数据源连通性（启动探针）----
+# 进程启动时后台探测东财/同花顺资金流接口直连可用性。若东财直连失败（连接被远端 reset，
+# 通常源于本机网络环境/ISP/防火墙对 eastmoney 的链路限制，或东财服务端短暂风控），主动熔断东财，
+# 后续资金流自动走同花顺兜底，并打印明确处置提示，避免每只股票都先撞一次死连接再回退。
+_FF_EM_REACHABLE: Optional[bool] = None
+_FF_THS_REACHABLE: Optional[bool] = None
+_FF_CHECK_DONE = False
+_FF_CHECK_LOCK = threading.Lock()
+
+
+def _probe_eastmoney_fund_flow(timeout: float = 8.0) -> bool:
+    """启动探针：用真实会话 Cookie + 多 host 探测东财资金流接口是否可达。
+
+    复用 ``src.sources.eastmoney.fund_flow`` 的健壮请求逻辑（真实 Cookie 预取 + 完整头 +
+    多 host 兜底），与 ``fetch_individual_fund_flow`` 保持判断一致，避免裸请求误判东财"死"。
+    """
+    try:
+        from src.sources.eastmoney.fund_flow import _em_fund_flow_reachable
+
+        return _em_fund_flow_reachable(timeout)
+    except Exception:
+        return False
+
+
+def _probe_ths_fund_flow(timeout: float = 8.0) -> bool:
+    """探测同花顺资金流兜底接口（个股资金流榜单页）直连是否可用。"""
+    try:
+        import requests
+
+        resp = requests.get(
+            "http://data.10jqka.com.cn/funds/ggzjl/",
+            timeout=(5, timeout),
+            verify=False,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "http://data.10jqka.com.cn/funds/hyzjl/",
+            },
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def check_fund_flow_connectivity(timeout: float = 8.0, log=None) -> None:
+    """启动探针：检测东财/同花顺资金流接口直连可用性，并据此自动熔断被拦截的东财。
+
+    幂等：整个进程只执行一次。``log`` 为可选的日志回调（缺省打印到 stdout）。
+    探针整体在锁内执行，结束后才置 ``_FF_CHECK_DONE``，避免并发调用读到半成品标志位。
+    """
+    global _FF_EM_REACHABLE, _FF_THS_REACHABLE, _FF_CHECK_DONE
+    with _FF_CHECK_LOCK:
+        if _FF_CHECK_DONE:
+            return
+        # 确保网络补丁已生效（强制直连，忽略环境代理），探针才能反映真实直连结果
+        try:
+            _apply_network_patches()
+        except Exception:
+            pass
+        em_ok = _probe_eastmoney_fund_flow(timeout)
+        ths_ok = _probe_ths_fund_flow(timeout)
+        _FF_EM_REACHABLE = em_ok
+        _FF_THS_REACHABLE = ths_ok
+        if not em_ok:
+            # 主动熔断：避免每只股票都先撞一次东财死连接再回退到同花顺
+            try:
+                _em_circuit_breaker.record_failure()
+                _em_circuit_breaker.record_failure()
+                _em_circuit_breaker.record_failure()
+            except Exception:
+                pass
+            warn = (
+                "⚠️ 东方财富资金流接口直连失败（连接被远端重置 RemoteDisconnected）。已自动切到同花顺兜底——"
+                "但同花顺仅含净流入净额，无主力/大单拆分。\n可能原因：本机到 eastmoney 的网络链路受限"
+                "（防火墙 / ISP / 公司网络），或东财服务端短暂风控。可稍后重试；若需完整主力/大单数据，"
+                "请确认本机能正常访问 push2his.eastmoney.com 后重启本程序。"
+            )
+            if log:
+                log(warn)
+            else:
+                print(warn)
+        if not ths_ok and em_ok:
+            msg = "注意：同花顺资金流兜底接口也不可达，东财若再失败将无兜底源。"
+            if log:
+                log(msg)
+            else:
+                print(msg)
+        _FF_CHECK_DONE = True
+
 
 import pandas as pd
 import akshare as ak
@@ -254,14 +343,6 @@ from src.network.headers import (
 _EASTMONEY_HEADERS = _random_eastmoney_headers()
 
 
-# ---- 可选免费代理池 ----
-# 实现已迁移到 src/network/proxy_pool.py；下面用别名保持调用方零修改。
-from src.network.proxy_pool import (
-    use_proxy_pool as _use_proxy_pool,
-    get_proxy as _get_proxy,
-    blacklist_proxy as _blacklist_proxy,
-    refresh_proxy_pool as _refresh_proxy_pool,
-)
 
 
 # 拉取全市场列表分页时写入 GUI 日志（由 get_all_stocks 临时注册）
@@ -715,9 +796,6 @@ class StockDataFetcher:
         self._default_intraday_source: str = "auto"
         self._default_fund_flow_source: str = "auto"
         self._default_limit_up_reason_source: str = "auto"
-        # 启动时预加载代理池（后台线程，不阻塞初始化）
-        if _use_proxy_pool():
-            threading.Thread(target=_refresh_proxy_pool, daemon=True).start()
 
     def set_log_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._log = cb
@@ -732,6 +810,18 @@ class StockDataFetcher:
                 self._notify(title, message)
             except Exception:
                 pass
+
+    def _eastmoney_fund_flow_expected(self) -> bool:
+        """当前是否还能指望东财提供含大单拆分的资金流数据。
+
+        启动探针确认东财不可达、或东财熔断器已开启时返回 False——
+        此时同花顺兜底只能给净额，不应为「缺大单」反复刷新空转。
+        """
+        if _FF_EM_REACHABLE is False:
+            return False
+        if _eastmoney_circuit_breaker_open():
+            return False
+        return True
 
     def history_request_concurrency_limit(self) -> int:
         return _history_request_concurrency()
@@ -1312,9 +1402,9 @@ class StockDataFetcher:
             return DataProviderPlan(mode="network", provider_sequence=("eastmoney",), reason="fund-flow-provider=eastmoney")
         if normalized == "ths":
             return DataProviderPlan(mode="network", provider_sequence=("ths",), reason="fund-flow-provider=ths")
-        # auto 模式：东财熔断时优先用 ths
-        if _eastmoney_circuit_breaker_open():
-            return DataProviderPlan(mode="network", provider_sequence=("ths", "eastmoney"), reason="fund-flow-provider=auto(em-circuit-open)")
+        # auto 模式：东财熔断 或 启动探针确认东财不可达（如 Clash 拦截）→ 优先用 ths
+        if _FF_EM_REACHABLE is False or _eastmoney_circuit_breaker_open():
+            return DataProviderPlan(mode="network", provider_sequence=("ths", "eastmoney"), reason="fund-flow-provider=auto(em-down)")
         return DataProviderPlan(mode="network", provider_sequence=("eastmoney", "ths"), reason="fund-flow-provider=auto")
 
     def build_limit_up_reason_plan(self, source: str = "auto") -> DataProviderPlan:
@@ -2030,13 +2120,26 @@ class StockDataFetcher:
                 if "big_order_amount" in cached.columns:
                     big_order_series = pd.to_numeric(cached["big_order_amount"], errors="coerce")
                     has_big_order_data = bool(big_order_series.notna().any())
+                em_expected = self._eastmoney_fund_flow_expected()
                 if has_big_order_data and not _should_refresh_today_row(cached):
                     return cached.tail(days).reset_index(drop=True)
-                if not has_big_order_data:
+                if has_big_order_data:
+                    # 有完整大单数据但当日尚未收盘 → 刷新当日最新
+                    if self._log:
+                        self._log(f"资金流 {code} 命中当天缓存，但尚未收盘，改为刷新最新数据。")
+                elif not em_expected:
+                    # 东财不可用：同花顺兜底仅能提供净额（无大单拆分）。当天已拉过就不空转；
+                    # 否则继续走网络拿同花顺净额兜底。
+                    if not _should_refresh_today_row(cached):
+                        if self._log:
+                            self._log(f"资金流 {code} 使用同花顺兜底（仅净额，无大单拆分），命中当天缓存。")
+                        return cached.tail(days).reset_index(drop=True)
+                    if self._log:
+                        self._log(f"资金流 {code} 东财不可达，使用同花顺兜底（仅净额，无大单拆分）。")
+                else:
+                    # 期望东财给大单但缓存缺 → 刷新补齐
                     if self._log:
                         self._log(f"资金流 {code} 缓存缺少大单净额，自动刷新最新数据。")
-                elif self._log:
-                    self._log(f"资金流 {code} 命中当天缓存，但尚未收盘，改为刷新最新数据。")
         market = _infer_market(code)
         plan = self.build_fund_flow_request_plan(source or self._default_fund_flow_source)
         flow_df = None
@@ -2044,12 +2147,19 @@ class StockDataFetcher:
         for provider in plan.provider_sequence:
             if provider == "eastmoney":
                 try:
-                    flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
+                    from src.sources.eastmoney.fund_flow import fetch_individual_fund_flow
+
+                    flow_df = fetch_individual_fund_flow(code, market)
                     break
                 except Exception as e:
-                    last_error = e
-                    if self._log:
-                        self._log(f"个股资金流 {code} 获取失败: {e}")
+                    # 兜底：再试 akshare 原路径（兼容极端情况），失败才记错误并继续下一个源
+                    try:
+                        flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
+                        break
+                    except Exception as e2:
+                        last_error = e2
+                        if self._log:
+                            self._log(f"个股资金流 {code} 获取失败: {e2}")
             elif provider == "ths":
                 try:
                     if self._log:
@@ -2947,3 +3057,11 @@ class StockDataFetcher:
                     except Exception:
                         pass
         return {"total": len(seen), "done": done, "failed": failed}
+
+
+# ---- 启动探针：后台检测东财/同花顺资金流直连可用性 ----
+# 任何入口（CLI / GUI）导入本模块即触发一次；被 Clash 拦截时自动熔断东财并告警。
+try:
+    threading.Thread(target=check_fund_flow_connectivity, daemon=True, name="fflow-probe").start()
+except Exception:  # pragma: no cover
+    pass

@@ -1,17 +1,21 @@
 """同花顺 (THS / 10jqka) 数据源。
 
-接口：``https://d.10jqka.com.cn/v6/line/{ths_code}/01/{year}.js``
-JSONP 格式，按年请求后合并筛选。
+- 历史日线：``https://d.10jqka.com.cn/v6/line/{ths_code}/01/{year}.js``（JSONP，按年请求后合并）。
+- 个股资金流兜底：``http://data.10jqka.com.cn/funds/ggzjl/`` 榜单，按 code 降序二分翻页定位目标股票。
 """
 from __future__ import annotations
 
 import json as _json
 import random
+import re
 import threading
 import time
+from io import StringIO
+from typing import Dict, Optional
 
 import akshare as ak
 import pandas as pd
+import requests
 
 from src.network.headers import USER_AGENT_POOL
 from src.network.host_health import (
@@ -21,6 +25,16 @@ from src.network.host_health import (
     on_cooldown,
 )
 from src.sources._common import normalize_history_frame
+
+try:
+    from akshare.datasets import get_ths_js
+    import py_mini_racer
+
+    _THS_HAS_VCODE = True
+except Exception:  # pragma: no cover - 缺依赖时退化为无 cookie 访问（仅第 1 页可用）
+    get_ths_js = None
+    py_mini_racer = None
+    _THS_HAS_VCODE = False
 
 
 _REQUEST_LOCK = threading.Lock()
@@ -46,38 +60,178 @@ def stock_code(code: str) -> str:
     return f"hs_{c}"
 
 
+# ---- 个股资金流兜底：按 code 降序二分翻页 ----
+# 同花顺榜单没有「按任意 code 查个股资金流」的接口，只有全市场榜单。akshare 的
+# stock_fund_flow_individual 用 field/code 算总页数、却用 field/zdf 翻页，排序错位会
+# 漏掉 000938 这类股票。这里统一用 field/code 排序，二分定位目标股票所在页。
+_THS_BOARD_BASE = "http://data.10jqka.com.cn/funds/ggzjl/field/code/order/desc"
+_THS_BOARD_REFERER = "http://data.10jqka.com.cn/funds/hyzjl/"
+_THS_VCODE_CACHE: Dict[str, float] = {"v": None, "ts": 0.0}
+
+
+def _ths_vcode() -> Optional[str]:
+    """同花顺反爬 cookie（hexin-v），带 60s 缓存；失败返回 None（第 1 页仍可无 cookie 访问）。"""
+    if not _THS_HAS_VCODE:
+        return None
+    now = time.time()
+    if _THS_VCODE_CACHE["v"] is not None and now - _THS_VCODE_CACHE["ts"] < 60.0:
+        return _THS_VCODE_CACHE["v"]
+    try:
+        js = open(get_ths_js("ths.js"), encoding="utf-8").read()
+        jr = py_mini_racer.MiniRacer()
+        jr.eval(js)
+        v = jr.call("v")
+        _THS_VCODE_CACHE["v"] = v
+        _THS_VCODE_CACHE["ts"] = now
+        return v
+    except Exception:
+        return None
+
+
+def _ths_board_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(USER_AGENT_POOL),
+        "Referer": _THS_BOARD_REFERER,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def _ths_page_frame(page: int, max_retry: int = 3) -> Optional[pd.DataFrame]:
+    """抓取按 code 降序的某一页个股资金流榜单。
+
+    返回 DataFrame（股票代码已补满 6 位）；连续重试仍失败/空表返回 None。
+    偶发 401/403 多为 hexin-v 失效，会清空 vcode 缓存并在重试时重算。
+    """
+    for attempt in range(max_retry):
+        try:
+            h = _ths_board_headers()
+            vc = _ths_vcode()
+            if vc:
+                h["hexin-v"] = vc
+            url = (
+                f"{_THS_BOARD_BASE}/page/{page}/ajax/1/free/1/"
+                if page > 1
+                else f"{_THS_BOARD_BASE}/ajax/1/free/1/"
+            )
+            resp = requests.get(url, headers=h, timeout=(5, 12), verify=False)
+            if resp.status_code != 200:
+                if resp.status_code in (401, 403):
+                    _THS_VCODE_CACHE["v"] = None  # 可能是 vcode 失效，下次重算
+                time.sleep(0.3 + 0.2 * attempt + random.uniform(0.0, 0.3))
+                continue
+            try:
+                d = pd.read_html(StringIO(resp.text))[0]
+            except Exception:
+                time.sleep(0.3)
+                continue
+            # pd.read_html 会把 000938 的前导零吞成 938，需从原始 HTML 取真实 6 位代码
+            codes = re.findall(r'class="stockCode">(\d{6})<', resp.text)
+            if codes and len(codes) == len(d):
+                d["股票代码"] = codes
+            if "股票代码" not in d.columns or d.empty:
+                time.sleep(0.3)
+                continue
+            return d
+        except Exception:
+            time.sleep(0.3)
+    return None
+
+
+def _ths_total_pages() -> int:
+    try:
+        resp = requests.get(
+            f"{_THS_BOARD_BASE}/ajax/1/free/1/",
+            headers=_ths_board_headers(),
+            timeout=(5, 12),
+            verify=False,
+        )
+        m = re.search(r"(\d+)/(\d+)", resp.text)
+        if m:
+            return max(1, int(m.group(2)))
+    except Exception:
+        pass
+    return 104
+
+
+def _ths_locate_code_row(code: str) -> pd.DataFrame:
+    """二分定位目标股票所在页（榜单按 code 降序），返回该股票单行；找不到返回空 DF。"""
+    total = _ths_total_pages()
+    lo, hi, cand = 1, total, None
+    for _ in range(30):
+        mid = (lo + hi) // 2
+        d = _ths_page_frame(mid)
+        if d is None:
+            lo = mid + 1
+            continue
+        c = d["股票代码"].astype(str).str.extract(r"(\d{6})", expand=False).dropna()
+        if c.empty:
+            lo = mid + 1
+            continue
+        first, last = c.iloc[0], c.iloc[-1]
+        if code > first:
+            hi = mid - 1
+        elif code < last:
+            lo = mid + 1
+        else:
+            cand = mid
+            break
+    if cand is None:
+        return pd.DataFrame()
+    # 候选页及相邻页各取一次，避免边界/空页导致漏判
+    for p in (cand - 2, cand - 1, cand, cand + 1, cand + 2):
+        if 1 <= p <= total:
+            d = _ths_page_frame(p)
+            if d is None:
+                continue
+            d = d.copy()
+            d["股票代码"] = d["股票代码"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
+            row = d[d["股票代码"] == code]
+            if not row.empty:
+                return row.reset_index(drop=True)
+    return pd.DataFrame()
+
+
 def fetch_fund_flow_frame(stock_code_in: str) -> "pd.DataFrame":
     """同花顺个股资金流补位。
 
-    当前优先复用 akshare 的同花顺资金流榜单接口，从“即时”榜单中过滤目标股票。
-    该源通常只提供最新一笔聚合数据，因此作为东方财富失败时的兜底返回单行结果。
+    用「按 code 降序二分翻页」定位目标股票（修复 akshare 用 zdf 翻页导致 000938 等被漏掉的
+    bug）。同花顺榜单仅含流入/流出/净额，无东财那样的主力/大单拆分；这里把「净额」映射到
+    主力净额/大单净额以便界面有值（启动时已对用户提示该兜底仅含净额）。
     """
     code = str(stock_code_in or "").strip().zfill(6)
     if not code:
         return pd.DataFrame()
 
-    df = ak.stock_fund_flow_individual(symbol="即时")
-    if df is None or df.empty:
+    try:
+        row = _ths_locate_code_row(code)
+    except Exception:
+        row = pd.DataFrame()
+    # 首次未命中（多为 vcode 偶发失效）→ 清空 vcode 缓存后重试一次
+    if row is None or row.empty:
+        try:
+            _THS_VCODE_CACHE["v"] = None
+            row = _ths_locate_code_row(code)
+        except Exception:
+            row = pd.DataFrame()
+    if row is None or row.empty:
         return pd.DataFrame()
 
-    out = df.copy()
-    if "股票代码" not in out.columns:
-        return pd.DataFrame()
-
-    out["股票代码"] = out["股票代码"].astype(str).str.extract(r"(\d{6})", expand=False).fillna("")
-    out = out[out["股票代码"] == code].copy()
-    if out.empty:
-        return pd.DataFrame()
-
+    out = row.copy()
     today_text = pd.Timestamp.now().strftime("%Y-%m-%d")
-    out["日期"] = today_text
+    if "日期" not in out.columns and "交易日" not in out.columns and "date" not in out.columns:
+        out["日期"] = today_text
 
-    # 同花顺即时榜单只给出汇总净额，没有东财那样的主力/大单/超大单拆分；
-    # 这里保留可用列，并把“净额”映射到统一层最常用的大单净额字段以便界面有值可展示。
-    if "净额" in out.columns and "大单净额" not in out.columns:
-        out["大单净额"] = out["净额"]
-    if "净额" in out.columns and "主力净额" not in out.columns:
-        out["主力净额"] = out["净额"]
+    # 同花顺榜单列名带「(元)」后缀：净额(元)/流入资金(元)/...
+    net_col = None
+    for cand in ("净额(元)", "净额"):
+        if cand in out.columns:
+            net_col = cand
+            break
+    if net_col is not None:
+        if "大单净额" not in out.columns:
+            out["大单净额"] = out[net_col]
+        if "主力净额" not in out.columns:
+            out["主力净额"] = out[net_col]
     if "最新价" in out.columns and "收盘价" not in out.columns:
         out["收盘价"] = out["最新价"]
 

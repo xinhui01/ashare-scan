@@ -263,7 +263,6 @@ src/
 ├── config.py                         统一 env 读取（env_int / env_float / env_bool / env_str）
 ├── network/                          HTTP 网络层（跨源共用）
 │   ├── headers.py                        UA / Referer 池 + 东财随机 headers/cookie
-│   ├── proxy_pool.py                     可选免费代理池（多源拉取 + 验证 + 黑名单）
 │   └── host_health.py                    全局主机健康/冷却管理（被所有源共享）
 ├── sources/                          数据源
 │   ├── _common.py                        市场前缀 / 历史 frame 标准化 / 列名匹配

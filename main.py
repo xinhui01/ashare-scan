@@ -19,8 +19,9 @@ from src.services.scoring.predict import (
 from stock_filter import StockFilter
 from stock_store import ensure_store_ready
 
-# 默认沿用系统/环境代理（trust_env=True）。网络出口交给启动 bat 的 _set_proxy.bat：
-# 本地 Clash(7897) 开着就走 Clash，没开就走直连。改回 True 可强制全程不走代理（旧行为）。
+# 网络请求默认全部直连：由 stock_data._apply_network_patches 强制 trust_env=False，
+# 忽略 HTTP(S)_PROXY 等环境代理，避免 Clash/公司代理对东方财富、同花顺等源断开。
+# BYPASS_PROXY 保留为兼容开关（会写 ASHARE_SCAN_BYPASS_PROXY），但已不影响实际行为。
 BYPASS_PROXY = False
 
 
