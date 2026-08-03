@@ -156,7 +156,7 @@ def check_fund_flow_connectivity(timeout: float = 8.0, log=None) -> None:
             except Exception:
                 pass
             warn = (
-                "⚠️ 东方财富资金流接口直连失败（连接被远端重置 RemoteDisconnected）。已自动切到同花顺兜底——"
+                "[警告] 东方财富资金流接口直连失败（连接被远端重置 RemoteDisconnected）。已自动切到同花顺兜底——"
                 "但同花顺仅含净流入净额，无主力/大单拆分。\n可能原因：本机到 eastmoney 的网络链路受限"
                 "（防火墙 / ISP / 公司网络），或东财服务端短暂风控。可稍后重试；若需完整主力/大单数据，"
                 "请确认本机能正常访问 push2his.eastmoney.com 后重启本程序。"

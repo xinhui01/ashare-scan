@@ -63,4 +63,4 @@ print("=" * 64)
 print("  plan eastmoney:", f.build_fund_flow_request_plan("eastmoney").provider_sequence)
 print("  plan ths      :", f.build_fund_flow_request_plan("ths").provider_sequence)
 
-print("\n✅ 验证脚本执行完毕")
+print("\n[OK] 验证脚本执行完毕")

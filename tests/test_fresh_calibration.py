@@ -83,8 +83,9 @@ def test_scan_fresh_candidates_sorts_by_calibrated_confidence(monkeypatch):
     rec_plain = {"code": "000002", "name": "普通", "change_pct": 2.0}
 
     def fake_score(rec, *_args, **_kwargs):
+        # 分数须 >= 55（scan 入选门槛，2026-07 由 45 回收到 55），否则进不到校准环节
         if rec["code"] == "000001":
-            return {"code": rec["code"], "name": rec["name"], "score": 50, "reasons": _REASON_A}
+            return {"code": rec["code"], "name": rec["name"], "score": 56, "reasons": _REASON_A}
         return {"code": rec["code"], "name": rec["name"], "score": 65, "reasons": _REASON_B}
 
     monkeypatch.setattr(fresh_scoring, "score_fresh_first_board", fake_score)
