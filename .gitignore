@@ -9,7 +9,7 @@ cache/
 .vscode/
 data/
 .claude/
-.workbuddy/
+# .workbuddy/  (用户选择同步策略记忆/复盘笔记，不再忽略；仅含文本md，无密钥)
 deliverables/
 docs/
 _diag_wrap.py
