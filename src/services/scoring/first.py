@@ -90,7 +90,7 @@ def score_followthrough_candidate(
     compare_context: Dict[str, Any],
     *,
     fetcher,
-    lookback_days: int = 5,
+    lookback_days: int = 90,
     log_fn: Optional[Callable[[str], None]] = None,
     limit_up_threshold_pct_fn: Optional[Callable[[str], float]] = None,
     build_local_cache_history_plan_fn: Optional[Callable[..., Any]] = None,
@@ -585,9 +585,13 @@ def score_followthrough_candidate(
         score += 3
         reasons.append(f"情绪温热{sent_score}+3")
 
-    # === 历史同类形态加分：近 90 日内的二波接力成功次数 ===
+    # === 历史同类形态加分：近 lookback_days 日内的二波接力成功次数 ===
+    # 注：lookback_days 此前被写死为 90（死参数），现改为透传函数入参。
+    # 该参数由调用方决定（predict.py 透传用户 lookback_days=5/25）。
+    # 实证表明 lookback 对主续板评分路径影响极小（latest_continuation_rate
+    # 与窗口无关），此处仅影响历史形态加分窗口，影响有界。
     occ_count, last_hit_days = _count_historical_followthrough(
-        history, code, lookback_days=90, window=5,
+        history, code, lookback_days=lookback_days, window=5,
         threshold_fn=threshold_fn, stock_name=name,
     )
     if occ_count >= 3:

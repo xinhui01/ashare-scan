@@ -2428,6 +2428,20 @@ def predict_limit_up_candidates(
         "summary": "\n".join(summary_lines),
         "data_quality": data_quality,
     }
+
+    # ===== 候选质量门（优化：类别筛选 + top-N 截断）=====
+    # 默认关闭（preset="off"），不改变现有行为。通过环境变量
+    # LIMITUP_QUALITY_GATE 切换预设（wrap_only / wrap_first / wrap_first_cont）。
+    # 实证见 docs/涨停预测优化方案.md：反包+二波+保留 且 top-5 命中率 ~30~40%。
+    try:
+        from src.services.scoring.quality_gate import apply_prediction_quality_gate
+
+        result = apply_prediction_quality_gate(
+            result, data_quality=data_quality, log_fn=log_fn
+        )
+    except Exception as exc:
+        logger.debug("候选质量门执行失败（已跳过，保留原结果）: %s", exc)
+
     try:
         save_last_limit_up_prediction(result)
     except Exception:
