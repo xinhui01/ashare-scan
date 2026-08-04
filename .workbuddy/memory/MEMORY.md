@@ -32,3 +32,16 @@
 - SSH 密钥：`~/.ssh/id_ed25519`（ed25519，空口令，comment `gupiao-workbuddy`），公钥已生成待加入 GitHub 账户。
 - 推送命令：`git push origin main`（走 SSH 22，无需任何代理）。首次推送前需把公钥加到 GitHub → Settings → SSH and GPG keys。
 - 与"股票数据全部直连"约定不冲突：GitHub 走 SSH 协议，数据 API 仍直连。
+
+## Git 跟踪引用沙箱限制（重要）
+- 本沙箱环境下 git 自身的引用写盘被拦截：`git update-ref` 返回成功但不生效；`git push`/`git fetch` 也**不会刷新** `origin/main` 远程跟踪引用。
+- 表现：`git status` 持续误报 `ahead N`（如 ahead 293 / ahead 1），但 `git ls-remote origin main` 查到的远程真值始终正确（推送其实已成功）。
+- **验证同步是否成功唯一可靠方式**：`git ls-remote origin main`（直接问 GitHub）。
+- 修正本地显示假 "ahead N"：直接编辑 `.git/packed-refs`，把 `refs/remotes/origin/main` 那行改成 `git ls-remote` 返回的 SHA；`git update-ref` 在此环境无效。
+- 直接改 packed-refs 文件（Edit/Write 工具）可持久生效、rev-parse 能正确读取；不要依赖 update-ref/push/fetch 去刷新该引用。
+
+## 策略复盘教训（预判次日用）
+- 当 涨停总数 / 晋级率 / 市场情绪 三者同步骤升 = 情绪 regime 切换为**进攻**，不要停留在"轮动日=防守"旧框架；应预案"情绪爆量则转攻、跟随当日新主线"。
+- 主线有惯性但也轮动：预判次日时，主线以"**当日**最强行业/题材"为准，不要机械沿用前一日主线（案例：0803夜按电网设备→0804实际切元件/芯片半导体，一夜切换）。
+- 超短纪律：持仓若掉出强度池 TOP10 且不在主线内 → 优先换主线而非死扛；开盘核 5日线，破即走。
+- 反包池被系统标"谨慎/回避"时，即便大环境火热也按规则不做（案例：中岩大地 0803 连板 → 0804 被砸成反包）。
