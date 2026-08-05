@@ -12,5 +12,14 @@ set "PREDICT_ARGS=--lookback 25"
 
 "%PYTHON_EXE%" main.py update-and-predict %CACHE_ARGS% %PREDICT_ARGS% %*
 set "RC=%ERRORLEVEL%"
+
+echo.
+echo [post-check] snapshot sync status:
+if exist "%~dp0scripts\check_snapshot_sync.py" (
+    "%PYTHON_EXE%" "%~dp0scripts\check_snapshot_sync.py"
+) else (
+    echo [!] scripts\check_snapshot_sync.py missing, skip check
+)
+
 if "%~1"=="" pause
 exit /b %RC%
