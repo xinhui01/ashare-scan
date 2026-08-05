@@ -606,9 +606,9 @@ def score_followthrough_candidate(
     if bonus > 0:
         if last_hit_days is not None and last_hit_days <= 30:
             bonus = min(bonus + 2, 10)
-            reasons.append(f"近90日{occ_count}次二波接力成功(最近{last_hit_days}日内)+{bonus}")
+            reasons.append(f"近{lookback_days}日{occ_count}次二波接力成功(最近{last_hit_days}日内)+{bonus}")
         else:
-            reasons.append(f"近90日{occ_count}次二波接力成功+{bonus}")
+            reasons.append(f"近{lookback_days}日{occ_count}次二波接力成功+{bonus}")
         score += bonus
 
     final_score = max(0, min(100, int(round(score))))

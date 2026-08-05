@@ -89,6 +89,16 @@ def apply_prediction_quality_gate(
 
     cfg = _resolve_config(preset, top_n, categories)
     if not cfg:
+        # 预设拼写错误时静默关闭会让人误以为已启用，这里显式提示一次
+        if preset and preset != "off" and preset not in QUALITY_GATE_PRESETS:
+            valid = ", ".join(k for k in QUALITY_GATE_PRESETS if k != "off")
+            msg = f"候选质量门：未知预设 '{preset}'（可选: {valid}），本次不启用"
+            if log_fn:
+                log_fn(msg)
+            else:
+                import logging
+
+                logging.getLogger(__name__).warning(msg)
         return result
 
     enabled = [c for c in cfg["categories"] if c in CATEGORY_RESULT_KEY]
