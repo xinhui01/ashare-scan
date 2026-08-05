@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>华达科技(603358) 投资分析报告 - 2026-08-05</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; max-width: 1080px; margin: 0 auto; padding: 24px; background: #f7f8fa; color: #1f2937; }
+  .decision-card { background: linear-gradient(135deg, #f59e0b, #d97706); color: white; padding: 32px; border-radius: 16px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(217,119,6,0.25); }
+  .decision-card h1 { font-size: 46px; margin: 0 0 4px; font-weight: 800; letter-spacing: 1px; }
+  .decision-card .sub { font-size: 15px; opacity: 0.92; margin-bottom: 16px; }
+  .badges { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .badge { background: rgba(255,255,255,0.2); padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .grid-item { background: rgba(255,255,255,0.18); padding: 14px; border-radius: 10px; }
+  .grid-item .label { font-size: 12px; opacity: 0.85; }
+  .grid-item .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .grid-item .value.small { font-size: 16px; }
+  .chart-card { background: white; padding: 24px; border-radius: 12px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .chart-card h2 { margin-top: 0; font-size: 19px; color: #111827; display: flex; align-items: center; gap: 8px; }
+  .chart-card h2 .dot { width: 10px; height: 10px; border-radius: 50%; background: #d97706; display: inline-block; }
+  .chart-wrap { position: relative; height: 360px; }
+  .chart-wrap.sm { height: 320px; }
+  .detail { background: white; padding: 24px; border-radius: 12px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .detail h2 { font-size: 19px; margin-top: 0; color: #111827; }
+  .detail h3 { font-size: 15px; color: #374151; margin: 18px 0 8px; border-left: 4px solid #d97706; padding-left: 10px; }
+  .detail p, .detail li { font-size: 14px; line-height: 1.7; color: #374151; }
+  .detail ul { padding-left: 20px; margin: 6px 0; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; margin-right: 6px; }
+  .pill.red { background: #fee2e2; color: #b91c1c; }
+  .pill.green { background: #dcfce7; color: #15803d; }
+  .pill.yellow { background: #fef3c7; color: #b45309; }
+  .pill.blue { background: #dbeafe; color: #1d4ed8; }
+  details { border: 1px solid #e5e7eb; border-radius: 8px; padding: 0 14px; margin: 10px 0; }
+  summary { cursor: pointer; padding: 12px 0; font-weight: 600; color: #374151; font-size: 14px; }
+  .disclaimer { color: #6b7280; font-size: 12px; padding: 18px; border-top: 1px solid #e5e7eb; margin-top: 20px; line-height: 1.6; }
+  .src { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+</style>
+</head>
+<body>
+
+  <!-- 1. 决策卡片 -->
+  <div class="decision-card">
+    <h1>🟡 HOLD（持有/空仓）</h1>
+    <div class="sub">华达科技 603358 · 沪市主板 · 分析基准日 2026-08-05（预测次日 08-06）· 现价 41.73</div>
+    <div class="badges">
+      <span class="badge">方向信心：高（HOLD 成立）</span>
+      <span class="badge">风险等级：高</span>
+      <span class="badge">试错成数信心：中</span>
+    </div>
+    <div class="grid">
+      <div class="grid-item"><div class="label">建议仓位</div><div class="value small">≤0.5 成</div></div>
+      <div class="grid-item"><div class="label">入场价区间</div><div class="value small">39.6–40.0</div></div>
+      <div class="grid-item"><div class="label">目标价</div><div class="value">42.40</div></div>
+      <div class="grid-item"><div class="label">止损价</div><div class="value">38.50</div></div>
+    </div>
+  </div>
+
+  <!-- 2. 综合评分雷达图 -->
+  <div class="chart-card">
+    <h2><span class="dot"></span>综合评分雷达图（0–10）</h2>
+    <div class="chart-wrap sm"><canvas id="radarChart"></canvas></div>
+    <div class="src">技术面=市场分析师 6/10；参考各 Phase 成员产出折算。风险面分值越高=风险越大。</div>
+  </div>
+
+  <!-- 3. 价格走势图 -->
+  <div class="chart-card">
+    <h2><span class="dot"></span>近 60 交易日价格走势（真实数据）</h2>
+    <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
+    <div class="src">K线序列来源：tdx-connector 独立复核（与 NeoData 结论一致，已排除失败的 37.32 错数据）。绿线=目标价 42.40，红线=止损价 38.50，蓝点=当前价 41.73。</div>
+  </div>
+
+  <!-- 4. 多空论点对比图 -->
+  <div class="chart-card">
+    <h2><span class="dot"></span>多空论点对比（权重 1–10）</h2>
+    <div class="chart-wrap"><canvas id="bullBearChart"></canvas></div>
+    <div class="src">论点与权重来自 Phase 2 多空辩论 + Phase 4 三方风险论证，研究主管/风险主管裁定权重。</div>
+  </div>
+
+  <!-- 5. 风险评估三角图 -->
+  <div class="chart-card">
+    <h2><span class="dot"></span>风险评估三角形（三方风险感知）</h2>
+    <div class="chart-wrap sm"><canvas id="riskChart"></canvas></div>
+    <div class="src">分值越高=该方感知的风险越大。激进方感知风险最低（3），保守方最高（9），中性居中（6）。</div>
+  </div>
+
+  <!-- 6. 详细分析文本 -->
+  <div class="detail">
+    <h2>详细分析结论</h2>
+
+    <h3>① 四维分析摘要</h3>
+    <p>
+      <span class="pill blue">技术 6/10</span> 二波形态，8/4 涨停 39.61、8/5 冲高 42.42 回落收 41.73（+5.35%），动能尚可但高位；8/5 为冲板未遂非涨停/炸板日。
+      <span class="pill red">基本面 2/10</span> PE 149.86（96.5%分位）、H1 预亏、中芯概念为参股影子股（0 收入）、机构零买入、公募持仓仅 0.24%、8/27 中报硬雷；净资产 9 个月缩水 2.88 亿、长投连续减值、现金 4.37 亿盖不住短债 8.61 亿（覆盖率 50.7%）。
+      <span class="pill yellow">新闻 3/10</span> 7/24 被迫更正三季报 + 年报被交易所问询 + 会计师专项说明；8/27 中报窗口；二次异动核查风险。
+      <span class="pill blue">情绪 5.2/10</span> 8/5 超大单 +1.04 亿但主动主力净流出 −1660 万（游资拉抬非机构共识）；融资盘净偿还；量比仅 1.24、委比 −35.53%（盘口内空）。
+    </p>
+
+    <h3>② 多空辩论结论</h3>
+    <p>研究主管裁决 <b>HOLD（空仓保持）</b>；交易员 FINAL PROPOSAL <b>HOLD</b>（0% 底仓，≤1 成试错）。<b>多头第三轮认输</b>：撤回多数论点、举证失败，EV 经三分支+滑点修正后仍≈ −0.35%，账户 EV≈ −0.005%/次，明确不反对 HOLD/NO BUY，原话"期望值已收敛到零，唯一仓位有更好去处"。空头胜、多头撤，HOLD 成立。</p>
+
+    <h3>③ 风险评估结论（Phase 4）</h3>
+    <p>
+      <span class="pill red">保守</span> 纯空仓、删试错后门——盘口内空、7/30 同型态 −14.66%、财报趋势恶化、止损 38.60 双错、规则赔率 0.36:1、路径期望 −1.9%、中报超预期计提概率 40~50%。<br>
+      <span class="pill yellow">中性</span> HOLD+≤1 成试错整体平衡，建议 0.5 成起步分批、止损下移至 38.50、异动停牌风险下等确认而非抢跑，中高风险。<br>
+      <span class="pill green">激进</span> 承认保守基本面质疑有效，但主张"用纪律换赔率"——0.8~1 成试错、硬止损 38.60、不过夜，认为删试错=让出二波窗口。<br>
+      <b>风险主管最终裁决：HOLD（空仓为主，仅保留极窄试错通道）。</b> 仓位 0% 底仓、试错上限 <b>≤0.5 成</b>。赔率裁判：激进 1.8:1 系幻觉——硬止损 38.60 恰为 8/5 日内低点，落在约 10% 正常波动噪声带内，真实可执行赔率≈保守 0.36:1，止损在真实波动下不可靠。风险等级：高。
+    </p>
+
+    <h3>④ 关键催化剂 & 风险事件</h3>
+    <ul>
+      <li><span class="pill green">上行催化</span> 半导体材料/中芯概念若继续发酵，42.42 以上打开新空间；二波接力形态在超短策略的高赔率窗口。</li>
+      <li><span class="pill red">核心风险</span> 8/6 再涨约 +4.7%（~43.67）触发沪市异动核查停牌；8/27 中报硬雷（预亏+可能补计提）；7/30 同型态已 −14.66% 的前车之鉴；PE 149 高位无估值锚；立案/一字跌停尾部风险下"不过夜"纪律失效。</li>
+      <li><span class="pill yellow">一票否决红线</span> ① 高开>43.40 不追 ② 跌破 39.61 放弃 ③ 半导体/中芯概念退潮 ④ 放量突破 42.42 不追 ⑤ 复牌后无持续催化或临近 8/27 中报雷 → 降至 0%。</li>
+    </ul>
+
+    <details>
+      <summary>📋 0806 可执行盘中条件单（展开）</summary>
+      <p><b>前提</b>：8/6 若因异动核查停牌则当日不可开仓；以下条件单适用于复牌首日。</p>
+      <ul>
+        <li><b>入场触发</b>：复牌后回踩 39.6~40.0 且缩量企稳（量比&lt;1、未破 39.61）；高开&gt;43.40 不追、放量突破 42.42 不追。</li>
+        <li><b>入场价区间</b>：39.6–40.0。</li>
+        <li><b>目标价</b>：42.40（先挂半仓止盈）；43.40 仅作参考不追。</li>
+        <li><b>止损价</b>：38.50（较原 38.60 下移 0.10 防毛刺；但需认清其下 6.7% 真空区，破位即放弃手动止损、等开盘核按钮）。</li>
+        <li><b>是否过夜</b>：绝不过夜。</li>
+        <li><b>仓位</b>：试错上限 ≤0.5 成（严于交易员原 1 成）。</li>
+      </ul>
+    </details>
+
+    <div class="disclaimer">
+      ⚠️ 免责声明：本分析由 AI 基于公开信息（NeoData 金融数据服务 + tdx-connector 价格复核）整理生成，仅供研究参考，<b>不构成任何投资建议或个股推荐</b>。文中所有观点为模型推演，存在局限性；投资有风险，决策需谨慎，请结合自身风险承受能力独立判断。
+    </div>
+    <div class="src">数据来源：NeoData 金融数据服务（各 Phase 成员分析产出）；价格序列经 tdx-connector 独立复核确认。</div>
+  </div>
+
+<script>
+  // ===== 真实 60 日数据（tdx-connector 复核，2026-05-13 ~ 2026-08-05）=====
+  const dates = ["05-13","05-14","05-15","05-18","05-19","05-20","05-21","05-22","05-25","05-26","05-27","05-28","05-29","06-01","06-02","06-03","06-04","06-05","06-08","06-09","06-10","06-11","06-12","06-15","06-16","06-17","06-18","06-22","06-23","06-24","06-25","06-26","06-29","06-30","07-01","07-02","07-03","07-06","07-07","07-08","07-09","07-10","07-13","07-14","07-15","07-16","07-17","07-20","07-21","07-22","07-23","07-24","07-27","07-28","07-29","07-30","07-31","08-03","08-04","08-05"];
+  const closes = [35.52,35.19,34.14,37.58,37.32,38.03,38.40,38.84,37.33,36.64,36.14,38.68,38.73,37.34,38.52,38.84,37.83,38.20,37.59,36.29,36.86,37.17,38.25,38.18,37.04,35.56,39.14,37.84,39.41,39.19,42.01,40.96,41.75,43.50,43.08,42.52,44.04,44.23,43.98,41.18,42.42,41.15,38.25,39.92,38.34,37.21,34.07,33.75,33.90,32.88,32.80,30.95,34.05,37.46,37.43,35.41,37.54,36.01,39.61,41.73];
+
+  function sma(arr, w, i){ if(i < w-1) return null; let s=0; for(let j=i-w+1;j<=i;j++) s+=arr[j]; return +(s/w).toFixed(2); }
+  const sma20 = closes.map((_,i)=>sma(closes,20,i));
+  const sma60 = closes.map((_,i)=>sma(closes,60,i));
+  const mean60 = closes.reduce((a,b)=>a+b,0)/closes.length;
+
+  // 1. 雷达图
+  new Chart(document.getElementById('radarChart'), {
+    type:'radar',
+    data:{ labels:['技术面','基本面','新闻面','情绪面','风险面'],
+      datasets:[{ label:'评分(风险面越高越危险)', data:[6,2,3,5,9],
+        backgroundColor:'rgba(217,119,6,0.25)', borderColor:'#d97706', pointBackgroundColor:'#d97706', pointRadius:4 }] },
+    options:{ scales:{ r:{ suggestedMin:0, suggestedMax:10, ticks:{stepSize:2} } }, plugins:{legend:{display:false}} }
+  });
+
+  // 2. 价格走势
+  const const_line = (v)=> closes.map(()=>v);
+  new Chart(document.getElementById('priceChart'), {
+    type:'line',
+    data:{ labels:dates, datasets:[
+      { label:'收盘价', data:closes, borderColor:'#1d4ed8', backgroundColor:'rgba(29,78,216,0.08)', borderWidth:2, pointRadius:0, fill:true },
+      { label:'SMA20', data:sma20, borderColor:'#f59e0b', borderWidth:1.5, pointRadius:0, borderDash:[] },
+      { label:'SMA60(全窗口均值)', data:const_line(+mean60.toFixed(2)), borderColor:'#9ca3af', borderWidth:1.2, pointRadius:0, borderDash:[5,4] },
+      { label:'目标价 42.40', data:const_line(42.40), borderColor:'#15803d', borderWidth:1.5, pointRadius:0, borderDash:[6,4] },
+      { label:'止损价 38.50', data:const_line(38.50), borderColor:'#b91c1c', borderWidth:1.5, pointRadius:0, borderDash:[6,4] }
+    ]},
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{position:'top', labels:{font:{size:11}}} },
+      scales:{ x:{ ticks:{maxTicksLimit:12, font:{size:10}} }, y:{ suggestedMin:30, suggestedMax:46 } } }
+  });
+
+  // 3. 多空对比（水平柱状）
+  new Chart(document.getElementById('bullBearChart'), {
+    type:'bar',
+    data:{ labels:[
+        '财报恶化+8/27中报硬雷','真实赔率0.36:1(负期望)','异动核查停牌风险','机构零买入/公募0.24%','PE149.86高位无锚','7/30同型态已-14.66%','止损38.60不可靠',
+        '二波接力+半导体催化','错失成本(空仓踏空)','严格止损+不过夜锁下行','超大单+1.04亿主动拉抬'
+      ],
+      datasets:[
+        { label:'空头权重', data:[9,9,8,8,8,8,7, null,null,null,null], backgroundColor:'#b91c1c' },
+        { label:'多头权重', data:[null,null,null,null,null,null,null, 6,5,5,4], backgroundColor:'#15803d' }
+      ]},
+    options:{ indexAxis:'y', responsive:true, maintainAspectRatio:false,
+      plugins:{ legend:{position:'top'}, tooltip:{callbacks:{label:(c)=> c.raw==null?'':c.dataset.label+': '+c.raw}} },
+      scales:{ x:{ max:10, title:{display:true,text:'权重 1–10'} } } }
+  });
+
+  // 4. 风险三角
+  new Chart(document.getElementById('riskChart'), {
+    type:'radar',
+    data:{ labels:['激进方','中性方','保守方'],
+      datasets:[{ label:'风险感知分值(越高越谨慎)', data:[3,6,9],
+        backgroundColor:'rgba(185,28,28,0.20)', borderColor:'#b91c1c', pointBackgroundColor:['#15803d','#d97706','#b91c1c'], pointRadius:5 }] },
+    options:{ scales:{ r:{ suggestedMin:0, suggestedMax:10, ticks:{stepSize:2} } }, plugins:{legend:{display:false}} }
+  });
+</script>
+</body>
+</html>
