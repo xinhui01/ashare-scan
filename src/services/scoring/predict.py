@@ -1605,14 +1605,11 @@ def predict_limit_up_candidates(
             "summary": summary,
             "data_quality": data_quality,
         }
-        try:
-            save_last_limit_up_prediction(result)
-        except Exception:
-            pass
-        try:
-            save_limit_up_prediction_record(result)
-        except Exception:
-            pass
+        # 中止结果不落库：空结果一旦覆盖 last / 写进历史表，会顶掉上一次
+        # 有效预测（如盘前东财熔断拉不到涨停池 → 空 last → 竞价确认无票可用），
+        # 且快照导入的日期比较会因此挡住旧快照回填。中止只返回、不持久化。
+        if log_fn:
+            log_fn(f"涨停预测中止：{summary}（结果不落库，保留上次有效预测）")
         return result
 
     # 涨停池就绪 → 记录来源 + 行数
@@ -1982,11 +1979,9 @@ def predict_limit_up_candidates(
             "summary": summary,
             "data_quality": data_quality,
         }
-        try:
-            save_last_limit_up_prediction(result)
-        except Exception:
-            pass
-        # 注意：中止结果不写入 prediction_record 历史表，避免污染历史
+        # 中止结果不落库（与"涨停池为空"分支同理）：不覆盖 last、不写历史表
+        if log_fn:
+            log_fn(f"涨停预测中止：{summary}（结果不落库，保留上次有效预测）")
         return result
 
     # 龙头身份预算：同板块今日最高板数 + 持有该板数的代码集合

@@ -1,16 +1,20 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul 2>&1
 rem ---------------------------------------------------------------------
-rem  网络出口策略：全部直连（不再走任何代理）。
+rem  Network egress policy: all direct connections (no proxy).
 rem
-rem  清掉可能从父进程 / 系统继承来的 HTTP(S)_PROXY，避免请求被导向失效的
-rem  代理（例如本地 Clash 7897 端口开着却未提供代理服务，导致 ProxyError）。
-rem  本文件只做清代理动作，不改变其它环境变量；被各启动 bat 以
-rem  `call _set_proxy.bat` 调用，但已不再做 Clash 探测与代理注入。
+rem  Clears HTTP(S)_PROXY inherited from parent process / system, so
+rem  requests are not routed to a dead local proxy (e.g. Clash port 7897
+rem  open but not serving -> ProxyError). This file only clears proxy
+rem  vars, nothing else. Called by launcher bats via `call _set_proxy.bat`;
+rem  Clash probing and proxy injection have been removed.
+rem
+rem  NOTE: keep this file ASCII-only. Long multibyte rem lines break the
+rem  cmd.exe batch parser under codepage 65001 (fragments get executed).
 rem ---------------------------------------------------------------------
 set "HTTP_PROXY="
 set "HTTPS_PROXY="
 set "http_proxy="
 set "https_proxy="
 set "ALL_PROXY="
-echo [proxy] 直连模式：已清空 HTTP(S)_PROXY，所有请求走本地直连
+echo [proxy] direct mode: HTTP(S)_PROXY cleared, all requests go direct

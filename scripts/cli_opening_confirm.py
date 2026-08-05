@@ -35,12 +35,76 @@ for _p in (
 # 网络补丁（直连）须在 import akshare / requests 前执行（stock_data 模块导入即生效）
 import stock_data  # noqa: F401  (side-effect: 应用 _apply_network_patches)
 
-from stock_store import load_last_limit_up_prediction
+from stock_store import (
+    list_limit_up_prediction_dates,
+    load_last_limit_up_prediction,
+    load_limit_up_prediction_by_date,
+)
 from prediction_snapshot_service import import_snapshot_if_newer
 import opening_confirmation_service  # noqa: E402
 
 
 _STATUS_ORDER = ["可买", "观察", "放弃", "风险过高"]
+
+_CANDIDATE_KEYS = (
+    "continuation_candidates",
+    "first_board_candidates",
+    "fresh_first_board_candidates",
+    "broken_board_wrap_candidates",
+    "trend_limit_up_candidates",
+)
+
+
+def _count_candidates(payload: dict) -> int:
+    return sum(len(payload.get(k) or []) for k in _CANDIDATE_KEYS)
+
+
+def _load_best_payload() -> tuple[dict | None, str]:
+    """优先读 last；last 缺失或候选为空时，回退历史表里最近一条非空预测。
+
+    盘前网络故障产生的空预测会顶掉 last（predict 中止分支已改为不落库，
+    这里再兜一层，兼容旧库里已写入的空记录）。
+    """
+    payload = load_last_limit_up_prediction()
+    if isinstance(payload, dict) and _count_candidates(payload) > 0:
+        return payload, ""
+    for trade_date in list_limit_up_prediction_dates():
+        rec = load_limit_up_prediction_by_date(trade_date)
+        if isinstance(rec, dict) and _count_candidates(rec) > 0:
+            last_date = str((payload or {}).get("trade_date") or "-")
+            return rec, f"最新预测({last_date})没有候选，已回退到 {trade_date} 的历史预测"
+    return (payload if isinstance(payload, dict) else None), ""
+
+
+def _last_trading_day_before(today_key: str) -> str:
+    """返回 today_key 之前最近的交易日（YYYYMMDD），失败返回空串。"""
+    try:
+        from datetime import timedelta
+        from src.utils.trade_calendar import _get_trade_calendar, _is_trading_day
+
+        cal = _get_trade_calendar()
+        day = datetime.strptime(today_key, "%Y%m%d").date() - timedelta(days=1)
+        for _ in range(15):
+            if _is_trading_day(day, cal):
+                return day.strftime("%Y%m%d")
+            day -= timedelta(days=1)
+    except Exception:
+        pass
+    return ""
+
+
+def _staleness_warning(trade_date) -> str:
+    """候选交易日早于最近盘后应有日期时给出过期告警。"""
+    td = str(trade_date or "").strip().replace("-", "")
+    if not td:
+        return ""
+    expected = _last_trading_day_before(datetime.now().strftime("%Y%m%d"))
+    if expected and td < expected:
+        return (
+            f"候选来自 {td} 盘后预测，早于最近盘后({expected})，已过期仅供参考；"
+            f"请先在有数据的电脑跑盘后预测并推送快照"
+        )
+    return ""
 
 
 def _build_candidate_lists(payload: dict) -> dict:
@@ -136,7 +200,7 @@ def _format_human(payload: dict, lists: dict, result: dict) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _format_json(payload: dict, lists: dict, result: dict) -> str:
+def _format_json(payload: dict, lists: dict, result: dict, warnings: list[str] | None = None) -> str:
     candidates: list[dict] = []
     for category, recs in lists.items():
         for rec in recs or []:
@@ -155,6 +219,7 @@ def _format_json(payload: dict, lists: dict, result: dict) -> str:
     return json.dumps(
         {
             "trade_date": str(payload.get("trade_date") or "").strip(),
+            "warnings": warnings or [],
             "generated_at": result.get("generated_at"),
             "fetched_auction": result.get("fetched_auction"),
             "fetched_intraday": result.get("fetched_intraday"),
@@ -180,12 +245,15 @@ def main() -> int:
         snap_status = "missing"
     print(f"[快照] import 状态: {snap_status}")
 
-    # 2) 读取最新预测候选
-    payload = load_last_limit_up_prediction()
+    # 2) 读取最新预测候选（last 为空/无候选时回退历史表最近一条非空预测）
+    payload, fallback_note = _load_best_payload()
     if not isinstance(payload, dict):
         print("[错误] 本地没有预测候选。请先在有数据的电脑跑盘后预测并 git push 快照，"
               "然后在本机 git pull 后再运行。")
         return 2
+    warnings = [n for n in (fallback_note, _staleness_warning(payload.get("trade_date"))) if n]
+    for note in warnings:
+        print(f"[警告] {note}")
 
     lists = _build_candidate_lists(payload)
     total = sum(len(v or []) for v in lists.values())
@@ -213,7 +281,7 @@ def main() -> int:
 
     # 4) 输出
     if args.json:
-        print(_format_json(payload, lists, result))
+        print(_format_json(payload, lists, result, warnings=warnings))
     else:
         print(_format_human(payload, lists, result))
     return 0
