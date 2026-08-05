@@ -181,6 +181,35 @@ def _run_update_cache(args: argparse.Namespace) -> int:
     return 0 if int(result.get("failed", 0) or 0) == 0 else 1
 
 
+def _run_accuracy_backfill() -> None:
+    """预测后回填历史预测的 T+1 命中评估。
+
+    此前该回填只挂在 GUI 预测页（predict.py 的 _refresh_accuracy_async），
+    纯 CLI 工作流不开 GUI 就会断更（实际断更过：0624~0803 六周无评估）。
+    评估失败只告警，不影响预测命令的退出码。
+    """
+    try:
+        from src.services import prediction_accuracy_service
+
+        def _progress(idx: int, total: int, td: str) -> None:
+            print(f"准确率回填 {idx}/{total}: {td}")
+
+        res = prediction_accuracy_service.evaluate_all_pending(
+            _progress, refresh_stale=True
+        )
+        evaluated = res.get("evaluated") or []
+        skipped = res.get("skipped") or []
+        if evaluated:
+            detail = "，".join(
+                f"{r.get('trade_date')}(写入{r.get('written', 0)})" for r in evaluated
+            )
+            print(f"准确率回填完成：{detail}；跳过 {len(skipped)} 个。")
+        elif res.get("total", 0):
+            print(f"准确率回填：无新增（待评 {res.get('total')} 个均未就绪或无候选）。")
+    except Exception as exc:  # noqa: BLE001 - 回填是附属步骤，绝不拖垮预测主流程
+        print(f"[!] 准确率回填失败（不影响预测结果）: {exc}")
+
+
 def _run_predict_today(args: argparse.Namespace) -> int:
     ensure_store_ready()
     trade_date = _resolve_predict_trade_date(str(args.date or ""))
@@ -206,6 +235,7 @@ def _run_predict_today(args: argparse.Namespace) -> int:
     }
     detail = "，".join(f"{name} {count}" for name, count in counts.items())
     print(f"涨停预测完成：交易日 {result.get('trade_date') or trade_date}，{detail}。")
+    _run_accuracy_backfill()
     return 0
 
 

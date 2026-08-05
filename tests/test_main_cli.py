@@ -67,6 +67,7 @@ def test_predict_today_command_calls_predictor(monkeypatch):
     monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
     monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
     monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+    monkeypatch.setattr(main, "_run_accuracy_backfill", lambda: None)
 
     rc = main.main(["predict-today", "--lookback", "7"])
 
@@ -94,6 +95,7 @@ def test_predict_today_command_defaults_to_25_day_environment(monkeypatch):
     monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
     monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
     monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+    monkeypatch.setattr(main, "_run_accuracy_backfill", lambda: None)
 
     rc = main.main(["predict-today"])
 
@@ -119,11 +121,51 @@ def test_predict_today_command_caps_environment_lookback_at_60(monkeypatch):
     monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
     monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
     monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+    monkeypatch.setattr(main, "_run_accuracy_backfill", lambda: None)
 
     rc = main.main(["predict-today", "--lookback", "120"])
 
     assert rc == 0
     assert calls["lookback_days"] == 60
+
+
+def test_predict_today_triggers_accuracy_backfill(monkeypatch):
+    called = []
+
+    class FakeStockFilter:
+        def predict_limit_up_candidates(self, trade_date, **kwargs):
+            return {
+                "trade_date": trade_date,
+                "continuation_candidates": [],
+                "first_board_candidates": [],
+                "fresh_first_board_candidates": [],
+                "broken_board_wrap_candidates": [],
+                "trend_limit_up_candidates": [],
+            }
+
+    monkeypatch.setattr(main, "ensure_store_ready", lambda: None)
+    monkeypatch.setattr(main, "StockFilter", FakeStockFilter)
+    monkeypatch.setattr(main, "_default_predict_trade_date", lambda: "20260612")
+    monkeypatch.setattr(main, "_run_accuracy_backfill", lambda: called.append(True))
+
+    rc = main.main(["predict-today"])
+
+    assert rc == 0
+    assert called == [True]
+
+
+def test_accuracy_backfill_swallows_errors(monkeypatch, capsys):
+    from src.services import prediction_accuracy_service as svc
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(svc, "evaluate_all_pending", _boom)
+
+    main._run_accuracy_backfill()  # 不应抛异常
+
+    out = capsys.readouterr().out
+    assert "准确率回填失败" in out
 
 
 def test_sentiment_command_prints_summary_on_success(monkeypatch, capsys):
