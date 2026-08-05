@@ -460,14 +460,18 @@ def score_followthrough_candidate(
     # 5. 情绪共振 —— 2026-05-29 减半：
     # "热门板块 +12" 实测反指 -3.7% (n=85)、"题材龙头≥20只" 反指 -3.4% (n=59)。
     # 高情绪共振往往出现在加速顶/见顶日，跟单股技术面冲突时往往是顶部信号。
-    if industry and hot_industries.get(industry, 0) >= 3:
+    # 候选 industry 是 spot 证监会粗命名，与 hot_industries（涨停池东财窄命名）
+    # 实测 0% 对得上，此信号原是死的；照 fresh 的解法用 em_industry_map 映射后再查。
+    em_industry_map = compare_context.get("em_industry_map") or {}
+    link_industry = em_industry_map.get(code) or industry
+    if link_industry and hot_industries.get(link_industry, 0) >= 3:
         score += 6
-        reasons.append(f"热门板块({hot_industries[industry]}只)+6")
-    elif industry and hot_industries.get(industry, 0) >= 2:
+        reasons.append(f"热门板块({hot_industries[link_industry]}只)+6")
+    elif link_industry and hot_industries.get(link_industry, 0) >= 2:
         score += 3
-        reasons.append(f"板块联动({hot_industries[industry]}只)+3")
+        reasons.append(f"板块联动({hot_industries[link_industry]}只)+3")
 
-    theme_bonus, theme_reason = _shared.theme_bonus(code, industry, compare_context)
+    theme_bonus, theme_reason = _shared.theme_bonus(code, link_industry, compare_context)
     if theme_bonus > 0:
         # 题材龙头数 ≥20 只时反指，封顶 4 避免过度加权
         score += min(theme_bonus, 4)
@@ -475,7 +479,7 @@ def score_followthrough_candidate(
             reasons.append(theme_reason)
 
     theme_fund_bonus, theme_fund_reasons = _shared.theme_fund_bonus(
-        code, industry, compare_context
+        code, link_industry, compare_context
     )
     if theme_fund_bonus:
         score += min(theme_fund_bonus, 5)
@@ -487,7 +491,7 @@ def score_followthrough_candidate(
         reasons.extend(flow_reasons)
 
     style_bonus, style_reasons = _shared.market_style_bias(
-        "first", code, industry, compare_context
+        "first", code, link_industry, compare_context
     )
     if style_bonus:
         score += style_bonus
