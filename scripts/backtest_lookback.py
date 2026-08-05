@@ -316,12 +316,18 @@ class Evaluator:
                 name = str(cand.get("name") or "")
                 ev = self._evaluate_one(code, name, td_dash, vd_dash)
                 hit = self._is_hit(cat_key, ev)
+                reasons_str = str(cand.get("reasons") or "")
+                linked = any(
+                    kw in reasons_str for kw in ("热门板块(", "板块联动(", "同板块今日")
+                )
                 records.append(
                     {
+                        "trade_date": trade_date,
                         "code": code,
                         "name": name,
                         "category": cat_key,
                         "score": cand.get("score"),
+                        "linked": linked,
                         "buyable": bool(ev.get("hit_buyable")),
                         "hit": hit,
                         "open_close_pct": ev.get("t1_open_close_pct"),
@@ -602,6 +608,7 @@ def main() -> int:
             "overall": overall,
             "by_category": by_cat,
             "per_day": per_day,
+            "records": {str(lb): all_records[lb] for lb in lookbacks},
         }
         Path(args.out).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
