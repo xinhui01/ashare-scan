@@ -388,6 +388,12 @@ def pick_dates(limit: int) -> List[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="lookback 5 vs 25 硬回测")
     parser.add_argument("--limit", type=int, default=5, help="回测最近 N 个交易日")
+    parser.add_argument(
+        "--dates",
+        default="",
+        help="显式指定回测交易日（逗号分隔 YYYYMMDD），绕过 accuracy 表选日"
+        "（该表可能断更，且旧日期的涨停池/缓存数据不全）",
+    )
     parser.add_argument("--lookbacks", default="5,25", help="逗号分隔的 lookback 列表")
     parser.add_argument("--out", default="", help="结果 JSON 输出路径")
     parser.add_argument(
@@ -461,7 +467,14 @@ def main() -> int:
 
     stock_filter = StockFilter()
 
-    dates = pick_dates(args.limit)
+    if args.dates:
+        raw = [d.strip() for d in str(args.dates).split(",") if d.strip()]
+        dates = sorted({d for d in raw if len(d) == 8 and d.isdigit()})
+        bad = [d for d in raw if not (len(d) == 8 and d.isdigit())]
+        if bad:
+            print(f"[warn] --dates 含无效日期（应为 YYYYMMDD），已忽略: {bad}")
+    else:
+        dates = pick_dates(args.limit)
     if not dates:
         print("没有可回测的日期（limit_up_prediction_accuracy 为空）")
         return 1
