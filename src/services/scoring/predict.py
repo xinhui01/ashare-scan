@@ -2424,15 +2424,16 @@ def predict_limit_up_candidates(
         "data_quality": data_quality,
     }
 
-    # ===== 候选质量门（优化：类别筛选 + top-N 截断）=====
-    # 默认关闭（preset="off"），不改变现有行为。通过环境变量
-    # LIMITUP_QUALITY_GATE 切换预设（wrap_only / wrap_first / wrap_first_cont）。
-    # 实证见 docs/涨停预测优化方案.md：反包+二波+保留 且 top-5 命中率 ~30~40%。
+    # ===== 候选质量门（类别筛选 + top-N 截断）=====
+    # 2026-08-05 起默认启用 wrap_first_cont（反包+二波+保留 合并 top-5）。
+    # 实证见 docs/涨停预测优化方案.md：全量候选命中 ~15%，该组合 ~30~40%。
+    # 副作用：fresh/trend 子列表被清空（fresh 观察名单暂停，见策略/改进方案_0805）。
+    # 环境变量 LIMITUP_QUALITY_GATE 可覆盖此预设（设 off 临时恢复全量对比）。
     try:
         from src.services.scoring.quality_gate import apply_prediction_quality_gate
 
         result = apply_prediction_quality_gate(
-            result, data_quality=data_quality, log_fn=log_fn
+            result, preset="wrap_first_cont", data_quality=data_quality, log_fn=log_fn
         )
     except Exception as exc:
         logger.debug("候选质量门执行失败（已跳过，保留原结果）: %s", exc)

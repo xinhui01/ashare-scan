@@ -10,8 +10,9 @@
   3) 组合：反包+二波+保留 且 top-5 → 命中率 ~30~40%。
 
 本模块在预测结果落盘前，对 5 个类别子列表做"类别筛选 + top-N 截断"。
-默认关闭（preset="off"）以保持现有行为完全不变；通过环境变量
-LIMITUP_QUALITY_GATE 选择预设启用，便于不改代码即可切换策略。
+函数级默认 preset="off"（库函数无副作用）；预测流程 predict.py 调用处
+显式传 wrap_first_cont，即 2026-08-05 起默认启用、跑预测即生效。
+环境变量 LIMITUP_QUALITY_GATE 可覆盖调用方预设（设 off 临时恢复全量对比）。
 """
 from typing import Any, Dict, List, Optional, Tuple
 
