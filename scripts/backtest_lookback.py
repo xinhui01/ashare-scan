@@ -316,10 +316,18 @@ class Evaluator:
                 name = str(cand.get("name") or "")
                 ev = self._evaluate_one(code, name, td_dash, vd_dash)
                 hit = self._is_hit(cat_key, ev)
-                reasons_str = str(cand.get("reasons") or "")
-                linked = any(
-                    kw in reasons_str for kw in ("热门板块(", "板块联动(", "同板块今日")
-                )
+                # 优先读专用字段（trend 的 reasons 只留前 8 条，联动理由常被截掉）
+                lhc = cand.get("link_hot_count")
+                if lhc is not None:
+                    try:
+                        linked = int(lhc or 0) >= 2
+                    except (TypeError, ValueError):
+                        linked = False
+                else:
+                    reasons_str = str(cand.get("reasons") or "")
+                    linked = any(
+                        kw in reasons_str for kw in ("热门板块(", "板块联动(", "同板块今日")
+                    )
                 records.append(
                     {
                         "trade_date": trade_date,

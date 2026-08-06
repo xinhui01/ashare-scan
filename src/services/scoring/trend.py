@@ -407,12 +407,13 @@ def score_trend_limit_up(
     # 实测 0% 对得上，此信号原是死的；照 fresh 的解法用 em_industry_map 映射后再查。
     em_industry_map = compare_context.get("em_industry_map") or {}
     link_industry = em_industry_map.get(code) or industry
-    if link_industry and hot_industries.get(link_industry, 0) >= 3:
+    link_hot_count = hot_industries.get(link_industry, 0) if link_industry else 0
+    if link_hot_count >= 3:
         score += 10
-        reasons.append(f"热门板块({hot_industries[link_industry]}只)+10")
-    elif link_industry and hot_industries.get(link_industry, 0) >= 2:
+        reasons.append(f"热门板块({link_hot_count}只)+10")
+    elif link_hot_count >= 2:
         score += 5
-        reasons.append(f"板块联动({hot_industries[link_industry]}只)+5")
+        reasons.append(f"板块联动({link_hot_count}只)+5")
 
     # 题材热度（来自 AI 题材聚类缓存）
     theme_bonus, theme_reason = _shared.theme_bonus(code, link_industry, compare_context)
@@ -470,6 +471,7 @@ def score_trend_limit_up(
         "code": code,
         "name": name,
         "industry": industry,
+        "link_hot_count": link_hot_count,
         "close": latest_close,
         "change_pct": change_pct,
         "turnover": turnover,
