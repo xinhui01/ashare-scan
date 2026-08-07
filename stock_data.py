@@ -171,6 +171,23 @@ def check_fund_flow_connectivity(timeout: float = 8.0, log=None) -> None:
         _FF_CHECK_DONE = True
 
 
+def _has_real_big_order_split(df) -> bool:
+    """缓存里是否有**真实**的大单拆分（东财口径）。
+
+    同花顺兜底没有主力/大单分档，是把同一个净额复制进主力/大单两列充数，
+    只看"big_order_amount 有没有值"会被这份伪造数据骗过——结果是东财恢复后
+    再也不会为补齐大单去重拉。故以 source 列为准：ths 一律不算。
+    """
+    if df is None or getattr(df, "empty", True) or "big_order_amount" not in df.columns:
+        return False
+    work = df
+    if "source" in df.columns:
+        work = df[df["source"].astype(str).str.strip() != "ths"]
+        if work.empty:
+            return False
+    return bool(pd.to_numeric(work["big_order_amount"], errors="coerce").notna().any())
+
+
 def _mark_fund_flow_em_reachable(log=None) -> None:
     """东财资金流真实成功后翻回可达标志。
 
@@ -2138,10 +2155,7 @@ class StockDataFetcher:
         if not force_refresh:
             cached = _load_fund_flow_store(code, min_rows=min_rows, log=self._log)
             if cached is not None and not cached.empty:
-                has_big_order_data = False
-                if "big_order_amount" in cached.columns:
-                    big_order_series = pd.to_numeric(cached["big_order_amount"], errors="coerce")
-                    has_big_order_data = bool(big_order_series.notna().any())
+                has_big_order_data = _has_real_big_order_split(cached)
                 em_expected = self._eastmoney_fund_flow_expected()
                 if has_big_order_data and not _should_refresh_today_row(cached):
                     return cached.tail(days).reset_index(drop=True)
@@ -2259,6 +2273,9 @@ class StockDataFetcher:
             if col in df.columns:
                 df[col] = df[col].map(_parse_cn_numeric)
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        # 标记来源：同花顺行的主力/大单是同一个净额的副本，不是真实分档；
+        # 下游据此判断能否做主力/大单分析，缓存也据此决定是否重拉补齐。
+        df["source"] = "ths" if chain.source == "同花顺" else "eastmoney"
         _save_fund_flow_store(code, df, keep_rows=max(60, days + 10))
         return df.tail(days).reset_index(drop=True)
 

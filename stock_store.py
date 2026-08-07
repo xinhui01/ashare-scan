@@ -199,6 +199,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             super_big_order_amount REAL,
             super_big_order_ratio REAL,
             updated_at TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (code, trade_date)
         );
 
@@ -399,6 +400,25 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     if "is_hit" not in simulated_trade_columns:
         conn.execute(
             "ALTER TABLE simulated_buy_trades ADD COLUMN is_hit INTEGER NOT NULL DEFAULT 0"
+        )
+
+    fund_flow_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(fund_flow)").fetchall()
+    }
+    if "source" not in fund_flow_columns:
+        conn.execute("ALTER TABLE fund_flow ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        # 回填历史行：同花顺兜底没有主力/大单拆分，是把同一个净额复制进两列、
+        # 且超大单恒为空。按这个特征把旧数据标成 ths，避免伪造的拆分值被
+        # 当成"已有大单数据"而永不刷新（其余保持空来源=未知，按东财待遇处理）。
+        conn.execute(
+            """
+            UPDATE fund_flow SET source='ths'
+            WHERE source=''
+              AND main_force_amount IS NOT NULL
+              AND big_order_amount IS NOT NULL
+              AND main_force_amount = big_order_amount
+              AND super_big_order_amount IS NULL
+            """
         )
 
 
@@ -1906,9 +1926,12 @@ def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
     ]:
         if col not in out.columns:
             out[col] = None
+    if "source" not in out.columns:
+        out["source"] = ""
     out = out.sort_values("date").reset_index(drop=True)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     date_series = out["date"].tolist()
+    source_vals = out["source"].tolist()
     close_vals = out["close"].tolist()
     change_pct_vals = out["change_pct"].tolist()
     main_force_amount = out["main_force_amount"].tolist()
@@ -1930,6 +1953,7 @@ def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
             _to_float(super_big_order_amount[i]),
             _to_float(super_big_order_ratio[i]),
             now_str,
+            str(source_vals[i] or ""),
         )
         for i in range(len(date_series))
     ]
@@ -1940,9 +1964,10 @@ def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
                 """
                 INSERT INTO fund_flow(
                     code, trade_date, close, change_pct, main_force_amount, main_force_ratio,
-                    big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio, updated_at
+                    big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio,
+                    updated_at, source
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(code, trade_date) DO UPDATE SET
                     close=excluded.close,
                     change_pct=excluded.change_pct,
@@ -1952,7 +1977,8 @@ def save_fund_flow(stock_code: str, df: pd.DataFrame) -> None:
                     big_order_ratio=excluded.big_order_ratio,
                     super_big_order_amount=excluded.super_big_order_amount,
                     super_big_order_ratio=excluded.super_big_order_ratio,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    source=excluded.source
                 """,
                 rows,
             )
@@ -1967,7 +1993,8 @@ def load_fund_flow(stock_code: str, limit: Optional[int] = None) -> Optional[pd.
     code = str(stock_code).strip().zfill(6)
     sql = """
         SELECT trade_date AS date, close, change_pct, main_force_amount, main_force_ratio,
-               big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio
+               big_order_amount, big_order_ratio, super_big_order_amount, super_big_order_ratio,
+               source
         FROM fund_flow
         WHERE code = ?
     """
