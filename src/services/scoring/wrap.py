@@ -400,12 +400,19 @@ def score_broken_board_wrap(
             reasons.append(f"换手{turnover:.1f}%极冷-3")
 
     # ---- 行业（共用）----
-    if industry and hot_industries.get(industry, 0) >= 3:
+    # 候选 industry 是 spot 证监会粗命名，与 hot_industries（涨停池东财窄命名）
+    # 实测 0% 对得上，此信号原是死的；照 fresh/first/trend 已有的解法用
+    # em_industry_map 映射后再查。仅修复死信号，不新增"必须同板块有涨停"的门槛
+    # （联动作为硬条件对二波/趋势已验证无增益甚至反向，见 0806 结案）。
+    em_industry_map = compare_context.get("em_industry_map") or {}
+    link_industry = em_industry_map.get(code) or industry
+    link_hot_count = hot_industries.get(link_industry, 0) if link_industry else 0
+    if link_hot_count >= 3:
         score += 10
-        reasons.append(f"热门板块({hot_industries[industry]}只)+10")
-    elif industry and hot_industries.get(industry, 0) >= 2:
+        reasons.append(f"热门板块({link_hot_count}只)+10")
+    elif link_hot_count >= 2:
         score += 5
-        reasons.append(f"板块联动({hot_industries[industry]}只)+5")
+        reasons.append(f"板块联动({link_hot_count}只)+5")
 
     # ---- 题材热度（来自 AI 题材聚类缓存）----
     theme_bonus, theme_reason = _shared.theme_bonus(code, industry, compare_context)
@@ -479,6 +486,9 @@ def score_broken_board_wrap(
         "code": code,
         "name": name,
         "industry": industry,
+        # 同板块涨停家数（按 em_industry_map 映射后统计），与 first/trend 口径一致，
+        # 便于回测按"是否联动触发"分组验证反包的板块共振到底有没有增益
+        "link_hot_count": link_hot_count,
         "close": latest_close,
         "change_pct": change_pct,
         "turnover": turnover,
