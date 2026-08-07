@@ -300,43 +300,41 @@ def fetch_spot_with_fallback(
     *,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[pd.DataFrame]:
-    """全市场实时行情快照，东财→新浪自动兜底。
+    """全市场实时行情快照，东财→新浪→腾讯逐级兜底。
 
-    东财熔断或失败时，回落到 ak.stock_zh_a_spot（新浪），并把代码列
-    归一化为不带 sh/sz/bj 前缀的 6 位形式。
+    新浪结果把代码列归一化为不带 sh/sz/bj 前缀的 6 位形式；
+    腾讯结果做完整列名映射。任一源返回空表均视为无效继续下探。
     """
     # 在函数内 import 以支持测试 monkey-patch `stock_data.*`
     from stock_data import _eastmoney_circuit_breaker_open, _retry_ak_call
+    from src.sources.fallback_chain import run_fallback_chain
 
-    if not _eastmoney_circuit_breaker_open():
-        try:
-            if log_fn:
-                log_fn("全市场 spot 快照：东财...")
-            return _retry_ak_call(ak.stock_zh_a_spot_em)
-        except Exception as exc:
-            if log_fn:
-                log_fn(f"全市场 spot 东财失败: {exc}，尝试新浪兜底")
-    try:
+    def _eastmoney_step():
+        if _eastmoney_circuit_breaker_open():
+            return None
+        if log_fn:
+            log_fn("全市场 spot 快照：东财...")
+        return _retry_ak_call(ak.stock_zh_a_spot_em)
+
+    def _sina_step():
         if log_fn:
             log_fn("全市场 spot 快照：新浪兜底（约 30s）...")
-        df = _enrich_spot_industry_from_universe(
+        return _enrich_spot_industry_from_universe(
             normalize_sina_spot_df(_retry_ak_call(ak.stock_zh_a_spot))
         )
-        if df is not None and not df.empty:
-            return df
-    except Exception as exc:
-        if log_fn:
-            log_fn(f"全市场 spot 新浪兜底失败: {exc}，尝试腾讯兜底")
-    try:
+
+    def _tencent_step():
         if log_fn:
             log_fn("全市场 spot 快照：腾讯兜底...")
-        df = fetch_tencent_spot_df()
-        if df is not None and not df.empty:
-            return df
-    except Exception as exc:
-        if log_fn:
-            log_fn(f"全市场 spot 腾讯兜底也失败: {exc}")
-    return None
+        return fetch_tencent_spot_df()
+
+    result = run_fallback_chain(
+        [("东财", _eastmoney_step), ("新浪", _sina_step), ("腾讯", _tencent_step)],
+        is_valid=lambda df: df is not None and not df.empty,
+        log_fn=log_fn,
+        chain_name="全市场 spot",
+    )
+    return result.value
 
 
 def derive_limit_up_pool_from_spot(

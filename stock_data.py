@@ -148,13 +148,10 @@ def check_fund_flow_connectivity(timeout: float = 8.0, log=None) -> None:
         _FF_EM_REACHABLE = em_ok
         _FF_THS_REACHABLE = ths_ok
         if not em_ok:
-            # 主动熔断：避免每只股票都先撞一次东财死连接再回退到同花顺
-            try:
-                _em_circuit_breaker.record_failure()
-                _em_circuit_breaker.record_failure()
-                _em_circuit_breaker.record_failure()
-            except Exception:
-                pass
+            # 注意：这里不再人为连打 3 次失败撬开全局熔断器——那会连坐其它健康的
+            # 东财集群/接口（0807 盘前曾放大成"全东财挂"假象，且探针盘前有误判先例）。
+            # 资金流自身的降级由 _FF_EM_REACHABLE 标志驱动（plan 改为同花顺优先）；
+            # 全局熔断器交给真实请求的失败去自然触发。
             warn = (
                 "[警告] 东方财富资金流接口直连失败（连接被远端重置 RemoteDisconnected）。已自动切到同花顺兜底——"
                 "但同花顺仅含净流入净额，无主力/大单拆分。\n可能原因：本机到 eastmoney 的网络链路受限"
@@ -172,6 +169,22 @@ def check_fund_flow_connectivity(timeout: float = 8.0, log=None) -> None:
             else:
                 print(msg)
         _FF_CHECK_DONE = True
+
+
+def _mark_fund_flow_em_reachable(log=None) -> None:
+    """东财资金流真实成功后翻回可达标志。
+
+    启动探针只跑一次（幂等），此前标志一旦置 False 进程内永无恢复路径，
+    东财盘中恢复后整个会话仍只用同花顺净额。这里以"真实请求成功"为证据恢复。
+    """
+    global _FF_EM_REACHABLE
+    if _FF_EM_REACHABLE is False:
+        _FF_EM_REACHABLE = True
+        msg = "东财资金流已恢复直连，后续恢复东财优先。"
+        if log:
+            log(msg)
+        else:
+            print(msg)
 
 
 import pandas as pd
@@ -208,6 +221,7 @@ T = TypeVar("T")
 # DaemonThreadPoolExecutor 已迁移到 src/utils/daemon_executor.py；
 # 此处重新导出，保持 `from stock_data import DaemonThreadPoolExecutor` 零修改。
 from src.utils.daemon_executor import DaemonThreadPoolExecutor
+from src.utils.retry import retry_call as _shared_retry_call
 from src.config import env_int, env_float
 from src.utils.snapshot_history import snapshot_rows_to_history_rows
 from src.utils.trade_calendar import resolve_sync_target_trade_date
@@ -378,14 +392,15 @@ def _is_name_resolution_error(exc: BaseException) -> bool:
 
 
 def _retry_ak_call(fn: Callable[..., T], *args, max_attempts: int = 2, base_delay: float = 1.0, **kwargs) -> T:
-    for attempt in range(max_attempts):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            if attempt < max_attempts - 1 and _is_transient_network_error(e):
-                time.sleep(base_delay * (attempt + 1))
-                continue
-            raise
+    # 语义：仅瞬时网络错误重试；实现统一在 src/utils/retry.py
+    return _shared_retry_call(
+        fn,
+        *args,
+        max_attempts=max_attempts,
+        base_delay=base_delay,
+        should_retry=_is_transient_network_error,
+        **kwargs,
+    )
 
 
 def _history_retry_ak_call(fn: Callable[..., T], *args, **kwargs) -> T:
@@ -460,6 +475,7 @@ from src.sources import sina as _src_sina
 _fetch_sina_hist_frame = _src_sina.fetch_hist_frame
 _fetch_sina_intraday_1min = _src_sina.fetch_intraday_1min
 from src.sources.auction_snapshot import snapshot_from_intraday_frame as _snapshot_from_intraday_frame
+from src.sources.fallback_chain import run_fallback_chain as _run_fallback_chain
 
 
 # ---- 腾讯实时竞价快照（东财 push2 被拦时的兜底） ----
@@ -777,8 +793,9 @@ class StockDataFetcher:
         self._limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         self._prev_limit_up_pool_cache: Dict[str, pd.DataFrame] = _LRUCache(maxsize=30)
         # 跟踪每个日期涨停池数据来源："cache_memory" / "cache_db" / "eastmoney" / "spot_fallback" / "empty"
-        self._last_pool_source: Dict[str, str] = {}
-        self._last_prev_pool_source: Dict[str, str] = {}
+        # 与上面的池缓存同为 LRU：否则缓存条目被淘汰后来源标记永久残留
+        self._last_pool_source: Dict[str, str] = _LRUCache(maxsize=30)
+        self._last_prev_pool_source: Dict[str, str] = _LRUCache(maxsize=30)
         self._limit_up_reason_cache: Dict[str, Dict[str, Dict[str, str]]] = _LRUCache(maxsize=30)
         self._concepts_cache: Optional[Dict[str, str]] = None
         self._universe_concepts_cache: Optional[Dict[str, str]] = None
@@ -2147,48 +2164,42 @@ class StockDataFetcher:
                         self._log(f"资金流 {code} 缓存缺少大单净额，自动刷新最新数据。")
         market = _infer_market(code)
         plan = self.build_fund_flow_request_plan(source or self._default_fund_flow_source)
-        flow_df = None
-        last_error: Optional[Exception] = None
-        for provider in plan.provider_sequence:
-            if provider == "eastmoney":
-                try:
-                    from src.sources.eastmoney.fund_flow import fetch_individual_fund_flow
 
-                    flow_df = fetch_individual_fund_flow(code, market)
-                    break
-                except Exception as e:
-                    # 兜底：再试 akshare 原路径（兼容极端情况），失败才记错误并继续下一个源
-                    try:
-                        flow_df = _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
-                        break
-                    except Exception as e2:
-                        last_error = e2
-                        if self._log:
-                            self._log(f"个股资金流 {code} 获取失败: {e2}")
-            elif provider == "ths":
-                try:
-                    if self._log:
-                        self._log(f"个股资金流 {code} 正在使用同花顺源补位。")
-                    flow_df = _fetch_ths_fund_flow_frame(code)
-                    if flow_df is not None and not flow_df.empty:
-                        flow_df = flow_df.copy()
-                        today_text = datetime.now().strftime("%Y-%m-%d")
-                        if "日期" not in flow_df.columns and "date" not in flow_df.columns and "交易日" not in flow_df.columns:
-                            flow_df["日期"] = today_text
-                        break
-                except Exception as e:
-                    last_error = e
-                    if self._log:
-                        self._log(f"个股资金流 {code} 使用同花顺源失败: {e}")
-        if flow_df is None or flow_df.empty:
-            if last_error is not None and self._log:
-                self._log(f"个股资金流 {code} 所有数据源失败: {last_error}")
+        def _eastmoney_step() -> Optional[pd.DataFrame]:
+            from src.sources.eastmoney.fund_flow import fetch_individual_fund_flow
+
+            try:
+                return fetch_individual_fund_flow(code, market)
+            except Exception:
+                # 自建路径失败再试 akshare 原路径（兼容极端情况）
+                return _retry_ak_call(ak.stock_individual_fund_flow, stock=code, market=market)
+
+        def _ths_step() -> Optional[pd.DataFrame]:
+            if self._log:
+                self._log(f"个股资金流 {code} 正在使用同花顺源补位。")
+            # 缺日期列的兜底补当天在 ths.fetch_fund_flow_frame 内部完成
+            return _fetch_ths_fund_flow_frame(code)
+
+        steps = {"eastmoney": ("东财", _eastmoney_step), "ths": ("同花顺", _ths_step)}
+        chain = _run_fallback_chain(
+            [steps[p] for p in plan.provider_sequence if p in steps],
+            # 空表视为无效继续下探：此前东财返空表会直接 break，白白跳过同花顺兜底
+            is_valid=lambda df: df is not None and not df.empty,
+            log_fn=self._log,
+            chain_name=f"个股资金流 {code}",
+        )
+        flow_df = chain.value
+        if flow_df is None:
+            if chain.last_error is not None and self._log:
+                self._log(f"个股资金流 {code} 所有数据源失败: {chain.last_error}")
             self._notify_user(
                 "资金流数据缺失",
                 f"个股 {code} 资金流获取失败，无法用于主力/大单分析。"
-                + (f"\n原因：{last_error}" if last_error is not None else ""),
+                + (f"\n原因：{chain.last_error}" if chain.last_error is not None else ""),
             )
             return None
+        if chain.source == "东财":
+            _mark_fund_flow_em_reachable(log=self._log)
         source_columns = [str(col) for col in flow_df.columns.tolist()]
         rename_map: Dict[str, str] = {}
 
@@ -2665,64 +2676,42 @@ class StockDataFetcher:
         主要在 09:30 后补位）。
         """
         log_fn = self._log if log else None
-        try:
-            snapshot = _retry_ak_call(
-                _fetch_eastmoney_auction_snapshot,
-                code,
-                logger=log_fn,
-            )
-            if snapshot:
-                out = dict(snapshot)
-                out.setdefault("source", "eastmoney")
-                return out
-        except Exception as exc:
-            if log_fn:
-                log_fn(f"竞价数据东财源失败 {code}: {exc}")
 
-        if intraday_raw is not None and not getattr(intraday_raw, "empty", True):
-            try:
-                snapshot = _snapshot_from_intraday_frame(
-                    intraday_raw,
-                    stock_code=code,
-                    source="eastmoney_intraday",
-                )
-                if snapshot:
-                    if log_fn:
-                        log_fn(f"竞价数据 {code} 使用东财分时09:25兜底。")
-                    return snapshot
-            except Exception as exc:
-                if log_fn:
-                    log_fn(f"竞价数据东财分时兜底失败 {code}: {exc}")
+        def _eastmoney_step() -> Optional[Dict[str, Any]]:
+            snapshot = _retry_ak_call(_fetch_eastmoney_auction_snapshot, code, logger=log_fn)
+            if not snapshot:
+                return None
+            out = dict(snapshot)
+            out.setdefault("source", "eastmoney")
+            return out
 
-        try:
-            snapshot = _retry_ak_call(
-                _fetch_tencent_auction_snapshot,
-                code,
-                logger=log_fn,
+        def _intraday_slice_step() -> Optional[Dict[str, Any]]:
+            if intraday_raw is None or getattr(intraday_raw, "empty", True):
+                return None
+            return _snapshot_from_intraday_frame(
+                intraday_raw, stock_code=code, source="eastmoney_intraday"
             )
-            if snapshot:
-                if log_fn:
-                    log_fn(f"竞价数据 {code} 使用腾讯实时快照兜底。")
-                return snapshot
-        except Exception as exc:
-            if log_fn:
-                log_fn(f"竞价数据腾讯兜底失败 {code}: {exc}")
 
-        try:
-            raw = _retry_ak_call(
-                _fetch_sina_intraday_1min,
-                code,
-                logger=log_fn,
-            )
-            snapshot = _snapshot_from_intraday_frame(raw, stock_code=code, source="sina")
-            if snapshot:
-                if log_fn:
-                    log_fn(f"竞价数据 {code} 使用新浪09:25分时兜底。")
-                return snapshot
-        except Exception as exc:
-            if log_fn:
-                log_fn(f"竞价数据新浪兜底失败 {code}: {exc}")
-        return None
+        def _tencent_step() -> Optional[Dict[str, Any]]:
+            return _retry_ak_call(_fetch_tencent_auction_snapshot, code, logger=log_fn)
+
+        def _sina_step() -> Optional[Dict[str, Any]]:
+            raw = _retry_ak_call(_fetch_sina_intraday_1min, code, logger=log_fn)
+            return _snapshot_from_intraday_frame(raw, stock_code=code, source="sina")
+
+        result = _run_fallback_chain(
+            [
+                ("东财", _eastmoney_step),
+                ("东财分时切片", _intraday_slice_step),
+                ("腾讯实时", _tencent_step),
+                ("新浪分时", _sina_step),
+            ],
+            log_fn=log_fn,
+            chain_name=f"竞价快照 {code}",
+        )
+        if result.value is not None and result.source != "东财" and log_fn:
+            log_fn(f"竞价快照 {code} 使用{result.source}兜底。")
+        return result.value
 
     def get_intraday_data(
         self,

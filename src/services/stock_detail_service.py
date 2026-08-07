@@ -56,13 +56,17 @@ def _fetch_history_with_sina_fallback(
         sina_plan = fetcher.build_history_request_plan(source="sina")
     except Exception as exc:
         logger.debug("构建新浪 plan 失败: %s", exc)
-        return history
-    return call_with_timeout_fn(
+        return None
+    sina_history = call_with_timeout_fn(
         lambda: fetcher.get_history_data(code, days=days, request_plan=sina_plan),
         timeout_sec=sina_timeout,
         fallback=None,
         task_name=f"{task_label}(新浪兜底)",
     )
+    # 统一返回契约：要么非空 DataFrame，要么 None（此前 None/空表混用）
+    if sina_history is not None and not getattr(sina_history, "empty", True):
+        return sina_history
+    return None
 
 
 def resolve_stock_identity(

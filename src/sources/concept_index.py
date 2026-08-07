@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from src.utils.retry import retry_call as shared_retry_call
 import stock_store
 from stock_logger import get_logger
 
@@ -28,16 +29,8 @@ logger = get_logger(__name__)
 # ============== 内部：带重试的 akshare 调用 ==============
 
 def _retry_call(fn, retries: int = 3, base_delay: float = 0.5):
-    last_exc: Optional[Exception] = None
-    for i in range(retries):
-        try:
-            return fn()
-        except Exception as exc:
-            last_exc = exc
-            time.sleep(base_delay * (i + 1))
-    if last_exc is not None:
-        raise last_exc
-    return None
+    # 语义：任意异常都重试；实现统一在 src/utils/retry.py
+    return shared_retry_call(fn, max_attempts=retries, base_delay=base_delay)
 
 
 # ============== 东财概念板块 ==============

@@ -186,7 +186,8 @@ def fetch_today_news(
     _l(f"今日新闻：早餐 {'有' if morning else '无'}, 电报 {len(raw_telegrams)} 条 → 排序后取 {len(ranked)}")
 
     out = {
-        "ok": True,
+        # 两源全失败时 ok=False：缓存命中要求 ok 为真，失败日不会被空结果钉死
+        "ok": morning is not None or bool(raw_telegrams),
         "date": td,
         "morning_briefing": morning,
         "telegrams": ranked,

@@ -397,66 +397,71 @@ def _fetch_index_pct(
     import akshare as ak
     from datetime import datetime as _dt, timedelta
 
-    # 0. 当前交易日(盘中)：日线接口要么抽风(东财 push2his)、要么没有今天(新浪/腾讯日线)，
-    #    故优先用新浪实时快照 stock_zh_index_spot_sina（host=hq.sinajs.cn，不碰 push2his）
-    #    直接取当日涨跌幅，支撑“实时情绪”。仅 date_key==今天 时走这条；历史日跳过。
-    if date_key == _dt.now().strftime("%Y%m%d"):
-        try:
-            spot = ak.stock_zh_index_spot_sina()
-            if spot is not None and not spot.empty and "代码" in spot.columns:
-                row = spot[spot["代码"].astype(str) == symbol]
-                if not row.empty:
-                    try:
-                        pct = float(row.iloc[0].get("涨跌幅"))
-                    except (TypeError, ValueError):
-                        pct = None
-                    if pct is not None and pct == pct:  # 过滤 None / NaN
-                        log(f"  {name}(新浪实时快照) 当日 {pct:+.2f}%")
-                        return pct
-        except Exception as exc:
-            log(f"  {name}(新浪实时快照)拉取失败: {exc}")
+    from src.sources.fallback_chain import run_fallback_chain
 
-    # 1. 东财日线：历史日首选；盘中也带实时 K 但 push2his 间歇抽风，故对瞬时抖动
-    #    （ProxyError/RemoteDisconnected）重试几次兜底。
+    def _sina_spot_step() -> Optional[float]:
+        # 仅当日(盘中)可用：日线接口要么抽风(东财 push2his)、要么没有今天(新浪/腾讯日线)，
+        # 故优先用新浪实时快照 stock_zh_index_spot_sina（host=hq.sinajs.cn，不碰 push2his）。
+        if date_key != _dt.now().strftime("%Y%m%d"):
+            return None
+        spot = ak.stock_zh_index_spot_sina()
+        if spot is None or spot.empty or "代码" not in spot.columns:
+            return None
+        row = spot[spot["代码"].astype(str) == symbol]
+        if row.empty:
+            return None
+        try:
+            pct = float(row.iloc[0].get("涨跌幅"))
+        except (TypeError, ValueError):
+            return None
+        if pct != pct:  # NaN
+            return None
+        log(f"  {name}(新浪实时快照) 当日 {pct:+.2f}%")
+        return pct
+
     end_dt = _dt.strptime(date_key, "%Y%m%d")
     start_dt = end_dt - timedelta(days=10)
-    for _attempt in range(3):
-        try:
-            df = ak.stock_zh_index_daily_em(
-                symbol=symbol,
-                start_date=start_dt.strftime("%Y%m%d"),
-                end_date=date_key,
-            )
-            pct = _compute_pct_from_index_df(df, date_key)
-            if pct is not None:
-                return pct
-            break  # 连上了但当天无此行（历史日缺数据）→ 不重试，转兜底源
-        except Exception as exc:
-            log(f"  {name}(东财)拉取失败(第 {_attempt + 1}/3 次): {exc}")
-            if _attempt < 2:
-                time.sleep(0.6)
 
-    # 2. 新浪：拉全量历史，毫秒级解析
-    try:
-        df = ak.stock_zh_index_daily(symbol=symbol)
-        pct = _compute_pct_from_index_df(df, date_key)
+    def _em_daily_step() -> Optional[float]:
+        # push2his 间歇抽风：异常重试 3 次；连上了但当天无该行 → 不重试，转兜底源
+        for _attempt in range(3):
+            try:
+                df = ak.stock_zh_index_daily_em(
+                    symbol=symbol,
+                    start_date=start_dt.strftime("%Y%m%d"),
+                    end_date=date_key,
+                )
+                return _compute_pct_from_index_df(df, date_key)
+            except Exception as exc:
+                log(f"  {name}(东财)拉取失败(第 {_attempt + 1}/3 次): {exc}")
+                if _attempt < 2:
+                    time.sleep(0.6)
+        return None
+
+    def _sina_daily_step() -> Optional[float]:
+        pct = _compute_pct_from_index_df(ak.stock_zh_index_daily(symbol=symbol), date_key)
         if pct is not None:
             log(f"  {name}(东财失败，新浪兜底成功)")
-            return pct
-    except Exception as exc:
-        log(f"  {name}(新浪)拉取失败: {exc}")
+        return pct
 
-    # 3. 腾讯：拉全量历史，逐分块下载较慢但稳
-    try:
-        df = ak.stock_zh_index_daily_tx(symbol=symbol)
-        pct = _compute_pct_from_index_df(df, date_key)
+    def _tencent_daily_step() -> Optional[float]:
+        # 逐分块下载较慢但稳
+        pct = _compute_pct_from_index_df(ak.stock_zh_index_daily_tx(symbol=symbol), date_key)
         if pct is not None:
             log(f"  {name}(东财/新浪失败，腾讯兜底成功)")
-            return pct
-    except Exception as exc:
-        log(f"  {name}(腾讯)拉取失败: {exc}")
+        return pct
 
-    return None
+    result = run_fallback_chain(
+        [
+            ("新浪实时快照", _sina_spot_step),
+            ("东财日线", _em_daily_step),
+            ("新浪日线", _sina_daily_step),
+            ("腾讯日线", _tencent_daily_step),
+        ],
+        log_fn=lambda msg: log(f"  {msg}"),
+        chain_name=name,
+    )
+    return result.value
 
 
 def _fetch_sh_index_pct(date_key: str, *, log: Callable[[str], None]) -> Optional[float]:
