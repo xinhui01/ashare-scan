@@ -2,7 +2,7 @@
 
 适用场景：另一台不能开 GUI 的电脑。前置条件：
   - 已 `git pull` 拉到最新 `snapshots/latest_prediction.json`（bat 会自动 pull）
-  - 能联网拉实时竞价（东财 → 新浪兜底，全程直连，不依赖本地 K 线缓存）
+  - 能联网拉实时竞价（东财 → 腾讯 → 新浪逐级兜底，全程直连，不依赖本地 K 线缓存）
   - 已 `pip install -r requirements.txt`
 
 用法：
@@ -151,11 +151,25 @@ def _format_human(payload: dict, lists: dict, result: dict) -> str:
     lines.append(f"  竞价确认 · 交易日 {trade_date or '-'} · 生成本地 {now}")
     lines.append("=" * 64)
 
+    all_confs = [
+        (rec.get("opening_confirmation") or {})
+        for recs in lists.values()
+        for rec in recs or []
+    ]
+    total = len(all_confs)
+    auction_hits = sum(1 for c in all_confs if c.get("auction_gap_pct") is not None)
+    open_hits = sum(1 for c in all_confs if c.get("open_gap_pct") is not None)
+
     mode_note = str(result.get("skipped_reason") or result.get("mode_note") or "").strip()
     if result.get("fetched_auction"):
-        lines.append("  数据源: 实时竞价(09:25) + 开盘分时 | 已拉取")
+        src_line = f"  数据源: 实时竞价(09:25) 命中 {auction_hits}/{total}"
+        if result.get("fetched_intraday"):
+            src_line += f" | 开盘分时 命中 {open_hits}/{total}"
+        lines.append(src_line)
+        if auction_hits == 0 and open_hits == 0:
+            lines.append("  [警告] 竞价价格全部缺失（东财/腾讯/新浪均未命中），以下状态按无实时信息降级")
     elif result.get("fetched_intraday"):
-        lines.append("  数据源: 实时开盘分时(已过竞价窗口) | 已拉取")
+        lines.append(f"  数据源: 实时开盘分时(已过竞价窗口) 命中 {open_hits}/{total}")
     elif mode_note:
         lines.append(f"  注意: {mode_note}，未请求实时竞价接口")
 
@@ -164,7 +178,6 @@ def _format_human(payload: dict, lists: dict, result: dict) -> str:
         parts = " / ".join(f"{s} {counts.get(s, 0)}" for s in _STATUS_ORDER if counts.get(s, 0))
         lines.append(f"  结果: {parts}")
 
-    total = sum(len(v or []) for v in lists.values())
     lines.append(f"  候选总数: {total}")
     lines.append("")
 

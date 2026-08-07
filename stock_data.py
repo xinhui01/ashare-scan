@@ -462,6 +462,11 @@ _fetch_sina_intraday_1min = _src_sina.fetch_intraday_1min
 from src.sources.auction_snapshot import snapshot_from_intraday_frame as _snapshot_from_intraday_frame
 
 
+# ---- 腾讯实时竞价快照（东财 push2 被拦时的兜底） ----
+from src.sources import tencent as _src_tencent
+_fetch_tencent_auction_snapshot = _src_tencent.fetch_auction_snapshot
+
+
 # ---- 网易财经历史日线 ----
 # 实现已迁移到 src/sources/netease.py；下面是公共函数别名。
 from src.sources import netease as _src_netease
@@ -2653,7 +2658,12 @@ class StockDataFetcher:
         intraday_raw: Optional["pd.DataFrame"] = None,
         log: bool = True,
     ) -> Optional[Dict[str, Any]]:
-        """获取当日 09:25 集合竞价撮合快照，按可靠度逐级兜底。"""
+        """获取当日 09:25 集合竞价撮合快照，按可靠度逐级兜底。
+
+        顺序：东财 trends2 → 东财分时切片 → 腾讯实时快照（仅竞价窗口内有效，
+        东财集群被网络出口拦截时的主兜底）→ 新浪分时（盘前无当日数据，
+        主要在 09:30 后补位）。
+        """
         log_fn = self._log if log else None
         try:
             snapshot = _retry_ak_call(
@@ -2683,6 +2693,20 @@ class StockDataFetcher:
             except Exception as exc:
                 if log_fn:
                     log_fn(f"竞价数据东财分时兜底失败 {code}: {exc}")
+
+        try:
+            snapshot = _retry_ak_call(
+                _fetch_tencent_auction_snapshot,
+                code,
+                logger=log_fn,
+            )
+            if snapshot:
+                if log_fn:
+                    log_fn(f"竞价数据 {code} 使用腾讯实时快照兜底。")
+                return snapshot
+        except Exception as exc:
+            if log_fn:
+                log_fn(f"竞价数据腾讯兜底失败 {code}: {exc}")
 
         try:
             raw = _retry_ak_call(
@@ -2868,7 +2892,7 @@ class StockDataFetcher:
         return _return(payload)
 
     def get_auction_snapshot(self, stock_code: str) -> Optional[Dict[str, Any]]:
-        """获取当日 09:25 集合竞价撮合快照，东财失败时尝试新浪分时兜底。"""
+        """获取当日 09:25 集合竞价撮合快照，东财失败时依次尝试腾讯/新浪兜底。"""
         code = str(stock_code or "").strip().zfill(6)
         if not code:
             return None
