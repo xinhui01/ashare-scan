@@ -123,6 +123,7 @@ def evaluate_candidate_opening(
     auction: Optional[Dict[str, Any]] = None,
     open_price: Optional[float] = None,
     trade_date: str = "",
+    exit_hint: str = "",
 ) -> Dict[str, Any]:
     code = str(rec.get("code") or "").strip().zfill(6)
     prev_close = _safe_float(rec.get("close"))
@@ -169,6 +170,7 @@ def evaluate_candidate_opening(
             "open_gap_pct": open_gap,
             "score": int(round(score)),
             "reason": " / ".join(reasons),
+            "exit_hint": exit_hint,
         }
     if auction_gap is None and open_gap is not None:
         reasons.append("缺竞价价格，按开盘确认")
@@ -233,10 +235,13 @@ def evaluate_candidate_opening(
         "open_gap_pct": open_gap,
         "score": int(round(score)),
         "reason": " / ".join(reasons),
+        "exit_hint": exit_hint,
     }
 
 
-def _skipped_confirmation(rec: Dict[str, Any], *, category: str, reason: str) -> Dict[str, Any]:
+def _skipped_confirmation(
+    rec: Dict[str, Any], *, category: str, reason: str, exit_hint: str = ""
+) -> Dict[str, Any]:
     score = _safe_float(rec.get("calibrated_score")) or _safe_float(rec.get("score")) or 0.0
     return {
         "status": "观察",
@@ -250,6 +255,7 @@ def _skipped_confirmation(rec: Dict[str, Any], *, category: str, reason: str) ->
         "open_gap_pct": None,
         "score": int(round(score)),
         "reason": reason,
+        "exit_hint": exit_hint,
     }
 
 
@@ -261,7 +267,26 @@ def confirm_candidate_lists(
     max_workers: int = 2,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
+    exit_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    # T+1 卖点建议：连板与其余类别的最优卖点相反，用一套卖法必然在一边持续亏钱。
+    # 每轮现算一次（读本地 accuracy 表），失败自动回退默认结论。
+    if exit_hints is None:
+        try:
+            from src.services.exit_timing import compute_exit_hints
+
+            exit_hints = compute_exit_hints()
+        except Exception as exc:  # noqa: BLE001
+            if log_fn:
+                log_fn(f"卖点建议统计失败，本次不显示: {exc}")
+            exit_hints = {}
+
+    def _hint_text(category: str) -> str:
+        hint = (exit_hints or {}).get(category)
+        if hint is None:
+            return ""
+        return hint.describe() if hasattr(hint, "describe") else str(hint)
+
     grouped: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
     for category, rec in _iter_candidates(candidate_lists):
         code = str(rec.get("code") or "").strip().zfill(6)
@@ -289,6 +314,7 @@ def confirm_candidate_lists(
                     rec,
                     category=category,
                     reason=f"{mode_note}，未请求竞价接口",
+                    exit_hint=_hint_text(category),
                 )
                 rec["opening_confirmation"] = confirmation
                 status = confirmation.get("status", "观察")
@@ -346,6 +372,7 @@ def confirm_candidate_lists(
                 auction=auction,
                 open_price=open_price,
                 trade_date=confirmation_date,
+                exit_hint=_hint_text(category),
             )
             rec["opening_confirmation"] = confirmation
             status = confirmation.get("status", "观察")

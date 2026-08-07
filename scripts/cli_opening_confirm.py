@@ -189,6 +189,19 @@ def _format_human(payload: dict, lists: dict, result: dict) -> str:
             status = str(conf.get("status") or "观察")
             grouped.setdefault(status, []).append((category, rec, conf))
 
+    # T+1 卖点建议图例：类别后的 →留到收盘 / →竞价可走 由本地 accuracy 表实证得出
+    seen_hints: dict[str, str] = {}
+    for _c, _r, conf in [x for v in grouped.values() for x in v]:
+        hint = str(conf.get("exit_hint") or "").strip()
+        cat = str(conf.get("category") or "").strip()
+        if hint and cat not in seen_hints:
+            seen_hints[cat] = hint
+    if seen_hints:
+        lines.append("── T+1 卖点建议（括号内为 收盘卖-竞价卖 的实证收益差/样本数）──")
+        for cat, hint in seen_hints.items():
+            lines.append(f"  {cat}: {hint}")
+        lines.append("")
+
     for status in _STATUS_ORDER:
         items = grouped.get(status) or []
         if not items:
@@ -204,8 +217,12 @@ def _format_human(payload: dict, lists: dict, result: dict) -> str:
             score = conf.get("score")
             score_txt = str(score) if isinstance(score, (int, float)) else "-"
             reason = str(conf.get("reason") or "").strip()
+            hint = str(conf.get("exit_hint") or "").strip()
+            cat_txt = _category_label(category)
+            if hint:
+                cat_txt = f"{cat_txt}→{hint.split('(')[0]}"
             lines.append(
-                f"  {code} {name:<8} [{_category_label(category)}] "
+                f"  {code} {name:<8} [{cat_txt}] "
                 f"{gap_txt:<9} 额{_fmt_num(conf.get('auction_amount')):<7} 分{score_txt:<4} {reason}"
             )
         lines.append("")
@@ -228,6 +245,7 @@ def _format_json(payload: dict, lists: dict, result: dict, warnings: list[str] |
                 "auction_amount": conf.get("auction_amount"),
                 "score": conf.get("score"),
                 "reason": str(conf.get("reason") or "").strip(),
+                "exit_hint": str(conf.get("exit_hint") or "").strip(),
             })
     return json.dumps(
         {
