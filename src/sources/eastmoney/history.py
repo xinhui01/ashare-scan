@@ -32,12 +32,11 @@ from src.sources.eastmoney.throttling import (
 )
 
 
+# 只保留跨集群的两个入口：push2his 与 push2 是不同集群、死活独立（0806 实测），
+# 有真实兜底价值；82/61/40 等编号节点与主域同集群、被拦时一起死，已删。
 HISTORY_MIRRORS = [
     "https://push2his.eastmoney.com/api/qt/stock/kline/get",
     "https://push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://82.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://61.push2.eastmoney.com/api/qt/stock/kline/get",
-    "https://40.push2.eastmoney.com/api/qt/stock/kline/get",
 ]
 
 

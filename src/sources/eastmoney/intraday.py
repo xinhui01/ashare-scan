@@ -16,7 +16,6 @@ from src.config import env_float, env_int
 from src.network.headers import random_eastmoney_headers
 from src.network.host_health import limit_host_inflight, mark_failed, mark_ok, on_cooldown
 from src.sources._common import first_existing_column
-from src.sources.eastmoney.mirrors import request_mirror_urls
 from src.sources.eastmoney.rate_limit import json_indicates_rate_limit, looks_like_rate_limit
 from src.sources.eastmoney.throttling import EastmoneyRateLimitError
 from src.utils import em_circuit_breaker
@@ -79,53 +78,48 @@ def fetch_auction_snapshot(
         return None
 
     data_json: Optional[Dict[str, Any]] = None
-    last_error: Optional[BaseException] = None
-    attempted = False
-    for url in request_mirror_urls(_AUCTION_URL):
-        if on_cooldown(url) or em_circuit_breaker.is_open():
-            continue
-        attempted = True
-        try:
-            with limit_host_inflight(url, default_limit=_auction_inflight_limit()):
-                _wait_for_auction_request_slot()
-                headers = random_eastmoney_headers()
-                headers["Connection"] = "close"
-                req_kw = {
-                    "url": url,
-                    "params": params,
-                    "timeout": _auction_timeout(),
-                    "headers": headers,
-                }
-                if _use_insecure_ssl():
-                    req_kw["verify"] = False
-                with requests.Session() as session:
-                    if _use_bypass_proxy():
-                        session.trust_env = False
-                    r = session.get(**req_kw)
-                    response_text = r.text or ""
-                    if looks_like_rate_limit(r.status_code, response_text):
-                        raise EastmoneyRateLimitError(
-                            f"东方财富竞价接口返回 {r.status_code}，疑似触发限流"
-                        )
-                    r.raise_for_status()
-                    parsed_json = r.json()
-                    if not isinstance(parsed_json, dict):
-                        raise ValueError("东方财富竞价接口返回非字典 JSON")
-                    if json_indicates_rate_limit(parsed_json):
-                        raise EastmoneyRateLimitError("东方财富竞价接口返回限流提示")
-                    data_json = parsed_json
-            mark_ok(url)
-            em_circuit_breaker.record_success()
-            break
-        except Exception as exc:
-            last_error = exc
-            mark_failed(url)
-            em_circuit_breaker.record_failure()
-            continue
-
-    if data_json is None:
-        if attempted and logger and last_error is not None:
-            logger(f"竞价数据网络请求失败 {stock_code}: {last_error}")
+    url = _AUCTION_URL
+    if on_cooldown(url):
+        return None
+    try:
+        with limit_host_inflight(url, default_limit=_auction_inflight_limit()):
+            _wait_for_auction_request_slot()
+            # 节流等待期间并发线程可能已触发熔断，发请求前再确认一次
+            if em_circuit_breaker.is_open():
+                return None
+            headers = random_eastmoney_headers()
+            headers["Connection"] = "close"
+            req_kw = {
+                "url": url,
+                "params": params,
+                "timeout": _auction_timeout(),
+                "headers": headers,
+            }
+            if _use_insecure_ssl():
+                req_kw["verify"] = False
+            with requests.Session() as session:
+                if _use_bypass_proxy():
+                    session.trust_env = False
+                r = session.get(**req_kw)
+                response_text = r.text or ""
+                if looks_like_rate_limit(r.status_code, response_text):
+                    raise EastmoneyRateLimitError(
+                        f"东方财富竞价接口返回 {r.status_code}，疑似触发限流"
+                    )
+                r.raise_for_status()
+                parsed_json = r.json()
+                if not isinstance(parsed_json, dict):
+                    raise ValueError("东方财富竞价接口返回非字典 JSON")
+                if json_indicates_rate_limit(parsed_json):
+                    raise EastmoneyRateLimitError("东方财富竞价接口返回限流提示")
+                data_json = parsed_json
+        mark_ok(url)
+        em_circuit_breaker.record_success()
+    except Exception as exc:
+        mark_failed(url)
+        em_circuit_breaker.record_failure()
+        if logger:
+            logger(f"竞价数据网络请求失败 {stock_code}: {exc}")
         return None
 
     if not data_json or not data_json.get("data"):

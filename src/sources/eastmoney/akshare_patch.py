@@ -2,7 +2,7 @@
 
 替换原因：
 - AkShare 默认实现重试间隔短、超时短、headers 简陋，遇东财限流容易雪崩
-- 用我们的 headers 池 + 镜像轮换 + 总 deadline + 熔断接入
+- 用我们的 headers 池 + 总 deadline + 熔断接入（多镜像轮换已下线：同集群一起死）
 
 注入方式：
 - AkShare 不同模块通过 ``from ... import request_with_retry`` 绑定函数对象，
@@ -32,9 +32,9 @@ def request_with_retry(
     base_delay: float = 1.0,
     random_delay_range: Tuple[float, float] = (0.3, 1.0),
 ):
-    """替换 akshare 内置 request_with_retry：显式浏览器头、多镜像、更长超时。
+    """替换 akshare 内置 request_with_retry：显式浏览器头、更长超时。
 
-    增加 total deadline（所有镜像+重试合计不超过 20s），防止东财不可达时无限阻塞。
+    增加 total deadline（全部重试合计不超过 20s），防止东财不可达时无限阻塞。
     """
     import random
 
@@ -60,61 +60,58 @@ def request_with_retry(
 
     last_exception: Optional[BaseException] = None
 
-    mirrors = request_mirror_urls(url)
-    for mi, base_url in enumerate(mirrors):
-        for attempt in range(max_retries):
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                if last_exception is None:
-                    last_exception = RequestsTimeout(
-                        f"request_with_retry 总时限 {_TOTAL_DEADLINE_SEC:.0f}s 已到"
-                    )
-                raise last_exception
-
-            lg = getattr(_stock_data, "_list_download_log", None)
-            if (
-                lg
-                and attempt == 0
-                and mi == 0
-                and "/api/qt/clist/get" in url
-                and isinstance(params, dict)
-            ):
-                pn = params.get("pn", "?")
-                lg(
-                    f"列表分页：正在请求第 {pn} 页（共 {len(mirrors)} 个镜像可轮换）…"
+    # 编号 push 节点规范到主域后取唯一 URL（多镜像轮换已下线）
+    base_url = request_mirror_urls(url)[0]
+    for attempt in range(max_retries):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            if last_exception is None:
+                last_exception = RequestsTimeout(
+                    f"request_with_retry 总时限 {_TOTAL_DEADLINE_SEC:.0f}s 已到"
                 )
-            try:
-                per_req_timeout = min(timeout, max(2, remaining))
-                with requests.Session() as session:
-                    if _use_bypass_proxy():
-                        session.trust_env = False
-                    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
-                    session.mount("http://", adapter)
-                    session.mount("https://", adapter)
-                    hdrs = random_eastmoney_headers()
-                    req_kw: Dict[str, Any] = {
-                        "url": base_url,
-                        "params": params,
-                        "timeout": per_req_timeout,
-                        "headers": hdrs,
-                    }
-                    if _use_insecure_ssl():
-                        req_kw["verify"] = False
-                    response = session.get(**req_kw)
-                    response.raise_for_status()
-                    if "eastmoney.com" in url:
-                        _em_circuit_breaker.record_success()
-                    return response
-            except (requests.RequestException, ValueError) as e:
-                last_exception = e
+            raise last_exception
+
+        lg = getattr(_stock_data, "_list_download_log", None)
+        if (
+            lg
+            and attempt == 0
+            and "/api/qt/clist/get" in url
+            and isinstance(params, dict)
+        ):
+            pn = params.get("pn", "?")
+            lg(f"列表分页：正在请求第 {pn} 页…")
+        try:
+            per_req_timeout = min(timeout, max(2, remaining))
+            with requests.Session() as session:
+                if _use_bypass_proxy():
+                    session.trust_env = False
+                adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                hdrs = random_eastmoney_headers()
+                req_kw: Dict[str, Any] = {
+                    "url": base_url,
+                    "params": params,
+                    "timeout": per_req_timeout,
+                    "headers": hdrs,
+                }
+                if _use_insecure_ssl():
+                    req_kw["verify"] = False
+                response = session.get(**req_kw)
+                response.raise_for_status()
                 if "eastmoney.com" in url:
-                    _em_circuit_breaker.record_failure()
-                if attempt < max_retries - 1 and (deadline - time.time()) > 1:
-                    delay = min(
-                        base_delay * (1.5 ** attempt) + random.uniform(*random_delay_range),
-                        max(0.5, deadline - time.time() - 1),
-                    )
-                    time.sleep(delay)
+                    _em_circuit_breaker.record_success()
+                return response
+        except (requests.RequestException, ValueError) as e:
+            last_exception = e
+            if "eastmoney.com" in url:
+                _em_circuit_breaker.record_failure()
+            if attempt < max_retries - 1 and (deadline - time.time()) > 1:
+                delay = min(
+                    base_delay * (1.5 ** attempt) + random.uniform(*random_delay_range),
+                    max(0.5, deadline - time.time() - 1),
+                )
+                time.sleep(delay)
     if last_exception is not None:
         raise last_exception
     raise RuntimeError("request_with_retry: no attempt made")

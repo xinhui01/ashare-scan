@@ -1,10 +1,14 @@
-"""东方财富镜像 URL 构造 + 健康度优先级排序。
+"""东方财富请求 URL 规范化 + 历史镜像健康度排序。
 
-- ``request_mirror_urls``：把单个 push2 URL 扩展成多节点候选列表（push2 / 82.push2 / 40.push2 等）。
+- ``request_mirror_urls``：多节点轮换已下线——82.push2 等编号节点与主域同属
+  一个集群，被网络出口按 TLS 指纹拦截时一起死（2026-08-06/07 两次实测），
+  轮换只会把熔断计数打得更快。现在仅把编号节点规范到无编号主域后返回
+  单元素列表，保持旧调用方的 for 循环签名不变。
 - ``prioritize_history_mirrors``：从候选列表里剔除冷却中的主机，按健康度截断。
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -12,33 +16,20 @@ from urllib.parse import urlparse, urlunparse
 from src.network.host_health import on_cooldown
 
 
+_NUMBERED_PUSH_HOST = re.compile(
+    r"^\d+\.(push2his|push2delay|push2)(\.eastmoney\.com)$", re.IGNORECASE
+)
+
+
 def request_mirror_urls(url: str) -> List[str]:
-    """东方财富 push 多节点；82 等单线路易在分页中途被断开，优先尝试无编号主域。"""
+    """返回单元素列表；编号 push 节点（82.push2 等）规范到无编号主域。"""
     raw = url.strip()
     p = urlparse(raw)
-    netloc = (p.netloc or "").lower()
-    if "eastmoney.com" not in netloc:
+    match = _NUMBERED_PUSH_HOST.match((p.netloc or "").strip().lower())
+    if not match:
         return [raw]
-    path = p.path or "/"
-    original = p.netloc
-    hosts = [
-        "push2.eastmoney.com",
-        original,
-        "82.push2.eastmoney.com",
-        "40.push2.eastmoney.com",
-    ]
-    seen: set[str] = set()
-    out: List[str] = []
-    for host in hosts:
-        h = (host or "").strip()
-        if not h:
-            continue
-        key = h.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(urlunparse(("https", h, path, "", "", "")))
-    return out if out else [raw]
+    host = match.group(1) + match.group(2)
+    return [urlunparse(("https", host, p.path or "/", "", p.query or "", ""))]
 
 
 def prioritize_history_mirrors(
