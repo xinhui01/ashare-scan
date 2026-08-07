@@ -506,6 +506,9 @@ def score_broken_board_wrap(
         **accumulation_metrics,
         **relative_strength_metrics,
         "score": final_score,
-        "reasons": " / ".join(reasons[:8]),
+        # 上限 8 条时实测反包候选全部顶满（0806 五只 8~9 条），被吞的恰好是排在
+        # 形态类之后的板块联动/题材/资金面——复盘最需要看的主线共振信号。放宽到
+        # 12 条（与 cont 一致），让这些露出来。
+        "reasons": " / ".join(reasons[:12]),
         "predict_type": predict_type,
     }

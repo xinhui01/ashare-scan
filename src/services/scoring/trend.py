@@ -490,6 +490,7 @@ def score_trend_limit_up(
         **accumulation_metrics,
         **relative_strength_metrics,
         "score": final_score,
-        "reasons": " / ".join(reasons[:8]),
+        # 与 wrap/cont 统一到 12 条，避免板块/题材/资金面这些后置信号被截掉
+        "reasons": " / ".join(reasons[:12]),
         "predict_type": "趋势涨停",
     }
