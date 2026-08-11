@@ -66,26 +66,6 @@ def _candidate_score(candidate: Dict[str, Any]) -> float:
         return 0.0
 
 
-# 退潮/冰点期自动缩减 top_n（2026-08-10 新增）。
-# 实证（见 .workbuddy/memory/MEMORY.md）：情绪 <= 63 时反包胜率仅 17%，
-# 情绪 <= 53 时 cont/first 候选停产，系统只剩 wrap → 强行输出 5 只反包连挂。
-# 退潮日缩到 2 只、冰点日缩到 1 只，避免在最不该做反包时满额输出。
-RETREAT_TOP_N: Dict[str, int] = {
-    "退潮日": 2,
-    "冰点日": 1,
-}
-
-
-def _retreat_top_n_override(market_state_label: str, sentiment_score: int) -> Optional[int]:
-    """按市场状态 / 情绪分返回退潮期 top_n 上限，None 表示不限制。"""
-    if market_state_label in RETREAT_TOP_N:
-        return RETREAT_TOP_N[market_state_label]
-    # 兜底：情绪分低但状态标签未明确标记时，也做保守处理
-    if sentiment_score < 60:
-        return 3
-    return None
-
-
 def apply_prediction_quality_gate(
     result: Dict[str, Any],
     preset: str = "off",
@@ -93,8 +73,6 @@ def apply_prediction_quality_gate(
     categories: Optional[List[str]] = None,
     data_quality: Optional[Dict[str, Any]] = None,
     log_fn: Optional[Any] = None,
-    market_state_label: str = "",
-    sentiment_score: int = 50,
 ) -> Dict[str, Any]:
     """对预测结果应用"类别筛选 + top-N 截断"。
 
@@ -102,9 +80,6 @@ def apply_prediction_quality_gate(
 
     启用类别的子列表保留、其余清空；启用类别内按"类别优先级 + 分数降序"合并后
     截断 top_n，再按原类别放回各自子列表 —— 保证 GUI / 竞价确认 读取的字段结构不变。
-
-    退潮/冰点日（market_state_label）或情绪分 < 60 时，自动缩减 top_n，
-    避免在退潮期强行输出反包候选（退潮期 cont/first 停产，只剩 wrap 且胜率极低）。
     """
     import os
 
@@ -133,18 +108,6 @@ def apply_prediction_quality_gate(
     top_n = int(cfg.get("top_n") or 0)
     if top_n <= 0:
         return result
-
-    # 退潮/冰点期自动缩减 top_n
-    pre_override_top_n = top_n
-    retreat_override = _retreat_top_n_override(market_state_label, sentiment_score)
-    if retreat_override is not None and retreat_override < top_n:
-        if log_fn:
-            log_fn(
-                f"候选质量门：退潮期缩减 top_n {top_n} → {retreat_override}"
-                f"（状态={market_state_label or '情绪<60'}）"
-            )
-        top_n = retreat_override
-        # 同时更新 gate_info 中的原始 top_n 记录（后面会覆盖，这里暂不处理）
 
     # 收集启用类别的候选，记录原始类别
     tagged: List[Tuple[str, Dict[str, Any]]] = []
@@ -179,8 +142,6 @@ def apply_prediction_quality_gate(
         "before_total": before_total,
         "after_total": after_total,
         "dropped": before_total - after_total,
-        "retreat_override": bool(retreat_override is not None and retreat_override < pre_override_top_n),
-        "pre_override_top_n": pre_override_top_n,
     }
     if data_quality is not None and isinstance(data_quality, dict):
         data_quality["quality_gate"] = gate_info
@@ -211,7 +172,7 @@ if __name__ == "__main__":
             {"code": f"t{i}", "score": 100 - i} for i in range(5)
         ],
     }
-    out = apply_prediction_quality_gate(fake, preset="wrap_first_cont", top_n=5, sentiment_score=70)
+    out = apply_prediction_quality_gate(fake, preset="wrap_first_cont", top_n=5)
     kept = (
         [(c["code"], c["score"]) for c in out["broken_board_wrap_candidates"]]
         + [(c["code"], c["score"]) for c in out["first_board_candidates"]]
@@ -224,24 +185,3 @@ if __name__ == "__main__":
     assert out["fresh_first_board_candidates"] == [], "非启用类别应清空"
     assert out["trend_limit_up_candidates"] == [], "非启用类别应清空"
     print("smoke OK")
-    # 退潮期缩减测试（每个测试用独立数据避免相互污染）
-    def _fake():
-        return {
-            "broken_board_wrap_candidates": [{"code": f"w{i}", "score": 90 - i} for i in range(5)],
-            "first_board_candidates": [{"code": f"f{i}", "score": 80 - i} for i in range(5)],
-            "continuation_candidates": [{"code": f"c{i}", "score": 70 - i} for i in range(5)],
-            "fresh_first_board_candidates": [{"code": f"r{i}", "score": 60 - i} for i in range(5)],
-            "trend_limit_up_candidates": [{"code": f"t{i}", "score": 100 - i} for i in range(5)],
-        }
-    def _kept_count(r):
-        return sum(len(r.get(k) or []) for k in CATEGORY_RESULT_KEY.values())
-    out_retreat = apply_prediction_quality_gate(_fake(), preset="wrap_first_cont", top_n=5,
-                                                 market_state_label="退潮日", sentiment_score=53)
-    assert _kept_count(out_retreat) == 2, f"退潮日应缩减到 2，实际 {_kept_count(out_retreat)}"
-    out_ice = apply_prediction_quality_gate(_fake(), preset="wrap_first_cont", top_n=5,
-                                             market_state_label="冰点日", sentiment_score=44)
-    assert _kept_count(out_ice) == 1, f"冰点日应缩减到 1，实际 {_kept_count(out_ice)}"
-    out_low = apply_prediction_quality_gate(_fake(), preset="wrap_first_cont", top_n=5,
-                                             sentiment_score=55)
-    assert _kept_count(out_low) == 3, f"情绪<60兜底应缩减到 3，实际 {_kept_count(out_low)}"
-    print("retreat smoke OK")

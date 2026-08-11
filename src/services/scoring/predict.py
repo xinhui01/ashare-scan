@@ -2432,11 +2432,8 @@ def predict_limit_up_candidates(
     try:
         from src.services.scoring.quality_gate import apply_prediction_quality_gate
 
-        state_label = compare_context.get("market_state_label", "")
-        sent_score = compare_context.get("sentiment_score", 50)
         result = apply_prediction_quality_gate(
-            result, preset="wrap_first_cont", data_quality=data_quality, log_fn=log_fn,
-            market_state_label=state_label, sentiment_score=sent_score,
+            result, preset="wrap_first_cont", data_quality=data_quality, log_fn=log_fn
         )
     except Exception as exc:
         logger.debug("候选质量门执行失败（已跳过，保留原结果）: %s", exc)
